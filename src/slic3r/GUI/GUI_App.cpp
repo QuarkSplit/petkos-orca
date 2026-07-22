@@ -3,6 +3,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
+#include "ConfigImport.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "slic3r/GUI/UserManager.hpp"
@@ -2537,8 +2538,22 @@ void GUI_App::init_app_config()
                 migrate_flatpak_legacy_datadir(data_dir_path);
                 set_data_dir(data_dir_path.string());
             #endif
-            if (!boost::filesystem::exists(data_dir_path)){
+            bool first_launch = !boost::filesystem::exists(data_dir_path);
+            if (first_launch){
                 boost::filesystem::create_directory(data_dir_path);
+            }
+            // First-launch import: if our data dir didn't exist yet, probe for
+            // other slicers' configs (stock OrcaSlicer, Bambu, Prusa) and offer
+            // to copy them in. Users already on Orca don't have to re-create
+            // their printer profiles in our fork. Silently skipped if nothing
+            // is found or the user declines. See ConfigImport.{hpp,cpp}.
+            if (first_launch) {
+                try {
+                    auto candidates = detect_import_candidates();
+                    if (!candidates.empty()) run_import_dialog(candidates);
+                } catch (const std::exception &e) {
+                    BOOST_LOG_TRIVIAL(warning) << "config-import: " << e.what();
+                }
             }
         }
 
@@ -6322,7 +6337,8 @@ std::string GUI_App::format_display_version()
 {
     if (!version_display.empty()) return version_display;
 
-    version_display = SoftFever_VERSION;
+    version_display = "WaveOverhangs v" + std::string(WAVE_OVERHANGS_VERSION)
+                    + " (OrcaSlicer " + std::string(SoftFever_VERSION) + ")";
     return version_display;
 }
 
@@ -7751,7 +7767,7 @@ int GUI_App::GetSingleChoiceIndex(const wxString& message,
 // select language from the list of installed languages
 bool GUI_App::select_language()
 {
-	wxArrayString translations = wxTranslations::Get()->GetAvailableTranslations(SLIC3R_APP_KEY);
+	wxArrayString translations = wxTranslations::Get()->GetAvailableTranslations(SLIC3R_GETTEXT_DOMAIN);
     std::vector<const wxLanguageInfo*> language_infos;
     language_infos.emplace_back(wxLocale::GetLanguageInfo(wxLANGUAGE_ENGLISH));
     for (size_t i = 0; i < translations.GetCount(); ++ i) {
@@ -7855,7 +7871,7 @@ bool GUI_App::load_language(wxString language, bool initial)
                     // There seems to be a support for that on Windows and OSX, while on Linuxes the code just returns wxLocale::GetSystemLanguage().
                     // The last parameter gets added to the list of detected dictionaries. This is a workaround
                     // for not having the English dictionary. Let's hope wxWidgets of various versions process this call the same way.
-                    wxString best_language = wxTranslations::Get()->GetBestTranslation(SLIC3R_APP_KEY, wxLANGUAGE_ENGLISH);
+                    wxString best_language = wxTranslations::Get()->GetBestTranslation(SLIC3R_GETTEXT_DOMAIN, wxLANGUAGE_ENGLISH);
                     if (!best_language.IsEmpty()) {
                         m_language_info_best = wxLocale::FindLanguageInfo(best_language);
                         BOOST_LOG_TRIVIAL(info) << boost::format("Best translation language detected (may be different from user locales): %1%") %
@@ -8024,7 +8040,7 @@ bool GUI_App::load_language(wxString language, bool initial)
     // Override language at the active wxTranslations class (which is stored in the active m_wxLocale)
     // to load possibly different dictionary, for example, load Czech dictionary for Slovak language.
     wxTranslations::Get()->SetLanguage(language_dict);
-    m_wxLocale->AddCatalog(SLIC3R_APP_KEY);
+    m_wxLocale->AddCatalog(SLIC3R_GETTEXT_DOMAIN);
     m_active_language_code = requested_language_code;
     m_imgui->set_language(into_u8(requested_language_code));
 

@@ -13,7 +13,15 @@ appimage_is_host_library() {
         libgstreamer-1.0.so*|libgst*.so*|libsoup-*.so*|libwebkit2gtk-*.so*|libjavascriptcoregtk-*.so*|libsecret-1.so*|libmanette-0.2.so*|libenchant-2.so*|libhyphen.so*|libtasn1.so*|\
         libfontconfig.so*|libfreetype.so*|libharfbuzz*.so*|libfribidi.so*|libgraphite2.so*|libthai.so*|libdatrie.so*|libepoxy.so*|libpixman-1.so*|\
         libstdc++.so*|libgcc_s.so*|libatomic.so*|libdbus-1.so*|libuuid.so*|libffi.so*|libselinux.so*|libmount.so*|libblkid.so*|libpcre2-*.so*|libsystemd.so*|libcap.so*|libseccomp.so*|\
-        liborc-0.4.so*|libgudev-1.0.so*)
+        liborc-0.4.so*|libgudev-1.0.so*|\
+        libavif.so*|libsharpyuv.so*|libheif.so*|libwebp.so*|libwebpdemux.so*|libwebpmux.so*)
+            # Note: libwebpdecoder.so* is deliberately NOT host-resolved. It is the
+            # decode-only webp library, a direct dependency of the slicer binary, and
+            # is not part of the host gdk-pixbuf loader stack. Ubuntu ships it in a
+            # standalone libwebpdecoder3 package that many distros (Linux Mint, clean
+            # Ubuntu) do not install by default, so the AppImage must bundle it. It
+            # has no libsharpyuv dependency, so the avif/sharpyuv ABI mismatch that
+            # made the other codec libs host-resolved does not apply here.
             return 0
             ;;
         *)
