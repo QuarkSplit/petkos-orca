@@ -313,7 +313,12 @@ public:
 
     std::vector<int> get_used_tpu_filaments(const std::vector<int> &used_filaments);
     // Orca: update selected filament and print
-    void           update_selections(AppConfig &config);
+    // preserve_project_filaments: keep the currently loaded project's filament count and
+    // colors across a printer switch instead of replacing them with the per-printer
+    // remembered ones. Shrinking the filament list or overwriting the colors destroys the
+    // project's multi-material data (painting is truncated irreversibly downstream, see
+    // ModelVolume::update_extruder_count).
+    void           update_selections(AppConfig &config, bool preserve_project_filaments = false);
     void set_calibrate_printer(std::string name);
 
     void set_is_validation_mode(bool mode) { validation_mode = mode; }

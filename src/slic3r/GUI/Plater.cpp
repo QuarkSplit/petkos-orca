@@ -5246,6 +5246,15 @@ struct Plater::priv
         bool                  show{false};
     } sidebar_layout;
     Bed3D bed;
+    //The project printer's bed as last synced from the config. Kept so the Bed3D can
+    //be put back when the selection moves off a plate that carries its own printer;
+    //the Bed3D itself may be showing that plate's bed instead at any given moment.
+    Pointfs              project_bed_shape;
+    double               project_bed_height { 0.0 };
+    std::vector<Pointfs> project_bed_extruder_areas;
+    std::vector<double>  project_bed_extruder_heights;
+    std::string          project_bed_custom_model;
+    bool                 project_bed_force_custom { false };
     Camera camera;
     //BBS: partplate related structure
     PartPlateList partplate_list;
@@ -12363,6 +12372,15 @@ void Plater::priv::set_bed_shape(const Pointfs       &shape,
     else
         SCALING_FACTOR = SCALING_FACTOR_INTERNAL_LARGE_PRINTER;
 
+    //remember the project bed so update_bed_for_selected_plate can restore it when
+    //the selection leaves a plate that carries its own printer
+    project_bed_shape            = shape;
+    project_bed_height           = printable_height;
+    project_bed_extruder_areas   = extruder_areas;
+    project_bed_extruder_heights = extruder_heights;
+    project_bed_custom_model     = custom_model;
+    project_bed_force_custom     = force_as_custom;
+
     //BBS: add shape position
     Vec2d shape_position = partplate_list.get_current_shape_position();
     bool new_shape = bed.set_shape(shape, printable_height, extruder_areas, extruder_heights, custom_model, force_as_custom, shape_position);
@@ -12391,11 +12409,12 @@ void Plater::priv::set_bed_shape(const Pointfs       &shape,
 
         partplate_list.reset_size(max.x() - min.x() - Bed3D::Axes::DefaultTipRadius, max.y() - min.y() - Bed3D::Axes::DefaultTipRadius, z);
         partplate_list.set_shapes(shape, exclude_areas, wrapping_exclude_areas, extruder_areas, extruder_heights, custom_texture, height_to_lid, height_to_rod);
-
-        Vec2d new_shape_position = partplate_list.get_current_shape_position();
-        if (shape_position != new_shape_position)
-            bed.set_shape(shape, printable_height, extruder_areas, extruder_heights, custom_model, force_as_custom, new_shape_position);
     }
+
+    //Whatever happened above, park the Bed3D on the selected plate. When that plate
+    //carries its own printer this swaps the project bed just applied for the plate's
+    //own; it also covers the reposition that set_shapes' reflow may have caused.
+    q->update_bed_for_selected_plate();
 }
 
 bool Plater::priv::can_delete() const
@@ -16876,6 +16895,22 @@ void Plater::reslice()
     if (get_view3D_canvas3D()->get_gizmos_manager().is_in_editing_mode(true))
         return;
 
+    //Per-plate machines: in-app slicing always uses the project printer; per-plate
+    //slicing is the farm pipeline's job. A plate pinned to a different machine would
+    //otherwise slice silently against the wrong printer, so say so where the user
+    //is looking instead of only in the log.
+    {
+        PartPlate* cp = p->partplate_list.get_curr_plate();
+        const std::string& sel_printer = wxGetApp().preset_bundle->printers.get_selected_preset().name;
+        if (cp != nullptr && cp->has_printer_assignment() && cp->get_printer_preset_name() != sel_printer) {
+            wxString msg = wxString::Format(
+                _L("Plate %d is assigned to printer \"%s\" but will be sliced for the project printer \"%s\". Per-plate slicing happens in the farm pipeline."),
+                cp->get_index() + 1, from_u8(cp->get_printer_preset_name()), from_u8(sel_printer));
+            get_notification_manager()->push_notification(NotificationType::BBLPlateInfo,
+                NotificationManager::NotificationLevel::WarningNotificationLevel, into_u8(msg));
+        }
+    }
+
     // Enforce the missing-plugin block at the slicing choke point: menu/keyboard/queued triggers can
     // carry a stale enabled state while plugins load asynchronously. refresh_missing_plugin_block
     // rebuilds the missing sets and notifications from the active presets without running
@@ -19051,6 +19086,7 @@ void Plater::open_platesettings_dialog(wxCommandEvent& evt) {
     }
 
     dlg.sync_spiral_mode(curr_plate->get_spiral_vase_mode(), !curr_plate->has_spiral_mode_config());
+    dlg.sync_printer_preset(curr_plate->get_printer_preset_name());
 
     dlg.Bind(EVT_SET_BED_TYPE_CONFIRM, [this, plate_index, &dlg](wxCommandEvent& e) {
         PartPlate* curr_plate = p->partplate_list.get_curr_plate();
@@ -19088,6 +19124,19 @@ void Plater::open_platesettings_dialog(wxCommandEvent& evt) {
         }
         else {
             curr_plate->set_spiral_vase_mode(false, true);
+        }
+
+        //Per-plate printer. Applying the bed resizes this plate and reflows its
+        //neighbours, so only do the work when the assignment actually changed.
+        const std::string new_printer = dlg.get_printer_preset_choice();
+        if (new_printer != curr_plate->get_printer_preset_name()) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                << boost::format("assign plate %1% to printer '%2%'") % plate_index % new_printer;
+            curr_plate->set_printer_preset_name(new_printer);
+            p->partplate_list.apply_printer_to_plate(curr_plate->get_index());
+            //the plate outline, grid and icons are rebuilt by the call above; the
+            //textured Bed3D underneath follows the plate through this call
+            update_bed_for_selected_plate();
         }
 
         update_project_dirty_from_presets();
@@ -19428,7 +19477,41 @@ int Plater::delete_plate(int plate_index)
 //BBS: set bed positions
 void Plater::set_bed_position(Vec2d& pos)
 {
-    p->bed.set_position(pos);
+    //moving the bed is also the moment its shape can change: the plate the
+    //selection landed on may carry its own printer
+    update_bed_for_selected_plate(&pos);
+}
+
+//Point the textured Bed3D at the selected plate: its position always, and its
+//shape whenever the plate is pinned to a printer of its own. Falls back to the
+//project bed recorded by priv::set_bed_shape. Bed3D::set_shape no-ops when
+//nothing changed, so calling this liberally is cheap.
+void Plater::update_bed_for_selected_plate(const Vec2d* forced_position)
+{
+    PartPlateList& ppl = p->partplate_list;
+    PartPlate* plate = ppl.get_curr_plate();
+    Vec2d pos = forced_position ? *forced_position : ppl.get_current_shape_position();
+
+    PlateBed plate_bed;
+    if (plate != nullptr && ppl.resolve_printer_bed(plate->get_printer_preset_name(), plate_bed)) {
+        const double height = plate_bed.printable_height > 0.0 ? plate_bed.printable_height : p->project_bed_height;
+        if (p->bed.get_shape() == plate_bed.shape && p->bed.build_volume().printable_height() == height)
+            p->bed.set_position(pos);   //pure move; keeps the bed model alive
+        else
+            p->bed.set_shape(plate_bed.shape, height, plate_bed.extruder_areas, plate_bed.extruder_heights,
+                             plate_bed.bed_model, false, pos);
+    }
+    else if (!p->project_bed_shape.empty()) {
+        if (p->bed.get_shape() == p->project_bed_shape && p->bed.build_volume().printable_height() == p->project_bed_height)
+            p->bed.set_position(pos);   //pure move; the common no-assignments path
+        else
+            p->bed.set_shape(p->project_bed_shape, p->project_bed_height, p->project_bed_extruder_areas,
+                             p->project_bed_extruder_heights, p->project_bed_custom_model, p->project_bed_force_custom, pos);
+    }
+    else {
+        //nothing recorded yet (startup); just move
+        p->bed.set_position(pos);
+    }
 }
 
 //BBS: is the background process slicing currently

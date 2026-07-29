@@ -1274,11 +1274,13 @@ bool GLVolumeCollection::check_outside_state(const BuildVolume &build_volume, Mo
 
     GUI::PartPlate* curr_plate = GUI::wxGetApp().plater()->get_partplate_list().get_selected_plate();
     const Pointfs& pp_bed_shape = curr_plate->get_shape();
-    BuildVolume plate_build_volume(pp_bed_shape, build_volume.printable_height(), build_volume.extruder_areas(), build_volume.extruder_heights());
+    //the plate's own height and extruder areas, not the project printer's: a plate
+    //pinned to its own machine must reject what that machine cannot print
+    BuildVolume plate_build_volume(pp_bed_shape, curr_plate->get_printable_height(), curr_plate->get_extruder_areas(), curr_plate->get_extruder_heights());
     const std::vector<BoundingBoxf3>& exclude_areas = curr_plate->get_exclude_areas();
 
     std::map<ModelObject*, std::map<int, std::set<int>>> objects_unprintable_filaments;
-    int extruder_count = build_volume.get_extruder_area_count();
+    int extruder_count = plate_build_volume.get_extruder_area_count();
     std::vector<std::set<int>> unprintable_filament_ids(extruder_count, std::set<int>());
     std::set<ModelObject*> partly_objects_set;
     const ModelObjectPtrs &model_objects = model.objects;

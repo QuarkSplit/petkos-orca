@@ -2368,6 +2368,12 @@ void PartPlate::set_pos_and_size(Vec3d& origin, int width, int depth, int height
 	bool size_changed = false; //size changed means the machine changed
 	bool pos_changed = false;
 
+	//A plate pinned to its own printer keeps that printer's height. Applied here,
+	//at the single choke point, because almost every caller passes the list-wide
+	//m_plate_height and would otherwise stamp the project height back on.
+	if (m_printable_height > 0.0)
+		height = (int)m_printable_height;
+
 	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate_id %1%, before, origin {%2%,%3%,%4%}, plate_width %5%, plate_depth %6%, plate_height %7%")\
 		% m_plate_index % m_origin.x() % m_origin.y() % m_origin.z() % m_width % m_depth % m_height;
 	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": with_instance_move %1%, after, origin {%2%,%3%,%4%}, plate_width %5%, plate_depth %6%, plate_height %7%")\
@@ -2462,6 +2468,10 @@ void PartPlate::generate_plate_name_texture()
 	// generate m_name_texture texture from m_name with generate_from_text_string
 	m_name_texture.reset();
 	auto text = m_name.empty()? _L("Untitled") : from_u8(m_name);
+	//a plate pinned to its own printer wears that printer's name; this is the
+	//at-a-glance affordance for which machine each plate goes to
+	if (has_printer_assignment())
+		text += wxString::FromUTF8(" \xE2\x86\x92 ") + from_u8(m_printer_preset_name);
 
     // ORCA also scale font size to prevent low res texture
     int size = wxGetApp().em_unit() * PARTPLATE_EDIT_PLATE_NAME_ICON_SIZE;
@@ -2664,7 +2674,8 @@ bool PartPlate::check_outside(int obj_id, int instance_id, BoundingBoxf3* boundi
 		// Orca: For sinking object, we use a more expensive algorithm so part below build plate won't be considered
 		if (plate_box.intersects(instance_box)) {
 			// TODO: FIXME: this does not take exclusion area into account
-            const BuildVolume build_volume(get_shape(), m_plater->build_volume().printable_height(), m_extruder_areas, m_extruder_heights);
+			//this plate's own printable height, so a plate pinned to a shorter machine rejects what would not fit it
+            const BuildVolume build_volume(get_shape(), get_printable_height(), m_extruder_areas, m_extruder_heights);
 			const auto state = instance->calc_print_volume_state(build_volume);
 			outside = state == ModelInstancePVS_Partly_Outside;
 		}
@@ -3217,6 +3228,13 @@ bool PartPlate::set_shape(const Pointfs& shape, const Pointfs& exclude_areas, co
 {
 	Pointfs new_shape, new_exclude_areas;
 	m_extruder_heights = extruder_heights;
+
+	//keep the untranslated profile geometry so this plate can be moved or resized
+	//on its own later without the caller re-supplying it
+	m_shape_local = shape;
+	m_exclude_area_local = exclude_areas;
+	m_extruder_areas_local = extruder_areas;
+
 	for (const Vec2d& p : shape) {
 		new_shape.push_back(Vec2d(p.x() + position.x(), p.y() + position.y()));
 	}
@@ -3305,6 +3323,27 @@ bool PartPlate::set_shape(const Pointfs& shape, const Pointfs& exclude_areas, co
 	calc_height_limit();
 
 	return true;
+}
+
+//footprint of this plate's own bed, independent of any neighbour
+Vec2d PartPlate::get_local_size() const
+{
+	if (m_shape_local.empty())
+		return Vec2d(0.0, 0.0);
+
+	return get_extents(m_shape_local).size();
+}
+
+//re-apply our own geometry at a new origin
+bool PartPlate::reposition(const Vec2d& position)
+{
+	//copy first: set_shape writes to the very members we are reading from
+	const Pointfs shape = m_shape_local;
+	const Pointfs exclude_areas = m_exclude_area_local;
+	const std::vector<Pointfs> extruder_areas = m_extruder_areas_local;
+	const std::vector<double> extruder_heights = m_extruder_heights;
+
+	return set_shape(shape, exclude_areas, extruder_areas, extruder_heights, position, m_height_to_lid, m_height_to_rod);
 }
 
 const BoundingBox PartPlate::get_bounding_box_crd()
@@ -4061,29 +4100,289 @@ Vec3d PartPlateList::compute_origin_using_new_size(int i, int new_width, int new
 }
 
 
-//compute the origin for printable plate with index i
+//park the unprintable plate in the next free slot after the last real plate.
+//derived from where the plates actually ended up rather than from a uniform grid,
+//so it stays put when neighbouring plates have different footprints.
 Vec3d PartPlateList::compute_origin_for_unprintable()
 {
-	int max_count = m_plate_cols * m_plate_cols;
-	if (m_plate_count == max_count)
-		return compute_origin(max_count + m_plate_cols - 1, m_plate_cols + 1);
-	else
-		return compute_origin(m_plate_count, m_plate_cols);
+	const Vec2d pos = predict_plate_origin((int)m_plate_list.size());
+	return Vec3d(pos.x(), pos.y(), 0.0);
 }
 
 //compute shape position
 Vec2d PartPlateList::compute_shape_position(int index, int cols)
 {
-	Vec2d pos;
-	int row, col;
+	//A plate that exists reports where it actually sits. reflow_layout() is the
+	//authority on that, not a uniform grid, because plates can differ in size.
+	if (index >= 0 && index < (int)m_plate_list.size() && m_plate_list[index] != nullptr)
+		return get_plate_origin_2d(index);
 
-	row = index / cols;
-	col = index % cols;
+	//An index past the end means a plate that is about to be created. Predict where
+	//it will land; the reflow that follows the insertion is what makes it final.
+	(void)cols;
+	return predict_plate_origin(index);
+}
 
-	pos(0) = col * plate_stride_x();
-	pos(1) = -row * plate_stride_y();
+Vec2d PartPlateList::get_plate_layout_size(int index) const
+{
+	//a plate that has never been positioned reports a zero footprint, so fall
+	//back to the list-wide size rather than collapsing the layout
+	if (index >= 0 && index < (int)m_plate_list.size() && m_plate_list[index] != nullptr) {
+		const Vec2d size = m_plate_list[index]->get_size();
+		if (size.x() > 0.0 && size.y() > 0.0)
+			return size;
+	}
 
-	return pos;
+	return Vec2d((double)m_plate_width, (double)m_plate_depth);
+}
+
+Vec2d PartPlateList::get_plate_origin_2d(int index) const
+{
+	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
+		return Vec2d(0.0, 0.0);
+
+	const Vec3d origin = m_plate_list[index]->m_origin;
+	return Vec2d(origin.x(), origin.y());
+}
+
+//Where slot `index` sits, whether or not a plate occupies it yet. Runs the same
+//packing as reflow_layout so a predicted origin matches where the plate will
+//actually land once it is created.
+Vec2d PartPlateList::predict_plate_origin(int index) const
+{
+	if (index <= 0)
+		return Vec2d(0.0, 0.0);
+	if (index < (int)m_plate_list.size())
+		return get_plate_origin_2d(index);
+
+	const int cols = std::max(1, m_plate_cols);
+	double x = 0.0, y = 0.0, row_depth = 0.0;
+
+	for (int i = 0; i < index; ++i)
+	{
+		const Vec2d size = (i < (int)m_plate_list.size())
+			? get_plate_layout_size(i)
+			: Vec2d((double)m_plate_width, (double)m_plate_depth);
+		row_depth = std::max(row_depth, size.y());
+
+		if (((i + 1) % cols) == 0) {
+			//wrap to the next row, clearing the deepest plate in the row we are leaving
+			x = 0.0;
+			y -= row_depth * (1. + LOGICAL_PART_PLATE_GAP);
+			row_depth = 0.0;
+		}
+		else {
+			x += size.x() * (1. + LOGICAL_PART_PLATE_GAP);
+		}
+	}
+
+	return Vec2d(x, y);
+}
+
+//lay every plate out from its own footprint, so plates of different sizes can coexist
+void PartPlateList::reflow_layout()
+{
+	if (m_plate_list.empty())
+		return;
+
+	const int cols = std::max(1, m_plate_cols);
+	const size_t row_count = (m_plate_list.size() + cols - 1) / cols;
+
+	//pass 1: a row is as deep as its deepest plate
+	std::vector<double> row_depth(row_count, 0.0);
+	for (size_t i = 0; i < m_plate_list.size(); ++i)
+		row_depth[i / cols] = std::max(row_depth[i / cols], get_plate_layout_size((int)i).y());
+
+	//pass 2: rows stack downwards, each clearing the one above it
+	std::vector<double> row_origin_y(row_count, 0.0);
+	for (size_t r = 1; r < row_count; ++r)
+		row_origin_y[r] = row_origin_y[r - 1] - row_depth[r - 1] * (1. + LOGICAL_PART_PLATE_GAP);
+
+	//pass 3: place them. x accumulates each plate's own width rather than a shared stride
+	double x = 0.0;
+	size_t current_row = 0;
+	for (size_t i = 0; i < m_plate_list.size(); ++i)
+	{
+		PartPlate* plate = m_plate_list[i];
+		assert(plate != NULL);
+
+		const size_t row = i / cols;
+		if (row != current_row) {
+			current_row = row;
+			x = 0.0;
+		}
+
+		const Vec2d size = get_plate_layout_size((int)i);
+		const Vec2d pos(x, row_origin_y[row]);
+
+		plate->set_index((int)i);
+		Vec3d origin(pos.x(), pos.y(), 0.0);
+		plate->set_pos_and_size(origin, (int)size.x(), (int)size.y(), m_plate_height, true);
+		plate->reposition(pos);
+
+		x += size.x() * (1. + LOGICAL_PART_PLATE_GAP);
+	}
+
+	//the unprintable plate parks after the last printable one
+	unprintable_plate.set_index((int)m_plate_list.size());
+	Vec3d unprintable_origin = compute_origin_for_unprintable();
+	unprintable_plate.set_pos_and_size(unprintable_origin, m_plate_width, m_plate_depth, m_plate_height, true);
+
+	calc_bounding_boxes();
+}
+
+//Pull a bed out of an arbitrary printer preset, not just the selected one.
+bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed &bed) const
+{
+	if (preset_name.empty())
+		return false;
+
+	//CLI mode has no wxApp instance, so wxGetApp() would dereference null. m_plater is
+	//the same null-in-CLI signal the rest of this file uses to skip GUI-only work.
+	if (m_plater == nullptr || wxApp::GetInstance() == nullptr)
+		return false;
+
+	PresetBundle* bundle = wxGetApp().preset_bundle;
+	if (bundle == nullptr)
+		return false;
+
+	//a project can name a printer this installation does not have
+	const Preset* preset = bundle->printers.find_preset(preset_name, false);
+	if (preset == nullptr) {
+		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": printer preset '%1%' not installed, falling back to the project printer") % preset_name;
+		return false;
+	}
+
+	const DynamicPrintConfig& cfg = preset->config;
+	const ConfigOptionPoints* area_opt = cfg.option<ConfigOptionPoints>("printable_area");
+	if (area_opt == nullptr || area_opt->values.size() < 3) {
+		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": printer preset '%1%' has no usable printable_area") % preset_name;
+		return false;
+	}
+
+	bed.shape = make_counter_clockwise(area_opt->values);
+
+	const ConfigOptionPoints* exclude_opt = cfg.option<ConfigOptionPoints>("bed_exclude_area");
+	bed.exclude_areas = (exclude_opt != nullptr) ? exclude_opt->values : Pointfs();
+
+	const ConfigOptionPointsGroups* ext_area_opt = cfg.option<ConfigOptionPointsGroups>("extruder_printable_area");
+	bed.extruder_areas = (ext_area_opt != nullptr) ? ext_area_opt->values : std::vector<Pointfs>();
+
+	const ConfigOptionFloatsNullable* ext_height_opt = cfg.option<ConfigOptionFloatsNullable>("extruder_printable_height");
+	bed.extruder_heights = (ext_height_opt != nullptr) ? ext_height_opt->values : std::vector<double>();
+
+	const ConfigOptionFloat* height_opt = cfg.option<ConfigOptionFloat>("printable_height");
+	bed.printable_height = (height_opt != nullptr) ? height_opt->value : 0.0;
+
+	//The stl Bed3D should draw for this machine. Same lookup Bed3D::detect_type does
+	//for the project printer, but against this preset's inheritance chain.
+	bed.bed_model.clear();
+	for (const Preset* curr = preset; curr != nullptr; curr = bundle->printers.get_preset_parent(*curr)) {
+		if (curr->is_system) {
+			bed.bed_model = PresetUtils::system_printer_bed_model(*curr);
+		} else {
+			const ConfigOptionString* printer_model = curr->config.opt<ConfigOptionString>("printer_model");
+			if (printer_model != nullptr && !printer_model->value.empty())
+				bed.bed_model = bundle->get_stl_model_for_printer_model(printer_model->value);
+		}
+		if (!bed.bed_model.empty())
+			break;
+	}
+
+	return true;
+}
+
+//Give one plate its assigned printer's bed. Plates with no assignment, or whose
+//assigned preset is not installed, keep the project bed.
+bool PartPlateList::apply_printer_to_plate(int index)
+{
+	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
+		return false;
+
+	PartPlate* plate = m_plate_list[index];
+
+	PlateBed bed;
+	const bool honoured = resolve_printer_bed(plate->get_printer_preset_name(), bed);
+	if (!honoured) {
+		//project bed
+		bed.shape = m_shape;
+		bed.exclude_areas = m_exclude_areas;
+		bed.extruder_areas = m_extruder_areas;
+		bed.extruder_heights = m_extruder_heights;
+		bed.printable_height = 0.0;
+	}
+
+	//record the height before reshaping so set_pos_and_size inside set_plate_shape
+	//already applies it; 0 clears the override and the plate follows the project again
+	plate->set_printable_height(honoured ? bed.printable_height : 0.0);
+
+	//set_plate_shape reports whether the bed actually moved, which is a different
+	//question from whether we honoured the assignment. Callers care about the latter.
+	set_plate_shape(index, bed.shape, bed.exclude_areas, bed.extruder_areas, bed.extruder_heights, m_height_to_lid, m_height_to_rod);
+
+	return honoured;
+}
+
+void PartPlateList::apply_printer_assignments()
+{
+	bool any_assigned = false;
+	for (int i = 0; i < (int)m_plate_list.size(); ++i) {
+		if (m_plate_list[i] == nullptr || !m_plate_list[i]->has_printer_assignment())
+			continue;
+
+		any_assigned = true;
+		if (!apply_printer_to_plate(i)) {
+			//The plate asked for a machine we could not give it, so it is silently
+			//sitting on the project bed. That can hand back gcode for a bed the target
+			//machine does not have, so say so loudly rather than let it pass.
+			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+				<< boost::format(": plate %1% is assigned to printer '%2%' but that bed could not be applied; "
+				                 "the plate is using the project printer's bed instead")
+				   % (i + 1) % m_plate_list[i]->get_printer_preset_name();
+		}
+	}
+
+	//set_plate_shape reflows per call; one more pass costs little and guarantees the
+	//final arrangement accounts for every plate whose footprint changed
+	if (any_assigned)
+		reflow_layout();
+}
+
+bool PartPlateList::set_plate_shape(int                         index,
+                                    const Pointfs              &shape,
+                                    const Pointfs              &exclude_areas,
+                                    const std::vector<Pointfs> &extruder_areas,
+                                    const std::vector<double>  &extruder_heights,
+                                    float                       height_to_lid,
+                                    float                       height_to_rod)
+{
+	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
+		return false;
+
+	PartPlate* plate = m_plate_list[index];
+
+	//stamp the new bed on at the plate's current origin; reflow_layout then shuffles
+	//the neighbours around whatever footprint it turned out to be
+	const Vec2d current_origin = get_plate_origin_2d(index);
+	const bool changed = plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights,
+	                                      current_origin, height_to_lid, height_to_rod);
+	if (!changed) {
+		//The outline did not move, but two printers can share an outline and differ
+		//in height (P1P vs X1E). set_pos_and_size applies the height override, and
+		//no-ops when that too is unchanged.
+		Vec3d origin(current_origin.x(), current_origin.y(), 0.0);
+		const Vec2d cur_size = plate->get_size();
+		plate->set_pos_and_size(origin, (int)cur_size.x(), (int)cur_size.y(), m_plate_height, false);
+		return false;
+	}
+
+	const Vec2d new_size = plate->get_local_size();
+	Vec3d origin(current_origin.x(), current_origin.y(), 0.0);
+	plate->set_pos_and_size(origin, (int)new_size.x(), (int)new_size.y(), m_plate_height, true);
+
+	reflow_layout();
+
+	return true;
 }
 
 //generate icon textures
@@ -4737,20 +5036,12 @@ int PartPlateList::delete_plate(int index)
 	current_origin = compute_origin_for_unprintable();
 	plate->set_pos_and_size(current_origin, m_plate_width, m_plate_depth, m_plate_height, true);
 
-	//update the plates after it
-	for (unsigned int i = index; i < (unsigned int)m_plate_list.size(); ++i)
-	{
-		PartPlate* plate = m_plate_list[i];
-		assert(plate != NULL);
-
-		plate->set_index(i);
-		Vec3d origin = compute_origin(i, m_plate_cols);
-		plate->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
-
-		//update render shapes
-		Vec2d pos = compute_shape_position(i, m_plate_cols);
-		plate->set_shape(m_shape, m_exclude_areas, m_extruder_areas, m_extruder_heights, pos, m_height_to_lid, m_height_to_rod);
-	}
+	//Re-place everything from scratch. The erase shifted every index after
+	//`index`, so a plate's recorded origin no longer matches its position in the
+	//list; only a full reflow can put them back in order. reflow_layout also
+	//preserves each plate's own bed, which the old loop clobbered by re-applying
+	//the list-wide shape.
+	reflow_layout();
 
 	//update current_plate if delete current
 	if (m_current_plate == index && index == 0) {
@@ -4969,21 +5260,10 @@ bool PartPlateList::contains(const BoundingBoxf3& bb)
 	return result;
 }
 
-double PartPlateList::plate_stride_x()
-{
-	//const auto plate_shape = Slic3r::Polygon::new_scale(m_shape);
-	//double plate_width = plate_shape.bounding_box().size().x();
-	//return unscaled<double>((1. + LOGICAL_PART_PLATE_GAP) * plate_width);
-	return m_plate_width * (1. + LOGICAL_PART_PLATE_GAP);
-}
-
-double PartPlateList::plate_stride_y()
-{
-	//const auto plate_shape = Slic3r::Polygon::new_scale(m_shape);
-	//double plate_depth = plate_shape.bounding_box().size().y();
-	//return unscaled<double>((1. + LOGICAL_PART_PLATE_GAP) * plate_depth);
-	return m_plate_depth * (1. + LOGICAL_PART_PLATE_GAP);
-}
+//NOTE: plate_stride_x()/plate_stride_y() lived here. A single stride for every plate
+//is meaningless once plates carry their own beds. Positions now come from
+//get_plate_origin_2d() for plates that exist and predict_plate_origin() for slots
+//that do not exist yet; both agree with reflow_layout()'s packing.
 
 //get the plate counts, not including the invalid plate
 int PartPlateList::get_plate_count() const
@@ -5015,7 +5295,11 @@ void PartPlateList::update_all_plates_pos_and_size(bool adjust_position, bool wi
 
 		//compute origin1 for PartPlate
 		origin1 = compute_origin(i, m_plate_cols);
-		plate->set_pos_and_size(origin1, m_plate_width, m_plate_depth, m_plate_height, adjust_position, do_clear);
+		//A plate pinned to its own printer keeps that printer's footprint; only plates
+		//following the project printer take the new list-wide size.
+		const Vec2d sz = plate->has_printer_assignment() ? plate->get_size()
+		                                                 : Vec2d((double)m_plate_width, (double)m_plate_depth);
+		plate->set_pos_and_size(origin1, (int)sz.x(), (int)sz.y(), m_plate_height, adjust_position, do_clear);
 
 		// set default wipe pos when switch plate
         if (switch_plate_type && m_plater/* && plate->get_used_extruders().size() <= 0*/) {
@@ -5031,8 +5315,6 @@ void PartPlateList::update_all_plates_pos_and_size(bool adjust_position, bool wi
 int PartPlateList::move_plate_to_index(int old_index, int new_index)
 {
 	int ret = 0, delta;
-	Vec3d origin;
-
 
 	if (old_index == new_index)
 	{
@@ -5050,19 +5332,14 @@ int PartPlateList::move_plate_to_index(int old_index, int new_index)
 	}
 
 	PartPlate* plate = m_plate_list[old_index];
-	//update the plates between old_index and new_index
+	//shuffle the plates between old_index and new_index along by one
 	for (unsigned int i = (unsigned int)old_index; i != (unsigned int)new_index; i = i + delta)
-	{
 		m_plate_list[i] = m_plate_list[i + delta];
-		m_plate_list[i]->set_index(i);
-
-		origin = compute_origin(i, m_plate_cols);
-		m_plate_list[i]->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
-	}
-	origin = compute_origin(new_index, m_plate_cols);
 	m_plate_list[new_index] = plate;
-	plate->set_index(new_index);
-	plate->set_pos_and_size(origin, m_plate_width, m_plate_depth, m_plate_height, true);
+
+	//the reorder invalidated every recorded origin between the two indices, and
+	//each plate keeps its own bed, so re-place the whole list
+	reflow_layout();
 
 	//update the new plate index
 	m_current_plate = new_index;
@@ -5500,19 +5777,10 @@ int PartPlateList::construct_objects_list_for_new_plate(int plate_index)
 }
 
 
-//compute the plate index
-int PartPlateList::compute_plate_index(arrangement::ArrangePolygon& arrange_polygon)
-{
-	int row, col;
-
-	float col_value = (unscale<double>(arrange_polygon.translation(X))) / plate_stride_x();
-	float row_value = (plate_stride_y() - unscale<double>(arrange_polygon.translation(Y))) / plate_stride_y();
-
-	row = round(row_value);
-	col = round(col_value);
-
-	return row * m_plate_cols + col;
-}
+//NOTE: compute_plate_index() lived here. It recovered a plate index by dividing an
+//object's world position by a uniform plate stride, which only ever worked because
+//every plate was the same size. It had no callers. Use PartPlate::contains() against
+//the plate's own bounding box if a hit test is needed.
 
 //preprocess a arrangement::ArrangePolygon, return true if it is in a locked plate
 bool PartPlateList::preprocess_arrange_polygon(int obj_index, int instance_index, arrangement::ArrangePolygon& arrange_polygon, bool selected)
@@ -5524,25 +5792,33 @@ bool PartPlateList::preprocess_arrange_polygon(int obj_index, int instance_index
 	{
 		if (m_plate_list[i]->contain_instance(obj_index, instance_index))
 		{
+			//world -> plate-local. Subtracting the plate's own origin replaces the old
+			//row/col-times-stride arithmetic, which could only work while every plate
+			//was the same size. row/col are kept for the log line below.
+			const Vec2d plate_origin = get_plate_origin_2d(i);
+
 			if (m_plate_list[i]->is_locked())
 			{
 				locked = true;
 				arrange_polygon.bed_idx = i;
 				arrange_polygon.row = i / m_plate_cols;
 				arrange_polygon.col = i % m_plate_cols;
-				arrange_polygon.translation(X) -= scaled<double>(plate_stride_x() * arrange_polygon.col);
-				arrange_polygon.translation(Y) += scaled<double>(plate_stride_y() * arrange_polygon.row);
+				arrange_polygon.translation(X) -= scaled<double>(plate_origin.x());
+				arrange_polygon.translation(Y) -= scaled<double>(plate_origin.y());
 			}
 			else
 			{
+				//remember where the item came from, in arrange's bed numbering (which
+				//skips locked plates); per-plate arranging keeps it on this plate
+				arrange_polygon.src_bed_idx = (int)i - lockplate_cnt;
 				if (!selected)
 				{
 					//will be treated as fixeditem later
 					arrange_polygon.bed_idx = i - lockplate_cnt;
 					arrange_polygon.row = i / m_plate_cols;
 					arrange_polygon.col = i % m_plate_cols;
-					arrange_polygon.translation(X) -= scaled<double>(plate_stride_x() * arrange_polygon.col);
-					arrange_polygon.translation(Y) += scaled<double>(plate_stride_y() * arrange_polygon.row);
+					arrange_polygon.translation(X) -= scaled<double>(plate_origin.x());
+					arrange_polygon.translation(Y) -= scaled<double>(plate_origin.y());
 				}
 			}
 			BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": obj_id %1% instance_id %2% already in plate %3%, locked %4%, row %5%, col %6%\n") % obj_index % instance_index % i % locked % arrange_polygon.row % arrange_polygon.col;
@@ -5576,11 +5852,14 @@ bool PartPlateList::preprocess_arrange_polygon_other_locked(int obj_index, int i
 		{
 			if (m_plate_list[i]->contain_instance(obj_index, instance_index))
 			{
+				//world -> plate-local, see preprocess_arrange_polygon
+				const Vec2d plate_origin = get_plate_origin_2d(i);
+
 				arrange_polygon.bed_idx = i;
 				arrange_polygon.row = i / m_plate_cols;
 				arrange_polygon.col = i % m_plate_cols;
-				arrange_polygon.translation(X) -= scaled<double>(plate_stride_x() * arrange_polygon.col);
-				arrange_polygon.translation(Y) += scaled<double>(plate_stride_y() * arrange_polygon.row);
+				arrange_polygon.translation(X) -= scaled<double>(plate_origin.x());
+				arrange_polygon.translation(Y) -= scaled<double>(plate_origin.y());
 				//BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": obj_id %1% instance_id %2% in plate %3%, locked %4%, row %5%, col %6%\n") % obj_index % instance_index % i % locked % arrange_polygon.row % arrange_polygon.col;
 				return locked;
 			}
@@ -5590,9 +5869,12 @@ bool PartPlateList::preprocess_arrange_polygon_other_locked(int obj_index, int i
 	return locked;
 }
 
-bool PartPlateList::preprocess_exclude_areas(arrangement::ArrangePolygons &unselected, bool enable_wrapping_detect, int num_plates, float inflation)
+bool PartPlateList::preprocess_exclude_areas(arrangement::ArrangePolygons &unselected, bool enable_wrapping_detect, int num_plates, float inflation, int geometry_from_plate)
 {
 	bool added = false;
+
+	if (geometry_from_plate < 0 || geometry_from_plate >= (int)m_plate_list.size())
+		geometry_from_plate = 0;
 
 	// wrapping detection area
     if (enable_wrapping_detect)
@@ -5624,18 +5906,24 @@ bool PartPlateList::preprocess_exclude_areas(arrangement::ArrangePolygons &unsel
 	}
 
 	// excluded area
-	if (m_exclude_areas.size() > 0)
+	//The geometry plate's own exclude areas, in its local frame. The bounding boxes
+	//are world-space, so subtract the plate's origin: for plate 0 that origin is
+	//(0,0) and this reduces to exactly the old behaviour.
+	PartPlate *plate = m_plate_list[geometry_from_plate];
+	const Vec2d geom_origin = get_plate_origin_2d(geometry_from_plate);
+	if (plate->m_exclude_bounding_box.size() > 0)
 	{
-		//has exclude areas
-		PartPlate *plate = m_plate_list[0];
-
 		for (int index = 0; index < plate->m_exclude_bounding_box.size(); index ++)
 		{
+			const double min_x = plate->m_exclude_bounding_box[index].min.x() - geom_origin.x();
+			const double min_y = plate->m_exclude_bounding_box[index].min.y() - geom_origin.y();
+			const double max_x = plate->m_exclude_bounding_box[index].max.x() - geom_origin.x();
+			const double max_y = plate->m_exclude_bounding_box[index].max.y() - geom_origin.y();
 			Polygon ap({
-				{scaled(plate->m_exclude_bounding_box[index].min.x()), scaled(plate->m_exclude_bounding_box[index].min.y())},
-				{scaled(plate->m_exclude_bounding_box[index].max.x()), scaled(plate->m_exclude_bounding_box[index].min.y())},
-				{scaled(plate->m_exclude_bounding_box[index].max.x()), scaled(plate->m_exclude_bounding_box[index].max.y())},
-				{scaled(plate->m_exclude_bounding_box[index].min.x()), scaled(plate->m_exclude_bounding_box[index].max.y())}
+				{scaled(min_x), scaled(min_y)},
+				{scaled(max_x), scaled(min_y)},
+				{scaled(max_x), scaled(max_y)},
+				{scaled(min_x), scaled(max_y)}
 				});
 
 			for (int j = 0; j < num_plates; j++)
@@ -5808,10 +6096,15 @@ void PartPlateList::postprocess_arrange_polygon(arrangement::ArrangePolygon& arr
 			arrange_polygon.translation(Y) = scaled<double>(static_cast<double>(m_plate_depth)) - 0.5 * apbox_size[1];
 		}
 
+		//plate-local -> world, the inverse of preprocess_arrange_polygon. bed_idx can
+		//point past the end of the list when arrange wants a plate we have not created
+		//yet, so predict the origin rather than looking one up.
+		const Vec2d plate_origin = predict_plate_origin(arrange_polygon.bed_idx);
+
 		arrange_polygon.row = arrange_polygon.bed_idx / m_plate_cols;
 		arrange_polygon.col = arrange_polygon.bed_idx % m_plate_cols;
-		arrange_polygon.translation(X) += scaled<double>(plate_stride_x() * arrange_polygon.col);
-		arrange_polygon.translation(Y) -= scaled<double>(plate_stride_y() * arrange_polygon.row);
+		arrange_polygon.translation(X) += scaled<double>(plate_origin.x());
+		arrange_polygon.translation(Y) += scaled<double>(plate_origin.y());
 	}
 
 	return;
@@ -5946,21 +6239,39 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
 	m_height_to_lid = height_to_lid;
 	m_height_to_rod = height_to_rod;
 
-	double stride_x = plate_stride_x();
-	double stride_y = plate_stride_y();
+	//Hand each plate a bed at wherever it currently sits, then let the layout pass
+	//work out positions from the resulting footprints. A plate pinned to its own
+	//printer keeps that printer's bed: changing the project printer must not silently
+	//retarget a plate the user deliberately assigned to a specific machine.
 	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
 	{
 		PartPlate* plate = m_plate_list[i];
 		assert(plate != NULL);
 
-		Vec2d pos;
+		PlateBed plate_bed;
+		const bool own_bed = resolve_printer_bed(plate->get_printer_preset_name(), plate_bed);
+		if (!own_bed) {
+			plate_bed.shape = shape;
+			plate_bed.exclude_areas = exclude_areas;
+			plate_bed.extruder_areas = extruder_areas;
+			plate_bed.extruder_heights = extruder_heights;
+		}
+		plate->set_printable_height(own_bed ? plate_bed.printable_height : 0.0);
 
-		pos = compute_shape_position(i, m_plate_cols);
-		plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights, pos, height_to_lid, height_to_rod);
+		plate->set_shape(plate_bed.shape, plate_bed.exclude_areas, plate_bed.extruder_areas, plate_bed.extruder_heights,
+		                 get_plate_origin_2d((int)i), height_to_lid, height_to_rod);
+
+		//Only assigned plates get their footprint taken from the bed itself. Unassigned
+		//plates stay on the list-wide size, which is the pre-existing behaviour and is
+		//derived differently (printable bbox less the axes tip radius).
+		if (own_bed) {
+			const Vec2d sz = plate->get_local_size();
+			plate->set_pos_and_size(plate->get_origin(), (int)sz.x(), (int)sz.y(), m_plate_height, true);
+		}
 	}
 	is_load_bedtype_textures = false; //reload textures
     is_load_extruder_only_area_textures = false; // reload textures
-	calc_bounding_boxes();
+	reflow_layout();
 
 	update_logo_texture_filename(texture_filename);
 
@@ -6294,6 +6605,7 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 		plate_data_item->locked = m_plate_list[i]->m_locked;
 		plate_data_item->plate_index = m_plate_list[i]->m_plate_index;
 		plate_data_item->plate_name  = m_plate_list[i]->get_plate_name();
+		plate_data_item->printer_preset_name = m_plate_list[i]->get_printer_preset_name();
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% before load, width %2%, height %3%, size %4%!")
 			%(i+1) %m_plate_list[i]->thumbnail_data.width %m_plate_list[i]->thumbnail_data.height %m_plate_list[i]->thumbnail_data.pixels.size();
 		plate_data_item->plate_thumbnail.load_from(m_plate_list[i]->thumbnail_data);
@@ -6385,6 +6697,7 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		m_plate_list[index]->m_locked = plate_data_list[i]->locked;
 		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
+		m_plate_list[index]->set_printer_preset_name(plate_data_list[i]->printer_preset_name);
 		if (plate_data_list[i]->plate_index != index)
 		{
 			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;
@@ -6513,6 +6826,11 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		}
 
 	}
+
+	//The project bed was applied before we knew each plate's assignment, so give the
+	//assigned plates their own beds now that the names have been read.
+	apply_printer_assignments();
+
 	print();
 	ret = reload_all_objects();
 	print();
@@ -6536,7 +6854,8 @@ int PartPlateList::load_gcode_files()
 			//BoundingBoxf3   print_volume = m_plate_list[i]->get_bounding_box(false);
 			//print_volume.max(2) = this->m_plate_height;
 			//print_volume.min(2) = -1e10;
-			m_model->update_print_volume_state({m_plate_list[i]->get_shape(), (double)this->m_plate_height, m_plate_list[i]->get_extruder_areas(), m_plate_list[i]->get_extruder_heights() });
+			//per-plate height: a plate assigned to its own printer prints as tall as that printer
+			m_model->update_print_volume_state({m_plate_list[i]->get_shape(), m_plate_list[i]->get_printable_height(), m_plate_list[i]->get_extruder_areas(), m_plate_list[i]->get_extruder_heights() });
 
 			if (!m_plate_list[i]->load_gcode_from_file(m_plate_list[i]->m_gcode_path_from_3mf))
 				ret ++;

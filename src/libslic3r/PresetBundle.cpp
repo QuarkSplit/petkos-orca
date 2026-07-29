@@ -2668,9 +2668,23 @@ void PresetBundle::load_installed_sla_materials(AppConfig &config)
         preset.set_visible_from_appconfig(config);
 }
 
-void PresetBundle::update_selections(AppConfig &config)
+void PresetBundle::update_selections(AppConfig &config, bool preserve_project_filaments)
 {
     std::string initial_printer_profile_name    = printers.get_selected_preset_name();
+
+    // Snapshot the open project's filament setup before the remembered per-printer
+    // selection overwrites it; merged back below when preserve_project_filaments is set.
+    std::vector<std::string> prev_filament_presets;
+    std::vector<std::string> prev_colors;
+    std::vector<std::string> prev_multi_colors;
+    std::vector<std::string> prev_color_types;
+    if (preserve_project_filaments) {
+        prev_filament_presets = this->filament_presets;
+        prev_colors           = project_config.option<ConfigOptionStrings>("filament_colour")->values;
+        prev_multi_colors     = project_config.option<ConfigOptionStrings>("filament_multi_colour")->values;
+        prev_color_types      = project_config.option<ConfigOptionStrings>("filament_colour_type")->values;
+    }
+
     // Orca: load from orca_presets
     std::string initial_print_profile_name        = config.get_printer_setting(initial_printer_profile_name, PRESET_PRINT_NAME);
     std::string initial_filament_profile_name     = config.get_printer_setting(initial_printer_profile_name, PRESET_FILAMENT_NAME);
@@ -2693,6 +2707,15 @@ void PresetBundle::update_selections(AppConfig &config)
         this->filament_presets.emplace_back(remove_ini_suffix(f_name));
     }
 
+    // Keep every filament slot the open project had: the remembered list for the new
+    // printer may be shorter (or missing entirely on a first switch), and letting the
+    // count drop truncates the model's multi-material painting on the next scene reload.
+    // Presets carried over from the previous printer are validated for compatibility at
+    // the end of this function like any other remembered preset.
+    if (preserve_project_filaments)
+        for (size_t i = this->filament_presets.size(); i < prev_filament_presets.size(); ++i)
+            this->filament_presets.emplace_back(prev_filament_presets[i]);
+
     update_filament_count();
 
     std::vector<std::string> filament_colors;
@@ -2701,20 +2724,34 @@ void PresetBundle::update_selections(AppConfig &config)
         boost::algorithm::split(filament_colors, f_colors, boost::algorithm::is_any_of(","));
     }
     filament_colors.resize(filament_presets.size(), "#26A69A");
+    // The project's colors win over the per-printer remembered ones: they belong to the
+    // loaded model (e.g. an imported multi-color 3mf), and the merged result is written
+    // back to the new printer's remembered config on the next save anyway.
+    if (preserve_project_filaments)
+        for (size_t i = 0; i < std::min(prev_colors.size(), filament_colors.size()); ++i)
+            filament_colors[i] = prev_colors[i];
     project_config.option<ConfigOptionStrings>("filament_colour")->values = filament_colors;
 
     std::vector<std::string> multi_filament_colors;
     if (config.has_printer_setting(initial_printer_profile_name, "filament_multi_colors")) {
         boost::algorithm::split(multi_filament_colors, config.get_printer_setting(initial_printer_profile_name, "filament_multi_colors"), boost::algorithm::is_any_of(","));
     }
-    if (multi_filament_colors.size() == 0) project_config.option<ConfigOptionStrings>("filament_multi_colour")->values = filament_colors;
-    else project_config.option<ConfigOptionStrings>("filament_multi_colour")->values = multi_filament_colors;
+    if (multi_filament_colors.size() == 0) multi_filament_colors = filament_colors;
+    if (preserve_project_filaments) {
+        multi_filament_colors.resize(filament_colors.size(), "#26A69A");
+        for (size_t i = 0; i < std::min(prev_multi_colors.size(), multi_filament_colors.size()); ++i)
+            multi_filament_colors[i] = prev_multi_colors[i];
+    }
+    project_config.option<ConfigOptionStrings>("filament_multi_colour")->values = multi_filament_colors;
 
     std::vector<std::string> filament_color_types;
     if (config.has_printer_setting(initial_printer_profile_name, "filament_color_types")) {
         boost::algorithm::split(filament_color_types, config.get_printer_setting(initial_printer_profile_name, "filament_color_types"), boost::algorithm::is_any_of(","));
     }
     filament_color_types.resize(filament_presets.size(), "1");
+    if (preserve_project_filaments)
+        for (size_t i = 0; i < std::min(prev_color_types.size(), filament_color_types.size()); ++i)
+            filament_color_types[i] = prev_color_types[i];
     project_config.option<ConfigOptionStrings>("filament_colour_type")->values = filament_color_types;
 
     std::vector<int> filament_maps(filament_colors.size(), 1);

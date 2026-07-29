@@ -1710,6 +1710,9 @@ public:
     bool          is_mm_painted() const;
     // Checks if any of objects is painted using the fuzzy skin painting gizmo.
     bool          is_fuzzy_skin_painted() const;
+    // Highest 1-based filament id referenced by any object or volume (per-object/per-volume
+    // assignments and multi-material painting); 0 for an empty model.
+    int           get_max_used_filament() const;
 
     std::unique_ptr<CalibPressureAdvancePattern> calib_pa_pattern;
 

@@ -41,6 +41,10 @@ void FillBedJob::prepare()
     BoundingBox plate_bb = plate->get_bounding_box_crd();
     int plate_cols = plate_list.get_plate_cols();
     int cur_plate_index = plate->get_index();
+    //world -> plate-local now goes through the plate's actual origin instead of
+    //row/col-times-stride, which was only ever right while every plate was the
+    //same size (per-plate printer assignments broke that assumption)
+    const Vec2d plate_origin = plate_list.get_plate_origin_2d(cur_plate_index);
 
     ModelObject *model_object = m_plater->model().objects[m_object_idx];
     if (model_object->instances.empty()) return;
@@ -74,8 +78,8 @@ void FillBedJob::prepare()
                         ap.itemid = m_unselected.size();
                         ap.row = cur_plate_index / plate_cols;
                         ap.col = cur_plate_index % plate_cols;
-                        ap.translation(X) -= bed_stride_x(m_plater) * ap.col;
-                        ap.translation(Y) += bed_stride_y(m_plater) * ap.row;
+                        ap.translation(X) -= scaled<double>(plate_origin.x());
+                        ap.translation(Y) -= scaled<double>(plate_origin.y());
                         m_unselected.emplace_back(ap);
                     }
                     else
@@ -94,8 +98,8 @@ void FillBedJob::prepare()
                     ap.itemid = m_unselected.size();
                     ap.row = cur_plate_index / plate_cols;
                     ap.col = cur_plate_index % plate_cols;
-                    ap.translation(X) -= bed_stride_x(m_plater) * ap.col;
-                    ap.translation(Y) += bed_stride_y(m_plater) * ap.row;
+                    ap.translation(X) -= scaled<double>(plate_origin.x());
+                    ap.translation(Y) -= scaled<double>(plate_origin.y());
                     m_unselected.emplace_back(ap);
                 }
                 else
@@ -121,9 +125,10 @@ void FillBedJob::prepare()
 
     bool enable_wrapping = global_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
     //add the virtual object into unselect list if has
+    //bed 0 here is the current plate, so its own exclude areas apply
     double scaled_exclusion_gap = scale_(1);
-    plate_list.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scaled_exclusion_gap);
-    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping);
+    plate_list.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scaled_exclusion_gap, cur_plate_index);
+    plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, 16, 0, cur_plate_index);
 
     m_bedpts = get_bed_shape(*m_plater->config());
 
@@ -226,6 +231,19 @@ void FillBedJob::process(Ctl &ctl)
     update_arrange_params(params, m_plater->config(), m_selected);
     m_bedpts = get_shrink_bedpts(m_plater->config(), params);
 
+    //filling happens on the current plate; when that plate is pinned to its own
+    //printer, fill against that printer's bed and height, not the project's
+    {
+        PartPlate* cur_plate = m_plater->get_partplate_list().get_curr_plate();
+        if (cur_plate != nullptr && cur_plate->has_printer_assignment() && !cur_plate->get_local_shape().empty()) {
+            Points bed;
+            for (const Vec2d& pt : cur_plate->get_local_shape())
+                bed.emplace_back(scaled(pt.x()), scaled(pt.y()));
+            m_bedpts = arrangement::get_shrink_bedpts(std::move(bed), params);
+            params.printable_height = (float)cur_plate->get_printable_height();
+        }
+    }
+
     auto &partplate_list               = m_plater->get_partplate_list();
     auto &print                        = wxGetApp().plater()->get_partplate_list().get_current_fff_print();
     const Slic3r::DynamicPrintConfig& global_config = wxGetApp().preset_bundle->full_config();
@@ -316,8 +334,11 @@ void FillBedJob::finalize(bool canceled, std::exception_ptr &eptr)
             if (m_selected.size() <= 100) {
                 ap.row = ap.bed_idx / plate_cols;
                 ap.col = ap.bed_idx % plate_cols;
-                ap.translation(X) += bed_stride_x(m_plater) * ap.col;
-                ap.translation(Y) -= bed_stride_y(m_plater) * ap.row;
+                //plate-local -> world through the plate's actual (or predicted) origin,
+                //not a uniform stride; plates can differ in size now
+                const Vec2d plate_origin = plate_list.predict_plate_origin(ap.bed_idx);
+                ap.translation(X) += scaled<double>(plate_origin.x());
+                ap.translation(Y) += scaled<double>(plate_origin.y());
             }
 
             ap.apply();

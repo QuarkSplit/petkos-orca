@@ -135,6 +135,9 @@ public:
     void set_position(Vec2d& position);
     void set_axes_mode(bool origin);
     const Vec2d& get_position() const { return m_position; }
+    //the untranslated outline this bed was last given; lets callers tell a pure
+    //move apart from an actual shape change (per-plate printer assignments)
+    const Pointfs& get_shape() const { return m_bed_shape; }
 
     // Build volume geometry for various collision detection tasks.
     const BuildVolume& build_volume() const { return m_build_volume; }

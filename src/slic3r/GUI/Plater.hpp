@@ -752,6 +752,9 @@ public:
     int select_sliced_plate(int plate_index, bool skip_zoom = false);
     //BBS: set bed positions
     void set_bed_position(Vec2d& pos);
+    //Sync the textured Bed3D to the selected plate, honouring a per-plate printer
+    //assignment. Safe to call whenever selection, assignment or project bed change.
+    void update_bed_for_selected_plate(const Vec2d* forced_position = nullptr);
     //BBS: is the background process slicing currently
     bool is_background_process_slicing() const;
     //BBS: update slicing context

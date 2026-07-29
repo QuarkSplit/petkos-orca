@@ -1092,6 +1092,19 @@ bool Model::is_fuzzy_skin_painted() const
     return std::any_of(this->objects.cbegin(), this->objects.cend(), [](const ModelObject *mo) { return mo->is_fuzzy_skin_painted(); });
 }
 
+int Model::get_max_used_filament() const
+{
+    int max_id = 0;
+    for (const ModelObject *mo : this->objects) {
+        if (const ConfigOption *opt = mo->config.option("extruder"))
+            max_id = std::max(max_id, opt->getInt());
+        for (const ModelVolume *mv : mo->volumes)
+            for (int id : mv->get_extruders())
+                max_id = std::max(max_id, id);
+    }
+    return max_id;
+}
+
 static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelVolume* src_volume, const Transform3d& cut_matrix, const std::string& suffix = {}, ModelVolumeType type = ModelVolumeType::MODEL_PART)
 {
     if (mesh.empty())

@@ -408,6 +408,30 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, const wxString& title
     if (!wxGetApp().preset_bundle->is_bbl_vendor())
       m_bed_type_choice->Disable();
 
+    // Printer this plate prints on. Empty selection means follow the project printer.
+    m_printer_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);
+    m_printer_choice->AppendString(_L("Same as Project Printer"));
+    m_cur_combox_printers.clear();
+    {
+        PresetBundle* bundle = wxGetApp().preset_bundle;
+        if (bundle != nullptr) {
+            for (size_t i = 0; i < bundle->printers.size(); ++i) {
+                const Preset& preset = bundle->printers.preset(i);
+                //only offer printers the user actually has available to select
+                if (!preset.is_visible || preset.is_default || preset.is_external)
+                    continue;
+                m_printer_choice->AppendString(from_u8(preset.name));
+                m_cur_combox_printers.emplace_back(preset.name);
+            }
+        }
+    }
+    m_printer_choice->SetSelection(0);
+
+    wxStaticText* m_printer_txt = new wxStaticText(this, wxID_ANY, _L("Printer"));
+    m_printer_txt->SetFont(Label::Body_14);
+    top_sizer->Add(m_printer_txt, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_LEFT | wxTOP | wxBOTTOM, FromDIP(5));
+    top_sizer->Add(m_printer_choice, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxTOP | wxBOTTOM, FromDIP(5));
+
     wxStaticText* m_bed_type_txt = new wxStaticText(this, wxID_ANY, _L("Bed type"));
     m_bed_type_txt->SetFont(Label::Body_14);
     top_sizer->Add(m_bed_type_txt, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_LEFT | wxTOP | wxBOTTOM, FromDIP(5));
@@ -615,6 +639,43 @@ wxString PlateSettingsDialog::to_print_sequence_name(PrintSequence print_seq) {
 
 void PlateSettingsDialog::on_dpi_changed(const wxRect& suggested_rect)
 {
+}
+
+void PlateSettingsDialog::sync_printer_preset(const std::string& preset_name)
+{
+    if (m_printer_choice == nullptr)
+        return;
+
+    //entry 0 is "same as project printer", so the preset list is offset by one
+    for (size_t i = 0; i < m_cur_combox_printers.size(); ++i) {
+        if (m_cur_combox_printers[i] == preset_name) {
+            m_printer_choice->SetSelection((int)i + 1);
+            return;
+        }
+    }
+
+    //An assignment naming a printer this installation does not have would otherwise
+    //show as "same as project printer" and get silently discarded on OK. Show it.
+    if (!preset_name.empty()) {
+        m_printer_choice->AppendString(from_u8(preset_name) + " " + _L("(not installed)"));
+        m_cur_combox_printers.emplace_back(preset_name);
+        m_printer_choice->SetSelection((int)m_cur_combox_printers.size());
+        return;
+    }
+
+    m_printer_choice->SetSelection(0);
+}
+
+std::string PlateSettingsDialog::get_printer_preset_choice() const
+{
+    if (m_printer_choice == nullptr)
+        return std::string();
+
+    const int sel = m_printer_choice->GetSelection();
+    if (sel <= 0 || sel > (int)m_cur_combox_printers.size())
+        return std::string();
+
+    return m_cur_combox_printers[sel - 1];
 }
 
 wxString PlateSettingsDialog::get_plate_name() const {

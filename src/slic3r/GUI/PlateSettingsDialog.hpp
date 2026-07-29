@@ -116,6 +116,11 @@ public:
 
     BedType get_bed_type_choice();
 
+    //Printer preset this plate is pinned to. Empty string means follow the project
+    //printer, which is what every plate did before per-plate machines existed.
+    void sync_printer_preset(const std::string& preset_name);
+    std::string get_printer_preset_choice() const;
+
     wxString get_plate_name() const;
     void set_plate_name(const wxString& name);
 
@@ -163,6 +168,10 @@ protected:
 protected:
     ComboBox* m_bed_type_choice { nullptr };
     std::vector<BedType> m_cur_combox_bed_types;
+    //printer this plate is pinned to; entry 0 is "follow the project printer" and maps
+    //to an empty preset name, so m_cur_combox_printers is offset by one from the combo
+    ComboBox* m_printer_choice { nullptr };
+    std::vector<std::string> m_cur_combox_printers;
     ComboBox* m_print_seq_choice { nullptr };
     ComboBox* m_first_layer_print_seq_choice { nullptr };
     ComboBox* m_spiral_mode_choice { nullptr };

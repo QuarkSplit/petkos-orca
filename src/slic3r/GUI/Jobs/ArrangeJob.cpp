@@ -496,8 +496,32 @@ void ArrangeJob::prepare()
 
 void ArrangeJob::check_unprintable()
 {
+    //An item is judged against the height of the machine that will print it: the
+    //plate's own printer when the plate is pinned to one, the project printer
+    //otherwise. Judging everything against the project height would wrongly reject
+    //items on a plate assigned to a taller machine.
+    PartPlateList& ppl = m_plater->get_partplate_list();
+    std::vector<int> logical_to_plate;   //arrange numbering skips locked plates
+    if (only_on_partplate)
+        logical_to_plate.push_back(current_plate_index);
+    else
+        for (int i = 0; i < ppl.get_plate_count(); ++i)
+            if (!ppl.get_plate(i)->is_locked())
+                logical_to_plate.push_back(i);
+
+    auto allowed_height = [&](const ArrangePolygon& ap) -> double {
+        //in current-plate mode everything belongs to the current plate
+        const int g = only_on_partplate ? 0 : ap.src_bed_idx;
+        if (g >= 0 && g < (int)logical_to_plate.size()) {
+            PartPlate* plate = ppl.get_plate(logical_to_plate[g]);
+            if (plate != nullptr && plate->has_printer_assignment())
+                return plate->get_printable_height();
+        }
+        return (double)params.printable_height;
+    };
+
     for (auto it = m_selected.begin(); it != m_selected.end();) {
-        if (it->poly.area() < 0.001 || it->height>params.printable_height)
+        if (it->poly.area() < 0.001 || it->height > allowed_height(*it))
         {
 #if SAVE_ARRANGE_POLY
             SVG svg(data_dir() + "/SVG/arrange_unprintable_"+it->name+".svg", get_extents(it->poly));
@@ -564,7 +588,26 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    //Per-plate machines: once a plate is pinned to its own printer the single
+    //project bed stops being true, so arrange plate by plate instead. Projects
+    //with no assignments take the old single-call path, unchanged.
+    bool per_plate_beds = false;
+    {
+        PartPlateList& ppl = m_plater->get_partplate_list();
+        if (only_on_partplate) {
+            PartPlate* cur = ppl.get_plate(current_plate_index);
+            per_plate_beds = (cur != nullptr) && cur->has_printer_assignment();
+        }
+        else {
+            for (int i = 0; i < ppl.get_plate_count(); ++i)
+                if (ppl.get_plate(i)->has_printer_assignment()) { per_plate_beds = true; break; }
+        }
+    }
+
+    if (per_plate_beds)
+        arrange_per_plate(ctl, bedpts, enable_wrapping);
+    else
+        arrangement::arrange(m_selected, m_unselected, bedpts, params);
 
     // sort by item id
     std::sort(m_selected.begin(), m_selected.end(), [](auto a, auto b) {return a.itemid < b.itemid; });
@@ -593,6 +636,211 @@ void ArrangeJob::process(Ctl &ctl)
     ctl.update_status(100,
         ctl.was_canceled() ? _u8L("Arranging canceled.") :
         we_have_unpackable_items ? _u8L("Arranging complete, but some items were not able to be arranged. Reduce spacing and try again.") : _u8L("Arranging done."));
+}
+
+//Arrange with per-plate beds. Sticky first, pool second; see the header comment.
+void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool enable_wrapping)
+{
+    PartPlateList& ppl = m_plater->get_partplate_list();
+
+    //arrange numbers beds skipping locked plates; recover which real plate each bed is
+    std::vector<int> logical_to_plate;
+    if (only_on_partplate) {
+        logical_to_plate.push_back(current_plate_index);
+    }
+    else {
+        for (int i = 0; i < ppl.get_plate_count(); ++i)
+            if (!ppl.get_plate(i)->is_locked())
+                logical_to_plate.push_back(i);
+    }
+    const int unlocked_count = (int)logical_to_plate.size();
+
+    std::vector<int> pool_beds;     //logical beds of plates following the project printer
+    std::vector<int> sticky_beds;   //logical beds of plates pinned to their own printer
+    for (int g = 0; g < unlocked_count; ++g) {
+        if (ppl.get_plate(logical_to_plate[g])->has_printer_assignment())
+            sticky_beds.push_back(g);
+        else
+            pool_beds.push_back(g);
+    }
+
+    //group the selected items by where they came from. Items on no plate at all
+    //join the pool, where arrange is free to place them anywhere; if every plate
+    //is assigned there is no pool, so they go to the first sticky bed instead.
+    std::map<int, std::vector<size_t>> sticky_groups;
+    std::vector<size_t> pool_items;
+    auto is_sticky_bed = [&sticky_beds](int g) {
+        return std::find(sticky_beds.begin(), sticky_beds.end(), g) != sticky_beds.end();
+    };
+    for (size_t k = 0; k < m_selected.size(); ++k) {
+        const int src = m_selected[k].src_bed_idx;
+        if (src >= 0 && is_sticky_bed(src))
+            sticky_groups[src].push_back(k);
+        else if (!pool_beds.empty())
+            pool_items.push_back(k);
+        else if (!sticky_beds.empty())
+            sticky_groups[(src >= 0 && src < unlocked_count) ? src : sticky_beds.front()].push_back(k);
+    }
+
+    //progress spans all the sub-arranges as if they were one
+    size_t done = 0;
+    auto make_progress = [this, &ctl](size_t offset) {
+        return [this, &ctl, offset](unsigned num_finished, std::string str = "") {
+            ctl.update_status((int)(offset + num_finished) * 100 / status_range(), _u8L("Arranging") + str);
+        };
+    };
+    auto is_region_name = [](const std::string& name) {
+        //plate-shape-derived virtual objects; rebuilt per plate from its own bed
+        return name.rfind("ExcludedRegion", 0) == 0 || name.rfind("WrappingRegion", 0) == 0;
+    };
+
+    //sticky plates: one arrange per plate, on that plate's own bed
+    for (int g : sticky_beds) {
+        auto it = sticky_groups.find(g);
+        if (it == sticky_groups.end() || it->second.empty())
+            continue;
+        if (ctl.was_canceled())
+            return;
+
+        const int plate_idx = logical_to_plate[g];
+        PartPlate* plate = ppl.get_plate(plate_idx);
+
+        //this plate's own outline, shrunk the same way the project bed is
+        Points bed_g;
+        const Pointfs& local_shape = plate->get_local_shape();
+        if (local_shape.empty()) {
+            //never been given a bed of its own; behave as if unassigned
+            bed_g = project_bedpts;
+        }
+        else {
+            for (const Vec2d& p : local_shape)
+                bed_g.emplace_back(scaled(p.x()), scaled(p.y()));
+            bed_g = arrangement::get_shrink_bedpts(std::move(bed_g), params);
+        }
+
+        //fixed items living on this bed keep their geometry; the plate-shape-derived
+        //regions are rebuilt from this plate's own bed
+        ArrangePolygons unsel_g;
+        for (const ArrangePolygon& ap : m_unselected) {
+            if (ap.bed_idx != g || is_region_name(ap.name))
+                continue;
+            unsel_g.emplace_back(ap);
+            unsel_g.back().bed_idx = 0;
+        }
+        ppl.preprocess_exclude_areas(unsel_g, enable_wrapping, 1, 0, plate_idx);
+
+        arrangement::ArrangeParams params_g = params;
+        params_g.printable_height = (float)plate->get_printable_height();
+        params_g.excluded_regions.clear();
+        ppl.preprocess_exclude_areas(params_g.excluded_regions, enable_wrapping, 1, scale_(1), plate_idx);
+        params_g.progressind = make_progress(done);
+
+        ArrangePolygons sel_g;
+        sel_g.reserve(it->second.size());
+        for (size_t k : it->second) {
+            ArrangePolygon& ap = m_selected[k];
+            if (ap.height > params_g.printable_height) {
+                //taller than this plate's machine; there is no point asking arrange
+                ap.bed_idx = arrangement::UNARRANGED;
+                BOOST_LOG_TRIVIAL(warning) << "arrange: " << ap.name << " is taller than the printer assigned to plate "
+                                           << (plate_idx + 1) << ", sending it to the unprintable area";
+                continue;
+            }
+            sel_g.emplace_back(ap);
+        }
+
+        if (!sel_g.empty()) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("arrange: plate %1% ('%2%'): %3% items on its own bed")
+                % (plate_idx + 1) % plate->get_printer_preset_name() % sel_g.size();
+            arrangement::arrange(sel_g, unsel_g, bed_g, params_g);
+
+            //bed 0 means it fits this plate. Anything else means it did not fit, and
+            //it goes to the unprintable area: spilling onto a neighbouring plate would
+            //silently change which machine prints it.
+            std::map<int, size_t> by_itemid;
+            for (size_t k : it->second)
+                by_itemid[m_selected[k].itemid] = k;
+            for (ArrangePolygon& res : sel_g) {
+                auto slot = by_itemid.find(res.itemid);   //arrange may reorder
+                if (slot == by_itemid.end())
+                    continue;
+                if (res.bed_idx == 0) {
+                    res.bed_idx = g;
+                }
+                else {
+                    if (res.bed_idx > 0)
+                        BOOST_LOG_TRIVIAL(warning) << "arrange: " << res.name << " does not fit plate "
+                                                   << (plate_idx + 1) << ", sending it to the unprintable area";
+                    res.bed_idx = arrangement::UNARRANGED;
+                }
+                m_selected[slot->second] = std::move(res);
+            }
+        }
+        done += it->second.size();
+    }
+
+    //the pool: every unassigned plate still shares the project bed, so they are
+    //arranged together with the old cross-plate semantics, including creating new
+    //(project-bed) plates for overflow
+    if (!pool_items.empty() && !pool_beds.empty()) {
+        if (ctl.was_canceled())
+            return;
+
+        //the pool renumbers its beds 0..N; ordinals past the existing pool map to
+        //brand-new plates appended after every existing plate
+        auto ordinal_of_logical = [&](int logical) -> int {
+            auto it = std::lower_bound(pool_beds.begin(), pool_beds.end(), logical);
+            if (it != pool_beds.end() && *it == logical)
+                return (int)(it - pool_beds.begin());
+            if (logical >= unlocked_count)
+                return (int)pool_beds.size() + (logical - unlocked_count);
+            return -1;   //an assigned bed; not part of the pool
+        };
+        auto logical_of_ordinal = [&](int j) -> int {
+            if (j < (int)pool_beds.size())
+                return pool_beds[j];
+            return unlocked_count + (j - (int)pool_beds.size());
+        };
+
+        ArrangePolygons unsel_pool;
+        for (const ArrangePolygon& ap : m_unselected) {
+            if (ap.bed_idx == PartPlateList::MAX_PLATES_COUNT || is_region_name(ap.name))
+                continue;
+            const int j = ordinal_of_logical(ap.bed_idx);
+            if (j < 0)
+                continue;   //fixed on an assigned plate; that arrange already saw it
+            unsel_pool.emplace_back(ap);
+            unsel_pool.back().bed_idx = j;
+        }
+        const int geometry_plate = logical_to_plate[pool_beds.front()];
+        ppl.preprocess_exclude_areas(unsel_pool, enable_wrapping, MAX_NUM_PLATES, 0, geometry_plate);
+
+        arrangement::ArrangeParams params_pool = params;
+        params_pool.excluded_regions.clear();
+        ppl.preprocess_exclude_areas(params_pool.excluded_regions, enable_wrapping, 1, scale_(1), geometry_plate);
+        params_pool.progressind = make_progress(done);
+
+        ArrangePolygons sel_pool;
+        sel_pool.reserve(pool_items.size());
+        for (size_t k : pool_items)
+            sel_pool.emplace_back(m_selected[k]);
+
+        BOOST_LOG_TRIVIAL(info) << boost::format("arrange: pool of %1% unassigned plates: %2% items on the project bed")
+            % pool_beds.size() % sel_pool.size();
+        arrangement::arrange(sel_pool, unsel_pool, project_bedpts, params_pool);
+
+        std::map<int, size_t> by_itemid;
+        for (size_t k : pool_items)
+            by_itemid[m_selected[k].itemid] = k;
+        for (ArrangePolygon& res : sel_pool) {
+            auto slot = by_itemid.find(res.itemid);
+            if (slot == by_itemid.end())
+                continue;
+            if (res.bed_idx >= 0)
+                res.bed_idx = logical_of_ordinal(res.bed_idx);
+            m_selected[slot->second] = std::move(res);
+        }
+    }
 }
 
 ArrangeJob::ArrangeJob() : m_plater{wxGetApp().plater()} { }
@@ -746,16 +994,9 @@ get_wipe_tower_arrangepoly(const Plater &plater)
     return {};
 }
 
-//BBS: add sudoku-style stride
-double bed_stride_x(const Plater* plater) {
-    double bedwidth = plater->build_volume().bounding_box().size().x();
-    return (1. + LOGICAL_BED_GAP) * bedwidth;
-}
-
-double bed_stride_y(const Plater* plater) {
-    double beddepth = plater->build_volume().bounding_box().size().y();
-    return (1. + LOGICAL_BED_GAP) * beddepth;
-}
+//NOTE: bed_stride_x()/bed_stride_y() lived here. A single stride between logical
+//beds is meaningless once plates carry their own printers; positions come from
+//PartPlateList::get_plate_origin_2d()/predict_plate_origin() instead.
 
 // call before get selected and unselected
 arrangement::ArrangeParams init_arrange_params(Plater *p)

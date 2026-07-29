@@ -88,6 +88,8 @@ struct PlateData
     std::string     gcode_weight;
     std::string     first_layer_time;
     std::string     plate_name;
+    //printer preset this plate is assigned to; empty means follow the project printer
+    std::string     printer_preset_name;
     std::vector<FilamentInfo> slice_filaments_info;
     std::vector<size_t> skipped_objects;
     DynamicPrintConfig config;

@@ -49,3 +49,10 @@ internal_docs/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# petkos-orca dev build: isolated --datadir (see run-petkos-orca.bat), never shared config
+datadir/
+
+# graphify knowledge-graph output
+graphify-out/
+

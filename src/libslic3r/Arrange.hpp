@@ -53,6 +53,10 @@ struct ArrangePolygon {
     coord_t   inflation = 0;        /// Arrange with inflated polygon
     int       bed_idx{UNARRANGED};  /// To which logical bed does poly belong...
     int       priority{0};
+    //Logical bed the item came from, recorded before arranging. bed_idx is an
+    //output that arrange() overwrites; this one survives, so per-plate arranging
+    //can keep an item on the plate it started on. -1 means "not on any plate".
+    int       src_bed_idx{ -1 };
     //BBS: add locked_plate to indicate whether it is in the locked plate
     int       locked_plate{ -1 };
     bool      is_virt_object{ false };
@@ -186,6 +190,10 @@ void update_unselected_items_inflation(ArrangePolygons& unselected, const Dynami
 void update_selected_items_axis_align(ArrangePolygons& selected, const DynamicPrintConfig* print_cfg, const ArrangeParams& params);
 
 Points get_shrink_bedpts(const DynamicPrintConfig* print_cfg, const ArrangeParams& params);
+
+//Same shrink applied to an arbitrary bed outline, for beds that do not come from
+//the project config (per-plate printer assignments hand each plate its own bed).
+Points get_shrink_bedpts(Points bedpts, const ArrangeParams& params);
 
 /**
  * \brief Arranges the input polygons.

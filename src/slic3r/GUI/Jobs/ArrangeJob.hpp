@@ -47,6 +47,13 @@ class ArrangeJob : public Job
     void prepare_partplate();
     void prepare_wipe_tower();
 
+    //Per-plate machines: when any plate is pinned to its own printer, one uniform
+    //bed no longer describes the world. Assigned plates are arranged one at a time
+    //against their own bed and their items never migrate (moving an item would
+    //change which machine prints it); the unassigned plates still form a shared
+    //pool over the project bed with the old cross-plate behaviour.
+    void arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool enable_wrapping);
+
     ArrangePolygon prepare_arrange_polygon(void* instance);
 
 protected:
@@ -76,10 +83,8 @@ std::optional<arrangement::ArrangePolygon> get_wipe_tower_arrangepoly(const Plat
 // the current bed width.
 static const constexpr double LOGICAL_BED_GAP = 1. / 5.;
 
-//BBS: add sudoku-style strides for x and y
-// Stride between logical beds
-double bed_stride_x(const Plater* plater);
-double bed_stride_y(const Plater* plater);
+//NOTE: bed_stride_x()/bed_stride_y() lived here; removed with per-plate machines.
+//Use PartPlateList::get_plate_origin_2d()/predict_plate_origin() for positions.
 
 arrangement::ArrangeParams init_arrange_params(Plater *p);
 

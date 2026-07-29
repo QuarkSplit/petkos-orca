@@ -74,6 +74,19 @@ class PartPlateList;
 
 using GCodeResult = GCodeProcessorResult;
 
+//Everything a plate needs to stand in for a specific printer's bed: the outline,
+//the carve-outs, the multi-extruder areas, how tall the machine can print, and the
+//stl Bed3D should draw underneath. Filled by PartPlateList::resolve_printer_bed.
+struct PlateBed
+{
+    Pointfs              shape;
+    Pointfs              exclude_areas;
+    std::vector<Pointfs> extruder_areas;
+    std::vector<double>  extruder_heights;
+    double               printable_height { 0.0 };
+    std::string          bed_model;   //may be empty; Bed3D then draws a plain bed
+};
+
 class PartPlate : public ObjectBase
 {
 public:
@@ -121,6 +134,13 @@ private:
     Pointfs m_exclude_area;
     std::vector<Pointfs> m_extruder_areas;
     std::vector<double> m_extruder_heights;
+    // The bed shape as supplied by the printer profile, before it is translated
+    // into world space by the plate origin. Kept so a plate can be repositioned
+    // (or resized independently of its neighbours) without the caller having to
+    // hand us the profile geometry again.
+    Pointfs m_shape_local;
+    Pointfs m_exclude_area_local;
+    std::vector<Pointfs> m_extruder_areas_local;
     BoundingBoxf3 m_bounding_box;
     BoundingBoxf3 m_extended_bounding_box;
     mutable std::vector<BoundingBoxf3> m_exclude_bounding_box;
@@ -157,6 +177,18 @@ private:
 
     // BBS
     DynamicPrintConfig m_config;
+
+    // Name of the printer preset this plate is assigned to, empty meaning "follow
+    // the project's printer". Held as its own member rather than a key in m_config
+    // because m_config is a DynamicPrintConfig and applying a key with no entry in
+    // the print config definition throws.
+    std::string m_printer_preset_name;
+
+    // Printable height of the assigned printer, 0 meaning "follow the project
+    // printer". Applied inside set_pos_and_size so that every code path that
+    // (re)sizes this plate — reflow, delete, project-printer change — keeps the
+    // assigned machine's height instead of stamping the list-wide one back on.
+    double m_printable_height { 0.0 };
 
     // SoftFever
     // part plate name
@@ -310,6 +342,24 @@ public:
     //set the plate's name
     void set_plate_name(const std::string& name);
 
+    //Printer preset this plate is assigned to. Empty means the plate follows the
+    //project's printer, which is how every plate behaved before per-plate machines.
+    const std::string& get_printer_preset_name() const { return m_printer_preset_name; }
+    void set_printer_preset_name(const std::string& name)
+    {
+        if (m_printer_preset_name == name)
+            return;
+        m_printer_preset_name = name;
+        //the plate renders its machine next to its name, so the name texture is stale now
+        invalidate_plate_name_texture();
+    }
+    bool has_printer_assignment() const { return !m_printer_preset_name.empty(); }
+
+    //How tall this plate can print: the assigned printer's height when it has one,
+    //otherwise whatever the plate was last sized to (the project printer's height).
+    double get_printable_height() const { return m_printable_height > 0.0 ? m_printable_height : (double)m_height; }
+    void set_printable_height(double height) { m_printable_height = height; }
+
     void set_timelapse_warning_code(int code) { m_timelapse_warning_code = code; }
     int  timelapse_warning_code() { return m_timelapse_warning_code; }
     
@@ -409,6 +459,17 @@ public:
     /*rendering related functions*/
     const Pointfs& get_shape() const { return m_shape; }
     bool set_shape(const Pointfs& shape, const Pointfs& exclude_areas, const std::vector<Pointfs>& extruder_areas, const std::vector<double>& extruder_heights, Vec2d position, float height_to_lid, float height_to_rod);
+
+    // The untranslated profile geometry backing this plate.
+    const Pointfs& get_local_shape() const { return m_shape_local; }
+    const Pointfs& get_local_exclude_area() const { return m_exclude_area_local; }
+    const std::vector<Pointfs>& get_local_extruder_areas() const { return m_extruder_areas_local; }
+    // Footprint of this plate's own bed, independent of any neighbour.
+    Vec2d get_local_size() const;
+    // Re-apply this plate's own geometry at a new origin. Cheaper and safer than
+    // set_shape when only the position moved, and it cannot pick up a neighbour's
+    // bed by accident.
+    bool reposition(const Vec2d& position);
     const std::vector<Pointfs>& get_extruder_areas() const { return m_extruder_areas; }
     const std::vector<double>& get_extruder_heights() const { return m_extruder_heights; }
     bool contains(const Vec3d& point) const;
@@ -538,7 +599,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -556,7 +617,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_name, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {
@@ -718,9 +779,21 @@ public:
     //reset partplate to init states
     void reinit();
 
-    //get the plate stride
-    double plate_stride_x();
-    double plate_stride_y();
+    //Lay every plate out from its own footprint. Plates flow left to right into
+    //rows of m_plate_cols; each row is as deep as its deepest plate. Replaces the
+    //old uniform grid, which could only ever place identically sized plates.
+    void reflow_layout();
+    //world-space origin of a plate's bed. Use this instead of multiplying an
+    //index by a stride: with per-plate beds there is no single stride.
+    Vec2d get_plate_origin_2d(int index) const;
+    //footprint reflow_layout should reserve for a plate, falling back to the
+    //list-wide size for plates that have not been given a bed of their own yet
+    Vec2d get_plate_layout_size(int index) const;
+    //Origin for any slot, including ones past the end of the list. Arrange hands
+    //back bed indices for plates it expects us to create, so we have to be able to
+    //say where a plate *will* sit. Not-yet-existing slots are assumed default sized.
+    Vec2d predict_plate_origin(int index) const;
+
     void get_plate_size(int& width, int& depth, int& height) {
         width = m_plate_width;
         depth = m_plate_depth;
@@ -836,11 +909,16 @@ public:
 
     /* arrangement related functions */
     //compute the plate index
-    int compute_plate_index(arrangement::ArrangePolygon& arrange_polygon);
     //preprocess an arrangement::ArrangePolygon, return true if it is in a locked plate
     bool preprocess_arrange_polygon(int obj_index, int instance_index, arrangement::ArrangePolygon& arrange_polygon, bool selected);
     bool preprocess_arrange_polygon_other_locked(int obj_index, int instance_index, arrangement::ArrangePolygon& arrange_polygon, bool selected);
-    bool preprocess_exclude_areas(arrangement::ArrangePolygons& unselected, bool enable_wrapping_detect, int num_plates = 16, float inflation = 0);
+    //geometry_from_plate says which plate's bed supplies the exclude-area geometry,
+    //translated into that plate's local frame. The default of 0 preserves the old
+    //behaviour: plate 0 sits at the origin, so its world coords already are local
+    //coords, and with uniform beds every plate's exclude area was identical anyway.
+    //With per-plate printers that stops being true, so callers arranging on a
+    //specific plate must name it.
+    bool preprocess_exclude_areas(arrangement::ArrangePolygons& unselected, bool enable_wrapping_detect, int num_plates = 16, float inflation = 0, int geometry_from_plate = 0);
     bool preprocess_nonprefered_areas(arrangement::ArrangePolygons& regions, int num_plates = 1, float inflation=0);
 
     void postprocess_bed_index_for_selected(arrangement::ArrangePolygon& arrange_polygon);
@@ -873,6 +951,28 @@ public:
                     const std::string          &custom_texture,
                     float                       height_to_lid,
                     float                       height_to_rod);
+    //Resolve a printer preset name to its bed geometry. Returns false when the preset
+    //is not installed, which is normal when opening a project authored elsewhere; the
+    //caller then falls back to the project printer's bed.
+    //NOTE: not static and not usable headless. It reads the GUI preset bundle, and in
+    //CLI mode there is no wxApp instance to read it from, so it reports failure there
+    //and every plate falls back to the project bed.
+    bool resolve_printer_bed(const std::string &preset_name, PlateBed &bed) const;
+    //Give one plate the bed of whatever printer it is assigned to, falling back to the
+    //project bed when it has no assignment or the assigned preset is missing.
+    bool apply_printer_to_plate(int index);
+    //Re-apply every plate's assignment, e.g. straight after loading a project.
+    void apply_printer_assignments();
+
+    //give a single plate a bed of its own, leaving every other plate alone.
+    //triggers a relayout because the neighbours have to shuffle around the new footprint.
+    bool set_plate_shape(int                         index,
+                         const Pointfs              &shape,
+                         const Pointfs              &exclude_areas,
+                         const std::vector<Pointfs> &extruder_areas,
+                         const std::vector<double>  &extruder_heights,
+                         float                       height_to_lid,
+                         float                       height_to_rod);
     void set_hover_id(int id);
     void reset_hover_id();
     bool intersects(const BoundingBoxf3 &bb);

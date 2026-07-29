@@ -259,7 +259,11 @@ void update_selected_items_axis_align(ArrangePolygons& selected, const DynamicPr
 //it will bed accurate after call update_params
 Points get_shrink_bedpts(const DynamicPrintConfig* print_cfg, const ArrangeParams& params)
 {
-    Points bedpts = get_bed_shape(*print_cfg);
+    return get_shrink_bedpts(get_bed_shape(*print_cfg), params);
+}
+
+Points get_shrink_bedpts(Points bedpts, const ArrangeParams& params)
+{
     // shrink bed by moving to center by dist
     auto shrinkFun = [](Points& bedpts, double dist, int direction) {
 #define SGN(x) ((x) >= 0 ? 1 : -1)

@@ -2199,15 +2199,19 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
     //Orca: sync filament num if it's a multi tool printer
     if (opt_key == "extruders_count" && !m_config->opt_bool("single_extruder_multi_material")){
         auto num_extruder = boost::any_cast<size_t>(value);
+        // Never shrink below the highest filament the model references: painting and
+        // per-object/volume assignments above the new count are truncated irreversibly
+        // (ModelVolume::update_extruder_count) on the next scene reload.
+        size_t num_filaments = std::max(num_extruder, (size_t)std::max(0, wxGetApp().model().get_max_used_filament()));
         int         old_filament_size = wxGetApp().preset_bundle->filament_presets.size();
         std::vector<std::string> new_colors;
-        for (int i = old_filament_size; i < num_extruder; ++i) {
+        for (int i = old_filament_size; i < num_filaments; ++i) {
             wxColour    new_col   = Plater::get_next_color_for_filament();
             std::string new_color = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
             new_colors.push_back(new_color);
         }
-        wxGetApp().preset_bundle->set_num_filaments(num_extruder, new_colors);
-        wxGetApp().plater()->on_filament_count_change(num_extruder);
+        wxGetApp().preset_bundle->set_num_filaments(num_filaments, new_colors);
+        wxGetApp().plater()->on_filament_count_change(num_filaments);
         wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
         wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
     }
@@ -6920,7 +6924,11 @@ bool Tab::select_preset(
 
         // Orca: update presets for the selected printer
         if (m_type == Preset::TYPE_PRINTER && wxGetApp().app_config->get_bool("remember_printer_config")) {
-            m_preset_bundle->update_selections(*wxGetApp().app_config);
+            // With a model on the plater, the project's filament count and colors must
+            // survive the switch — restoring the remembered per-printer setup wholesale
+            // would discard an imported project's colors and truncate its painting.
+            const bool preserve_project_filaments = !wxGetApp().model().objects.empty();
+            m_preset_bundle->update_selections(*wxGetApp().app_config, preserve_project_filaments);
             wxGetApp().plater()->sidebar().on_filament_count_change(m_preset_bundle->filament_presets.size());
         }
         load_current_preset();
