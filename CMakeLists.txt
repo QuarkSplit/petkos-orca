@@ -1156,7 +1156,7 @@ if (DEFINED WAVE_OVERHANGS_VERSION AND NOT "${WAVE_OVERHANGS_VERSION}" STREQUAL 
 else ()
     set (_installer_ver "${SoftFever_VERSION}")
 endif ()
-set (CPACK_PACKAGE_FILE_NAME "OrcaSlicerWaveOverhangs_Windows_Installer_V${_installer_ver}")
+set (CPACK_PACKAGE_FILE_NAME "PetkosOrca_Windows_Installer_V${_installer_ver}")
 # Suffix the Windows installer with its target arch so the x64 and arm64 builds
 # produce distinct filenames (matches ARCH_SUFFIX in build_orca.yml). Same
 # CMAKE_SYSTEM_PROCESSOR mapping used by orcaslicer_copy_dlls() above.
