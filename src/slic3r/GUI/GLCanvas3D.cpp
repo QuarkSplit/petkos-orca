@@ -3012,32 +3012,51 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             //if (printer_technology != ptSLA || !contained_min_one)
             //    _set_warning_notification(EWarning::SlaSupportsOutside, false);
 
-            // The background print has already been configured for the current plate's
-            // assigned printer. Keep action-button validation on that same configuration;
-            // the globally selected printer may belong to a different plate.
-            const DynamicPrintConfig& full_config_temp = cur_plate->fff_print()->full_print_config();
-            bool tpu_valid = cur_plate->check_tpu_printable_status(full_config_temp, wxGetApp().preset_bundle->get_used_tpu_filaments(cur_plate->get_extruders(true)));
-            _set_warning_notification(EWarning::TPUPrintableError, !tpu_valid);
+            // Validate against the plate's own RESOLVED configuration, not its Print's
+            // full_print_config(). A plate's Print only carries a config once the
+            // background process has applied one to it, so on a project load this runs
+            // against a config with no keys at all and the checks below read null
+            // options. The resolver composes the same identity from the plate's exact
+            // printer, process and filament presets, and is valid as soon as the
+            // presets are loaded.
+            ResolvedPlateSlicingConfig resolved_plate;
+            std::string                plate_context_error;
+            bool tpu_valid = true, filament_printable = true;
+            if (!wxGetApp().plater()->resolve_plate_slicing_config(cur_plate, resolved_plate, plate_context_error)) {
+                // No substitute config: an unresolved plate cannot be checked, so say
+                // nothing rather than guess. The checks re-run once it resolves.
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": plate " << (cur_plate->get_index() + 1)
+                                           << " is unresolved, skipping filament checks: " << plate_context_error;
+                _set_warning_notification(EWarning::TPUPrintableError, false);
+                _set_warning_notification(EWarning::FilamentPrintableError, false);
+                _set_warning_notification(EWarning::MixUsePLAAndPETG, false);
+                _set_warning_notification(EWarning::NozzleFilamentIncompatible, false);
+                _set_warning_notification(EWarning::MixtureFilamentIncompatible, false);
+            } else {
+                const DynamicPrintConfig& full_config_temp = resolved_plate.config;
+                tpu_valid = cur_plate->check_tpu_printable_status(full_config_temp, wxGetApp().preset_bundle->get_used_tpu_filaments(cur_plate->get_extruders(true)));
+                _set_warning_notification(EWarning::TPUPrintableError, !tpu_valid);
 
-            bool filament_printable = cur_plate->check_filament_printable(full_config_temp, filament_printable_error_msg);
-            _set_warning_notification(EWarning::FilamentPrintableError, !filament_printable);
+                filament_printable = cur_plate->check_filament_printable(full_config_temp, filament_printable_error_msg);
+                _set_warning_notification(EWarning::FilamentPrintableError, !filament_printable);
 
-            bool mix_pla_and_petg = cur_plate->check_mixture_of_pla_and_petg(full_config_temp);
-            _set_warning_notification(EWarning::MixUsePLAAndPETG, !mix_pla_and_petg);
+                bool mix_pla_and_petg = cur_plate->check_mixture_of_pla_and_petg(full_config_temp);
+                _set_warning_notification(EWarning::MixUsePLAAndPETG, !mix_pla_and_petg);
 
-            //the filament names must come from the same configuration as the nozzle
-            //they are being checked against. full_config_temp is this plate's, so its
-            //own filament_settings_id is the exact list; the Project row's
-            //filament_presets can name filaments this plate does not use.
-            std::vector<std::string> plate_filaments = wxGetApp().preset_bundle->filament_presets;
-            if (const ConfigOptionStrings* plate_filament_ids = full_config_temp.option<ConfigOptionStrings>("filament_settings_id");
-                    plate_filament_ids != nullptr && !plate_filament_ids->values.empty())
-                plate_filaments = plate_filament_ids->values;
-            bool filament_nozzle_compatible = cur_plate->check_compatible_of_nozzle_and_filament(full_config_temp, plate_filaments, get_nozzle_filament_incompatible_text());
-            _set_warning_notification(EWarning::NozzleFilamentIncompatible, !filament_nozzle_compatible);
+                //the filament names must come from the same configuration as the nozzle
+                //they are being checked against. full_config_temp is this plate's, so its
+                //own filament_settings_id is the exact list; the Project row's
+                //filament_presets can name filaments this plate does not use.
+                std::vector<std::string> plate_filaments = wxGetApp().preset_bundle->filament_presets;
+                if (const ConfigOptionStrings* plate_filament_ids = full_config_temp.option<ConfigOptionStrings>("filament_settings_id");
+                        plate_filament_ids != nullptr && !plate_filament_ids->values.empty())
+                    plate_filaments = plate_filament_ids->values;
+                bool filament_nozzle_compatible = cur_plate->check_compatible_of_nozzle_and_filament(full_config_temp, plate_filaments, get_nozzle_filament_incompatible_text());
+                _set_warning_notification(EWarning::NozzleFilamentIncompatible, !filament_nozzle_compatible);
 
-            bool filament_mixture_compatible = cur_plate->check_mixture_filament_compatible(full_config_temp, get_filament_mixture_warning_text());
-            _set_warning_notification(EWarning::MixtureFilamentIncompatible, !filament_mixture_compatible);
+                bool filament_mixture_compatible = cur_plate->check_mixture_filament_compatible(full_config_temp, get_filament_mixture_warning_text());
+                _set_warning_notification(EWarning::MixtureFilamentIncompatible, !filament_mixture_compatible);
+            }
 
             bool model_fits = contained_min_one && !m_model->objects.empty() && !partlyOut && object_results.filaments.empty() && tpu_valid && filament_printable;
             // Honor the missing-plugin block so this geometry-only path does not re-enable slicing

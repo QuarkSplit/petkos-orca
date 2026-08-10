@@ -2059,8 +2059,15 @@ bool PartPlate::check_mixture_of_pla_and_petg(const DynamicPrintConfig &config)
     std::map<int, bool> nozzle_has_petg;
 
     std::vector<int> used_filaments = get_extruders(true); // 1-based
+    const auto *filament_types = config.option<ConfigOptionStrings>("filament_type");
+    if (filament_types == nullptr) {
+        //a config with no filament_type cannot answer this question; it used to be
+        //dereferenced unconditionally and took the application down whenever this ran
+        //against a config that was not yet populated
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the given config has no filament_type";
+        return true;
+    }
     if (!used_filaments.empty()) {
-        const auto *filament_types = config.option<ConfigOptionStrings>("filament_type");
         for (auto filament_idx : used_filaments) {
             int filament_id = filament_idx - 1;
             if (filament_id < (int)filament_types->values.size()) {
