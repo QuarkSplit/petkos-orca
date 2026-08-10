@@ -37,6 +37,30 @@ Preset portability for downloaded MakerWorld and Printables projects is a real u
 problem, but it is separate. Do not bury compatibility fallbacks in the per-plate architecture;
 make the context model exact first, then solve portable reconciliation independently.
 
+**That deferral was withdrawn on 2026-08-10 and this paragraph is now historical.** The context
+model is exact enough; cross-printer import is first-class work. The problem it names is not an
+edge case but a routine workflow: the well-plated, coloured, split projects worth downloading are
+overwhelmingly authored for Bambu machines, and pushing one onto a different printer produces a
+flood of "unavailable" settings, many of which exist on the target under another name, and
+sometimes a crash. The per-plate context is an asset here rather than a complication, because a
+project's authored printer identity can be preserved per plate instead of flattened onto one
+global printer.
+
+**The second scope decision withdrawn the same day: per-plate PROCESS settings are wanted.** The
+UI plan put them out of scope because the live control is `ParamsPanel::get_top_panel()` driven by
+the Tab's own preset combo, so per-plate process means touching the Tab system rather than the
+sidebar. That cost is now worth paying. The case that settles it: a project with one plate needing
+supports and one not. Today that is five to ten per-object toggles on one plate and the inverse on
+the other, which multiplies the work far past what the task is. Upstream's global/per-object split
+is not a constraint to design around; it is one of the things this fork may replace.
+
+**This fork has free rein.** Upstream compatibility is not a goal in itself. Rebase cost is real
+but secondary, and worth paying where the current design is genuinely wrong rather than merely
+different. Quality-of-life gaps count as wrong: an operation that technically succeeds but leaves
+the user manual work the app could obviously have done is a defect, not a missing luxury. The
+worked example is paste, which drops a copy directly on top of its original and stacks every
+subsequent paste in the same spot, leaving the user to drag each one out.
+
 ## Historical baseline before the 2026-08-10 refactor
 
 This section records the state that prompted the current work. It is not a description of the

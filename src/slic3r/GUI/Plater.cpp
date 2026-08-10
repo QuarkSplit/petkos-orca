@@ -692,7 +692,11 @@ struct Sidebar::priv
     ExtruderGroup *single_extruder = nullptr;
 
     int  FromDIP(int n) { return plater->FromDIP(n); }
-    void layout_printer(bool has_bbl_network, bool isDual);
+    void layout_printer(bool has_bbl_network, bool isDual, const DynamicPrintConfig *printer_cfg);
+    //The part of the printer layout that depends on WHICH MACHINE is being described, split
+    //out so a plate switch can redo it without also re-running layout_printer's tail, which
+    //expands a printer section the user has collapsed.
+    void layout_printer_machine(bool isDual, const DynamicPrintConfig *printer_cfg);
 
     void flush_printer_sync(bool restart = false);
 
@@ -807,7 +811,17 @@ struct Sidebar::priv
 //question were the same argument. isDual is a property of the printer's extruder
 //count, never of its vendor: this fleet's dual-extruder machines are not Bambu ones,
 //and gating the layout on vendor hid the second extruder from all of them.
-void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual)
+//
+//printer_cfg is the machine this layout is FOR, supplied by the caller instead of looked up
+//here. It used to read the edited Project printer, which made this function and
+//update_all_preset_comboboxes - which resolves the current plate - two writers of
+//panel_printer_bed answering about two different machines inside one call chain, with this
+//one running second and winning. Pass the current plate's resolved printer config; pass the
+//Project preset's only where no plate exists yet, i.e. from Sidebar's own constructor.
+//nullptr means the plate did not resolve: the bed and flow controls are then left exactly as
+//they are, because substituting the Project machine is the fallback this fork forbids and
+//hiding them on a missing fact would be a silent gate.
+void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual, const DynamicPrintConfig *printer_cfg)
 {
     // Printer - preset
     if (auto sizer = static_cast<wxBoxSizer *>(panel_printer_preset->GetSizer());
@@ -895,28 +909,7 @@ void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual)
     //btn_sync_printer->Show(isBBL);
     m_printer_bbl_sync->Show(has_bbl_network);
 
-    // ORCA show plate type combo box only when its supported
-    PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
-    const auto& cfg = preset_bundle.printers.get_edited_preset().config;
-    // Orca: we use preset_bundle.is_bbl_vendor() instead of isBBL to determine if the plate type combo box should be shown
-    // ref: https://github.com/OrcaSlicer/OrcaSlicer/pull/11610#discussion_r2607411847
-    panel_printer_bed->Show(preset_bundle.is_bbl_vendor() || cfg.opt_bool("support_multi_bed_types"));
-
-    extruder_dual_sizer->Show(isDual);
-
-    // NEEDFIX requires AMS check or any type of ???
-    // Single nozzle & non ams
-    if (!isDual) {
-        // Orca: for printer without flow variant, we do not show flow combo
-        int extruder_count = 0;
-        const bool has_flow_variant = cfg.support_different_extruders(extruder_count);
-
-        panel_nozzle_dia->Show(!has_flow_variant);
-        extruder_single_sizer->Show(has_flow_variant);
-    } else {
-        panel_nozzle_dia->Show(false);
-        extruder_single_sizer->Show(false);
-    }
+    layout_printer_machine(isDual, printer_cfg);
 
     // ORCA ensure printer section is visible after changing printer from printer selection dialog
     // this will inform user on printer change when printer section is collapsed
@@ -926,6 +919,37 @@ void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual)
             m_text_printer_settings->SetLabel(_L("Printer")); // ensure title returns to default state
             m_panel_printer_content->Show();
         }
+    }
+}
+
+//printer_cfg is the machine these controls describe. nullptr means it could not be resolved,
+//and then nothing here is touched: substituting the Project machine is the fallback this fork
+//forbids, and hiding a control because a fact is missing is a silent gate.
+void Sidebar::priv::layout_printer_machine(bool isDual, const DynamicPrintConfig *printer_cfg)
+{
+    if (printer_cfg == nullptr)
+        return;
+
+    // ORCA show plate type combo box only when its supported
+    // Orca: the vendor, not isBBL, decides whether the plate type combo is shown
+    // ref: https://github.com/OrcaSlicer/OrcaSlicer/pull/11610#discussion_r2607411847
+    PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
+    panel_printer_bed->Show(preset_bundle.is_bbl_vendor(*printer_cfg) || printer_cfg->opt_bool("support_multi_bed_types"));
+
+    extruder_dual_sizer->Show(isDual);
+
+    // NEEDFIX requires AMS check or any type of ???
+    // Single nozzle & non ams
+    if (!isDual) {
+        // Orca: for printer without flow variant, we do not show flow combo
+        int extruder_count = 0;
+        const bool has_flow_variant = printer_cfg->support_different_extruders(extruder_count);
+
+        panel_nozzle_dia->Show(!has_flow_variant);
+        extruder_single_sizer->Show(has_flow_variant);
+    } else {
+        panel_nozzle_dia->Show(false);
+        extruder_single_sizer->Show(false);
     }
 }
 
@@ -2890,7 +2914,10 @@ Sidebar::Sidebar(Plater *parent)
         p->single_extruder->combo_diameter->Bind(wxEVT_COMBOBOX, switch_diameter);
 
         p->vsizer_printer = new wxBoxSizer(wxVERTICAL);
-        p->layout_printer(true, true);
+        //No plate exists yet - Sidebar is built from inside Plater::priv's constructor - so the
+        //Project row's machine is not a substitute for a plate here, it is the only machine
+        //there is. update_presets(TYPE_PRINTER) lays it out for the current plate afterwards.
+        p->layout_printer(true, true, &wxGetApp().preset_bundle->printers.get_edited_preset().config);
         p->m_panel_printer_content->SetSizer(p->vsizer_printer);
         p->m_panel_printer_content->Layout();
         scrolled_sizer->Add(p->m_panel_printer_content, 0, wxEXPAND, 0);
@@ -3525,8 +3552,29 @@ void Sidebar::update_presets(Preset::Type preset_type)
         auto extruder_variants = printer_preset.config.option<ConfigOptionStrings>("extruder_variant_list");
         std::string printer_model = printer_preset.config.option<ConfigOptionString>("printer_model")->value;
 
+        //The bed-type and flow-variant controls describe the machine the CURRENT PLATE prints
+        //on, which is what update_all_preset_comboboxes already resolves a few lines above.
+        //Resolving it here too stops this call undoing that one. An unresolved plate is not
+        //permission to lay out the Project machine instead: layout_printer is then given no
+        //config and leaves those controls alone.
+        //
+        //is_dual_extruder deliberately stays Project-derived. Everything below this line -
+        //the toolhead titles, update_extruder_variant, update_extruder_diameter - indexes
+        //printer_preset's own extruder_variant_list, extruder_type and nozzle_diameter at
+        //[1], so making this flag say "dual" for a plate whose machine is dual while the
+        //Project machine is not would read those arrays out of bounds. That whole block is
+        //still single-printer and has to be made plate-scoped as one piece, not by this flag.
+        ResolvedPlateSlicingConfig plate_resolved;
+        std::string                plate_error;
+        const DynamicPrintConfig  *plate_printer_cfg = nullptr;
+        if (p->plater != nullptr && p->plater->resolve_current_plate_slicing_config(plate_resolved, plate_error, false) &&
+            plate_resolved.printer_preset != nullptr)
+            plate_printer_cfg = &plate_resolved.printer_preset->config;
+        else if (!plate_error.empty())
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": current plate printer is unresolved: " << plate_error;
+
         bool is_dual_extruder = extruder_variants->size() == 2;
-        p->layout_printer(preset_bundle.use_bbl_network(), is_dual_extruder);
+        p->layout_printer(preset_bundle.use_bbl_network(), is_dual_extruder, plate_printer_cfg);
 
         // Update nozzle titles from printer config (e.g. "Main Nozzle" / "Auxiliary Nozzle" for N6)
         // UI left = DEPUTY_EXTRUDER_ID(1), UI right = MAIN_EXTRUDER_ID(0)
@@ -5194,8 +5242,22 @@ void Sidebar::on_plate_selection_changed(int current_plate)
     ResolvedPlateSlicingConfig resolved;
     std::string                error;
     if (p->plater != nullptr && p->plater->resolve_current_plate_slicing_config(resolved, error, false) &&
-        resolved.printer_preset != nullptr && resolved.printer_preset->name != p->print_routing_printer)
-        update_all_preset_comboboxes();
+        resolved.printer_preset != nullptr) {
+        if (resolved.printer_preset->name != p->print_routing_printer)
+            update_all_preset_comboboxes();
+
+        //The bed-type panel and the nozzle/flow controls are written nowhere but
+        //layout_printer, and nothing on this path called it, so they kept describing
+        //whichever machine was current when a preset last changed. isDual stays the
+        //Project preset's answer because the extruder groups it shows are still filled
+        //from that preset in update_presets(TYPE_PRINTER).
+        const auto *project_variants = wxGetApp().preset_bundle->printers.get_edited_preset()
+                                           .config.option<ConfigOptionStrings>("extruder_variant_list");
+        p->layout_printer_machine(project_variants != nullptr && project_variants->size() == 2,
+                                  &resolved.printer_preset->config);
+        if (p->m_panel_printer_content != nullptr)
+            p->m_panel_printer_content->Layout();
+    }
 }
 
 wxString Sidebar::printer_summary_text() const
@@ -17446,8 +17508,11 @@ void Plater::reslice()
         }
         else {
             clean_gcode_toolpaths = false;
-            if (Print *print = current_plate->fff_print())
-                current_plate->set_sliced_config(print->full_print_config());
+            //No snapshot is taken here on purpose. update_slice_result_valid_state(true)
+            //captures the plate's composed config itself, and that is the basis
+            //is_slice_result_valid() later recomposes; a Print's full_print_config() is the
+            //engine's rewritten config and is deliberately not that basis. Setting one here
+            //only wrote a value the next line overwrote.
             current_plate->update_slice_result_valid_state(true);
         }
         p->main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate, false);

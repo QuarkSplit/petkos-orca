@@ -31,6 +31,32 @@ std::string trim_copy(const std::string& text)
     return text.substr(first, last - first + 1);
 }
 
+// The vendor's model_id for a printer config, or "" when no vendor profile claims it.
+//
+// printer_model is a DISPLAY NAME ("Bambu Lab H2D"); the device-capability files under
+// resources/printers are named by model_id ("O1D.json"), so DevPrinterConfigUtil's lookups
+// need the id. Passing the name opens no file, and get_value_from_config returns T() on a
+// miss, i.e. "not supported" - which is how every wrapping-detection-capable machine (N7,
+// O1C, O1C2, O1D, O1E) lost the feature: the option was hidden and any stored true was
+// rewritten to false, with nothing said. Preset::get_printer_type does this same walk for a
+// Preset; this takes the config, because a plate-scoped caller holds a resolved printer
+// config rather than a preset. It belongs beside PresetBundle::get_vendor_type, which walks
+// the identical loop for the vendor name - fold the two when that file is next opened.
+std::string printer_model_id(const DynamicPrintConfig *printer_config)
+{
+    if (printer_config == nullptr)
+        return {};
+    const auto *printer_model = printer_config->opt<ConfigOptionString>("printer_model");
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (printer_model == nullptr || bundle == nullptr)
+        return {};
+    for (const auto &vendor_profile : bundle->vendors)
+        for (const auto &vendor_model : vendor_profile.second.models)
+            if (vendor_model.name == printer_model->value)
+                return vendor_model.model_id;
+    return {};
+}
+
 } // namespace
 
 void ConfigManipulation::apply(DynamicPrintConfig* config, DynamicPrintConfig* new_config)
@@ -362,7 +388,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     }
 
     if (config->option<ConfigOptionBool>("enable_wrapping_detection")->value) {
-        const std::string printer_type = printer_config->opt_string("printer_model");
+        const std::string printer_type = printer_model_id(printer_config);
         if (!DevPrinterConfigUtil::support_wrapping_detection(printer_type)) {
             DynamicPrintConfig new_conf = *config;
             new_conf.set_key_value("enable_wrapping_detection", new ConfigOptionBool(false));
@@ -1080,7 +1106,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     
     toggle_line("infill_overhang_angle", config->opt_enum<InfillPattern>("sparse_infill_pattern") == InfillPattern::ipLateralHoneycomb);
 
-    const std::string printer_type = printer_config->opt_string("printer_model");
+    const std::string printer_type = printer_model_id(printer_config);
     toggle_line("enable_wrapping_detection", DevPrinterConfigUtil::support_wrapping_detection(printer_type));
 
     // Orca: wave-overhangs conditional visibility.

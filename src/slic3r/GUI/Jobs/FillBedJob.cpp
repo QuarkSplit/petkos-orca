@@ -194,14 +194,13 @@ void FillBedJob::prepare()
     ModelInstance *mi = model_object->instances[sel_id];
     ArrangePolygon template_ap = get_instance_arrange_poly(mi, plate_config);
 
-    int obj_idx;
-    double offset_base, offset;
-    bool was_one_instance;
+    //Both of these are read by the loop below whatever m_instances is, and only the
+    //instance path assigned them, so the object path was adding two uninitialised
+    //doubles on every iteration.
+    double offset_base = 0.0, offset = 0.0;
     if (m_instances) {
-        obj_idx = m_plater->get_selected_object_idx();
         offset_base = m_plater->canvas3D()->get_size_proportional_to_max_bed_size(0.05);
         offset = offset_base;
-        was_one_instance = model_object->instances.size()==1;
     }
 
     for (int i = 0; i < needed_items; ++i, offset += offset_base) {

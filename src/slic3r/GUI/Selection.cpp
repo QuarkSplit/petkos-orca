@@ -9,6 +9,8 @@
 #include "Gizmos/GLGizmoBase.hpp"
 #include "Camera.hpp"
 #include "Plater.hpp"
+#include "NotificationManager.hpp"
+#include "Jobs/ArrangeJob.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
 #include "libslic3r/LocalesUtils.hpp"
@@ -2189,15 +2191,24 @@ void Selection::paste_from_clipboard()
     {
     case Volume:
     {
+        //Parts can only be pasted into one specific instance. When there is no such
+        //destination this used to do nothing at all, with no message: the user pressed
+        //Ctrl+V and the application stayed silent. Say what is missing instead.
         if (is_from_single_instance())
             paste_volumes_from_clipboard();
+        else
+            wxGetApp().plater()->get_notification_manager()->push_notification(
+                into_u8(_L("The clipboard holds parts, so paste needs one object instance to paste them into. "
+                           "Select a single object first.")));
 
         break;
     }
     case Instance:
     {
-        if (m_mode == Instance)
-            paste_objects_from_clipboard();
+        //Whole objects do not need a destination, so the current selection mode -
+        //which only decides whether a click picks a part or an instance - has no say
+        //in whether they can be pasted. It used to silently block the paste.
+        paste_objects_from_clipboard();
 
         break;
     }
@@ -3295,63 +3306,68 @@ void Selection::paste_objects_from_clipboard()
     check_model_ids_validity(*m_model);
 #endif /* _DEBUG */
 
-    std::vector<size_t> object_idxs;
     const ModelObjectPtrs& src_objects = m_clipboard.get_objects();
-    PartPlate *            plate       = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    if (src_objects.empty())
+        return;
 
-    //BBS: if multiple objects are selected, move them as a whole after copy
-    Vec2d shift_all = {0, 0};
-    Vec2f empty_cell_all = {0, 0};
-    if (src_objects.size() > 1) {
-        BoundingBoxf3 bbox_all;
-        for (const ModelObject *src_object : src_objects) {
-            BoundingBoxf3 bbox = src_object->instance_convex_hull_bounding_box(size_t(0));
-            bbox_all.merge(bbox);
+    Plater*        plater     = wxGetApp().plater();
+    PartPlateList& plate_list = plater->get_partplate_list();
+    //Per-plate machines: a copy belongs to the plate the user is looking at, not to
+    //wherever the source object happened to sit, because the plate is what decides
+    //which machine prints it. A copy taken from plate 1 and pasted while plate 3 is
+    //selected belongs on plate 3.
+    const int  dst_plate_idx = plate_list.get_curr_plate_index();
+    PartPlate* dst_plate     = plate_list.get_plate(dst_plate_idx);
+
+    //Land the copies on the destination plate first, keeping their positions relative
+    //to one another. This is only a seed - the arranger below finds them real space -
+    //but it is what stops a copy from ever existing at another plate's coordinates.
+    Vec3d seed_shift = Vec3d::Zero();
+    if (dst_plate != nullptr) {
+        BoundingBoxf3 src_bb;
+        for (const ModelObject* src_object : src_objects)
+            for (size_t i = 0; i < src_object->instances.size(); ++i)
+                src_bb.merge(src_object->instance_convex_hull_bounding_box(i));
+        if (src_bb.defined) {
+            const Vec3d dst_center = dst_plate->get_build_volume().center();
+            seed_shift = Vec3d(dst_center.x() - src_bb.center().x(), dst_center.y() - src_bb.center().y(), 0.0);
         }
-        auto bsize = bbox_all.size();
-        if (bsize.x() < bsize.y())
-            shift_all = {bbox_all.size().x(), 0};
-        else
-            shift_all = {0, bbox_all.size().y()};
     }
 
-    for (size_t i=0;i<src_objects.size();i++)
+    std::vector<size_t>              object_idxs;
+    std::vector<std::pair<int, int>> pasted_instances;
+    for (const ModelObject* src_object : src_objects)
     {
-        const ModelObject *src_object = src_objects[i];
         ModelObject* dst_object = m_model->add_object(*src_object);
+        const int    obj_idx    = (int)m_model->objects.size() - 1;
 
-        // BBS: find an empty cell to put the copied object
-        BoundingBoxf3 bbox = src_object->instance_convex_hull_bounding_box(size_t(0));
-
-        Vec3d displacement;
-        bool  in_current  = plate->intersects(bbox);
-        auto  start_point = in_current ? bbox.center() : plate->get_build_volume().center();
-        auto  start_offset = in_current ? src_object->instances.front()->get_offset() : plate->get_build_volume().center();
-        if (shift_all(0) != 0 || shift_all(1) != 0) {
-            // BBS: if multiple objects are selected, move them as a whole after copy
-            if (i == 0) empty_cell_all = wxGetApp().plater()->canvas3D()->get_nearest_empty_cell({start_point(0), start_point(1)}, {bbox.size()(0)+1,bbox.size()(1)+1});
-            auto instance_shift = src_object->instances.front()->get_offset() - src_objects[0]->instances.front()->get_offset();
-            displacement        = {shift_all.x() + empty_cell_all.x() + instance_shift.x(), shift_all.y() + empty_cell_all.y() + instance_shift.y(), start_offset(2)};
-        } else {
-            // BBS: if only one object is copied, find an empty cell to put it
-            auto point_offset = start_offset - start_point;
-            auto empty_cell   = wxGetApp().plater()->canvas3D()->get_nearest_empty_cell({start_point(0), start_point(1)}, {bbox.size()(0)+1, bbox.size()(1)+1});
-            displacement      = {empty_cell.x() + point_offset.x(), empty_cell.y() + point_offset.y(), start_offset(2)};
+        //Every instance is placed in its own right. The old code gave every instance of
+        //a copied object one shared offset, so copying a two-instance selection produced
+        //two instances sitting exactly on top of each other.
+        for (size_t inst_idx = 0; inst_idx < dst_object->instances.size(); ++inst_idx) {
+            ModelInstance* inst = dst_object->instances[inst_idx];
+            inst->set_offset(inst->get_offset() + seed_shift);
+            pasted_instances.emplace_back(obj_idx, (int)inst_idx);
         }
 
-        for (ModelInstance* inst : dst_object->instances) {
-            inst->set_offset(displacement);
-
-            //BBS init asssmble transformation
-            Geometry::Transformation t = inst->get_transformation();
-            inst->set_assemble_transformation(t);
-        }
-
-        object_idxs.push_back(m_model->objects.size() - 1);
+        object_idxs.push_back((size_t)obj_idx);
 #ifdef _DEBUG
 	    check_model_ids_validity(*m_model);
 #endif /* _DEBUG */
     }
+
+    //Pack the copies into the destination plate's free space, against that plate's own
+    //bed and its own exclusion areas, without moving anything already standing there.
+    //This replaces GLCanvas3D::get_nearest_empty_cell(), which pushed a candidate cell
+    //into its result once for every instance the cell was NOT inside - so a cell covered
+    //by one object still came back as free, and repeated pastes stacked in one spot.
+    place_instances_on_plate(plater, dst_plate_idx, pasted_instances);
+
+    //BBS init assemble transformation. It follows placement: the assemble view should
+    //start from where the copy actually ended up.
+    for (size_t obj_idx : object_idxs)
+        for (ModelInstance* inst : m_model->objects[obj_idx]->instances)
+            inst->set_assemble_transformation(inst->get_transformation());
 
     wxGetApp().obj_list()->paste_objects_into_list(object_idxs);
 

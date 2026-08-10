@@ -1,15 +1,19 @@
 #ifndef slic3r_GUI_PlateBoard_hpp_
 #define slic3r_GUI_PlateBoard_hpp_
 
+#include <set>
 #include <string>
 #include <vector>
 
+#include <wx/dc.h>
 #include <wx/panel.h>
 #include <wx/scrolwin.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
+#include <wx/timer.h>
 
 #include "Widgets/PopupWindow.hpp"
+#include "wxExtensions.hpp"
 
 //Both live at global scope, like every other widget in Widgets/. Forward-declared so
 //this header does not drag DropDown and StaticBox into everything that includes it.
@@ -34,6 +38,22 @@ class PlateSwatchStrip;
 //both use for "the project".
 static constexpr int PLATE_BOARD_PROJECT_ROW = -1;
 
+//A group holding more than this many plates draws its rows compact. Above eight rows the
+//eye stops doing the grouping for itself, which is the same threshold the default
+//grouping switches on, and for the same reason.
+static constexpr int PLATE_BOARD_COMPACT_ABOVE = 8;
+
+//How the board files its rows. A VIEW mode, not the frame: it changes nothing about any
+//plate, and it is per-project session state that is never inherited from the previously
+//open project, because a large project would otherwise leave a small one grouped.
+enum class PlateBoardGrouping
+{
+    PlateOrder = 0, //one flat list in plate-index order
+    ByMachine  = 1, //assigned preset name; inherited plates form one final group
+    ByCapacity = 2, //the same groups, sorted by descending queue hours
+    ByMaterial = 3  //(colour, type) of the dominant slot, machine sub-groups nested
+};
+
 //One row's worth of facts, all of them read from the plate list and the preset
 //bundle. Nothing here is derived from a plate's name: the prep pipeline writes
 //machine, colour and hours into plate names as free text, and an overflow run
@@ -51,6 +71,10 @@ struct PlateBoardRow
     double bed_d = 0.;
 
     bool  sliced             = false; //a retained slice this plate's context still matches
+    //A retained slice the plate's own context no longer matches: the G-code is still
+    //attached, it is simply not current. Distinct from "never sliced", which shows
+    //nothing at all, because the two want different repairs.
+    bool  stale              = false;
     bool  has_time           = false;
     float print_time_seconds = 0.f;
     double weight_grams      = 0.;
@@ -58,7 +82,15 @@ struct PlateBoardRow
     int  part_count    = 0;
     bool parts_outside = false; //instance_outside_set is not empty
 
-    std::vector<int> filament_slots; //1-based library slots this plate's instances use
+    std::vector<int>         filament_slots;   //1-based library slots this plate's instances use
+    std::vector<std::string> filament_colours; //parallel; empty where the library is shorter
+
+    //The slot the material grouping files this plate under: most grams from the plate's
+    //own slice, and the lowest used slot when there is no slice to ask. 0 means the plate
+    //references no slot at all, which is its own group rather than a guess.
+    int         dominant_slot   = 0;
+    std::string material_type;   //filament_type of the dominant slot's preset
+    std::string material_colour; //library colour of the dominant slot
 
     //Nozzle is a property of the PRESET, never of the plate: a plate stores one printer
     //string and nothing else. It is carried here so the inspector can show it read-only
@@ -72,6 +104,31 @@ struct PlateBoardRow
     int bed_type = 0;
     //FilamentMapMode as int, same reason. Per-plate and read-only in the inspector.
     int filament_map_mode = 0;
+};
+
+//A run of rows under one header. Groups are held flat and in display order with a depth,
+//rather than as a tree: the only nesting the design has is material > machine, and a flat
+//list with a depth renders, hit-tests and collapses in one pass instead of three.
+struct PlateBoardGroup
+{
+    //Stable identity, so a collapsed group stays collapsed across a rebuild. It carries
+    //the grouping mode, because the same machine name means a different group under a
+    //different mode and a shared key would carry collapse state across the change.
+    std::string key;
+    std::string caption;       //what the header says
+    std::string detail;        //bed size for a machine group; empty otherwise
+    std::string swatch_colour; //material groups draw their colour; empty means none
+
+    int   depth         = 0;    //0 top level, 1 a machine sub-group inside a material group
+    int   plate_count   = 0;    //including descendants, so a material group can state its total
+    float queue_seconds = 0.f;  //same
+    //True when the header already names one machine, which is what lets a compact row
+    //spend the width the name would have taken on its swatches instead.
+    bool  names_machine = false;
+
+    //Indices into PlateBoardModel::rows(). Empty for a material group, whose rows live in
+    //its machine sub-groups.
+    std::vector<int> rows;
 };
 
 //The four rollup cells, plus the count that stops the totals being a lie by omission.
@@ -91,15 +148,30 @@ struct PlateBoardRollup
 class PlateBoardModel
 {
 public:
-    void rebuild(const PartPlateList &plates, const PresetBundle &bundle);
+    void rebuild(const PartPlateList &plates,
+                 const PresetBundle & bundle,
+                 PlateBoardGrouping   grouping = PlateBoardGrouping::PlateOrder);
 
-    const std::vector<PlateBoardRow> &rows() const { return m_rows; }
-    const PlateBoardRow &             project_row() const { return m_project_row; }
-    const PlateBoardRollup &          rollup() const { return m_rollup; }
+    const std::vector<PlateBoardRow> &  rows() const { return m_rows; }
+    //Empty in plate order: one unnamed group holding everything is a header that says
+    //nothing, and drawing it would cost a row of height to state the obvious.
+    const std::vector<PlateBoardGroup> &groups() const { return m_groups; }
+    const PlateBoardRow &               project_row() const { return m_project_row; }
+    const PlateBoardRollup &            rollup() const { return m_rollup; }
+
+    //The largest bed dimension anywhere in the project, floored, which is what the row
+    //glyphs are drawn in proportion to. See the note on bed_glyph_size in the .cpp.
+    double glyph_reference_mm() const { return m_glyph_reference_mm; }
 
     //The collapsed printer-section title: the project printer when the project holds
     //one plate or every plate inherits, and "N machines" otherwise.
     std::string summary_text() const;
+
+    //Plate order at eight plates or fewer, by machine above eight. Above eight the eye
+    //cannot do the grouping the panel refused to do; at or below it, reordering rows away
+    //from plate numbering costs more than it buys, because the number is the project's
+    //shared vocabulary and every prep-pipeline filename is keyed on it.
+    static PlateBoardGrouping default_grouping(int plate_count);
 
     //W x D of a printer preset's printable area, in mm. False when the preset is not
     //installed or carries no usable printable_area.
@@ -112,10 +184,14 @@ public:
     static bool printer_nozzle_diameter(const PresetBundle &bundle, const std::string &preset_name, double &diameter);
 
 private:
-    std::vector<PlateBoardRow> m_rows;
-    PlateBoardRow              m_project_row;
-    PlateBoardRollup           m_rollup;
-    bool                       m_all_inherited = true;
+    void build_groups(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle);
+
+    std::vector<PlateBoardRow>   m_rows;
+    std::vector<PlateBoardGroup> m_groups;
+    PlateBoardRow                m_project_row;
+    PlateBoardRollup             m_rollup;
+    bool                         m_all_inherited      = true;
+    double                       m_glyph_reference_mm = 0.;
 };
 
 //The picker. Deliberately NOT a PlaterPresetComboBox subclass: every preset combo in
@@ -144,6 +220,14 @@ private:
         std::string name;        //empty means "Same as Global"
         wxString    label;
         wxString    detail;
+        double      bed_w = 0.;  //drives the mini bed glyph; 0 means the preset has no usable bed
+        double      bed_d = 0.;
+        //This candidate's bed is smaller than the bed the plate is on now, in at least one
+        //axis. Stated as the fact it is, rather than as a count of parts that would fall
+        //outside: that count needs a geometry pass against a build volume this plate does
+        //not have yet, and a number produced by a cheaper test would be a guess wearing a
+        //number's clothes. The row state names the parts once the assignment is committed.
+        bool        smaller_bed = false;
         bool        is_header = false;
         bool        keep_missing = false;
         bool        is_bulk_toggle = false;  //"every unassigned plate"
@@ -160,6 +244,7 @@ private:
     std::vector<Item> m_items;
     int               m_hover = -1;
     int               m_row_height = 0;
+    double            m_glyph_reference_mm = 0.;
     //Plates with no assignment of their own. The bulk footer names how many, because
     //an action whose blast radius is larger than what the user can see is the silent
     //write this whole design exists to end.
@@ -172,7 +257,7 @@ private:
     bool              m_bulk_to_scope = false;
 };
 
-//The board itself: the rollup, then one scrolling row per plate.
+//The board itself: the rollup tiles, the grouping control, then the scrolling rows.
 //
 //The Project row is the sidebar's existing printer-preset panel sitting directly
 //above this control, not a row drawn here. That panel already IS the project printer
@@ -213,19 +298,102 @@ public:
     wxSize DoGetBestSize() const override;
 
 private:
+    enum class HitKind { None, Rollup, Segment, GroupHeader, Row };
+    struct Hit
+    {
+        HitKind kind  = HitKind::None;
+        int     index = -1; //segment ordinal, group index, or row index - never a plate index
+        bool operator==(const Hit &other) const { return kind == other.kind && index == other.index; }
+        bool operator!=(const Hit &other) const { return !(*this == other); }
+    };
+
+    //One drawable line in the scroll region, laid out once per rebuild. Group headers and
+    //rows share the list so that scrolling, hit-testing and "draw only what is in view"
+    //are one arithmetic problem rather than three.
+    struct Item
+    {
+        bool header = false;
+        int  group  = -1; //index into m_model.groups() when header
+        int  row    = -1; //index into m_model.rows()   when not
+        int  y      = 0;  //content-space top
+        int  height = 0;
+    };
+
+    //The bed glyph animates between two sizes so a reassignment that resizes a bed is
+    //visible rather than instantaneous. One clock for the whole board: the rows all move
+    //together, and a per-row clock would buy nothing but drift.
+    struct GlyphAnim
+    {
+        double from_w = 0., from_h = 0.;
+        double to_w   = 0., to_h   = 0.;
+    };
+
     void on_paint(wxPaintEvent &evt);
     void on_mouse(wxMouseEvent &evt);
     void on_scroll(wxMouseEvent &evt);
-    int  hit_test(const wxPoint &pos) const;
+    void on_anim_tick(wxTimerEvent &evt);
+
+    void rebuild_items();
+    void clamp_scroll();
+    void sync_glyph_targets();
+    void scroll_row_into_view(int row_index);
+    int  find_row_item(int plate_index) const;
+
+    int  rollup_height() const;
+    int  grouping_height() const;
+    int  view_top() const { return rollup_height() + grouping_height(); }
+    int  view_height() const;
+    int  sticky_group() const;
+    int  segment_at(int x) const;
+    Hit  hit_test(const wxPoint &pos) const;
+
+    void draw_rollup(wxDC &dc, bool dark, int width);
+    void draw_grouping(wxDC &dc, bool dark, int width, int top);
+    void draw_group_header(wxDC &dc, bool dark, int width, int y, int height, const PlateBoardGroup &group, bool collapsed);
+    void draw_row(wxDC &dc, bool dark, int width, int y, int height, int row_index, const PlateBoardGroup *group);
+    void draw_swatches(wxDC &dc, bool dark, const PlateBoardRow &row, int x, int y, int box, int max_width);
+    void draw_state_icon(wxDC &dc, const PlateBoardRow &row, int x, int y);
+
+    void set_grouping(PlateBoardGrouping grouping);
 
     Plater *           m_plater = nullptr;
     PlatePrinterPopup *m_popup  = nullptr;
     PlateBoardModel    m_model;
-    int             m_current_plate = 0;
-    int             m_hover        = -2;
-    int             m_scroll_rows  = 0; //first visible plate row
-    int             m_row_height   = 0;
-    int             m_rollup_height = 0;
+
+    std::vector<Item>      m_items;
+    std::vector<GlyphAnim> m_glyphs; //indexed by row index, so it is parallel to m_model.rows()
+    std::set<std::string>  m_collapsed;
+
+    int  m_current_plate  = 0;
+    Hit  m_hover;
+    int  m_scroll_px      = 0;
+    int  m_content_height = 0;
+    int  m_row_height     = 0;
+    int  m_row_compact    = 0;
+    int  m_header_height  = 0;
+    int  m_rollup_height  = 0;
+    int  m_segment_height = 0;
+    int  m_best_height    = 0; //last height handed to the sizer; a change asks for one layout
+
+    //The grouping mode, and whether the user picked it. While it is not explicit the
+    //default is recomputed from the plate count on every reload, so a project that grows
+    //past eight plates regroups itself without being asked twice.
+    PlateBoardGrouping m_grouping          = PlateBoardGrouping::PlateOrder;
+    bool               m_grouping_explicit = false;
+    //Identity of the project the explicit choice belongs to. A different project resets
+    //the mode and the collapse set: a large project must not leave a small one grouped.
+    wxString           m_project_id;
+    bool               m_project_seen = false;
+
+    wxTimer  m_anim_timer;
+    int      m_anim_elapsed_ms = 0;
+    bool     m_anim_running    = false;
+
+    ScalableBitmap m_icon_sliced;  //a retained slice this plate's context still matches
+    ScalableBitmap m_icon_stale;   //a retained slice the context has moved out from under
+    ScalableBitmap m_icon_problem; //parts outside the bed, or an assignment with no preset
+    bool           m_icons_ok = false;
+
     //render copies of the sidebar's scope set; see set_scope
     std::vector<int> m_scoped_plates;
     bool             m_scope_project = false;
@@ -277,6 +445,13 @@ private:
     PlateSwatchStrip *m_filament_value = nullptr;
     wxStaticText *m_mapping_label  = nullptr;
     wxStaticText *m_mapping_value  = nullptr;
+    //Where this plate's printer comes from: its own assignment, or the Project row it is
+    //still following. Deliberately NOT a "slice for" divergence marker. That row belonged
+    //to the design in which the application always sliced on the project printer; this
+    //fork resolves each plate's own context, so a row saying the plate slices somewhere
+    //else would state something that is no longer true.
+    wxStaticText *m_source_label = nullptr;
+    wxStaticText *m_source_value = nullptr;
     Button *      m_more_btn       = nullptr;
 
     PlatePrinterPopup *m_popup = nullptr;

@@ -3,6 +3,8 @@
 
 
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "Job.hpp"
 #include "libslic3r/Arrange.hpp"
@@ -87,6 +89,28 @@ static const constexpr double LOGICAL_BED_GAP = 1. / 5.;
 //Use PartPlateList::get_plate_origin_2d()/predict_plate_origin() for positions.
 
 arrangement::ArrangeParams init_arrange_params(Plater *p);
+
+//What place_instances_on_plate() managed to do. `arranged` is false when the plate
+//supplied no bed to pack against at all, which is a defect in the plate rather than
+//a reason to refuse the operation that created the instances.
+struct PlacementResult
+{
+    int  placed{0};
+    int  unplaced{0};
+    bool arranged{false};
+};
+
+//Per-plate machines: place the given instances into the free space of ONE plate,
+//against that plate's own bed and that plate's own exclusion areas. Instances are
+//named by (object index, instance index) into plater->model().
+//
+//Nothing already on the plate is moved: the user placed those deliberately, and
+//shoving them aside is a larger harm than the stacking this exists to end. Anything
+//that will not fit is laid out in a readable row directly in front of the plate and
+//named in a notification, because a paste that refuses, or that drops the copy where
+//it cannot be seen, is worse than an honest placement plus a message.
+PlacementResult place_instances_on_plate(Plater *plater, int plate_idx,
+                                         const std::vector<std::pair<int, int>> &instances);
 
 }} // namespace Slic3r::GUI
 

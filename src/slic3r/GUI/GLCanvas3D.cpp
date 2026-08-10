@@ -8898,7 +8898,23 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
     PartPlateList& plate_list = wxGetApp().plater()->get_partplate_list();
     size_t         sliced_plates_cnt = 0; // ORCA make it accesable for other conditions
 
-    for (int i = 0; i < plate_list.get_plate_count(); i++) {
+    // One is_slice_result_valid() per plate per frame instead of three. It is no longer the bool
+    // read it was before the per-plate refactor: for a plate holding a retained slice it
+    // recomposes that plate's exact config and compares it with the snapshot the slice was made
+    // from, and this function runs on every Preview frame for every plate. Both loops below run
+    // on the GUI thread inside one frame and neither mutates a plate or the preset bundle, so
+    // the hoisted answers cannot go stale between them.
+    const int         plate_count = plate_list.get_plate_count();
+    std::vector<char> slice_valid(plate_count, 0);
+    std::vector<char> ready_for_print(plate_count, 0);
+    for (int i = 0; i < plate_count; i++) {
+        PartPlate *plate   = plate_list.get_plate(i);
+        const bool valid   = plate->is_slice_result_valid();
+        slice_valid[i]     = valid ? 1 : 0;
+        ready_for_print[i] = plate->is_slice_result_ready_for_print(valid) ? 1 : 0;
+    }
+
+    for (int i = 0; i < plate_count; i++) {
         if (i < m_sel_plate_toolbar.m_items.size()) {
             if (i == plate_list.get_curr_plate_index() && !all_plates_stats_item->selected)
                 m_sel_plate_toolbar.m_items[i]->selected = true;
@@ -8910,8 +8926,8 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
             bool can_slice = plate_list.get_plate(i)->can_slice();
             bool is_empty  = plate_list.get_plate(i)->empty();
 
-            if (plate_list.get_plate(i)->is_slice_result_valid()) {
-                if ((!is_empty && can_slice) && plate_list.get_plate(i)->is_slice_result_ready_for_print())
+            if (slice_valid[i]) {
+                if ((!is_empty && can_slice) && ready_for_print[i])
                     m_sel_plate_toolbar.m_items[i]->slice_state = IMToolbarItem::SliceState::SLICED;
                 else
                     m_sel_plate_toolbar.m_items[i]->slice_state = IMToolbarItem::SliceState::SLICE_FAILED;
@@ -8932,7 +8948,8 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
         all_plates_stats_item->percent = 0.0f;
 
         for (auto plate : plate_list.get_nonempty_plate_list()) {
-            if (plate->is_slice_result_valid() && plate->is_slice_result_ready_for_print())
+            const int idx = plate->get_index();
+            if (idx >= 0 && idx < plate_count && slice_valid[idx] && ready_for_print[idx])
                 sliced_plates_cnt++;
         }
         all_plates_stats_item->percent = (float)(sliced_plates_cnt) / (float)(plate_list.get_nonempty_plate_list().size()) * 100.0f;

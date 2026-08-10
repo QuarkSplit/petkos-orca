@@ -592,9 +592,14 @@ public:
     const DynamicPrintConfig &get_sliced_config() const { return m_sliced_config; }
 
     //is slice result ready for print
-    bool is_slice_result_ready_for_print() const
+    bool is_slice_result_ready_for_print() const { return is_slice_result_ready_for_print(is_slice_result_valid()); }
+    // Overload for a caller that already holds the validity answer. is_slice_result_valid() is
+    // no longer the bool read it used to be: it recomposes this plate's exact config and
+    // compares it with the snapshot the slice was made from. A render pass that asks it once
+    // per plate and then asks this too pays that twice.
+    bool is_slice_result_ready_for_print(bool slice_result_valid) const
     {
-        bool result = is_slice_result_valid();
+        bool result = slice_result_valid;
         if (result)
             result = m_gcode_result ?
 			(!m_gcode_result->toolpath_outside && m_gcode_result->gcode_check_result.error_code == 0 && !m_gcode_result->filament_printable_reuslt.has_value()) :
