@@ -13,13 +13,32 @@ static const wxColour LabelDisableColor = wxColour("#ACACAC");
 static const wxColour GreyColor = wxColour("#6B6B6B");
 static const wxColour BackGroundColor = wxColour("#FFFFFF");
 
-static bool should_pop_up()
+static bool resolve_popup_plate_config(PartPlate *plate, ResolvedPlateSlicingConfig &resolved)
 {
-    const auto &preset_bundle    = wxGetApp().preset_bundle;
-    if (!preset_bundle->is_bbl_vendor()) return false;
-    const auto &full_config      = preset_bundle->full_config();
-    const auto  nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
-    return nozzle_diameters->size() > 1;
+    if (plate == nullptr)
+        return false;
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    std::string error;
+    if (!bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    resolved.config.apply(*plate->config(), true);
+    return true;
+}
+
+static bool should_pop_up(PartPlate *plate)
+{
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_popup_plate_config(plate, resolved) || !resolved.is_bbl_printer)
+        return false;
+    const auto *nozzle_diameters = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    return nozzle_diameters != nullptr && nozzle_diameters->size() > 1;
 }
 
 static FilamentMapMode get_prefered_map_mode()
@@ -28,10 +47,8 @@ static FilamentMapMode get_prefered_map_mode()
     auto                                   &app_config    = wxGetApp().app_config;
     std::string                             mode_str      = app_config->get("prefered_filament_map_mode");
     auto                                    iter          = enum_keys_map.find(mode_str);
-    if (iter == enum_keys_map.end()) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format("Could not get prefered_filament_map_mode from app config, use AutoForFlsuh mode");
-        return FilamentMapMode::fmmAutoForFlush;
-    }
+    if (iter == enum_keys_map.end())
+        throw RuntimeError("Invalid prefered_filament_map_mode value: " + mode_str);
     return FilamentMapMode(iter->second);
 }
 
@@ -42,7 +59,8 @@ static void set_prefered_map_mode(FilamentMapMode mode)
     std::string                           mode_str;
     if (mode < enum_values.size()) mode_str = enum_values[mode];
 
-    if (mode_str.empty()) BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format("Set empty prefered_filament_map_mode to app config");
+    if (mode_str.empty())
+        throw RuntimeError("Invalid filament map mode");
     app_config->set("prefered_filament_map_mode", mode_str);
 }
 
@@ -267,7 +285,11 @@ void FilamentGroupPopup::Init()
 
 void FilamentGroupPopup::tryPopup(Plater* plater,PartPlate* partplate,bool slice_all)
 {
-    if (should_pop_up()) {
+    // One popup cannot truthfully edit a heterogeneous set of plates. The slice
+    // workflow validates and prompts each plate separately.
+    if (slice_all)
+        return;
+    if (should_pop_up(partplate)) {
         bool connect_status = plater->get_machine_sync_status();
         this->partplate_ref = partplate;
         this->plater_ref = plater;
@@ -292,27 +314,12 @@ void FilamentGroupPopup::tryPopup(Plater* plater,PartPlate* partplate,bool slice
 FilamentMapMode FilamentGroupPopup::GetFilamentMapMode() const
 {
     const auto& proj_config = wxGetApp().preset_bundle->project_config;
-    if (m_sync_plate)
-        return partplate_ref->get_real_filament_map_mode(proj_config);
-
-    return plater_ref->get_global_filament_map_mode();
+    return partplate_ref->get_real_filament_map_mode(proj_config);
 }
 
 void FilamentGroupPopup::SetFilamentMapMode(const FilamentMapMode mode)
 {
-    if (m_sync_plate) {
-        if (m_slice_all) {
-            auto plate_list = plater_ref->get_partplate_list().get_plate_list();
-            for (int i = 0; i < plate_list.size(); ++i) {
-                plate_list[i]->set_filament_map_mode(mode);
-            }
-        }
-        else {
-            partplate_ref->set_filament_map_mode(mode);
-        }
-        return;
-    }
-    plater_ref->set_global_filament_map_mode(mode);
+    partplate_ref->set_filament_map_mode(mode);
 }
 
 
@@ -453,9 +460,8 @@ void FilamentGroupPopup::MakeSmartFilamentSection(wxSizer *top_sizer, int horizo
 
 void FilamentGroupPopup::OnSmartFilamentToggle(wxCommandEvent &event)
 {
-    auto &config           = wxGetApp().preset_bundle->project_config;
-    auto *dynamic_filament = dynamic_cast<ConfigOptionBool *>(config.option("enable_filament_dynamic_map"));
-    if (dynamic_filament) { dynamic_filament->value = m_smart_filament_switch->GetValue(); }
+    auto *dynamic_filament = partplate_ref->config()->option<ConfigOptionBool>("enable_filament_dynamic_map", true);
+    dynamic_filament->value = m_smart_filament_switch->GetValue();
     plater_ref->update();
     event.Skip();
 }
@@ -467,9 +473,15 @@ void FilamentGroupPopup::UpdateSmartFilamentSection()
     m_smart_filament_spacer->Show(show);
 
     if (show) {
-        auto &config           = wxGetApp().preset_bundle->project_config;
-        auto *dynamic_filament = dynamic_cast<ConfigOptionBool *>(config.option("enable_filament_dynamic_map"));
-        if (dynamic_filament) { m_smart_filament_switch->SetValue(dynamic_filament->value); }
+        ResolvedPlateSlicingConfig resolved;
+        if (!resolve_popup_plate_config(partplate_ref, resolved)) {
+            m_smart_filament_panel->Hide();
+            m_smart_filament_spacer->Show(false);
+            return;
+        }
+        const auto *dynamic_filament = resolved.config.option<ConfigOptionBool>("enable_filament_dynamic_map");
+        if (dynamic_filament != nullptr)
+            m_smart_filament_switch->SetValue(dynamic_filament->value);
     }
 }
 

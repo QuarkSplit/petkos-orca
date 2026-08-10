@@ -10,10 +10,13 @@
 #include "libslic3r/ProjectTask.hpp"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/fstream.hpp>
 
 #include <catch2/catch_tostring.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <array>
+#include <iterator>
 #include <type_traits> // for std::enable_if_t
 #include <typeinfo>    // for typeid
 
@@ -168,6 +171,7 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
         PlateData* plate = new PlateData();
         plate->plate_index      = 0;
         plate->is_sliced_valid  = true; // gate for the slice_info.config writer (nozzle_volume_type)
+        plate->sliced_config    = config;
         plate->filament_maps    = { 1, 2, 1 }; // slice_info uses this; keep it == model_settings' value
         plate->config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));
         plate->config.set_key_value("filament_map", new ConfigOptionInts({ 1, 2, 1 }));
@@ -236,6 +240,162 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
     }
 }
 
+SCENARIO("Per-plate slicing identity survives a .3mf round-trip", "[3mf][PlateContext]") {
+    GIVEN("a plate with logical presets, vendor identity, and a physical target") {
+        Model model;
+        std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
+        REQUIRE(load_stl(src_file.c_str(), &model));
+        model.add_default_instances();
+
+        const boost::filesystem::path backup_dir =
+            boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("orca_plate_context_%%%%%%%%");
+        boost::filesystem::create_directories(backup_dir);
+        model.set_backup_path(backup_dir.string());
+
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        PlateData *plate = new PlateData();
+        plate->plate_index = 0;
+        plate->slicing_context.printer_preset_name   = "Voron 2.4 0.6 nozzle";
+        plate->slicing_context.printer_vendor_id     = "VORON";
+        plate->slicing_context.print_preset_name     = "0.28mm structural";
+        plate->slicing_context.filament_preset_names = {"PETG black", "PLA support interface"};
+        plate->slicing_context.physical_printer_id   = "workshop-voron-02";
+
+        WHEN("the project is stored and loaded") {
+            const boost::filesystem::path test_file = backup_dir / "plate_context.3mf";
+            StoreParams store_params;
+            store_params.path = test_file.string().c_str();
+            store_params.model = &model;
+            store_params.config = &config;
+            store_params.plate_data_list.push_back(plate);
+            store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+            REQUIRE(store_bbs_3mf(store_params));
+
+            Model dst_model;
+            DynamicPrintConfig dst_config;
+            ConfigSubstitutionContext ctxt{ForwardCompatibilitySubstitutionRule::Enable};
+            PlateDataPtrs dst_plates;
+            std::vector<Preset*> project_presets;
+            bool is_bbl_3mf = false, is_orca_3mf = false;
+            Semver file_version;
+            const bool loaded = load_bbs_3mf(test_file.string().c_str(), &dst_config, &ctxt, &dst_model, &dst_plates,
+                                             &project_presets, &is_bbl_3mf, &is_orca_3mf, &file_version, nullptr,
+                                             LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+
+            THEN("the exact context is restored without remapping") {
+                REQUIRE(loaded);
+                REQUIRE(dst_plates.size() == 1);
+                CHECK(dst_plates.front()->slicing_context == plate->slicing_context);
+            }
+
+            release_PlateData_list(dst_plates);
+            for (Preset *preset : project_presets)
+                delete preset;
+            boost::filesystem::remove(test_file);
+        }
+
+        delete plate;
+        boost::filesystem::remove_all(backup_dir);
+    }
+}
+
+SCENARIO("Individually sliced plate G-code survives project save and reopen", "[3mf][PlateContext][RetainedGcode]") {
+    GIVEN("two plates with distinct effective configs and retained G-code files") {
+        Model model;
+        const std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
+        REQUIRE(load_stl(src_file.c_str(), &model));
+        model.add_default_instances();
+
+        const boost::filesystem::path work_dir =
+            boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("orca_retained_gcode_%%%%%%%%");
+        const boost::filesystem::path extract_dir = work_dir / "loaded";
+        boost::filesystem::create_directories(extract_dir);
+        model.set_backup_path((work_dir / "source").string());
+        boost::filesystem::create_directories(model.get_backup_path());
+
+        const std::array<std::string, 2> contents = {
+            "; PETKOS_PLATE_ONE\nG1 X11 Y11\n",
+            "; PETKOS_PLATE_TWO\nG1 X22 Y22\n"
+        };
+        const std::array<boost::filesystem::path, 2> source_paths = {
+            work_dir / "plate-one.gcode",
+            work_dir / "plate-two.gcode"
+        };
+        for (size_t i = 0; i < source_paths.size(); ++i) {
+            boost::filesystem::ofstream stream(source_paths[i], std::ios::binary);
+            REQUIRE(stream.good());
+            stream << contents[i];
+        }
+
+        DynamicPrintConfig project_config = DynamicPrintConfig::full_print_config();
+        PlateDataPtrs source_plates;
+        for (int i = 0; i < 2; ++i) {
+            PlateData *plate = new PlateData();
+            plate->plate_index = i;
+            plate->is_sliced_valid = true;
+            plate->gcode_file = source_paths[i].string();
+            plate->sliced_config = project_config;
+            plate->sliced_config.set_key_value("nozzle_diameter", new ConfigOptionFloats({i == 0 ? 0.4 : 0.6}));
+            plate->slicing_context.printer_preset_name = i == 0 ? "Printer A 0.4" : "Printer B 0.6";
+            plate->slicing_context.printer_vendor_id = i == 0 ? "VENDOR_A" : "VENDOR_B";
+            source_plates.push_back(plate);
+        }
+
+        WHEN("the project is saved with G-code and loaded into a fresh backup directory") {
+            const boost::filesystem::path project_file = work_dir / "retained.3mf";
+            StoreParams store_params;
+            store_params.path = project_file.string();
+            store_params.model = &model;
+            store_params.config = &project_config;
+            store_params.plate_data_list = source_plates;
+            store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence | SaveStrategy::WithGcode;
+            REQUIRE(store_bbs_3mf(store_params));
+
+            // Saving must never replace the live retained paths with archive-internal names.
+            CHECK(source_plates[0]->gcode_file == source_paths[0].string());
+            CHECK(source_plates[1]->gcode_file == source_paths[1].string());
+
+            Model loaded_model;
+            loaded_model.set_backup_path(extract_dir.string());
+            DynamicPrintConfig loaded_config;
+            ConfigSubstitutionContext ctxt{ForwardCompatibilitySubstitutionRule::Enable};
+            PlateDataPtrs loaded_plates;
+            std::vector<Preset*> project_presets;
+            bool is_bbl_3mf = false, is_orca_3mf = false;
+            Semver file_version;
+            const bool loaded = load_bbs_3mf(project_file.string().c_str(), &loaded_config, &ctxt, &loaded_model,
+                                             &loaded_plates, &project_presets, &is_bbl_3mf, &is_orca_3mf,
+                                             &file_version, nullptr,
+                                             LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+
+            THEN("each plate restores its own exact G-code and slicing context") {
+                REQUIRE(loaded);
+                REQUIRE(loaded_plates.size() == 2);
+                for (size_t i = 0; i < loaded_plates.size(); ++i) {
+                    CHECK(loaded_plates[i]->slicing_context == source_plates[i]->slicing_context);
+                    const auto *loaded_nozzles = loaded_plates[i]->sliced_config.option<ConfigOptionFloats>("nozzle_diameter");
+                    REQUIRE(loaded_nozzles != nullptr);
+                    REQUIRE(loaded_nozzles->values.size() == 1);
+                    CHECK_THAT(loaded_nozzles->values.front(),
+                               Catch::Matchers::WithinAbs(i == 0 ? 0.4 : 0.6, 1e-9));
+                    REQUIRE_FALSE(loaded_plates[i]->gcode_file.empty());
+                    REQUIRE(boost::filesystem::exists(loaded_plates[i]->gcode_file));
+                    boost::filesystem::ifstream stream(loaded_plates[i]->gcode_file, std::ios::binary);
+                    const std::string restored((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+                    CHECK(restored == contents[i]);
+                }
+            }
+
+            release_PlateData_list(loaded_plates);
+            for (Preset *preset : project_presets)
+                delete preset;
+        }
+
+        release_PlateData_list(source_plates);
+        boost::filesystem::remove_all(work_dir);
+    }
+}
+
 // Saved nozzle diameter for a single-nozzle-per-extruder printer with a non-standard nozzle.
 // The grouping result rounds every nozzle diameter to the nearest of {0.2,0.4,0.6,0.8} for its
 // internal matching key. That rounded value must NOT reach the saved <filament>/<nozzle> metadata on
@@ -262,6 +422,7 @@ SCENARIO("Non-standard nozzle diameter survives .3mf save on a single-nozzle pri
         PlateData* plate = new PlateData();
         plate->plate_index     = 0;
         plate->is_sliced_valid = true;      // gate for the slice_info.config writer
+        plate->sliced_config   = config;
         plate->filament_maps   = { 1 };
 
         // Seed the stamped diameter with the grouping result's rounded value (0.5 -> 0.4) so the
@@ -452,6 +613,7 @@ SCENARIO("Nozzle-group metadata .3mf round-trip", "[3mf][MultiNozzle]") {
         PlateData* plate = new PlateData();
         plate->plate_index     = 0;
         plate->is_sliced_valid = true;
+        plate->sliced_config   = config;
         plate->filament_maps   = { 1, 2, 1 };
         plate->nozzle_group_result = group;
         plate->config.set_key_value("filament_map_mode", new ConfigOptionEnum<FilamentMapMode>(fmmManual));

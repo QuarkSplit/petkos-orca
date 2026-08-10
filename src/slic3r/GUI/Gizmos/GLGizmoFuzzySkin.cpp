@@ -324,10 +324,24 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
         m_parent.reset_all_gizmos();
     }
 
-    const DynamicPrintConfig &glb_cfg                    = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for fuzzy-skin editing" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    const DynamicPrintConfig &plate_cfg                  = resolved.config;
     const bool                has_object_fuzzy_override  = obj_cfg.option("fuzzy_skin");
     const FuzzySkinType       effective_fuzzy_skin_state = has_object_fuzzy_override ? obj_cfg.opt_enum<FuzzySkinType>("fuzzy_skin")
-                                                                                     : glb_cfg.opt_enum<FuzzySkinType>("fuzzy_skin");
+                                                                                     : plate_cfg.opt_enum<FuzzySkinType>("fuzzy_skin");
     if (effective_fuzzy_skin_state == FuzzySkinType::Disabled_fuzzy) {
         float font_size = ImGui::GetFontSize();
         auto link_text = [&]() {

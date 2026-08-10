@@ -1538,19 +1538,20 @@ ElegooPrintHostSendDialog::ElegooPrintHostSendDialog(const fs::path&            
                                                      const wxArrayString&       groups,
                                                      const wxArrayString&       storage_paths,
                                                      const wxArrayString&       storage_names,
-                                                     bool                       switch_to_device_tab)
+                                                     bool                       switch_to_device_tab,
+                                                     std::string                printer_model_id,
+                                                     BedType                    plate_bed_type)
     : PrintHostSendDialog(path, post_actions, groups, storage_paths, storage_names, switch_to_device_tab)
     , m_timeLapse(0)
     , m_heatedBedLeveling(0)
     , m_BedType(BedType::btPTE)
+    , m_printer_model_id(std::move(printer_model_id))
+    , m_plate_bed_type(plate_bed_type)
 {}
 
 void ElegooPrintHostSendDialog::init() {
 
-    auto preset_bundle = wxGetApp().preset_bundle;
-    auto model_id = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
-
-    if (model_id != "Elegoo-CC" && model_id != "Elegoo-C") {
+    if (m_printer_model_id != "Elegoo-CC" && m_printer_model_id != "Elegoo-C") {
         PrintHostSendDialog::init();
         return;
     }
@@ -1838,9 +1839,7 @@ void ElegooPrintHostSendDialog::EndModal(int ret)
 
 BedType ElegooPrintHostSendDialog::appBedType() const
 {
-    std::string str_bed_type = wxGetApp().app_config->get("curr_bed_type");
-    int bed_type_value = atoi(str_bed_type.c_str());
-    return static_cast<BedType>(bed_type_value);
+    return m_plate_bed_type;
 }
 
 void ElegooPrintHostSendDialog::refresh()
@@ -1865,10 +1864,12 @@ CrealityPrintHostSendDialog::CrealityPrintHostSendDialog(const fs::path&        
                                                          const wxArrayString&       storage_paths,
                                                          const wxArrayString&       storage_names,
                                                          bool                       switch_to_device_tab,
-                                                         PrintHost*                 printhost)
+                                                         PrintHost*                 printhost,
+                                                         DynamicPrintConfig         plate_config)
     : PrintHostSendDialog(path, post_actions, groups, storage_paths, storage_names, switch_to_device_tab)
     , m_enableSelfTest(false)
     , m_printhost(printhost)
+    , m_plate_config(std::move(plate_config))
 {}
 
 void CrealityPrintHostSendDialog::init()
@@ -1920,10 +1921,8 @@ void CrealityPrintHostSendDialog::init()
 
     // --- Color mapping UI ---
     // Get gcode filament info from slicer
-    auto  preset_bundle    = wxGetApp().preset_bundle;
-    auto  full_config      = preset_bundle->full_config();
-    auto* filament_colors  = full_config.option<ConfigOptionStrings>("filament_colour");
-    auto* filament_types   = full_config.option<ConfigOptionStrings>("filament_type");
+    auto* filament_colors  = m_plate_config.option<ConfigOptionStrings>("filament_colour");
+    auto* filament_types   = m_plate_config.option<ConfigOptionStrings>("filament_type");
     int   gcode_filament_count = filament_colors ? (int)filament_colors->values.size() : 0;
 
     // Query printer for loaded materials

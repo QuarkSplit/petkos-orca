@@ -1734,9 +1734,23 @@ bool MainFrame::can_send_gcode() const
 {
     if (m_plater && !m_plater->model().objects.empty())
     {
-        auto cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-
-        const auto *print_host_opt = cfg.option<ConfigOptionString>("print_host");
+        PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (plate == nullptr || bundle == nullptr ||
+            !bundle->resolve_plate_slicing_config(
+                plate->get_slicing_context(),
+                plate->get_real_filament_maps(bundle->project_config),
+                plate->get_real_filament_volume_maps(bundle->project_config),
+                resolved, error)) {
+            if (plate != nullptr)
+                plate->update_apply_result_invalid(true);
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return false;
+        }
+        resolved.config.apply(*plate->config(), true);
+        const auto *print_host_opt = resolved.config.option<ConfigOptionString>("print_host");
         if (! print_host_opt) return false;
         else return !print_host_opt->value.empty();
     }
@@ -1906,9 +1920,7 @@ wxBoxSizer* MainFrame::create_side_tools()
 
             auto curr_plate = m_plater->get_partplate_list().get_curr_plate();
             #ifdef __linux__
-                PresetBundle* preset = wxGetApp().preset_bundle;
-                bool force_show_fila_group_dlg        = (preset && preset->is_bbl_vendor() && preset->get_printer_extruder_count() == 2);
-                slice = try_pop_up_before_slice(m_slice_select == eSliceAll, m_plater, curr_plate, force_show_fila_group_dlg);
+                slice = try_pop_up_before_slice(m_slice_select == eSliceAll, m_plater, curr_plate, false);
             #else
                 slice = try_pop_up_before_slice(m_slice_select == eSliceAll, m_plater, curr_plate, false);
             #endif
@@ -1998,9 +2010,26 @@ wxBoxSizer* MainFrame::create_side_tools()
     m_print_option_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event)
         {
             SidePopup* p = new SidePopup(this);
+            PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            ResolvedPlateSlicingConfig resolved;
+            std::string error;
+            if (plate == nullptr || bundle == nullptr ||
+                !bundle->resolve_plate_slicing_config(
+                    plate->get_slicing_context(),
+                    plate->get_real_filament_maps(bundle->project_config),
+                    plate->get_real_filament_volume_maps(bundle->project_config),
+                    resolved, error)) {
+                if (plate != nullptr)
+                    plate->update_apply_result_invalid(true);
+                show_error(this, from_u8(error.empty() ? "No plate is selected" : error), false);
+                delete p;
+                return;
+            }
+            resolved.config.apply(*plate->config(), true);
+            const DynamicPrintConfig &plate_config = resolved.config;
 
-            if (wxGetApp().preset_bundle
-                && !wxGetApp().preset_bundle->is_bbl_vendor()) {
+            if (!resolved.is_bbl_printer) {
                 // ThirdParty Buttons
                 SideButton* export_gcode_btn = new SideButton(p, _L("Export G-code file"), "");
                 export_gcode_btn->SetCornerRadius(0);
@@ -2031,8 +2060,7 @@ wxBoxSizer* MainFrame::create_side_tools()
 
                 // Orca: when the printer accepts a .gcode.3mf (the "Support 3MF as gcode" option),
                 // also offer exporting the sliced .gcode.3mf bundle
-                const auto& printer_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-                const auto* use_3mf_opt    = printer_config.option<ConfigOptionBool>("use_3mf");
+                const auto* use_3mf_opt = plate_config.option<ConfigOptionBool>("use_3mf");
                 if (use_3mf_opt != nullptr && use_3mf_opt->value) {
                     SideButton* export_sliced_file_btn = new SideButton(p, _L("Export plate sliced file"), "");
                     export_sliced_file_btn->SetCornerRadius(0);
@@ -2074,33 +2102,9 @@ wxBoxSizer* MainFrame::create_side_tools()
                     p->Dismiss();
                     });
 
-                SideButton* print_all_btn = new SideButton(p, _L("Print all"), "");
-                print_all_btn->SetCornerRadius(0);
-                print_all_btn->Bind(wxEVT_BUTTON, [this, p](wxCommandEvent&) {
-                    m_print_btn->SetLabel(_L("Print all"));
-                    m_print_select = ePrintAll;
-                    m_print_enable = get_enable_print_status();
-                    m_print_btn->Enable(m_print_enable);
-                    this->Layout();
-                    fit_tab_labels(); // ORCA on label change
-                    p->Dismiss();
-                    });
-
                 send_to_printer_btn->Bind(wxEVT_BUTTON, [this, p](wxCommandEvent&) {
                     m_print_btn->SetLabel(_L("Send"));
                     m_print_select = eSendToPrinter;
-                    m_print_enable = get_enable_print_status();
-                    m_print_btn->Enable(m_print_enable);
-                    this->Layout();
-                    fit_tab_labels(); // ORCA on label change
-                    p->Dismiss();
-                    });
-
-                SideButton* send_to_printer_all_btn = new SideButton(p, _L("Send all"), "");
-                send_to_printer_all_btn->SetCornerRadius(0);
-                send_to_printer_all_btn->Bind(wxEVT_BUTTON, [this, p](wxCommandEvent&) {
-                    m_print_btn->SetLabel(_L("Send all"));
-                    m_print_select = eSendToPrinterAll;
                     m_print_enable = get_enable_print_status();
                     m_print_btn->Enable(m_print_enable);
                     this->Layout();
@@ -2129,30 +2133,18 @@ wxBoxSizer* MainFrame::create_side_tools()
                     });
 
                 bool support_send = true;
-                bool support_print_all = true;
 
-                const auto preset_bundle = wxGetApp().preset_bundle;
-                if (preset_bundle) {
-                    if (preset_bundle->use_bbl_network()) {
+                if (bundle) {
+                    if (bundle->use_bbl_network()) {
                         // BBL network support everything
                     } else {
                         support_send = false; // All 3rd print hosts do not have the send options
-
-                        auto cfg = preset_bundle->printers.get_edited_preset().config;
-                        const auto host_type = cfg.option<ConfigOptionEnum<PrintHostType>>("host_type")->value;
-
-                        // Only simply print support uploading all plates
-                        support_print_all = host_type == PrintHostType::htSimplyPrint;
                     }
                 }
 
                 p->append_button(print_plate_btn);
-                if (support_print_all) {
-                    p->append_button(print_all_btn);
-                }
                 if (support_send) {
                     p->append_button(send_to_printer_btn);
-                    p->append_button(send_to_printer_all_btn);
                 }
                 if (enable_multi_machine) {
                     SideButton* print_multi_machine_btn = new SideButton(p, _L("Send to Multi-device"), "");
@@ -2256,10 +2248,9 @@ bool MainFrame::get_enable_print_status()
     bool is_all_plates = wxGetApp().plater()->get_preview_canvas3D()->is_all_plates_selected();
     if (m_print_select == ePrintAll)
     {
-        if (!part_plate_list.is_all_slice_results_ready_for_print())
-        {
-            enable = false;
-        }
+        // Project-wide dispatch is deliberately unsupported. Each retained
+        // plate artifact must be reviewed and sent to its own explicit target.
+        enable = false;
     }
     else if (m_print_select == ePrintPlate)
     {
@@ -2311,10 +2302,7 @@ bool MainFrame::get_enable_print_status()
 	}
     else if (m_print_select == eSendToPrinterAll)
     {
-        if (!part_plate_list.is_all_slice_results_ready_for_print())
-        {
-            enable = false;
-        }
+        enable = false;
     }
     else if (m_print_select == eExportAllSlicedFile)
     {
@@ -3787,7 +3775,7 @@ void MainFrame::load_config_file()
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " user is: " << agent->get_user_id();
         }
     }
-    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
+    wxGetApp().preset_bundle->update_compatible(PresetSelectCompatibleType::Never);
     update_side_preset_ui();
     auto msg = wxString::Format(_L_PLURAL("There is %d config imported. (Only non-system and compatible configs)",
         "There are %d configs imported. (Only non-system and compatible configs)", cfiles.size()), cfiles.size());
@@ -3883,12 +3871,12 @@ bool MainFrame::load_config_file(const std::string &path)
 // Also update the plater with the new presets.
 void MainFrame::load_config(const DynamicPrintConfig& config)
 {
-	PrinterTechnology printer_technology = wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology();
+	const PrinterTechnology printer_technology = ptFFF;
 	const auto       *opt_printer_technology = config.option<ConfigOptionEnum<PrinterTechnology>>("printer_technology");
-	if (opt_printer_technology != nullptr && opt_printer_technology->value != printer_technology) {
-		printer_technology = opt_printer_technology->value;
-		this->plater()->set_printer_technology(printer_technology);
-	}
+	if (opt_printer_technology != nullptr && opt_printer_technology->value != ptFFF) {
+        show_error(this, _L("Petko's Orca supports FDM printer configurations only."), false);
+        return;
+    }
 #if 0
 	for (auto tab : wxGetApp().tabs_list)
 		if (tab->supports_printer_technology(printer_technology)) {
@@ -4260,11 +4248,16 @@ void MainFrame::load_printer_url(wxString url, wxString apikey)
 
 void MainFrame::load_printer_url()
 {
-    PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
-    if (preset_bundle.use_bbl_device_tab() || NetworkAgentFactory::is_current_printer_agent_plugin())
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!m_plater->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return;
+    }
+    if (resolved.is_bbl_printer || NetworkAgentFactory::is_current_printer_agent_plugin())
         return;
 
-    auto     cfg = preset_bundle.printers.get_edited_preset().config;
+    DynamicPrintConfig cfg = std::move(resolved.config);
     wxString url = from_u8(PrintHost::get_print_host_webui(&cfg));
     wxString apikey;
     const auto host_type = cfg.option<ConfigOptionEnum<PrintHostType>>("host_type")->value;

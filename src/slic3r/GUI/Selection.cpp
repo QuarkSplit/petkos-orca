@@ -1275,8 +1275,21 @@ void Selection::translate(const Vec3d &displacement, TransformationType transfor
                 Vec3d         tower_size          = v.bounding_box().size();
                 Vec3d         tower_origin        = m_cache.volumes_data[i].get_volume_position();
                 Vec3d         actual_displacement = displacement;
-                bool show_read_wipe_tower = wxGetApp().plater()->get_partplate_list().get_plate(plate_idx)->fff_print()->is_step_done(psWipeTower);
-                float brim_width = wxGetApp().preset_bundle->prints.get_edited_preset().config.opt_float("prime_tower_brim_width");
+                PartPlate *tower_plate = wxGetApp().plater()->get_partplate_list().get_plate(plate_idx);
+                bool show_read_wipe_tower = tower_plate->fff_print()->is_step_done(psWipeTower);
+                PresetBundle *bundle = wxGetApp().preset_bundle;
+                ResolvedPlateSlicingConfig resolved;
+                std::string context_error;
+                if (!bundle->resolve_plate_slicing_config(
+                        tower_plate->get_slicing_context(),
+                        tower_plate->get_real_filament_maps(bundle->project_config),
+                        tower_plate->get_real_filament_volume_maps(bundle->project_config),
+                        resolved, context_error)) {
+                    tower_plate->update_apply_result_invalid(true);
+                    throw RuntimeError(context_error);
+                }
+                resolved.config.apply(*tower_plate->config(), true);
+                float brim_width = resolved.config.opt_float("prime_tower_brim_width");
 
                 const double margin = show_read_wipe_tower ? WIPE_TOWER_MARGIN : brim_width + 0.5; // 0.5 is the line width of wipe tower
 
@@ -3068,7 +3081,7 @@ void Selection::synchronize_unselected_instances(SyncRotationType sync_rotation_
                 new_inst_trafo_j.linear() = (old_inst_trafo_j.linear() * old_inst_trafo_i.linear().inverse()) * curr_inst_trafo_i.linear();
 
             bool should_synchronize_z = m_model->objects[volume_j->object_idx()]->instances[volume_j->instance_idx()]->auto_drop == false;
-            if (should_synchronize_z && wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() != ptSLA)
+            if (should_synchronize_z)
                 new_inst_trafo_j.translation().z() = curr_inst_trafo_i.translation().z();
 
             assert(is_rotation_xy_synchronized(curr_inst_trafo_i, new_inst_trafo_j));

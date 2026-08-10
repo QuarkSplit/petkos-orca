@@ -941,13 +941,10 @@ void AMSMaterialsSetting::Popup(wxString filament, wxString sn, wxString temp_mi
     std::set<std::string> filament_id_set;
     PresetBundle *        preset_bundle = wxGetApp().preset_bundle;
     std::ostringstream    stream;
-    // Defensive: this dialog is opened only from StatusPanel (BBL-only) today, so the fallback fires
-    // only during the brief BBL startup window before firmware reports nozzle info. Without this,
-    // the "0.0" lookup string returns an empty set and the filament dropdown goes blank.
     float machine_diameter = obj->GetExtderSystem()->GetNozzleDiameter(0);
-    if (machine_diameter == 0.0f && preset_bundle) {
-        const ConfigOption *opt = preset_bundle->printers.get_selected_preset().config.option("nozzle_diameter");
-        if (opt) machine_diameter = static_cast<const ConfigOptionFloats *>(opt)->values[0];
+    if (machine_diameter == 0.0f) {
+        show_error(this, _L("The connected printer has not reported its nozzle diameter."), false);
+        return;
     }
     stream << std::fixed << std::setprecision(1) << machine_diameter;
     std::string nozzle_diameter_str = stream.str();
@@ -1188,13 +1185,10 @@ void AMSMaterialsSetting::on_select_filament(wxCommandEvent &evt)
     if (preset_bundle) {
         std::ostringstream stream;
         if (obj) {
-            // Defensive: this dialog is opened only from StatusPanel (BBL-only) today, so the fallback fires
-            // only during the brief BBL startup window before firmware reports nozzle info. Without this,
-            // the "0.0" lookup string returns an empty set and filament lookup yields no results.
             float machine_diameter = obj->GetExtderSystem()->GetNozzleDiameter(0);
             if (machine_diameter == 0.0f) {
-                const ConfigOption *opt = preset_bundle->printers.get_selected_preset().config.option("nozzle_diameter");
-                if (opt) machine_diameter = static_cast<const ConfigOptionFloats *>(opt)->values[0];
+                show_error(this, _L("The connected printer has not reported its nozzle diameter."), false);
+                return;
             }
             stream << std::fixed << std::setprecision(1) << machine_diameter;
         }

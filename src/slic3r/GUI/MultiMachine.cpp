@@ -15,9 +15,10 @@ wxDEFINE_EVENT(EVT_MULTI_DEVICE_SELECTED_FINHSH, wxCommandEvent);
 wxDEFINE_EVENT(EVT_MULTI_DEVICE_VIEW, wxCommandEvent);
 wxDEFINE_EVENT(EVT_MULTI_REFRESH, wxCommandEvent);
 
-DeviceItem::DeviceItem(wxWindow* parent,  MachineObject* obj)
+DeviceItem::DeviceItem(wxWindow* parent, MachineObject* obj, std::string source_model)
     : wxWindow(parent, wxID_ANY)
     , obj_(obj)
+    , m_source_model(std::move(source_model))
 {
     sync_state();
     Bind(EVT_MULTI_REFRESH, &DeviceItem::on_refresh, this);
@@ -111,8 +112,9 @@ bool DeviceItem::is_blocking_printing(MachineObject* obj_)
     auto target_model = obj_->printer_type;
     std::string source_model = "";
 
-    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+    source_model = m_source_model;
+    if (source_model.empty())
+        return false; // non-send device lists do not perform print compatibility checks
 
     if (source_model != target_model) {
         std::vector<std::string> compatible_machine = obj_->get_compatible_machine();

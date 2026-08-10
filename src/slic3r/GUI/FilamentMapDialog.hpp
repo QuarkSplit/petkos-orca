@@ -40,6 +40,7 @@ class FilamentMapDialog : public wxDialog
     };
 public:
     FilamentMapDialog(wxWindow *parent,
+        PartPlate *plate,
         const std::vector<std::string>& filament_color,
         const std::vector<std::string>& filament_type,
         const std::vector<int> &filament_map,

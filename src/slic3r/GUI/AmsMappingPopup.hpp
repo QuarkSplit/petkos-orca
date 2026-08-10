@@ -352,6 +352,8 @@ public:
     void         paintEvent(wxPaintEvent &evt);
     void         set_parent_item(MaterialItem* item) {m_parent_item = item;};
     void         set_show_type(ShowType type) { m_show_type = type; };
+    void         set_source_plate_config(const std::string &printer_model_id, const DynamicPrintConfig &config);
+    void         clear_source_plate_config();
     // Orca: kept as a no-op for SelectMachine — its only caller passes false, which
     // equals the update path's default (all slots shown).
     void         set_only_show_ext_spool(bool /*flag*/) {}
@@ -378,6 +380,7 @@ public:
 
 private:
     // update
+    size_t source_nozzle_count(MachineObject *obj) const;
     void update_title(MachineObject* obj);
     void update_ams_tips(MachineObject* obj);
     void update_mapping_items(MachineObject* obj, const std::vector<FilamentInfo>& ams_mapping_result, bool use_dynamic_switch);
@@ -391,6 +394,8 @@ private:
 
     ResetCallback m_reset_callback{nullptr};
     std::string m_material_index;
+    std::string m_source_printer_model_id;
+    size_t      m_source_plate_nozzle_count{0};
 };
 
 class AmsMapingTipPopup : public PopupWindow

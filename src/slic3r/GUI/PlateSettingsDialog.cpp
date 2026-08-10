@@ -363,7 +363,7 @@ void OtherLayersSeqPanel::sync_layers_print_seq(int selection, const std::vector
 }
 
 
-PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, const wxString& title, bool only_layer_seq, const wxPoint& pos, const wxSize& size, long style)
+PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, int plate_index, const wxString& title, bool only_layer_seq, const wxPoint& pos, const wxSize& size, long style)
 :DPIDialog(parent, wxID_ANY, title, pos, size, style)
 {
     SetBackgroundColour(*wxWHITE);
@@ -384,7 +384,7 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, const wxString& title
     top_sizer->Add(m_ti_plate_name, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxTOP | wxBOTTOM, FromDIP(5));
 
     m_bed_type_choice = new ComboBox( this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240),-1), 0, NULL, wxCB_READONLY );
-    auto pm           = wxGetApp().plater()->get_curr_printer_model();
+    auto pm           = wxGetApp().plater()->get_plate_printer_model(plate_index);
     if (pm) {
         m_cur_combox_bed_types.clear();
         m_bed_type_choice->AppendString(_L("Same as Global Plate Type"));
@@ -405,8 +405,12 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, const wxString& title
         }
     }
 
-    if (!wxGetApp().preset_bundle->is_bbl_vendor())
-      m_bed_type_choice->Disable();
+    ResolvedPlateSlicingConfig plate_context;
+    std::string context_error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(plate_context, context_error))
+        throw RuntimeError(context_error);
+    if (!plate_context.is_bbl_printer)
+        m_bed_type_choice->Disable();
 
     // Printer this plate prints on. Empty selection means follow the project printer.
     m_printer_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);

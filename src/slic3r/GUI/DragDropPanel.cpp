@@ -1,6 +1,7 @@
 #include "DragDropPanel.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
+#include "Plater.hpp"
 #include "Widgets/Label.hpp"
 #include "Widgets/StateColor.hpp"
 #include <slic3r/GUI/wxExtensions.hpp>
@@ -8,6 +9,18 @@
 namespace Slic3r { namespace GUI {
 
 wxDEFINE_EVENT(wxEVT_DRAG_DROP_COMPLETED, wxCommandEvent);
+
+static std::vector<int> current_plate_nozzle_volume_types()
+{
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error))
+        throw Slic3r::RuntimeError("Unable to resolve the current plate for filament mapping: " + error);
+    const auto *option = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    if (option == nullptr)
+        throw Slic3r::RuntimeError("The current plate slicing context has no nozzle volume types");
+    return option->values;
+}
 
 struct CustomData
 {
@@ -562,10 +575,10 @@ std::vector<int> SeparatedDragDropPanel::GetHighFlowFilaments() const
     if (m_use_separation) {
         return m_high_flow_panel->GetAllFilaments();
     }
-    auto nozzle_volumes = wxGetApp().preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto nozzle_volumes = current_plate_nozzle_volume_types();
     const int right_eid = 1;
-    if (nozzle_volumes->values.size() > right_eid) {
-        int volume_type = nozzle_volumes->values[right_eid];
+    if (nozzle_volumes.size() > right_eid) {
+        int volume_type = nozzle_volumes[right_eid];
         if (volume_type == static_cast<int>(NozzleVolumeType::nvtHighFlow)) {
             return m_unified_panel->GetAllFilaments();
         }
@@ -578,10 +591,10 @@ std::vector<int> SeparatedDragDropPanel::GetStandardFilaments() const
     if (m_use_separation) {
         return m_standard_panel->GetAllFilaments();
     }
-    auto nozzle_volumes = wxGetApp().preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto nozzle_volumes = current_plate_nozzle_volume_types();
     const int right_eid = 1;
-    if (nozzle_volumes->values.size() > right_eid) {
-        int volume_type = nozzle_volumes->values[right_eid];
+    if (nozzle_volumes.size() > right_eid) {
+        int volume_type = nozzle_volumes[right_eid];
         if (volume_type == static_cast<int>(NozzleVolumeType::nvtStandard)) {
             return m_unified_panel->GetAllFilaments();
         }
@@ -594,10 +607,10 @@ std::vector<int> SeparatedDragDropPanel::GetTPUHighFlowFilaments() const
     if (m_use_separation) {
         return {};
     }
-    auto nozzle_volumes = wxGetApp().preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto nozzle_volumes = current_plate_nozzle_volume_types();
     const int right_eid = 1;
-    if (nozzle_volumes->values.size() > right_eid) {
-        int volume_type = nozzle_volumes->values[right_eid];
+    if (nozzle_volumes.size() > right_eid) {
+        int volume_type = nozzle_volumes[right_eid];
         if (volume_type == static_cast<int>(NozzleVolumeType::nvtTPUHighFlow)) {
             return m_unified_panel->GetAllFilaments();
         }

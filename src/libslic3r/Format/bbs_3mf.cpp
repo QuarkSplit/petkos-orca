@@ -15,6 +15,7 @@
 #include "bbs_3mf.hpp"
 
 #include <limits>
+#include <cstring>
 #include <stdexcept>
 #include <iomanip>
 #include <regex>
@@ -361,8 +362,14 @@ static constexpr const char* INSTANCEID_ATTR = "instance_id";
 static constexpr const char* IDENTIFYID_ATTR = "identify_id";
 static constexpr const char* PLATERID_ATTR = "plater_id";
 static constexpr const char* PLATER_NAME_ATTR = "plater_name";
-//printer preset assigned to this plate; absent for projects that predate per-plate machines
+// Complete per-plate slicing identity. Attributes are omitted only when the
+// corresponding field explicitly inherits the Project-row default.
 static constexpr const char* PLATER_PRINTER_PRESET_ATTR = "plater_printer_preset";
+static constexpr const char* PLATER_PRINTER_VENDOR_ATTR = "plater_printer_vendor";
+static constexpr const char* PLATER_PRINT_PRESET_ATTR = "plater_print_preset";
+static constexpr const char* PLATER_FILAMENT_PRESETS_ATTR = "plater_filament_presets";
+static constexpr const char* PLATER_PHYSICAL_PRINTER_ATTR = "plater_physical_printer";
+static constexpr const char* PLATER_SLICED_CONFIG_PREFIX = "plater_sliced_config:";
 static constexpr const char* PLATE_IDX_ATTR = "index";
 static constexpr const char* PRINTER_MODEL_ID_ATTR = "printer_model_id";
 static constexpr const char* EXTRUDER_TYPE_ATTR = "extruder_type";
@@ -2325,7 +2332,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             plate_data_list[it->first-1]->locked = it->second->locked;
             plate_data_list[it->first-1]->plate_index = it->second->plate_index-1;
             plate_data_list[it->first-1]->plate_name = it->second->plate_name;
-            plate_data_list[it->first-1]->printer_preset_name = it->second->printer_preset_name;
+            plate_data_list[it->first-1]->slicing_context = it->second->slicing_context;
             plate_data_list[it->first-1]->obj_inst_map = it->second->obj_inst_map;
             plate_data_list[it->first-1]->gcode_file = (m_load_restore || it->second->gcode_file.empty()) ? it->second->gcode_file : m_backup_path + "/" + it->second->gcode_file;
             plate_data_list[it->first-1]->gcode_prediction = it->second->gcode_prediction;
@@ -4460,7 +4467,37 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 m_curr_plater->plate_name = xml_unescape(value.c_str());
             }
             else if (key == PLATER_PRINTER_PRESET_ATTR) {
-                m_curr_plater->printer_preset_name = xml_unescape(value.c_str());
+                m_curr_plater->slicing_context.printer_preset_name = xml_unescape(value.c_str());
+            }
+            else if (key == PLATER_PRINTER_VENDOR_ATTR) {
+                m_curr_plater->slicing_context.printer_vendor_id = xml_unescape(value.c_str());
+            }
+            else if (key == PLATER_PRINT_PRESET_ATTR) {
+                m_curr_plater->slicing_context.print_preset_name = xml_unescape(value.c_str());
+            }
+            else if (key == PLATER_FILAMENT_PRESETS_ATTR) {
+                const std::string encoded = xml_unescape(value.c_str());
+                if (!unescape_strings_cstyle(encoded, m_curr_plater->slicing_context.filament_preset_names)) {
+                    add_error("Invalid per-plate filament preset list");
+                    return false;
+                }
+            }
+            else if (key == PLATER_PHYSICAL_PRINTER_ATTR) {
+                m_curr_plater->slicing_context.physical_printer_id = xml_unescape(value.c_str());
+            }
+            else if (boost::algorithm::starts_with(key, PLATER_SLICED_CONFIG_PREFIX)) {
+                const std::string option_key = key.substr(std::strlen(PLATER_SLICED_CONFIG_PREFIX));
+                if (option_key.empty()) {
+                    add_error("Invalid empty key in retained plate slicing config");
+                    return false;
+                }
+                try {
+                    ConfigSubstitutionContext substitutions { ForwardCompatibilitySubstitutionRule::Disable };
+                    m_curr_plater->sliced_config.set_deserialize(option_key, xml_unescape(value.c_str()), substitutions);
+                } catch (const std::exception &ex) {
+                    add_error("Invalid retained plate slicing option '" + option_key + "': " + ex.what());
+                    return false;
+                }
             }
             else if (key == LOCK_ATTR)
             {
@@ -6013,7 +6050,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool _add_project_embedded_presets_to_archive(mz_zip_archive& archive, Model& model, std::vector<Preset*> project_presets);
         bool _add_model_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config, int export_plate_idx = -1, bool save_gcode = true, bool use_loaded_id = false);
         bool _add_cut_information_file_to_archive(mz_zip_archive &archive, Model &model);
-        bool _add_slice_info_config_file_to_archive(mz_zip_archive &archive, const Model &model, PlateDataPtrs &plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config);
+        bool _add_slice_info_config_file_to_archive(mz_zip_archive &archive, const Model &model, PlateDataPtrs &plate_data_list, const ObjectToObjectDataMap &objects_data);
         bool _add_filament_sequence_file_to_archive(mz_zip_archive& archive, const PlateDataPtrs& plate_data_list);
         bool _add_gcode_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, Export3mfProgressFn proFn = nullptr);
         bool _add_custom_gcode_per_print_z_file_to_archive(mz_zip_archive& archive, Model& model, const DynamicPrintConfig* config);
@@ -6517,8 +6554,6 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
 
         // Adds gcode files ("Metadata/plate_1.gcode, plate_2.gcode, ...)
-        // Before _add_model_config_file_to_archive, because we modify plate_data
-        //if (!m_skip_static && !_add_gcode_file_to_archive(archive, model, plate_data_list, proFn)) {
         if (!m_skip_static && m_save_gcode && !_add_gcode_file_to_archive(archive, model, plate_data_list, proFn)) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", _add_gcode_file_to_archive failed\n");
             return false;
@@ -6548,7 +6583,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
         // Adds sliced info of plate file ("Metadata/slice_info.config")
         // This file contains all sliced info of all plates
-        if (!_add_slice_info_config_file_to_archive(archive, model, plate_data_list, objects_data, *config)) {
+        if (!_add_slice_info_config_file_to_archive(archive, model, plate_data_list, objects_data)) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":" << __LINE__ << boost::format(", _add_slice_info_config_file_to_archive failed\n");
             return false;
         }
@@ -7850,10 +7885,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             Preset* preset = project_presets[i];
 
             if (preset) {
-                preset->file = temp_path + std::string("/") + "_temp_1.config";
-                DynamicPrintConfig& config = preset->config;
-                //config.save(preset->file);
-                config.save_to_json(preset->file, preset->name, std::string("project"), preset->version.to_string());
+                const std::string temp_file = temp_path + std::string("/") + "_temp_1.config";
+                const DynamicPrintConfig& config = preset->config;
+                config.save_to_json(temp_file, preset->name, std::string("project"), preset->version.to_string());
 
                 std::string dest_file;
                 if (preset->type == Preset::TYPE_PRINT) {
@@ -7871,7 +7905,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 else
                     continue;
 
-                _add_file_to_archive(archive, dest_file, preset->file);
+                _add_file_to_archive(archive, dest_file, temp_file);
             }
         }
 
@@ -8026,10 +8060,26 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 //plate index
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATERID_ATTR << "\" " << VALUE_ATTR << "=\"" << plate_data->plate_index + 1 << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_NAME_ATTR << "\" " << VALUE_ATTR << "=\"" <<  xml_escape(plate_data->plate_name.c_str()) << "\"/>\n";
-                //Only written when the plate actually carries an assignment, so projects
-                //that do not use per-plate machines save byte for byte as they did before.
-                if (!plate_data->printer_preset_name.empty())
-                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PRINTER_PRESET_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(plate_data->printer_preset_name.c_str()) << "\"/>\n";
+                const PlateSlicingContext &context = plate_data->slicing_context;
+                if (!context.printer_preset_name.empty())
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PRINTER_PRESET_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.printer_preset_name.c_str()) << "\"/>\n";
+                if (!context.printer_vendor_id.empty())
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PRINTER_VENDOR_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.printer_vendor_id.c_str()) << "\"/>\n";
+                if (!context.print_preset_name.empty())
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PRINT_PRESET_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.print_preset_name.c_str()) << "\"/>\n";
+                if (!context.filament_preset_names.empty()) {
+                    const std::string encoded = escape_strings_cstyle(context.filament_preset_names);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_PRESETS_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
+                }
+                if (!context.physical_printer_id.empty())
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PHYSICAL_PRINTER_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.physical_printer_id.c_str()) << "\"/>\n";
+                if (plate_data->is_sliced_valid) {
+                    for (const std::string &key : plate_data->sliced_config.keys()) {
+                        stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\""
+                               << PLATER_SLICED_CONFIG_PREFIX << key << "\" " << VALUE_ATTR << "=\""
+                               << xml_escape(plate_data->sliced_config.opt_serialize(key).c_str()) << "\"/>\n";
+                    }
+                }
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << LOCK_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->locked<< "\"/>\n";
                 ConfigOption* bed_type_opt = plate_data->config.option("curr_bed_type");
                 t_config_enum_names bed_type_names = ConfigOptionEnum<BedType>::get_enum_names();
@@ -8105,10 +8155,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     stream << "\"/>\n";
                 }
 
+                const bool has_retained_gcode = save_gcode && plate_data->is_sliced_valid
+                    && !plate_data->gcode_file.empty() && boost::filesystem::exists(plate_data->gcode_file);
+                const std::string archived_gcode = has_retained_gcode
+                    ? (boost::format(GCODE_FILE_FORMAT) % (plate_data->plate_index + 1)).str()
+                    : std::string();
                 if (save_gcode)
-                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << GCODE_FILE_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha << xml_escape(plate_data->gcode_file) << "\"/>\n";
-                if (!plate_data->gcode_file.empty()) {
-                    gcode_paths.push_back(plate_data->gcode_file);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << GCODE_FILE_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha << xml_escape(archived_gcode) << "\"/>\n";
+                if (has_retained_gcode) {
+                    gcode_paths.push_back(archived_gcode);
                 }
                 if (plate_data->plate_thumbnail.is_valid()) {
                     std::string thumbnail_file_in_3mf = (boost::format(THUMBNAIL_FILE_FORMAT) % (plate_data->plate_index + 1)).str();
@@ -8283,7 +8338,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         return result;
     }
 
-    bool _BBS_3MF_Exporter::_add_slice_info_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config)
+    bool _BBS_3MF_Exporter::_add_slice_info_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data)
     {
         std::stringstream stream;
         // Store mesh transformation in full precision, as the volumes are stored transformed and they need to be transformed back
@@ -8305,12 +8360,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             PlateData* plate_data = plate_data_list[i];
             //int instance_size = plate_data->objects_and_instances.size();
 
-            if (plate_data != nullptr && plate_data->is_sliced_valid) {
+            if (plate_data != nullptr && plate_data->is_sliced_valid && !plate_data->sliced_config.keys().empty()) {
+                const DynamicPrintConfig &plate_config = plate_data->sliced_config;
                 stream << "  <" << PLATE_TAG << ">\n";
                 //plate index
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATE_IDX_ATTR        << "\" " << VALUE_ATTR << "=\"" << plate_data->plate_index + 1 << "\"/>\n";
 
-                int timelapse_type = int(config.opt_enum<TimelapseType>("timelapse_type"));
+                int timelapse_type = int(plate_config.opt_enum<TimelapseType>("timelapse_type"));
                 for (auto it = plate_data->warnings.begin(); it != plate_data->warnings.end(); it++) {
                     if (it->msg == NOT_GENERATE_TIMELAPSE) {
                         timelapse_type = -1;
@@ -8318,9 +8374,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     }
                 }
 
-                std::vector<int> extruder_types      = config.option<ConfigOptionEnumsGeneric>("extruder_type")->values;
-                std::vector<int> nozzle_volume_types = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values;
-                auto* nozzle_volume_type_option = dynamic_cast<const ConfigOptionEnumsGeneric*>(config.option("nozzle_volume_type"));
+                std::vector<int> extruder_types      = plate_config.option<ConfigOptionEnumsGeneric>("extruder_type")->values;
+                std::vector<int> nozzle_volume_types = plate_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values;
+                auto* nozzle_volume_type_option = dynamic_cast<const ConfigOptionEnumsGeneric*>(plate_config.option("nozzle_volume_type"));
 
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << EXTRUDER_TYPE_ATTR << "\" " << VALUE_ATTR << "=\"";
                 add_vector(stream, extruder_types);
@@ -8330,7 +8386,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 add_vector(stream, nozzle_volume_types);
                 stream << "\"/>\n";
 
-                auto* nozzle_diameter_option = dynamic_cast<const ConfigOptionFloats*>(config.option("nozzle_diameter"));
+                auto* nozzle_diameter_option = dynamic_cast<const ConfigOptionFloats*>(plate_config.option("nozzle_diameter"));
                 std::string nozzle_diameters_str;
                 if (nozzle_diameter_option)
                     nozzle_diameters_str = nozzle_diameter_option->serialize();
@@ -8342,7 +8398,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // config value; the grouping result rounds it to the nearest of {0.2,0.4,0.6,0.8} for its
                 // internal matching key, so reading that back would rewrite a non-standard nozzle
                 // (e.g. 0.5 -> 0.4). Use this flag to keep the exact config value in that case.
-                auto* extruder_max_nozzle_count_option = dynamic_cast<const ConfigOptionInts*>(config.option("extruder_max_nozzle_count"));
+                auto* extruder_max_nozzle_count_option = dynamic_cast<const ConfigOptionInts*>(plate_config.option("extruder_max_nozzle_count"));
                 const bool has_multi_nozzle_extruder = extruder_max_nozzle_count_option &&
                     std::any_of(extruder_max_nozzle_count_option->values.begin(), extruder_max_nozzle_count_option->values.end(),
                                 [](int v) { return v > 1; });
@@ -8356,23 +8412,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << OUTSIDE_ATTR      << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->toolpath_outside << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << SUPPORT_USED_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->is_support_used << "\"/>\n";
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << LABEL_OBJECT_ENABLED_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->is_label_object_enabled << "\"/>\n";
-                // Report the plate's dynamic-map state from the grouping result. The result is present
-                // for the whole fleet (a static single-nozzle result too), so this if-branch is normally
-                // taken; is_support_dynamic_nozzle_map() is false for any non-dynamic (static /
-                // single-extruder) result ⇒ byte-identical to the previously hard-coded value. The else
-                // is a defensive fallback for a missing result.
                 if (plate_data && plate_data->nozzle_group_result)
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << ENABLE_FILAMENT_DYNAMIC_MAP_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha << plate_data->nozzle_group_result->is_support_dynamic_nozzle_map() << "\"/>\n";
-                else
-                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << ENABLE_FILAMENT_DYNAMIC_MAP_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha << false << "\"/>\n";
                 {
-                    bool has_filament_switcher = config.has("has_filament_switcher") ? config.opt_bool("has_filament_switcher") : false;
+                    bool has_filament_switcher = plate_config.has("has_filament_switcher") ? plate_config.opt_bool("has_filament_switcher") : false;
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << HAS_FILAMENT_SWITCHER_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha << has_filament_switcher << "\"/>\n";
                 }
 
                 std::vector<int> filament_maps = plate_data->filament_maps;
                 if (filament_maps.empty())
-                    filament_maps = config.option<ConfigOptionInts>("filament_map")->values;
+                    filament_maps = plate_config.option<ConfigOptionInts>("filament_map")->values;
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << FILAMENT_MAP_ATTR << "\" " << VALUE_ATTR << "=\"";
                 add_vector<int>(stream, filament_maps);
                 stream << "\"/>\n";
@@ -8390,8 +8439,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 // "<name>_id_<object index>_copy_<instance index>" (see GCode::set_object_info), which we
                 // reconstruct here from the (sorted) objects_and_instances list. identify_id is unchanged.
                 // BambuLab printers keep the raw object name.
-                const GCodeFlavor slice_gcode_flavor    = config.opt_enum<GCodeFlavor>("gcode_flavor");
-                const bool        use_gcode_object_name  = !GCodeProcessor::s_IsBBLPrinter &&
+                const GCodeFlavor slice_gcode_flavor    = plate_config.opt_enum<GCodeFlavor>("gcode_flavor");
+                const bool        use_gcode_object_name  = plate_data->slicing_context.printer_vendor_id != "BBL" &&
                     (slice_gcode_flavor == gcfKlipper || slice_gcode_flavor == gcfMarlinLegacy ||
                      slice_gcode_flavor == gcfMarlinFirmware || slice_gcode_flavor == gcfRepRapFirmware);
                 int gcode_object_index = -1;
@@ -8589,7 +8638,6 @@ bool _BBS_3MF_Exporter::_add_gcode_file_to_archive(mz_zip_archive& archive, cons
             auto src_gcode_file = plate_data->gcode_file;
             std::string gcode_in_3mf = (boost::format(GCODE_FILE_FORMAT) % (plate_data->plate_index + 1)).str();
 
-            plate_data->gcode_file = gcode_in_3mf;
             mz_zip_archive archive;
             mz_zip_writer_staged_context context;
             mz_zip_zero_struct(&archive);

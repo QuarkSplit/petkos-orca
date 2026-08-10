@@ -56,3 +56,11 @@ datadir/
 # graphify knowledge-graph output
 graphify-out/
 
+
+# Generated project index for the home page library (build_library.py).
+# Machine-specific paths and 28 MB of extracted thumbnails; regenerable, never committed.
+resources/web/homepage/data/library.js
+resources/web/homepage/data/thumbs/
+
+resources/web/homepage/data/views.js
+resources/web/homepage/data/views/

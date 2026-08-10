@@ -4,6 +4,7 @@
 #include "../GCode/ThumbnailData.hpp"
 #include "libslic3r/ProjectTask.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/PlateSlicingContext.hpp"
 #include <functional>
 
 namespace Slic3r {
@@ -88,11 +89,17 @@ struct PlateData
     std::string     gcode_weight;
     std::string     first_layer_time;
     std::string     plate_name;
-    //printer preset this plate is assigned to; empty means follow the project printer
-    std::string     printer_preset_name;
+    // Complete plate-owned slicing identity. Empty fields explicitly inherit the
+    // corresponding Project-row default; non-empty fields resolve exactly.
+    PlateSlicingContext slicing_context;
     std::vector<FilamentInfo> slice_filaments_info;
     std::vector<size_t> skipped_objects;
+    // Plate-owned overrides persisted in model_settings.config.
     DynamicPrintConfig config;
+    // Exact effective configuration that produced gcode_file. This is an export
+    // snapshot, not a layer of live overrides, and must never be applied when a
+    // plate is reassigned to another printer.
+    DynamicPrintConfig sliced_config;
     bool            is_support_used {false};
     bool            is_sliced_valid = false;
     bool            toolpath_outside {false};

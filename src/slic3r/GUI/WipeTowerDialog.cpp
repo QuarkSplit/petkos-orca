@@ -14,6 +14,8 @@
 #include "libslic3r/Config.hpp"
 #include "Widgets/Label.hpp"
 #include "MainFrame.hpp"
+#include "Plater.hpp"
+#include "PartPlate.hpp"
 
 using namespace Slic3r;
 using namespace Slic3r::GUI;
@@ -199,11 +201,45 @@ std::string RammingPanel::get_parameters()
 static const float g_min_flush_multiplier = 0.f;
 static const float g_max_flush_multiplier = 3.f;
 
+static PartPlate *current_plate_or_throw()
+{
+    Plater *plater = wxGetApp().plater();
+    PartPlate *plate = plater != nullptr ? plater->get_partplate_list().get_curr_plate() : nullptr;
+    if (plate == nullptr)
+        throw Slic3r::RuntimeError("No plate is selected for flushing-volume editing");
+    return plate;
+}
+
+static DynamicPrintConfig current_plate_config_or_throw()
+{
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_plate_slicing_config(current_plate_or_throw(), resolved, error))
+        throw Slic3r::RuntimeError("Unable to resolve the flushing-volume plate: " + error);
+    return std::move(resolved.config);
+}
+
+//A QUERY, not an action: it only decides whether a button wears a "modified" badge.
+//It used to share current_plate_config_or_throw() with the editing path, so during
+//Sidebar construction, where there is no current plate yet, asking whether a badge
+//was needed terminated the application. Editing flush volumes with no plate is still
+//an error; wondering about them is not.
 bool is_flush_config_modified()
 {
-    const auto                &project_config    = wxGetApp().preset_bundle->project_config;
-    const std::vector<double> &config_matrix     = (project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values;
-    const std::vector<double> &config_multiplier = (project_config.option<ConfigOptionFloats>("flush_multiplier"))->values;
+    Plater *plater = wxGetApp().plater();
+    PartPlate *plate = (plater != nullptr && plater->is_initialized()) ? plater->get_partplate_list().get_curr_plate()
+                                                                      : nullptr;
+    ResolvedPlateSlicingConfig resolved;
+    std::string                error;
+    if (plate == nullptr || !plater->resolve_plate_slicing_config(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": no resolvable current plate yet ("
+                                 << (error.empty() ? "no plate" : error) << "), reporting unmodified";
+        return false;
+    }
+
+    const DynamicPrintConfig  &config       = resolved.config;
+    const std::vector<double> &config_matrix = config.option<ConfigOptionFloats>("flush_volumes_matrix")->values;
+    const std::vector<double> &config_multiplier = config.option<ConfigOptionFloats>("flush_multiplier")->values;
 
     bool has_modify = false;
     for (int i = 0; i < config_multiplier.size(); i++) {
@@ -230,19 +266,18 @@ bool is_flush_config_modified()
 
 void open_flushing_dialog(wxEvtHandler *parent, const wxEvent &event)
 {
-    auto                      &project_config = wxGetApp().preset_bundle->project_config;
-
     WipingDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe));
     dlg.ShowModal();
     if (dlg.GetSubmitFlag()) {
         auto matrix = dlg.GetFlattenMatrix();
         auto flush_multipliers = dlg.GetMultipliers();
-        (project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values = std::vector<double>(matrix.begin(), matrix.end());
-        (project_config.option<ConfigOptionFloats>("flush_multiplier"))->values = std::vector<double>(flush_multipliers.begin(), flush_multipliers.end());
+        PartPlate *plate = current_plate_or_throw();
+        plate->config()->set_key_value("flush_volumes_matrix", new ConfigOptionFloats(matrix));
+        plate->config()->set_key_value("flush_multiplier", new ConfigOptionFloats(flush_multipliers));
+        plate->update_apply_result_invalid(true);
         bool flushing_volume_modify = is_flush_config_modified();
         wxGetApp().sidebar().set_flushing_volume_warning(flushing_volume_modify);
-        wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
-        wxGetApp().plater()->update_project_dirty_from_presets();
+        wxGetApp().plater()->set_plater_dirty(true);
         wxPostEvent(parent, event);
     }
 }
@@ -258,7 +293,7 @@ static std::vector<float> MatrixFlatten(const WipingDialog::VolumeMatrix& matrix
 
 wxString WipingDialog::BuildTableObjStr()
 {
-    auto full_config = wxGetApp().preset_bundle->full_config();
+    auto full_config = current_plate_config_or_throw();
     auto filament_colors = full_config.option<ConfigOptionStrings>("filament_colour")->values;
     auto flush_multiplier = full_config.option<ConfigOptionFloats>("flush_multiplier")->values;
     int nozzle_num = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
@@ -372,7 +407,7 @@ WipingDialog::WipingDialog(wxWindow* parent, const int max_flush_volume) :
     wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
     this->SetSizer(main_sizer);
     this->SetBackgroundColour(*wxWHITE);
-    auto filament_count = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour")->values.size();
+    auto filament_count = current_plate_config_or_throw().option<ConfigOptionStrings>("filament_colour")->values.size();
 
     // Estimate table scroll area size based on filament count
     // Each table cell is ~60x25 DIP, plus headers and borders
@@ -521,7 +556,7 @@ int WipingDialog::CalcFlushingVolume(const wxColour& from, const wxColour& to, i
 WipingDialog::VolumeMatrix WipingDialog::CalcFlushingVolumes(int extruder_id)
 {
     auto& preset_bundle = wxGetApp().preset_bundle;
-    auto full_config = preset_bundle->full_config();
+    auto full_config = current_plate_config_or_throw();
     auto& ams_multi_color_filament = preset_bundle->ams_multi_color_filment;
 
     std::vector<std::string> filament_color_strs = full_config.option<ConfigOptionStrings>("filament_colour")->values;

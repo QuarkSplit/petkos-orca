@@ -58,7 +58,7 @@ wxDEFINE_EVENT(EVT_PARTPLATE_LIST_PLATE_SELECT, IntEvent);
 
 static PrinterTechnology printer_technology()
 {
-    return wxGetApp().preset_bundle->printers.get_selected_preset().printer_technology();
+    return ptFFF;
 }
 
 static const Selection& scene_selection()
@@ -70,10 +70,16 @@ static const Selection& scene_selection()
     return wxGetApp().plater()->get_view3D_canvas3D()->get_selection();
 }
 
-// Config from current edited printer preset
-static DynamicPrintConfig& printer_config()
+static bool resolve_current_plate_config(ResolvedPlateSlicingConfig &resolved)
 {
-    return wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    std::string error;
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || !plater->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": "
+                                 << (error.empty() ? "No plate is selected" : error);
+        return false;
+    }
+    return true;
 }
 
 static int filaments_count()
@@ -2071,9 +2077,18 @@ void ObjectList::add_category_to_settings_from_selection(const std::vector< std:
                                                             _u8L("Object setting added");
     take_snapshot(snapshot_text);
 
-    const DynamicPrintConfig& from_config = printer_technology() == ptFFF ?
-                                            wxGetApp().preset_bundle->prints.get_edited_preset().config :
-                                            wxGetApp().preset_bundle->sla_prints.get_edited_preset().config;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const DynamicPrintConfig& from_config = resolved.config;
+
+    for (const auto &opt : category_options) {
+        if (opt.second && std::find(opt_keys.begin(), opt_keys.end(), opt.first) == opt_keys.end() &&
+            from_config.option(opt.first) == nullptr) {
+            show_error(this, from_u8("The selected plate configuration does not define option '" + opt.first + "'."));
+            return;
+        }
+    }
 
     for (auto& opt : category_options) {
         auto& opt_key = opt.first;
@@ -2082,11 +2097,6 @@ void ObjectList::add_category_to_settings_from_selection(const std::vector< std:
 
         if (find(opt_keys.begin(), opt_keys.end(), opt_key) == opt_keys.end() && opt.second) {
             const ConfigOption* option = from_config.option(opt_key);
-            if (!option) {
-                // if current option doesn't exist in prints.get_edited_preset(),
-                // get it from default config values
-                option = DynamicPrintConfig::new_from_defaults_keys({ opt_key })->option(opt_key);
-            }
             m_config->set_key_value(opt_key, option->clone());
         }
     }
@@ -2112,16 +2122,21 @@ void ObjectList::add_category_to_settings_from_frequent(const std::vector<std::s
                                                           _u8L("Object settings added");
     take_snapshot(snapshot_text);
 
-    const DynamicPrintConfig& from_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const DynamicPrintConfig& from_config = resolved.config;
+    for (const std::string &opt_key : options) {
+        if (std::find(opt_keys.begin(), opt_keys.end(), opt_key) == opt_keys.end() &&
+            from_config.option(opt_key) == nullptr) {
+            show_error(this, from_u8("The selected plate configuration does not define option '" + opt_key + "'."));
+            return;
+        }
+    }
     for (auto& opt_key : options)
     {
         if (find(opt_keys.begin(), opt_keys.end(), opt_key) == opt_keys.end()) {
             const ConfigOption* option = from_config.option(opt_key);
-            if (!option) {
-                // if current option doesn't exist in prints.get_edited_preset(),
-                // get it from default config values
-                option = DynamicPrintConfig::new_from_defaults_keys({ opt_key })->option(opt_key);
-            }
             m_config->set_key_value(opt_key, option->clone());
         }
     }
@@ -2556,8 +2571,6 @@ void ObjectList::load_shape_object(const std::string &type_name)
     if (obj_idx < 0)
         return;
 
-    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Add Primitive"));
-
     // Create mesh
     BoundingBoxf3 bb;
     TriangleMesh mesh = create_mesh(type_name, bb);
@@ -2565,11 +2578,15 @@ void ObjectList::load_shape_object(const std::string &type_name)
     // cooling friendly orientation. Skip the plain cube: the pressure advance pattern
     // calibration reuses it as an axis-aligned anchor and scales it by its bounding box,
     // so its orientation must stay fixed.
-    const Slic3r::DynamicPrintConfig& full_config = wxGetApp().preset_bundle->full_config();
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const DynamicPrintConfig& full_config = resolved.config;
     if (type_name != "Cube" && full_config.has("fan_direction") && full_config.has("auxiliary_fan")) {
         FanDirection config_dir = full_config.option<ConfigOptionEnum<FanDirection>>("fan_direction")->value;
         orientation::orient_for_cooling(mesh, config_dir);
     }
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Add Primitive"));
     // BBS: remove "Shape" prefix
     load_mesh_object(mesh, _(type_name));
     wxGetApp().mainframe->update_title();
@@ -2896,9 +2913,12 @@ void ObjectList::split()
 
     ModelVolume* volume;
     if (!get_volume_by_item(item, volume)) return;
-    DynamicPrintConfig&	config = printer_config();
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const DynamicPrintConfig& config = resolved.config;
     // BBS
-    const ConfigOptionStrings* filament_colors = config.option<ConfigOptionStrings>("filament_colour", false);
+    const ConfigOptionStrings* filament_colors = config.option<ConfigOptionStrings>("filament_colour");
     const auto filament_cnt = (filament_colors == nullptr) ? size_t(1) : filament_colors->size();
     if (!volume->is_splittable()) {
         wxMessageBox(_(L("The target object contains only one part and can not be split.")));
@@ -3110,11 +3130,8 @@ void ObjectList::merge(bool to_multipart_object)
             for (auto& opt_key : opt_keys) {
                 if (find(new_opt_keys.begin(), new_opt_keys.end(), opt_key) == new_opt_keys.end()) {
                     const ConfigOption* option = from_config.option(opt_key);
-                    if (!option) {
-                        // if current option doesn't exist in prints.get_edited_preset(),
-                        // get it from default config values
-                        option = DynamicPrintConfig::new_from_defaults_keys({ opt_key })->option(opt_key);
-                    }
+                    if (!option)
+                        throw RuntimeError("Object configuration key '" + opt_key + "' has no value");
                     config.set_key_value(opt_key, option->clone());
                 }
             }
@@ -3252,9 +3269,12 @@ void ObjectList::layers_editing()
 
         // set some default value
         if (ranges.empty()) {
+            ResolvedPlateSlicingConfig resolved;
+            if (!resolve_current_plate_config(resolved))
+                return;
             // BBS: remove snapshot name "Add layers"
             take_snapshot(_u8L("Add layers"));
-            ranges[{ 0.0f, 2.0f }].assign_config(get_default_layer_config(obj_idx));
+            ranges[{ 0.0f, 2.0f }].assign_config(get_default_layer_config(obj_idx, resolved.config));
         }
 
         // create layer root item
@@ -3370,17 +3390,17 @@ wxDataViewItem ObjectList::add_layer_root_item(const wxDataViewItem obj_item)
     return layers_item;
 }
 
-DynamicPrintConfig ObjectList::get_default_layer_config(const int obj_idx)
+DynamicPrintConfig ObjectList::get_default_layer_config(const int obj_idx, const DynamicPrintConfig &plate_config)
 {
     DynamicPrintConfig config;
     coordf_t layer_height = object(obj_idx)->config.has("layer_height") ?
                             object(obj_idx)->config.opt_float("layer_height") :
-                            wxGetApp().preset_bundle->prints.get_edited_preset().config.opt_float("layer_height");
+                            plate_config.opt_float("layer_height");
     config.set_key_value("layer_height",new ConfigOptionFloat(layer_height));
     // BBS
     int extruder = object(obj_idx)->config.has("extruder") ?
         object(obj_idx)->config.opt_int("extruder") :
-        wxGetApp().preset_bundle->prints.get_edited_preset().config.opt_float("extruder");
+        plate_config.opt_int("extruder");
     config.set_key_value("extruder",    new ConfigOptionInt(0));
 
     return config;
@@ -4511,15 +4531,13 @@ void ObjectList::del_layer_range(const t_layer_height_range& range)
     select_item(selectable_item);
 }
 
-static double get_min_layer_height(const int extruder_idx)
+static double get_min_layer_height(const DynamicPrintConfig &config, const int extruder_idx)
 {
-    const DynamicPrintConfig& config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
     return config.opt_float("min_layer_height", std::max(0, extruder_idx - 1));
 }
 
-static double get_max_layer_height(const int extruder_idx)
+static double get_max_layer_height(const DynamicPrintConfig &config, const int extruder_idx)
 {
-    const DynamicPrintConfig& config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
     int extruder_idx_zero_based = std::max(0, extruder_idx - 1);
     double max_layer_height = config.opt_float("max_layer_height", extruder_idx_zero_based);
 
@@ -4538,6 +4556,11 @@ void ObjectList::add_layer_range_after_current(const t_layer_height_range curren
     if (obj_idx < 0)
         // This should not happen.
         return;
+
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const DynamicPrintConfig &plate_config = resolved.config;
 
     const wxDataViewItem layers_item = GetSelection();
 
@@ -4558,7 +4581,7 @@ void ObjectList::add_layer_range_after_current(const t_layer_height_range curren
         changed = true;
 
         const t_layer_height_range new_range = { current_range.second, current_range.second + 2. };
-        ranges[new_range].assign_config(get_default_layer_config(obj_idx));
+        ranges[new_range].assign_config(get_default_layer_config(obj_idx, plate_config));
         add_layer_item(new_range, layers_item);
     }
     else if (const std::pair<coordf_t, coordf_t> &next_range = it_next_range->first; current_range.second <= next_range.first)
@@ -4573,9 +4596,9 @@ void ObjectList::add_layer_range_after_current(const t_layer_height_range curren
                 const auto old_config = ranges.at(next_range);
                 const coordf_t delta = next_range.second - next_range.first;
                 // Layer height of the current layer.
-                const coordf_t old_min_layer_height = get_min_layer_height(old_config.opt_int("extruder"));
+                const coordf_t old_min_layer_height = get_min_layer_height(plate_config, old_config.opt_int("extruder"));
                 // Layer height of the layer to be inserted.
-                const coordf_t new_min_layer_height = get_min_layer_height(0);
+                const coordf_t new_min_layer_height = get_min_layer_height(plate_config, 0);
                 if (delta >= old_min_layer_height + new_min_layer_height - EPSILON) {
                     const coordf_t middle_layer_z = (new_min_layer_height > 0.5 * delta) ?
 	                    next_range.second - new_min_layer_height :
@@ -4596,11 +4619,11 @@ void ObjectList::add_layer_range_after_current(const t_layer_height_range curren
                     add_layer_item(new_range, layers_item, layer_idx);
 
                     new_range = { current_range.second, middle_layer_z };
-                    ranges[new_range].assign_config(get_default_layer_config(obj_idx));
+                    ranges[new_range].assign_config(get_default_layer_config(obj_idx, plate_config));
                     add_layer_item(new_range, layers_item, layer_idx);
                 }
             }
-            else if (next_range.first - current_range.second >= get_min_layer_height(0) - EPSILON)
+            else if (next_range.first - current_range.second >= get_min_layer_height(plate_config, 0) - EPSILON)
             {
                 // Filling in a gap between the current and a new layer height range with a new one.
                 // BBS: remove snapshot name "Add Height Range"
@@ -4608,7 +4631,7 @@ void ObjectList::add_layer_range_after_current(const t_layer_height_range curren
                 changed = true;
 
                 const t_layer_height_range new_range = { current_range.second, next_range.first };
-                ranges[new_range].assign_config(get_default_layer_config(obj_idx));
+                ranges[new_range].assign_config(get_default_layer_config(obj_idx, plate_config));
                 add_layer_item(new_range, layers_item, layer_idx);
             }
         }
@@ -4685,8 +4708,12 @@ bool ObjectList::edit_layer_range(const t_layer_height_range& range, coordf_t la
 
     const int extruder_idx = config->opt_int("extruder");
 
-    if (layer_height >= get_min_layer_height(extruder_idx) &&
-        layer_height <= get_max_layer_height(extruder_idx))
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return false;
+
+    if (layer_height >= get_min_layer_height(resolved.config, extruder_idx) &&
+        layer_height <= get_max_layer_height(resolved.config, extruder_idx))
     {
         config->set_key_value("layer_height", new ConfigOptionFloat(layer_height));
         changed_object(obj_idx);

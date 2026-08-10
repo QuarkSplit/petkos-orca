@@ -53,6 +53,7 @@ class ObjectTableSettings : public OTG_Settings
     int m_current_row{ 0 };
     std::string m_current_category;
     int m_current_different { 0 };
+    bool m_is_bbl_printer { false };
     std::map<std::string, int> m_different_map;
 
 public:

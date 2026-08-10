@@ -4,6 +4,7 @@
 #include "Preset.hpp"
 #include "AppConfig.hpp"
 #include "enum_bitmask.hpp"
+#include "PlateSlicingContext.hpp"
 
 #include <memory>
 #include <shared_mutex>
@@ -32,6 +33,16 @@ enum class VendorType {
 };
 namespace Slic3r {
 
+struct ResolvedPlateSlicingConfig
+{
+    DynamicPrintConfig         config;
+    const Preset              *printer_preset { nullptr };
+    const Preset              *print_preset { nullptr };
+    std::vector<const Preset*> filament_presets;
+    std::string                printer_vendor_id;
+    bool                       is_bbl_printer { false };
+};
+
 struct AMSMapInfo
 {
     /*for new ams mapping*/ // from struct FilamentInfo
@@ -54,12 +65,6 @@ struct AMSComboInfo
         return ams_names.empty();
     }
 };
-struct MergeFilamentInfo {
-    std::vector<std::vector<int>> merges;
-    bool  is_empty() { return merges.empty();}
-};
-
-
 struct FilamentBaseInfo
 {
     std::string filament_name;
@@ -178,6 +183,14 @@ public:
                                                     std::optional<std::vector<int>> filament_maps_new,
                                                     std::optional<std::vector<int>> filament_volume_maps_new = std::nullopt);
 
+    // Resolve a plate's complete slicing identity. Empty context fields inherit
+    // the Project row; non-empty names are exact and never remapped.
+    bool resolve_plate_slicing_config(const PlateSlicingContext            &context,
+                                      std::optional<std::vector<int>>        filament_maps,
+                                      std::optional<std::vector<int>>        filament_volume_maps,
+                                      ResolvedPlateSlicingConfig            &resolved,
+                                      std::string                           &error) const;
+
     // ORCA: utility function to find the vendor for a given preset name
     static std::string find_preset_vendor(const std::string& preset_name, Preset::Type type);
 
@@ -284,6 +297,14 @@ public:
     // Whether using bbl's device tab
     bool use_bbl_device_tab();
 
+    // The same three questions asked of ONE printer config rather than of whichever
+    // preset the Project row is editing. A project holds several printers at once, so
+    // "is this a Bambu machine" has an answer per plate, not per project.
+    VendorType get_vendor_type(const DynamicPrintConfig &printer_config);
+    bool is_bbl_vendor(const DynamicPrintConfig &printer_config) { return get_vendor_type(printer_config) == VendorType::Marlin_BBL; }
+    bool use_bbl_network(const DynamicPrintConfig &printer_config);
+    bool use_bbl_device_tab(const DynamicPrintConfig &printer_config);
+
     bool backup_user_folder() const;
 
     //BBS: project embedded preset logic
@@ -304,8 +325,14 @@ public:
     void            set_num_filaments(unsigned int n, std::string new_col = "");
     void         update_num_filaments(unsigned int to_del_flament_id);
 
-    void get_ams_cobox_infos(AMSComboInfo &combox_info);
-    unsigned int sync_ams_list(std::vector<std::pair<DynamicPrintConfig *,std::string>> &unknowns, bool use_map, std::map<int, AMSMapInfo> &maps, bool enable_append, MergeFilamentInfo &merge_info, bool color_only = false);
+    bool resolve_ams_filament_preset(const DynamicPrintConfig        &ams,
+                                     const ResolvedPlateSlicingConfig &plate_config,
+                                     std::optional<size_t>             preferred_slot,
+                                     const Preset                     *&preset,
+                                     std::string                       &error) const;
+    bool get_ams_cobox_infos(const ResolvedPlateSlicingConfig &plate_config,
+                             AMSComboInfo                     &combox_info,
+                             std::string                      &error) const;
     //BBS: check whether this is the only edited filament
     bool is_the_only_edited_filament(unsigned int filament_index);
 
@@ -324,7 +351,7 @@ public:
     void set_is_validation_mode(bool mode) { validation_mode = mode; }
     void set_vendor_to_validate(std::string vendor) { vendor_to_validate = vendor; }
 
-    std::vector<std::vector<DynamicPrintConfig>> get_extruder_filament_info() const;
+    std::vector<std::vector<DynamicPrintConfig>> get_extruder_filament_info(size_t extruder_count) const;
 
     std::set<std::string> get_printer_names_by_printer_type_and_nozzle(const std::string &printer_type, std::string nozzle_diameter_str, bool system_only = true);
     bool                  check_filament_temp_equation_by_printer_type_and_nozzle_for_mas_tray(const std::string &printer_type,
@@ -334,7 +361,6 @@ public:
                                                                                                std::string &      nozzle_temp_min,
                                                                                                std::string &      nozzle_temp_max,
                                                                                                std::string &      preset_setting_id);
-    Preset *                    get_similar_printer_preset(std::string printer_model, std::string printer_variant);
 
     PresetCollection            prints;
     PresetCollection            sla_prints;

@@ -1,6 +1,7 @@
 #include "PrinterWebViewHandler.hpp"
 
 #include "I18N.hpp"
+#include "Plater.hpp"
 #include "PrinterWebView.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/GUI/Widgets/WebView.hpp"
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <boost/filesystem/path.hpp>
 #include <thread>
+#include <optional>
 #include <wx/filedlg.h>
 #include <wx/string.h>
 
@@ -46,12 +48,16 @@ wxWebView* PrinterWebViewHandler::browser() const
 
 namespace {
 
-DynamicPrintConfig* get_active_printer_config()
+std::optional<DynamicPrintConfig> get_active_printer_config()
 {
-    if (wxGetApp().preset_bundle == nullptr)
-        return nullptr;
-
-    return &wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return std::nullopt;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!plater->resolve_current_plate_slicing_config(resolved, error))
+        return std::nullopt;
+    return std::move(resolved.config);
 }
 
 std::string json_string(const json& node, const char* key)
@@ -205,8 +211,8 @@ private:
         if (file_name.empty())
             file_name = filename_to_utf8(source_path);
 
-        DynamicPrintConfig* config = get_active_printer_config();
-        std::unique_ptr<PrintHost> print_host(config == nullptr ? nullptr : PrintHost::get_print_host(config));
+        auto config = get_active_printer_config();
+        std::unique_ptr<PrintHost> print_host(config ? PrintHost::get_print_host(&*config) : nullptr);
         if (print_host == nullptr) {
             upload_in_progress = false;
             send_ipc_message("response", request_id, method, 1, "Could not get a valid Printer Host reference");
@@ -288,8 +294,8 @@ private:
         // Panel always calls get_sn with a 10s IPC timeout. Answer immediately from
         // dev_sn / cache — do not spawn a thread or perform HTTP (panel uses URL sn on miss).
         std::string sn;
-        if (DynamicPrintConfig* config = get_active_printer_config()) {
-            const std::unique_ptr<PrintHost> host(PrintHost::get_print_host(config));
+        if (auto config = get_active_printer_config()) {
+            const std::unique_ptr<PrintHost> host(PrintHost::get_print_host(&*config));
             if (host)
                 sn = host->get_sn();
         }
@@ -306,8 +312,8 @@ private:
 
 std::unique_ptr<PrinterWebViewHandler> create_printer_webview_handler(PrinterWebView& owner)
 {
-    auto     cfg = get_active_printer_config();
-    if(cfg == nullptr) return nullptr;
+    auto cfg = get_active_printer_config();
+    if (!cfg) return nullptr;
     
     const auto host_type = cfg->option<ConfigOptionEnum<PrintHostType>>("host_type")->value;
     switch (host_type)

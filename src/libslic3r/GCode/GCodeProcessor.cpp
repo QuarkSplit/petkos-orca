@@ -129,7 +129,7 @@ const std::string GCodeProcessor::Toolchange_Wipe_Tag          = " CP_TOOLCHANGE
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
 
-bool GCodeProcessor::s_IsBBLPrinter = true;
+thread_local bool GCodeProcessor::s_IsBBLPrinter = false;
 
 static void set_option_value(ConfigOptionFloats& option, size_t id, float value)
 {
@@ -3630,11 +3630,28 @@ void GCodeProcessor::process_file(const std::string& filename, std::function<voi
             // thus a probability of incorrect substitution is low and the G-code viewer is a consumer-only anyways.
             config.load_from_gcode_file(filename, ForwardCompatibilitySubstitutionRule::EnableSilent);
 
-            // Get the correct printer vendor based on the `printer_model` field
-            auto printer_model_opt = config.opt<ConfigOptionString>("printer_model");
-            if (printer_model_opt && !printer_model_opt->value.empty()) {
-                // TODO: Orca hack, proper vendor check?
-                GCodeProcessor::s_IsBBLPrinter = boost::starts_with(printer_model_opt->value, "Bambu Lab");
+            const ConfigOptionString *printer_vendor = config.opt<ConfigOptionString>("printer_vendor_id");
+            if (printer_vendor != nullptr && !printer_vendor->value.empty()) {
+                GCodeProcessor::s_IsBBLPrinter = printer_vendor->value == "BBL";
+            } else {
+                std::optional<bool> detected_dialect;
+                m_parser.parse_file_raw(filename, [&detected_dialect](GCodeReader& reader, const char *begin, const char *end) {
+                    begin = skip_whitespaces(begin, end);
+                    if (begin == end || *begin != ';')
+                        return;
+                    begin = skip_whitespaces(++begin, end);
+                    const std::string_view comment(begin, remove_eols(begin, end) - begin);
+                    if (comment.rfind("FEATURE:", 0) == 0)
+                        detected_dialect = true;
+                    else if (comment.rfind("TYPE:", 0) == 0)
+                        detected_dialect = false;
+                    if (detected_dialect.has_value())
+                        reader.quit_parsing();
+                });
+                m_parser.reset();
+                if (!detected_dialect.has_value())
+                    throw RuntimeError("Orca G-code has no printer vendor metadata and its dialect cannot be determined");
+                GCodeProcessor::s_IsBBLPrinter = *detected_dialect;
             }
 
             ConfigOptionStrings *filament_color = config.opt<ConfigOptionStrings>("filament_colour");

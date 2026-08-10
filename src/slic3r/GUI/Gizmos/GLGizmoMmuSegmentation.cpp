@@ -32,7 +32,7 @@ static inline void show_notification_extruders_limit_exceeded()
 
 void GLGizmoMmuSegmentation::on_opening()
 {
-    if (wxGetApp().filaments_cnt() > int(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
+    if (wxGetApp().plater()->get_extruders_colors().size() > size_t(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
         show_notification_extruders_limit_exceeded();
 }
 
@@ -49,14 +49,14 @@ std::string GLGizmoMmuSegmentation::on_get_name() const
 
 bool GLGizmoMmuSegmentation::on_is_selectable() const
 {
-    return (wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() == ptFFF
-            && /*wxGetApp().get_mode() != comSimple && */wxGetApp().filaments_cnt() > 1);
+    return /*wxGetApp().get_mode() != comSimple && */wxGetApp().plater()->get_extruders_colors().size() > 1;
 }
 
 bool GLGizmoMmuSegmentation::on_is_activable() const
 {
     const Selection& selection = m_parent.get_selection();
-    return !selection.is_empty() && (selection.is_single_full_instance() || selection.is_any_volume()) && wxGetApp().filaments_cnt() > 1;
+    return !selection.is_empty() && (selection.is_single_full_instance() || selection.is_any_volume()) &&
+           wxGetApp().plater()->get_extruders_colors().size() > 1;
 }
 
 static std::vector<int> get_extruder_id_for_volumes(const ModelObject &model_object)
@@ -174,20 +174,21 @@ void GLGizmoMmuSegmentation::render_painter_gizmo()
 void GLGizmoMmuSegmentation::data_changed(bool is_serializing)
 {
     GLGizmoPainterBase::data_changed(is_serializing);
-    if (m_state != On || wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() != ptFFF || wxGetApp().extruders_edited_cnt() <= 1)
+    const std::vector<ColorRGBA> current_colors = wxGetApp().plater()->get_extruders_colors();
+    if (m_state != On || current_colors.size() <= 1)
         return;
 
     ModelObject* model_object = m_c->selection_info()->model_object();
     int prev_extruders_count = int(m_extruders_colors.size());
-    if (prev_extruders_count != wxGetApp().filaments_cnt()) {
-        if (wxGetApp().filaments_cnt() > int(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
+    if (prev_extruders_count != int(current_colors.size())) {
+        if (current_colors.size() > size_t(GLGizmoMmuSegmentation::EXTRUDERS_LIMIT))
             show_notification_extruders_limit_exceeded();
 
         this->init_extruders_data();
         // Reinitialize triangle selectors because of change of extruder count need also change the size of GLIndexedVertexArray
-        if (prev_extruders_count != wxGetApp().filaments_cnt())
+        if (prev_extruders_count != int(current_colors.size()))
             this->init_model_triangle_selectors();
-    } else if (wxGetApp().plater()->get_extruders_colors() != m_extruders_colors) {
+    } else if (current_colors != m_extruders_colors) {
         this->init_extruders_data();
         this->update_triangle_selectors_colors();
     }
@@ -766,8 +767,9 @@ void GLGizmoMmuSegmentation::update_from_model_object(bool first_update)
 
     // Extruder colors need to be reloaded before calling init_model_triangle_selectors to render painted triangles
     // using colors from loaded 3MF and not from printer profile in Slicer.
+    const std::vector<ColorRGBA> current_colors = wxGetApp().plater()->get_extruders_colors();
     if (int prev_extruders_count = int(m_extruders_colors.size());
-        prev_extruders_count != wxGetApp().filaments_cnt() || wxGetApp().plater()->get_extruders_colors() != m_extruders_colors)
+        prev_extruders_count != int(current_colors.size()) || current_colors != m_extruders_colors)
         this->init_extruders_data();
 
     this->init_model_triangle_selectors();
@@ -1155,7 +1157,7 @@ void GLGizmoMmuSegmentation::remap_filament_assignments()
         if (volume_extruder_changed) {
             this->update_triangle_selectors_colors();
             // ORCA: Update GUI_ObjectList extruder column to reflect the new extruder value
-            wxGetApp().obj_list()->update_objects_list_filament_column(wxGetApp().filaments_cnt());
+            wxGetApp().obj_list()->update_objects_list_filament_column(int(m_extruders_colors.size()));
         }
 
         // ORCA: Removed "Filament remapping finished" notification to reduce UI noise.

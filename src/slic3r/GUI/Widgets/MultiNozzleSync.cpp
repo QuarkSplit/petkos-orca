@@ -275,44 +275,76 @@ void onNozzleVolumeTypeSwitch(PresetBundle *preset_bundle, int extruder_id, Nozz
 
 void manuallySetNozzleCount(int extruder_id)
 {
-    PresetBundle *preset_bundle = wxGetApp().preset_bundle;
-    if (!preset_bundle)
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
         return;
+    PartPlate *plate = plater->get_partplate_list().get_curr_plate();
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!plater->resolve_plate_slicing_config(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return;
+    }
 
-    DynamicPrintConfig full_config      = preset_bundle->full_config();
-    auto              *max_nozzle_count = full_config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
-    // Multi-nozzle gate: no-op for every single-nozzle / dual-extruder ({1,1}) printer.
-    // Skip nil entries: a nullable-int nil is INT_MAX (> 1) and would otherwise falsely pass the gate.
+    const auto *max_nozzle_count = resolved.config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
     if (!max_nozzle_count ||
         !std::any_of(max_nozzle_count->values.begin(), max_nozzle_count->values.end(),
                      [](int v) { return v > 1 && v != ConfigOptionIntsNullable::nil_value(); }))
         return;
 
-    auto *nozzle_volume_type_opt = full_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const auto *nozzle_volume_type_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
     if (!nozzle_volume_type_opt || extruder_id < 0 || extruder_id >= (int) nozzle_volume_type_opt->values.size() ||
         extruder_id >= (int) max_nozzle_count->values.size())
         return;
 
+    const auto *stats_opt = resolved.config.option<ConfigOptionStrings>("extruder_nozzle_stats");
+    auto stats = stats_opt == nullptr ? std::vector<std::map<NozzleVolumeType, int>>{}
+                                      : get_extruder_nozzle_stats(stats_opt->values);
+    const auto *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzles == nullptr)
+        return;
+    stats.resize(nozzles->values.size());
+    if (extruder_id >= int(stats.size()))
+        return;
+    auto count = [&stats](int id, NozzleVolumeType type) {
+        if (id < 0 || id >= int(stats.size()))
+            return 0;
+        const auto it = stats[id].find(type);
+        return it == stats[id].end() ? 0 : it->second;
+    };
+    auto total = [&stats](int id) {
+        if (id < 0 || id >= int(stats.size()))
+            return 0;
+        return std::accumulate(stats[id].begin(), stats[id].end(), 0,
+                               [](int value, const auto &entry) { return value + entry.second; });
+    };
+
     const NozzleVolumeType volume_type    = NozzleVolumeType(nozzle_volume_type_opt->values[extruder_id]);
-    const int              standard_count = getExtruderNozzleCount(preset_bundle, extruder_id, nvtStandard);
-    const int              highflow_count = getExtruderNozzleCount(preset_bundle, extruder_id, nvtHighFlow);
+    const int              standard_count = count(extruder_id, nvtStandard);
+    const int              highflow_count = count(extruder_id, nvtHighFlow);
 
     // Require at least one nozzle for a Hybrid extruder (an empty mix is meaningless) and when the other
     // extruder currently has none.
     bool force_no_zero = volume_type == nvtHybrid;
     if (nozzle_volume_type_opt->values.size() > 1)
-        force_no_zero |= getExtruderNozzleCountTotal(preset_bundle, 1 - extruder_id) == 0;
+        force_no_zero |= total(1 - extruder_id) == 0;
 
-    ManualNozzleCountDialog dialog(wxGetApp().plater(), volume_type, standard_count, highflow_count, max_nozzle_count->values[extruder_id], force_no_zero);
+    ManualNozzleCountDialog dialog(plater, volume_type, standard_count, highflow_count,
+                                   max_nozzle_count->values[extruder_id], force_no_zero);
     if (dialog.ShowModal() == wxID_OK) {
+        stats[extruder_id].clear();
         if (volume_type == nvtHybrid) {
-            setExtruderNozzleCount(preset_bundle, extruder_id, nvtStandard, dialog.GetNozzleCount(nvtStandard), true);
-            setExtruderNozzleCount(preset_bundle, extruder_id, nvtHighFlow, dialog.GetNozzleCount(nvtHighFlow), false);
+            stats[extruder_id][nvtStandard] = dialog.GetNozzleCount(nvtStandard);
+            stats[extruder_id][nvtHighFlow] = dialog.GetNozzleCount(nvtHighFlow);
         } else {
-            setExtruderNozzleCount(preset_bundle, extruder_id, volume_type, dialog.GetNozzleCount(volume_type), true);
+            stats[extruder_id][volume_type] = dialog.GetNozzleCount(volume_type);
         }
-        updateNozzleCountDisplay(preset_bundle, extruder_id, volume_type);
-        wxGetApp().plater()->update();
+        plate->config()->set_key_value("extruder_nozzle_stats",
+            new ConfigOptionStrings(save_extruder_nozzle_stats_to_string(stats)));
+        plate->update_slice_result_valid_state(false);
+        const int display_count = volume_type == nvtHybrid ? total(extruder_id) : count(extruder_id, volume_type);
+        plater->sidebar().set_extruder_nozzle_count(extruder_id, display_count);
+        plater->update();
     }
 }
 
@@ -1232,55 +1264,10 @@ std::optional<NozzleOption> tryPopUpMultiNozzleDialog(MachineObject* obj)
         return std::nullopt;
     MultiNozzleSyncDialog dialog(wxGetApp().plater_,rack);
 
-    bool has_unreliable = rack->HasUnreliableNozzles();
-    bool has_unknown = rack->HasUnknownNozzles();
-
-    auto config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-
     if (dialog.ShowModal() == wxID_OK) {
         auto selected_option = dialog.GetSelectedOption();
         if (!selected_option)
             return std::nullopt;
-        auto& preset_bundle = GUI::wxGetApp().preset_bundle;
-        auto& project_config = preset_bundle->project_config;
-
-        ConfigOptionEnumsGeneric* nozzle_volume_type_opt = project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-
-        // write to preset bundle config
-        for (int extruder_id = 0; extruder_id < 2; ++extruder_id) {
-            NozzleVolumeType volume_type;
-            int nozzle_count;
-            bool clear_all = true;
-            if (!selected_option->extruder_nozzle_stats.count(extruder_id)) {
-                nozzle_count = 0;
-                // Reset the concrete volume types (Standard/High Flow); Hybrid is a mix marker, never a stats key.
-                // TPU High Flow is a concrete variant that exists only on 0.4/0.6 nozzles, so reset it too, but
-                // only there (same guard that skips High Flow on 0.2).
-                std::vector<NozzleVolumeType> reset_types{nvtStandard, nvtHighFlow};
-                if (extruder_supports_tpu_high_flow(preset_bundle, extruder_id))
-                    reset_types.push_back(nvtTPUHighFlow);
-                for (NozzleVolumeType vt : reset_types) {
-                    volume_type = vt;
-                    setExtruderNozzleCount(preset_bundle, extruder_id, volume_type, nozzle_count, clear_all);
-                    clear_all = false;
-                }
-            }
-            else {
-                for (auto& stat : selected_option->extruder_nozzle_stats[extruder_id]) {
-                    volume_type = stat.first;
-                    nozzle_count = stat.second;
-                    setExtruderNozzleCount(preset_bundle, extruder_id, volume_type, nozzle_count, clear_all);
-                    clear_all = false;
-                }
-            }
-        }
-        // The stats now hold the device's per-type breakdown: protect it from being collapsed by a manual
-        // flow switch, and refresh the sidebar badges.
-        setNozzleStatsFromMachine(true);
-        if (nozzle_volume_type_opt) {
-            for (int extruder_id = 0; extruder_id < 2 && extruder_id < (int) nozzle_volume_type_opt->values.size(); ++extruder_id)
-                updateNozzleCountDisplay(preset_bundle, extruder_id, NozzleVolumeType(nozzle_volume_type_opt->values[extruder_id]));
-        }
         return selected_option;
     }
 

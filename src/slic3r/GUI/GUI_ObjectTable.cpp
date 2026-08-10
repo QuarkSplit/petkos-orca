@@ -17,6 +17,7 @@
 #include "BitmapCache.hpp"
 #include "GUI_ObjectTable.hpp"
 #include "GUI_ObjectList.hpp"
+#include "PartPlate.hpp"
 
 //use wxGridWindow to compute position
 //#include "wx/generic/private/grid.h"
@@ -46,6 +47,24 @@ static int g_dialog_height = 0;
 static int g_dialog_max_width = 0;
 static int g_dialog_max_height = 0;
 static wxSize g_max_size_from_parent;
+
+static bool resolve_object_plate_config(Plater *plater, PartPlateList &plates, int object_id,
+                                        DynamicPrintConfig &config)
+{
+    const int plate_index = plates.find_instance_belongs(object_id, 0);
+    if (plate_index < 0) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": object " << object_id << " is not on a plate";
+        return false;
+    }
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!plater->resolve_plate_slicing_config(plates.get_plate(plate_index), resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    config = std::move(resolved.config);
+    return true;
+}
 
 /* ObjectGridTable related class */
 // ----------------------------------------------------------------------------
@@ -1462,7 +1481,10 @@ void ObjectGridTable::update_volume_values_from_object(int row, int col)
 {
     ObjectGridRow* grid_row = m_grid_data[row - 1];
     bool need_refresh = false;
-    DynamicPrintConfig&  global_config   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    DynamicPrintConfig plate_config;
+    if (!resolve_object_plate_config(m_panel->m_plater, m_panel->m_plater->get_partplate_list(),
+                                     grid_row->object_id, plate_config))
+        return;
     if (grid_row->row_type == row_object) {
         int next_row = row + 1;
         while ((next_row - 1) < m_grid_data.size())
@@ -1482,7 +1504,7 @@ void ObjectGridTable::update_volume_values_from_object(int row, int col)
                     //part_row->ori_filaments = grid_row->filaments;
                 }
                 else
-                    reload_part_data(part_row, grid_row, m_col_data[col]->category, global_config);
+                    reload_part_data(part_row, grid_row, m_col_data[col]->category, plate_config);
                 next_row++;
                 need_refresh = true;
             }
@@ -1959,10 +1981,6 @@ void ObjectGridTable::construct_object_configs(ObjectGrid *object_grid)
     }
     int object_count = m_panel->m_model->objects.size();
     PartPlateList& partplate_list = m_panel->m_plater->get_partplate_list();
-    DynamicPrintConfig&  global_config   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    const DynamicPrintConfig* plater_config = m_panel->m_plater->config();
-    const DynamicPrintConfig&  filament_config = *plater_config;
-
     for (int i = 0; i < object_count; i++)
     {
         ModelObject* object = m_panel->m_model->objects[i];
@@ -1977,6 +1995,12 @@ void ObjectGridTable::construct_object_configs(ObjectGrid *object_grid)
             object_grid->plate_index.value = ObjectGridTable::plate_outside;
         else
             object_grid->plate_index.value = /*std::string("Plate ") + */std::to_string(plate_index+1);
+        DynamicPrintConfig global_config;
+        if (!resolve_object_plate_config(m_panel->m_plater, partplate_list, i, global_config)) {
+            delete object_grid;
+            release_object_configs();
+            return;
+        }
        /* object_grid->assemble_name.value = object->module_name;
         object_grid->ori_assemble_name = object_grid->assemble_name;*/
         object_grid->printable.value = object->instances[0]->printable;
@@ -2193,7 +2217,10 @@ void ObjectGridTable::reload_cell_data(int row, const std::string& category)
     if (row == 0)
         return;
     ObjectGridRow* grid_row = m_grid_data[row - 1];
-    DynamicPrintConfig&  global_config   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    DynamicPrintConfig global_config;
+    if (!resolve_object_plate_config(m_panel->m_plater, m_panel->m_plater->get_partplate_list(),
+                                     grid_row->object_id, global_config))
+        return;
 
     if (grid_row->row_type == row_object) {
         reload_object_data(grid_row, category, global_config);
@@ -2837,48 +2864,50 @@ int ObjectTablePanel::init_bitmap()
 
 int ObjectTablePanel::init_filaments_and_colors()
 {
-    //DynamicPrintConfig&  global_config   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    const DynamicPrintConfig* global_config = m_plater->config();
-    const std::vector<std::string> filament_presets = wxGetApp().preset_bundle->filament_presets;
-    m_filaments_count = filament_presets.size();
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!m_plater->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        m_filaments_count = 0;
+        m_filaments_colors.clear();
+        m_filaments_name.clear();
+        return -1;
+    }
+    m_filaments_count = int(resolved.filament_presets.size());
     if (m_filaments_count <= 0) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", can not get filaments, count: %1%, set to default") %m_filaments_count;
-        set_default_filaments_and_colors();
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected plate has no filament presets";
         return -1;
     }
 
-    const ConfigOptionStrings* filament_opt = dynamic_cast<const ConfigOptionStrings*>(global_config->option("filament_colour"));
+    const ConfigOptionStrings* filament_opt = resolved.config.option<ConfigOptionStrings>("filament_colour");
     if (filament_opt == nullptr) {
-        set_default_filaments_and_colors();
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected plate has no filament_colour";
+        return -1;
+    }
+    unsigned int color_count = filament_opt->values.size();
+    if (color_count != m_filaments_count) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", color count %1% does not match filament count %2%") %color_count %m_filaments_count;
         return -1;
     }
     m_filaments_colors.resize(m_filaments_count);
     m_filaments_name.resize(m_filaments_count);
-    unsigned int color_count = filament_opt->values.size();
-    if (color_count != m_filaments_count) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", invalid color count:%1%, extruder count: %2%") %color_count %m_filaments_count;
-    }
 
     unsigned int i = 0;
     ColorRGB rgb;
     while (i < m_filaments_count) {
-        const std::string& txt_color = global_config->opt_string("filament_colour", i);
-        if (i < color_count) {
-            if (decode_color(txt_color, rgb))
-            {
-                m_filaments_colors[i] = wxColour(rgb.r_uchar(), rgb.g_uchar(), rgb.b_uchar());
-            }
-            else
-            {
-                m_filaments_colors[i] = *wxGREEN;
-            }
+        const std::string& txt_color = filament_opt->values[i];
+        if (!decode_color(txt_color, rgb)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid filament color '" << txt_color
+                                     << "' at slot " << (i + 1);
+            m_filaments_colors.clear();
+            m_filaments_name.clear();
+            m_filaments_count = 0;
+            return -1;
         }
-        else {
-            m_filaments_colors[i] = *wxGREEN;
-        }
+        m_filaments_colors[i] = wxColour(rgb.r_uchar(), rgb.g_uchar(), rgb.b_uchar());
 
         //parse the filaments
-        m_filaments_name[i] = wxString(std::to_string(i+1) + ": " + filament_presets[i]);
+        m_filaments_name[i] = wxString(std::to_string(i+1) + ": " + resolved.filament_presets[i]->name);
 
         i++;
     }

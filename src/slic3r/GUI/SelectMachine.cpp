@@ -34,6 +34,7 @@
 #include "DeviceCore/DevPrintOptions.h" // smart-nozzle-blob detection option
 #include "libslic3r/MultiNozzleUtils.hpp" // filament-change-gap model for the best-position popup
 #include "BackgroundSlicingProcess.hpp"   // complete type for background_process().get_current_gcode_result()
+#include "NotificationManager.hpp"        // the channel a maybe uses to inform instead of blocking
 #include "DeviceCore/DevStorage.h"
 
 #include <wx/progdlg.h>
@@ -49,6 +50,15 @@
 #include "BindDialog.hpp"
 
 namespace Slic3r { namespace GUI {
+
+static bool resolve_plate_slicing_context(PartPlate *plate, ResolvedPlateSlicingConfig &resolved, std::string &error);
+
+static MachineObject *resolve_machine_exact(DeviceManager *device_manager, const std::string &device_id)
+{
+    return device_manager != nullptr && !device_id.empty()
+        ? device_manager->get_my_machine(device_id)
+        : nullptr;
+}
 
 wxDEFINE_EVENT(EVT_SWITCH_PRINT_OPTION, wxCommandEvent);
 wxDEFINE_EVENT(EVT_UPDATE_USER_MACHINE_LIST, wxCommandEvent);
@@ -848,7 +858,7 @@ void SelectMachineDialog::init_bind()
         if (e.GetInt() == 0) {
             DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
             if (!dev) return;
-            MachineObject* obj = dev->get_selected_machine();
+            MachineObject* obj = resolve_machine_exact(dev, m_printer_last_select);
             if (!obj) return;
 
             if (obj->get_dev_id() == e.GetString()) {
@@ -930,9 +940,9 @@ void SelectMachineDialog::popup_filament_backup()
 
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
-    if (dev->get_selected_machine()/* && dev->get_selected_machine()->filam_bak.size() > 0*/) {
+    if (MachineObject *obj = resolve_machine_exact(dev, m_printer_last_select)) {
         AmsReplaceMaterialDialog* m_replace_material_popup = new AmsReplaceMaterialDialog(this);
-        m_replace_material_popup->update_machine_obj(dev->get_selected_machine());
+        m_replace_material_popup->update_machine_obj(obj);
         m_replace_material_popup->ShowModal();
     }
 }
@@ -1025,7 +1035,7 @@ void SelectMachineDialog::sync_ams_mapping_result(std::vector<FilamentInfo> &res
     // Reflow the grid so the taller cards aren't clipped; no-op for printers that never show it.
     auto relayout_nozzle_cards = [this]() {
         DeviceManager* dev = wxGetApp().getDeviceManager();
-        MachineObject* obj_ = dev ? dev->get_selected_machine() : nullptr;
+        MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
         if (!obj_) return;
         DevNozzleSystem* ns = obj_->GetNozzleSystem();
         if (!obj_->GetFilaSwitch()->IsInstalled() && !(ns && ns->GetNozzleRack()->IsSupported())) return;
@@ -1114,13 +1124,21 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_,bool use_ams)
     obj_->get_ams_colors(m_cur_colors_in_thumbnail);
     // try color and type mapping
 
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    const auto& project_config = wxGetApp().preset_bundle->project_config;
-    size_t nozzle_nums = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
-
+    const DynamicPrintConfig *slicing_config = &m_required_data_config;
+    ResolvedPlateSlicingConfig resolved;
     if (m_print_type == FROM_NORMAL) {
-        m_filaments_map = wxGetApp().plater()->get_partplate_list().get_curr_plate()->get_real_filament_maps(project_config);
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return false;
+        }
+        slicing_config = &resolved.config;
+        m_filaments_map = plate->get_real_filament_maps(*slicing_config);
     }
+    const auto *nozzle_diameter = slicing_config->option<ConfigOptionFloats>("nozzle_diameter");
+    if (!nozzle_diameter) return false;
+    const size_t nozzle_nums = nozzle_diameter->values.size();
 
     int filament_result = 0;
     std::vector<bool> map_opt;  //four values: use_left_ams, use_right_ams, use_left_ext, use_right_ext
@@ -1267,21 +1285,16 @@ bool SelectMachineDialog::get_ams_mapping_result(std::string &mapping_array_str,
             json mapping_v1_json   = json::array();
             json mapping_info_json = json::array();
 
-            /* get filament maps */
-            std::vector<int> filament_maps;
-            Plater *         plater = wxGetApp().plater();
-            if (plater) {
-                PartPlate *curr_plate = plater->get_partplate_list().get_curr_plate();
-                if (curr_plate) {
-                    filament_maps = curr_plate->get_filament_maps();
-                } else {
-                    BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, curr_plate is nullptr";
-                }
-            } else {
-                BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, plater is nullptr";
+            PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+            ResolvedPlateSlicingConfig resolved;
+            std::string context_error;
+            if (!resolve_plate_slicing_context(plate, resolved, context_error)) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+                return false;
             }
+            const std::vector<int> filament_maps = plate->get_filament_maps();
 
-            for (int i = 0; i < wxGetApp().preset_bundle->filament_presets.size(); i++) {
+            for (int i = 0; i < resolved.filament_presets.size(); i++) {
                 int  tray_id = -1;
                 json mapping_item_v1;
                 mapping_item_v1["ams_id"]  = 0xff;
@@ -1296,10 +1309,7 @@ bool SelectMachineDialog::get_ams_mapping_result(std::string &mapping_array_str,
                         tray_id                      = m_ams_mapping_result[k].tray_id;
                         mapping_item["ams"]          = tray_id;
                         mapping_item["filamentType"] = m_filaments[k].type;
-                        if (i >= 0 && i < wxGetApp().preset_bundle->filament_presets.size()) {
-                            auto it = wxGetApp().preset_bundle->filaments.find_preset(wxGetApp().preset_bundle->filament_presets[i]);
-                            if (it != nullptr) { mapping_item["filamentId"] = it->filament_id; }
-                        }
+                        mapping_item["filamentId"] = resolved.filament_presets[size_t(i)]->filament_id;
                         /* nozzle id */
                         if (i >= 0 && i < filament_maps.size()) { mapping_item["nozzleId"] = convert_filament_map_nozzle_id_to_task_nozzle_id(filament_maps[i]); }
                         // convert #RRGGBB to RRGGBBAA
@@ -1316,7 +1326,10 @@ bool SelectMachineDialog::get_ams_mapping_result(std::string &mapping_array_str,
                                 mapping_item_v1["ams_id"]  = std::stoi(m_ams_mapping_result[k].ams_id);
                                 mapping_item_v1["slot_id"] = std::stoi(m_ams_mapping_result[k].slot_id);
                             }
-                        } catch (...) {}
+                        } catch (const std::exception &ex) {
+                            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid AMS mapping: " << ex.what();
+                            return false;
+                        }
                     }
                 }
                 mapping_v0_json.push_back(tray_id);
@@ -1346,7 +1359,10 @@ bool SelectMachineDialog::get_ams_mapping_result(std::string &mapping_array_str,
                             mapping_item_v1["slot_id"] = std::stoi(m_ams_mapping_result[k].slot_id);
                         }
                     }
-                } catch (...) {}
+                } catch (const std::exception &ex) {
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid SD-card AMS mapping: " << ex.what();
+                    return false;
+                }
 
                 mapping_v0_json.push_back(mapping_result);
                 mapping_v1_json.push_back(mapping_item_v1);
@@ -1368,12 +1384,19 @@ bool SelectMachineDialog::build_nozzles_info(std::string& nozzles_info)
     PresetBundle* preset_bundle = wxGetApp().preset_bundle;
     if (!preset_bundle)
         return false;
-    auto opt_nozzle_diameters = preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    auto opt_nozzle_diameters = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
     if (opt_nozzle_diameters == nullptr) {
         BOOST_LOG_TRIVIAL(error) << "build_nozzles_info, opt_nozzle_diameters is nullptr";
         return false;
     }
-    auto opt_nozzle_volume_type = preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    auto opt_nozzle_volume_type = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
     if (opt_nozzle_volume_type == nullptr) {
         BOOST_LOG_TRIVIAL(error) << "build_nozzles_info, opt_nozzle_volume_type is nullptr";
         return false;
@@ -1416,8 +1439,14 @@ bool SelectMachineDialog::can_hybrid_mapping(MachineObject* obj_) const {
 ShowType SelectMachineDialog::get_filament_mapping_show_type(MachineObject* obj_, int fila_logic_id) const
 {
     try {
-        const auto& full_config = wxGetApp().preset_bundle->full_config();
-        size_t total_ext_count = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return ShowType::RIGHT;
+        }
+        size_t total_ext_count = resolved.config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
         if (total_ext_count < 2) {
             return ShowType::RIGHT;
         }
@@ -1482,13 +1511,19 @@ std::map<int, DevNozzle> SelectMachineDialog::get_mapped_nozzles(int fila_id) co
 
     DeviceManager* dev = wxGetApp().getDeviceManager();
     if (!dev) { return nozzle_map; }
-    MachineObject* obj_ = dev->get_selected_machine();
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_) { return nozzle_map; }
 
     int total_ext_count = 0;
     if (m_print_type == FROM_NORMAL) {
-        const auto& full_config = wxGetApp().preset_bundle->full_config();
-        const auto  opt         = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return nozzle_map;
+        }
+        const auto opt = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
         total_ext_count         = opt ? opt->values.size() : 0;
     } else {
         const auto opt  = m_required_data_config.option<ConfigOptionFloats>("nozzle_diameter");
@@ -1532,7 +1567,7 @@ wxString SelectMachineDialog::get_mapped_nozzle_str(int fila_id) const
 
     DeviceManager* dev = wxGetApp().getDeviceManager();
     if (!dev) { return wxEmptyString; }
-    MachineObject* obj_ = dev->get_selected_machine();
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_) { return wxEmptyString; }
 
     DevNozzleSystem* nozzle_system = obj_->GetNozzleSystem();
@@ -1586,7 +1621,14 @@ bool SelectMachineDialog::slicing_with_fila_switch() const
         return true;
 
     if (m_print_type == FROM_NORMAL) {
-        auto has_filament_switcher = wxGetApp().preset_bundle->project_config.option<ConfigOptionBool>("has_filament_switcher");
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return false;
+        }
+        auto has_filament_switcher = resolved.config.option<ConfigOptionBool>("has_filament_switcher");
         if (has_filament_switcher)
             return has_filament_switcher->value;
     } else if (m_print_type == FROM_SDCARD_VIEW) {
@@ -1637,7 +1679,7 @@ void SelectMachineDialog::clear_nozzle_mapping()
     m_nozzle_mapping_result.clear();
     // Orca: no BBS get_current_machine(); use the selected device (same accessor get_mapped_nozzles uses).
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    if (MachineObject* obj_ = dev ? dev->get_selected_machine() : nullptr)
+    if (MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select))
         obj_->get_nozzle_mapping_result()->Clear();
 }
 
@@ -1656,7 +1698,7 @@ void SelectMachineDialog::update_pa_value_option(MachineObject *obj)
 void SelectMachineDialog::on_flow_cali_option_changed()
 {
     DeviceManager* dev  = wxGetApp().getDeviceManager();
-    MachineObject* obj_ = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_) return;
 
     // Orca: the PA-profile-sharing toggle is shown only while Flow Dynamics Calibration is off,
@@ -1679,7 +1721,7 @@ void SelectMachineDialog::on_pa_value_option_changed()
     // Orca: the PA-sharing value feeds the printer-side rack nozzle-mapping request (V0), so a
     // change must invalidate the cached mapping and let the next status poll re-request it.
     DeviceManager* dev  = wxGetApp().getDeviceManager();
-    MachineObject* obj_ = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_ || !(obj_->GetNozzleSystem() && obj_->GetNozzleSystem()->GetNozzleRack()->IsSupported())) return;
     if (use_dynamic_nozzle_map()) return;
     clear_nozzle_mapping();
@@ -1874,6 +1916,19 @@ bool SelectMachineDialog::is_selected_ams_drying(MachineObject* obj)
 void SelectMachineDialog::prepare(int print_plate_idx)
 {
     m_print_plate_idx = print_plate_idx;
+    if (m_print_type != PrintFromType::FROM_NORMAL) {
+        m_mapping_popup.clear_source_plate_config();
+        return;
+    }
+    if (print_plate_idx < 0)
+        throw Slic3r::RuntimeError("Normal dispatch requires one explicit plate");
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error))
+        throw Slic3r::RuntimeError("Unable to prepare plate dispatch: " + error);
+    m_mapping_popup.set_source_plate_config(
+        resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle), resolved.config);
 }
 
 void SelectMachineDialog::update_print_status_msg()
@@ -1943,9 +1998,14 @@ bool SelectMachineDialog::CheckWarningSmartNozzleBlobAuto(MachineObject* obj_)
 
     // Need at least one stringing-prone filament in the sliced project for any nozzle on the current
     // printer config; iterating the diameters covers single- and dual-extruder printers.
-    if (!wxGetApp().preset_bundle) return true;
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    const auto* opt_nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return true;
+    }
+    const auto* opt_nozzle_diameters = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
     if (!opt_nozzle_diameters || opt_nozzle_diameters->values.empty()) return true;
 
     for (const auto& fila : m_filaments) {
@@ -2021,10 +2081,16 @@ std::optional<float> SelectMachineDialog::get_filament_change_gap_time(MachineOb
     const std::vector<int> nozzle_change_seq(gcode_result->nozzle_change_sequence.begin(), gcode_result->nozzle_change_sequence.end());
 
     MultiNozzleUtils::FilamentChangeTimeParams params;
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    if (const auto* load_time_opt = full_config.option<ConfigOptionFloat>("machine_load_filament_time"))
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return std::nullopt;
+    }
+    if (const auto* load_time_opt = resolved.config.option<ConfigOptionFloat>("machine_load_filament_time"))
         params.standard_load_time = load_time_opt->value;
-    if (const auto* unload_time_opt = full_config.option<ConfigOptionFloat>("machine_unload_filament_time"))
+    if (const auto* unload_time_opt = resolved.config.option<ConfigOptionFloat>("machine_unload_filament_time"))
         params.standard_unload_time = unload_time_opt->value;
     params.selector_load_time   = params.standard_load_time * 0.5;
     params.selector_unload_time = params.standard_unload_time * 0.5;
@@ -2157,7 +2223,7 @@ void SelectMachineDialog::on_reselect_dialog_btn_clicked(wxMouseEvent&)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__;
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj) return;
     if (m_best_pos_dialog == nullptr)
         m_best_pos_dialog = new ReselectMachineDialog(static_cast<wxWindow*>(this));
@@ -2183,7 +2249,7 @@ void SelectMachineDialog::update_best_pos_dialog(wxCommandEvent& evt)
 {
     if (!m_best_pos_dialog) return; // Orca: only relevant while the popup is open
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj_ = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_) return;
     update_show_status(obj_);
 
@@ -2316,7 +2382,7 @@ void SelectMachineDialog::show_status(PrintDialogStatus status, std::vector<wxSt
             if (!dev) return;
 
             //source print
-            MachineObject* obj_ = dev->get_selected_machine();
+            MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
             if (obj_ == nullptr) return;
             auto sourcet_print_name = obj_->get_printer_type_display_str();
             sourcet_print_name.Replace(wxT("Bambu Lab "), wxEmptyString);
@@ -2324,8 +2390,12 @@ void SelectMachineDialog::show_status(PrintDialogStatus status, std::vector<wxSt
             //target print
             std::string target_model_id;
             if (m_print_type == PrintFromType::FROM_NORMAL){
-                PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-                target_model_id = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+                ResolvedPlateSlicingConfig resolved;
+                std::string error;
+                if (!resolve_plate_slicing_context(m_plater->get_partplate_list().get_plate(m_print_plate_idx),
+                                                   resolved, error))
+                    return;
+                target_model_id = resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle);
             }
             else if (m_print_type == PrintFromType::FROM_SDCARD_VIEW) {
                 if (m_required_data_plate_data_list.size() > 0) {
@@ -2367,7 +2437,7 @@ void SelectMachineDialog::show_status(PrintDialogStatus status, std::vector<wxSt
         Enable_Send_Button(false);
     } else if (status == PrintDialogStatus::PrintStatusTimelapseWarning) {  //this is warning
         wxString   msg_text;
-        PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
         for (auto warning : plate->get_slice_result()->warnings) {
             if (warning.msg == NOT_GENERATE_TIMELAPSE) {
                 if (warning.error_code == "10014001") {
@@ -2492,6 +2562,22 @@ void SelectMachineDialog::on_cancel(wxCloseEvent &event)
     this->EndModal(wxID_CANCEL);
 }
 
+static bool resolve_plate_slicing_context(PartPlate *plate, ResolvedPlateSlicingConfig &resolved, std::string &error)
+{
+    if (plate == nullptr) {
+        error = "No plate is selected";
+        return false;
+    }
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const std::vector<int> filament_maps = plate->get_real_filament_maps(bundle->project_config);
+    const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle->project_config);
+    if (!bundle->resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+                                              resolved, error))
+        return false;
+    resolved.config.apply(*plate->config(), true);
+    return false;
+}
+
 bool SelectMachineDialog::is_blocking_printing(MachineObject* obj_)
 {
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
@@ -2500,10 +2586,14 @@ bool SelectMachineDialog::is_blocking_printing(MachineObject* obj_)
     std::string source_model = "";
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
-        PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-        source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
-
-
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return true;
+        }
+        source_model = resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle);
     }else if (m_print_type == PrintFromType::FROM_SDCARD_VIEW) {
         if (m_required_data_plate_data_list.size() > 0) {
             source_model = m_required_data_plate_data_list[m_print_plate_idx]->printer_model_id;
@@ -2521,27 +2611,36 @@ bool SelectMachineDialog::is_blocking_printing(MachineObject* obj_)
     return false;
 }
 
-static std::unordered_set<int> _get_used_nozzle_idxes()
+static bool _get_used_nozzle_idxes(PartPlate *plate, std::unordered_set<int> &used_nozzle_idxes, std::string &error)
 {
-    std::unordered_set<int> used_nozzle_idxes;
+    used_nozzle_idxes.clear();
+    error.clear();
 
-    DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
-    if (dev) {
-        MachineObject *obj_ = dev->get_selected_machine();
-        if (obj_) {
-            try {
-                PresetBundle *preset_bundle   = wxGetApp().preset_bundle;
-                PartPlate *cur_plate          = wxGetApp().plater()->get_partplate_list().get_curr_plate();
-                auto       used_filament_idxs = cur_plate->get_used_filaments(); /*the index is started from 1*/
-                for (int used_filament_idx : used_filament_idxs) {
-                    int used_nozzle_idx = cur_plate->get_physical_extruder_by_filament_id(preset_bundle->full_config(), used_filament_idx);
-                    used_nozzle_idxes.insert(used_nozzle_idx);
-                }
-            } catch (const std::exception &) {}
+    if (plate == nullptr) {
+        error = "Normal dispatch has no explicit plate";
+        return false;
+    }
+    try {
+        auto used_filament_idxs = plate->get_used_filaments(); /*the index is started from 1*/
+        ResolvedPlateSlicingConfig resolved;
+        if (!resolve_plate_slicing_context(plate, resolved, error))
+            return false;
+        for (int used_filament_idx : used_filament_idxs) {
+            int used_nozzle_idx = plate->get_physical_extruder_by_filament_id(resolved.config, used_filament_idx);
+            if (used_nozzle_idx < 0) {
+                error = "The plate filament-to-nozzle mapping is invalid";
+                used_nozzle_idxes.clear();
+                return false;
+            }
+            used_nozzle_idxes.insert(used_nozzle_idx);
         }
+    } catch (const std::exception &ex) {
+        error = "Unable to resolve the plate nozzle usage: " + std::string(ex.what());
+        used_nozzle_idxes.clear();
+        return false;
     }
 
-    return used_nozzle_idxes;
+    return true;
 }
 
 // On a hotend-rack printer the right extruder swaps to the required nozzle during the print, so
@@ -2589,22 +2688,40 @@ bool SelectMachineDialog::is_nozzle_hrc_matched(const DevExtder* extruder, std::
     return true;
 }
 
+//"Is the machine this G-code was sliced for the machine it is about to be sent to?"
+//An unknown answer is not a yes. Every early return here used to be true, so a missing
+//device manager, an unresolvable machine or a missing preset bundle all read as
+//"same model" and the mismatch warning never appeared. The caller turns false into a
+//confirm-before-send warning, not a refusal, so saying "cannot confirm" costs the user
+//one dialog and saves them sending one machine's G-code to another.
 bool SelectMachineDialog::is_same_printer_model()
 {
-    bool result = true;
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
-    if (!dev) return result;
+    if (!dev) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no device manager, cannot confirm the printer model";
+        return false;
+    }
 
-    MachineObject* obj_ = dev->get_selected_machine();
-
-    assert(obj_->get_dev_id() == m_printer_last_select);
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (obj_ == nullptr) {
-        return result;
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": device '" << m_printer_last_select
+                                   << "' is not resolvable, cannot confirm the printer model";
+        return false;
     }
 
     PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    if(preset_bundle == nullptr) return result;
-    const auto source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+    if (preset_bundle == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no preset bundle, cannot confirm the printer model";
+        return false;
+    }
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    const auto source_model = resolved.printer_preset->get_printer_type(preset_bundle);
     const auto target_model = obj_->printer_type;
     // Orca: ignore P1P -> P1S
     if (source_model != target_model) {
@@ -2640,7 +2757,7 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
 
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
-    MachineObject* obj_ = dev->get_selected_machine();
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj_) return;
 
     std::vector<ConfirmBeforeSendInfo> confirm_text;
@@ -2746,7 +2863,7 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
         }
     }
 
-    PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
+    PartPlate* plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
 
     bool has_show_traditional_timelapse_waring = false;
     for (auto warning : plate->get_slice_result()->warnings) {
@@ -3189,7 +3306,7 @@ void SelectMachineDialog::show_timelapse_folder_popup()
     auto* sizer = new wxBoxSizer(wxHORIZONTAL);
 
     DeviceManager* dev_popup = wxGetApp().getDeviceManager();
-    MachineObject* obj_popup = dev_popup ? dev_popup->get_selected_machine() : nullptr;
+    MachineObject* obj_popup = resolve_machine_exact(dev_popup, m_printer_last_select);
     bool has_sdcard = obj_popup && obj_popup->GetStorage()->get_sdcard_state() == DevStorage::SdcardState::HAS_SDCARD_NORMAL;
     // if external was previously selected but sdcard is now absent, fall back to internal
     if (!has_sdcard && m_timelapse_storage == "external")
@@ -3213,7 +3330,7 @@ void SelectMachineDialog::show_timelapse_folder_popup()
                 update_timelapse_folder_btn_icon();
                 if (m_timelapse_storage_popup) m_timelapse_storage_popup->Dismiss();
                 DeviceManager* dev = wxGetApp().getDeviceManager();
-                MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+                MachineObject* obj = resolve_machine_exact(dev, m_printer_last_select);
                 if (obj) check_timelapse_storage_warning(obj);
             };
             radio->Bind(wxEVT_LEFT_DOWN, on_select);
@@ -3284,7 +3401,7 @@ void SelectMachineDialog::start_timelapse_storage_check(MachineObject* obj)
     // derive the timelapse layer count from the sliced print objects instead.
     m_timelapse_total_layer = 0;
     if (m_print_type == PrintFromType::FROM_NORMAL) {
-        PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
+        PartPlate* plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
         if (plate && plate->fff_print()) {
             for (const PrintObject* po : plate->fff_print()->objects())
                 m_timelapse_total_layer = std::max(m_timelapse_total_layer, (int)po->layer_count());
@@ -3309,7 +3426,7 @@ void SelectMachineDialog::on_timelapse_storage_check_timer(wxTimerEvent& /*event
     m_timelapse_check_elapsed_ms += m_timelapse_check_interval_ms;
 
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj = resolve_machine_exact(dev, m_printer_last_select);
 
     bool timed_out = m_timelapse_check_elapsed_ms >= m_timelapse_check_timeout_ms;
     bool done = obj && obj->timelapse_storage_check_done.load();
@@ -3317,7 +3434,13 @@ void SelectMachineDialog::on_timelapse_storage_check_timer(wxTimerEvent& /*event
     if (done || timed_out) {
         m_timelapse_check_timer->Stop();
         if (timed_out && !done) {
+            //Proceeding is right: an unanswered storage query is a maybe, and a maybe
+            //must not block a print the user asked for. Proceeding SILENTLY was the
+            //bug. The consequence of being wrong here is an overwritten old video, not
+            //a damaged machine, so this informs and gets out of the way.
             BOOST_LOG_TRIVIAL(warning) << "timelapse storage check timed out, proceeding with print";
+            notify_timelapse_check_unanswered(_L("The printer did not answer the timelapse storage check in time. "
+                                                 "Printing anyway; a timelapse may overwrite the oldest video files."));
             on_send_print();
             return;
         }
@@ -3325,15 +3448,31 @@ void SelectMachineDialog::on_timelapse_storage_check_timer(wxTimerEvent& /*event
     }
 }
 
+//One place for "the storage check could not answer". Named so both the timeout and the
+//failed-query path say the same thing in the same channel rather than only logging.
+void SelectMachineDialog::notify_timelapse_check_unanswered(const wxString &message)
+{
+    if (wxGetApp().plater() == nullptr || wxGetApp().plater()->get_notification_manager() == nullptr)
+        return;
+    wxGetApp().plater()->get_notification_manager()->push_notification(
+        NotificationType::CustomNotification,
+        NotificationManager::NotificationLevel::WarningNotificationLevel,
+        into_u8(message));
+}
+
 void SelectMachineDialog::on_timelapse_storage_check_result()
 {
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+    MachineObject* obj = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj) { on_send_print(); return; }
 
-    // query failed -> ignore, proceed with print
+    // query failed -> proceed, but say so. Same reasoning as the timeout above: the
+    // check not answering is not evidence that printing is wrong, and refusing on it
+    // would gate a definite request on a maybe.
     if (obj->timelapse_storage_check_result != 0) {
         BOOST_LOG_TRIVIAL(info) << "timelapse storage check failed (result=" << obj->timelapse_storage_check_result << "), proceeding";
+        notify_timelapse_check_unanswered(_L("The timelapse storage check failed. Printing anyway; "
+                                             "a timelapse may overwrite the oldest video files."));
         on_send_print();
         return;
     }
@@ -3486,8 +3625,7 @@ void SelectMachineDialog::on_send_print()
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
 
-    MachineObject* obj_ = dev->get_selected_machine();
-    assert(obj_->get_dev_id() == m_printer_last_select);
+    MachineObject* obj_ = resolve_machine_exact(dev, m_printer_last_select);
     if (obj_ == nullptr) { return; }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", print_job: for send task, current printer id =  " << m_printer_last_select << std::endl;
@@ -3861,7 +3999,8 @@ _compare_obj_names(MachineObject* obj1, MachineObject* obj2)
 /*******************************************************************/
 static void
 _collect_sorted_machines(Slic3r::DeviceManager* dev_manager,
-                         std::vector<MachineObject*>& sorted_machine_objs)
+                         std::vector<MachineObject*>& sorted_machine_objs,
+                         PartPlate *plate)
 {
     sorted_machine_objs.clear();
     if (!dev_manager)
@@ -3871,22 +4010,22 @@ _collect_sorted_machines(Slic3r::DeviceManager* dev_manager,
 
     /* Step 1 :Collect the target and compatible types*/
     PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    const std::string& printer_type = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return;
+    }
+    const std::string printer_type = resolved.printer_preset->get_printer_type(preset_bundle);
     const auto& compatible_types_list = DevPrinterConfigUtil::get_compatible_machine(printer_type);
     std::set<std::string> compatible_types_set(compatible_types_list.begin(), compatible_types_list.end());
 
     /* Step 2: collect different machine list*/
-    MachineObject* cur_selected_obj = dev_manager->get_selected_machine();
     std::vector<MachineObject*> match_avaliable_list;  // match and availiable machines
     std::vector<MachineObject*> match_inavaliable_list;// match but inavaliable machines
     std::vector<MachineObject*> other_list;// other bound machines
     auto _collect_machine = [&](MachineObject* obj)
     {
-         if (obj == cur_selected_obj)
-         {
-             return;
-         }
-
         if (obj->printer_type == printer_type)
         {
             obj->is_avaliable() ? match_avaliable_list.push_back(obj) : match_inavaliable_list.push_back(obj);
@@ -3923,12 +4062,6 @@ _collect_sorted_machines(Slic3r::DeviceManager* dev_manager,
         }
     };
 
-    // the shown list, STUDIO-8235
-    if (cur_selected_obj)
-    {
-        std::vector<MachineObject*> cur_selected_obj_list{ cur_selected_obj };
-        _collect_sorted_objs(cur_selected_obj_list, sorted_machine_objs);
-    }
     _collect_sorted_objs(match_avaliable_list, sorted_machine_objs);
     _collect_sorted_objs(match_inavaliable_list, sorted_machine_objs);
     _collect_sorted_objs(other_list, sorted_machine_objs);
@@ -3945,16 +4078,52 @@ void SelectMachineDialog::update_user_printer()
         m_print_info = "";
     }
 
-    // update the machine list, and select a default machine
-    _collect_sorted_machines(dev, m_list);
+    // Update the machine list. Normal project dispatch is selected only from the
+    // plate's explicit physical-printer assignment.
+    PartPlate *plate = m_print_type == PrintFromType::FROM_NORMAL
+        ? m_plater->get_partplate_list().get_plate(m_print_plate_idx)
+        : nullptr;
+    if (m_print_type == PrintFromType::FROM_NORMAL && plate == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": normal dispatch has no explicit plate";
+        m_list.clear();
+        m_printer_box->SetPrinters(m_list);
+        m_printer_last_select.clear();
+        update_select_layout(nullptr);
+        return;
+    }
+
+    _collect_sorted_machines(dev, m_list, plate);
     m_printer_box->SetPrinters(m_list);
     if (!m_list.empty())
     {
-        m_printer_last_select = m_list.front()->get_dev_id();
-        m_printer_box->GetPrinterComboBox()->SetSelection(0);
-        wxCommandEvent event(wxEVT_COMBOBOX);
-        event.SetEventObject(m_printer_box->GetPrinterComboBox());
-        wxPostEvent(m_printer_box->GetPrinterComboBox(), event);
+        int selection = -1;
+        std::string requested_device;
+        if (m_print_type == PrintFromType::FROM_NORMAL)
+            requested_device = plate ? plate->get_physical_printer_id() : std::string();
+        else if (m_print_type == PrintFromType::FROM_SDCARD_VIEW) {
+            MachineObject *selected = dev->get_selected_machine();
+            if (selected != nullptr)
+                requested_device = selected->get_dev_id();
+        }
+        if (!requested_device.empty()) {
+            for (size_t i = 0; i < m_list.size(); ++i) {
+                if (m_list[i]->get_dev_id() == requested_device) {
+                    selection = int(i);
+                    break;
+                }
+            }
+        }
+
+        m_printer_box->GetPrinterComboBox()->SetSelection(selection);
+        if (selection >= 0) {
+            m_printer_last_select = m_list[size_t(selection)]->get_dev_id();
+            wxCommandEvent event(wxEVT_COMBOBOX);
+            event.SetEventObject(m_printer_box->GetPrinterComboBox());
+            wxPostEvent(m_printer_box->GetPrinterComboBox(), event);
+        } else {
+            m_printer_last_select = requested_device;
+            update_select_layout(nullptr);
+        }
     }
     else
     {
@@ -4153,14 +4322,13 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
     if (obj && !obj->get_lan_mode_connection_state()) {
         obj->command_get_version();
         obj->command_request_push_all();
-        if (!dev->get_selected_machine()) {
-            dev->set_selected_machine(m_printer_last_select);
-        }else if (dev->get_selected_machine()->get_dev_id() != m_printer_last_select) {
-            dev->set_selected_machine(m_printer_last_select);
-        }
 
         // Has changed machine unrecoverably
         m_check_flag = false;
+
+        if (m_print_type == PrintFromType::FROM_NORMAL) {
+            m_plater->set_plate_physical_printer(m_print_plate_idx, m_printer_last_select);
+        }
     } else {
         BOOST_LOG_TRIVIAL(error) << "on_selection_changed dev_id not found";
         return;
@@ -4193,9 +4361,7 @@ void SelectMachineDialog::update_ams_check(MachineObject *obj)
 void SelectMachineDialog::update_filament_change_count()
 {
     /*check filament change times*/
-    PartPlate *  part_plate   = m_plater->get_partplate_list().get_curr_plate();
-    PrintBase *  print        = nullptr;
-    GCodeResult *gcode_result = nullptr;
+    PartPlate *part_plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
 
     m_change_filament_times_sizer->Show(false);
     m_txt_change_filament_times->Show(false);
@@ -4204,9 +4370,9 @@ void SelectMachineDialog::update_filament_change_count()
 
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
-    MachineObject *obj = dev->get_selected_machine();
+    MachineObject *obj = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj) return;
-    if (m_print_type == FROM_SDCARD_VIEW) return;
+    if (m_print_type == FROM_SDCARD_VIEW || part_plate == nullptr || part_plate->fff_print() == nullptr) return;
 
     std::vector<int> filament_ids;
     for (auto mr : m_ams_mapping_result) {
@@ -4216,7 +4382,7 @@ void SelectMachineDialog::update_filament_change_count()
     }
 
     /*check nozzle & filament is it the best*/
-    auto stats = m_plater->get_partplate_list().get_current_fff_print().statistics_by_extruder();
+    auto stats = part_plate->fff_print()->statistics_by_extruder();
     auto best  = stats.stats_by_multi_extruder_best;
     auto curr  = stats.stats_by_multi_extruder_curr;
 
@@ -4282,92 +4448,82 @@ static wxString _get_nozzle_name(int total_ext_count, int ext_id)
 // For example:
 // {0, {0.4, S_FLOW}}, {1, {0.8, H_FLOW}}
 // {0, {0.4, S_FLOW}}, {0, {0.4, H_FLOW}} // hybrid
-static std::unordered_multimap<int, NozzleDef> s_get_slicing_extuder_nozzles()
+static bool s_get_slicing_extuder_nozzles(PartPlate *plate,
+                                           std::unordered_multimap<int, NozzleDef> &used_extuder_nozzles,
+                                           std::string &error)
 {
-    std::unordered_multimap<int, NozzleDef> used_extuder_nozzles;
-
-    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    if (!preset_bundle) {
-        return used_extuder_nozzles;
+    used_extuder_nozzles.clear();
+    error.clear();
+    if (plate == nullptr) {
+        error = "Normal dispatch has no explicit plate";
+        return false;
     }
 
-    PartPlate* cur_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
-    if (!cur_plate) {
-        return used_extuder_nozzles;
-    }
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_plate_slicing_context(plate, resolved, error))
+        return false;
 
-    auto opt_nozzle_diameters = preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter");
-    if (!opt_nozzle_diameters) {
-        return used_extuder_nozzles;
-    }
-
-    auto nozzle_volume_type_opt = dynamic_cast<const ConfigOptionEnumsGeneric*>(preset_bundle->project_config.option("nozzle_volume_type"));
-    if (!nozzle_volume_type_opt) {
-        return used_extuder_nozzles;
+    const auto *nozzle_diameters = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *nozzle_volume_types = dynamic_cast<const ConfigOptionEnumsGeneric *>(
+        resolved.config.option("nozzle_volume_type"));
+    const auto *filament_volume_types = dynamic_cast<const ConfigOptionEnumsGeneric *>(
+        resolved.config.option("filament_volume_map"));
+    if (nozzle_diameters == nullptr || nozzle_volume_types == nullptr) {
+        error = "The plate slicing context has no complete nozzle definition";
+        return false;
     }
 
     try {
-        auto nozzle_group_res = DevUtilBackend::GetNozzleGroupResult(wxGetApp().plater());
-        if (nozzle_group_res && nozzle_group_res->is_support_dynamic_nozzle_map() && nozzle_volume_type_opt->values.size() == 2) {
-            const auto& used_nozzles = nozzle_group_res->get_used_nozzles_in_extruder();
-            for (const auto& used_nozzle : used_nozzles) {
-                NozzleDef nozzle_data;
-                nozzle_data.nozzle_diameter = std::stof(used_nozzle.diameter);
-                nozzle_data.nozzle_flow_type = DevNozzle::ToNozzleFlowType(used_nozzle.volume_type);
-                if (used_nozzle.extruder_id == 0) {
-                    used_extuder_nozzles.insert({ DEPUTY_EXTRUDER_ID, nozzle_data });
-                } else if (used_nozzle.extruder_id == 1) {
-                    used_extuder_nozzles.insert({ MAIN_EXTRUDER_ID, nozzle_data });
-                }
-            };
-
-            return used_extuder_nozzles;
-        }
-
-        const auto& used_filament_idxs = cur_plate->get_used_filaments(); /*the index is started from 1*/
-        for (int used_filament_idx : used_filament_idxs) {
-            int physical_idx = cur_plate->get_physical_extruder_by_filament_id(preset_bundle->full_config(), used_filament_idx);
-            int logic_extruder_idx = cur_plate->get_logical_extruder_by_filament_id(preset_bundle->full_config(), used_filament_idx);
-            if (physical_idx < 0 || logic_extruder_idx < 0) {
-                assert(0);
-                continue;
+        for (int used_filament_idx : plate->get_used_filaments()) {
+            const int physical_idx = plate->get_physical_extruder_by_filament_id(resolved.config, used_filament_idx);
+            const int logical_idx = plate->get_logical_extruder_by_filament_id(resolved.config, used_filament_idx);
+            if (physical_idx < 0 || logical_idx < 0 ||
+                size_t(logical_idx) >= nozzle_diameters->values.size() ||
+                size_t(logical_idx) >= nozzle_volume_types->values.size()) {
+                error = "The plate filament-to-nozzle mapping is invalid";
+                used_extuder_nozzles.clear();
+                return false;
             }
 
-            NozzleDef nozzle_data;
-            nozzle_data.nozzle_diameter = float(opt_nozzle_diameters->get_at(logic_extruder_idx));
-            nozzle_data.nozzle_flow_type = NozzleFlowType::S_FLOW;// default value
-
-            auto volume_type = (NozzleVolumeType)nozzle_volume_type_opt->get_at(logic_extruder_idx);
+            NozzleVolumeType volume_type =
+                static_cast<NozzleVolumeType>(nozzle_volume_types->get_at(logical_idx));
             if (volume_type == NozzleVolumeType::nvtHybrid) {
-                if (used_extuder_nozzles.find(physical_idx) != used_extuder_nozzles.end()) {
-                    continue;// already collected
+                const int filament_idx = used_filament_idx - 1;
+                if (filament_volume_types == nullptr || filament_idx < 0 ||
+                    size_t(filament_idx) >= filament_volume_types->values.size()) {
+                    error = "The plate hybrid-nozzle assignment has no exact filament volume mapping";
+                    used_extuder_nozzles.clear();
+                    return false;
                 }
-
-                // A hybrid extruder prints with a mix of nozzle flows: collect the flow of each
-                // physically used nozzle instead of forcing a single one.
-                if (nozzle_group_res) {
-                    for (const auto& nozzle_info : nozzle_group_res->get_used_nozzles_in_extruder(logic_extruder_idx)) {
-                        nozzle_data.nozzle_flow_type = DevNozzle::ToNozzleFlowType(nozzle_info.volume_type);
-                        used_extuder_nozzles.insert({ physical_idx, nozzle_data });
-                    }
-                } else {
-                    // Orca: a by-object plate with several objects produces no plate-level nozzle
-                    // grouping, so the used flows are unknown; skip the check for this extruder
-                    // rather than blocking the print.
-                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no nozzle group result, nozzle check skipped for extruder " << logic_extruder_idx;
+                volume_type = static_cast<NozzleVolumeType>(filament_volume_types->get_at(filament_idx));
+                if (volume_type == NozzleVolumeType::nvtHybrid) {
+                    error = "The plate hybrid-nozzle assignment does not identify a physical nozzle flow";
+                    used_extuder_nozzles.clear();
+                    return false;
                 }
-
-                continue;
             }
 
-            nozzle_data.nozzle_flow_type = DevNozzle::ToNozzleFlowType(volume_type);
-            used_extuder_nozzles.insert({ physical_idx, nozzle_data });
-        };
-    } catch (const std::exception& e) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "exception: " << e.what();
+            NozzleDef nozzle;
+            nozzle.nozzle_diameter = float(nozzle_diameters->get_at(logical_idx));
+            nozzle.nozzle_flow_type = DevNozzle::ToNozzleFlowType(volume_type);
+            if (nozzle.nozzle_diameter <= 0.0f || nozzle.nozzle_flow_type == NozzleFlowType::NONE_FLOWTYPE) {
+                error = "The plate slicing context contains an invalid nozzle requirement";
+                used_extuder_nozzles.clear();
+                return false;
+            }
+            used_extuder_nozzles.insert({physical_idx, nozzle});
+        }
+    } catch (const std::exception &ex) {
+        error = "Unable to resolve the plate nozzle requirements: " + std::string(ex.what());
+        used_extuder_nozzles.clear();
+        return false;
     }
 
-    return used_extuder_nozzles;
+    if (used_extuder_nozzles.empty()) {
+        error = "The sliced plate has no nozzle requirements";
+        return false;
+    }
+    return true;
 }
 
 bool SelectMachineDialog::CheckErrorRackStatus(MachineObject* obj_)
@@ -4475,7 +4631,14 @@ bool SelectMachineDialog::CheckErrorExtruderNozzleWithSlicing(MachineObject* obj
     const auto& ext_sys = obj_->GetExtderSystem();
     const auto& nozzle_sys = obj_->GetNozzleSystem();
     if (m_print_type == FROM_NORMAL) {
-        const auto& slicing_ext_nozzles = s_get_slicing_extuder_nozzles();
+        std::unordered_multimap<int, NozzleDef> slicing_ext_nozzles;
+        std::string nozzle_error;
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        if (!s_get_slicing_extuder_nozzles(plate, slicing_ext_nozzles, nozzle_error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << nozzle_error;
+            show_status(PrintDialogStatus::PrintStatusNozzleDataInvalid, {from_u8(nozzle_error)});
+            return false;
+        }
         for (auto slicing_ext_nozzle : slicing_ext_nozzles) {
             int slicing_ext_idx = slicing_ext_nozzle.first;
             auto slicing_ext = slicing_ext_nozzle.second;
@@ -4636,10 +4799,15 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     /*mode check*/
     if (get_status() == PrintDialogStatus::PrintStatusRefreshingMachineList || get_status() == PrintDialogStatus::PrintStatusSending) return;
 
+    PartPlate *normal_plate = nullptr;
     /*no valid gcode file*/
     if (m_print_type == PrintFromType::FROM_NORMAL) {
-        PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
-        if (plate && !plate->is_valid_gcode_file()) {
+        normal_plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        if (normal_plate == nullptr) {
+            show_status(PrintDialogStatus::PrintStatusBlankPlate);
+            return;
+        }
+        if (!normal_plate->is_valid_gcode_file()) {
             show_status(PrintDialogStatus::PrintStatusBlankPlate);
             return;
         }
@@ -4666,13 +4834,6 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     }
 
     reset_timeout();
-
-    /*check print all*/
-    if (!obj_->GetConfig()->SupportPrintAllPlates() && m_print_plate_idx == PLATE_ALL_IDX)
-    {
-        show_status(PrintDialogStatus::PrintStatusNotSupportedPrintAll);
-        return;
-    }
 
     if (!m_check_flag && obj_->is_info_ready()) {
         update_select_layout(obj_);
@@ -4753,7 +4914,18 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     // shows the actual count.
     int max_color = obj_->get_max_filament_color_count();
     if (max_color < 16) max_color = 16;
-    if (wxGetApp().preset_bundle->filament_presets.size() > (size_t)max_color && m_print_type != PrintFromType::FROM_SDCARD_VIEW) {
+    size_t sliced_filament_count = m_filaments_map.size();
+    if (m_print_type == PrintFromType::FROM_NORMAL) {
+        ResolvedPlateSlicingConfig resolved;
+        std::string context_error;
+        if (!resolve_plate_slicing_context(normal_plate, resolved, context_error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+            show_status(PrintDialogStatus::PrintStatusBlankPlate);
+            return;
+        }
+        sliced_filament_count = resolved.filament_presets.size();
+    }
+    if (sliced_filament_count > (size_t)max_color) {
         if (!obj_->is_enable_ams_np && !obj_->is_enable_np)
         {
             show_status(PrintDialogStatus::PrintStatusColorQuantityExceed, {wxString::Format("%d", max_color)});
@@ -4799,9 +4971,6 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
         }
     }
 
-    const auto &full_config = wxGetApp().preset_bundle->full_config();
-    size_t      nozzle_nums = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
-
     // Filament Track Switch: warn on a slicing/hardware mismatch, and block Send when dynamic
     // nozzle mapping needs a switch that isn't installed or set up. No-op for printers without one.
     if (!CheckErrorDynamicSwitchNozzle(obj_)) return;
@@ -4816,7 +4985,13 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     {
         // Orca: blocking hardness gate on the mounted nozzles; the rack extruder is instead judged
         // per dispatch-mapped nozzle in the blacklist loop below, as a non-blocking caution.
-        const auto &used_nozzle_idxes = _get_used_nozzle_idxes();
+        std::unordered_set<int> used_nozzle_idxes;
+        std::string used_nozzle_error;
+        if (!_get_used_nozzle_idxes(normal_plate, used_nozzle_idxes, used_nozzle_error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << used_nozzle_error;
+            show_status(PrintDialogStatus::PrintStatusNozzleDataInvalid, {from_u8(used_nozzle_error)});
+            return;
+        }
         for (const auto &extder : obj_->GetExtderSystem()->GetExtruders()) {
             if (used_nozzle_idxes.count(extder.GetNozzleId()) == 0) { continue; }
             if (_is_rack_managed_nozzle(obj_, extder.GetNozzleId())) { continue; }
@@ -4975,6 +5150,16 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     }
 
     /** warning check **/
+    PartPlate *status_plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig status_context;
+    std::string status_context_error;
+    if (!resolve_plate_slicing_context(status_plate, status_context, status_context_error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << status_context_error;
+        show_status(PrintDialogStatus::PrintStatusUnsupportedPrinter);
+        return;
+    }
+    const size_t nozzle_nums = status_context.config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+
     struct ExtruderStatus
     {
         bool has_ams{false};
@@ -5011,9 +5196,9 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
             PrintDialogStatus::PrintStatusSmartNozzleBlobNeedAuto,
             _L("There is stringing-prone filament in this file. For best print quality, we recommend switching nozzle clumping detection to Auto mode."),
             _L("Switch"),
-            [] {
+            [device_id = m_printer_last_select] {
                 DeviceManager* dev = wxGetApp().getDeviceManager();
-                MachineObject* o   = dev ? dev->get_selected_machine() : nullptr;
+                MachineObject* o   = resolve_machine_exact(dev, device_id);
                 if (o && o->GetPrintOptions())
                     o->GetPrintOptions()->command_smart_nozzle_blob_detect_mode(2);
             });
@@ -5082,8 +5267,20 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
         std::set<string>  high_temp_filaments;
         std::unordered_set<int> known_fila_soften_extruders;
         std::unordered_set<int> unknown_fila_soften_extruders;
-        auto preset_full_config = wxGetApp().preset_bundle->full_config();
-        auto chamber_temperatures = preset_full_config.option<ConfigOptionInts>("chamber_temperature");
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!resolve_plate_slicing_context(plate, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            show_status(PrintDialogStatus::PrintStatusUnsupportedPrinter);
+            return;
+        }
+        auto chamber_temperatures = resolved.config.option<ConfigOptionInts>("chamber_temperature");
+        if (!chamber_temperatures) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate config has no chamber_temperature";
+            show_status(PrintDialogStatus::PrintStatusUnsupportedPrinter);
+            return;
+        }
         for (const FilamentInfo& item : m_ams_mapping_result) {
             try
             {
@@ -5157,7 +5354,7 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
 
 bool SelectMachineDialog::has_timelapse_warning(wxString &msg_text)
 {
-    PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
     for (auto warning : plate->get_slice_result()->warnings) {
         if (warning.msg == NOT_GENERATE_TIMELAPSE) {
             if (warning.error_code == "10014001") {
@@ -5177,10 +5374,10 @@ bool SelectMachineDialog::can_support_pa_auto_cali()
 {
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev)
-        return true;
-    MachineObject *obj = dev->get_selected_machine();
+        return false;
+    MachineObject *obj = resolve_machine_exact(dev, m_printer_last_select);
     if (!obj)
-        return true;
+        return false;
 
     std::vector<std::string> unsupport_auto_cali_filaments = DevPrinterConfigUtil::get_unsupport_auto_cali_filaments(obj->printer_type);
     if (!unsupport_auto_cali_filaments.empty()) {
@@ -5274,14 +5471,10 @@ void SelectMachineDialog::set_default()
     //project name
     m_rename_switch_panel->SetSelection(0);
 
-    wxString filename = m_plater->get_export_gcode_filename("", true, m_print_plate_idx == PLATE_ALL_IDX ? true : false);
-    if (m_print_plate_idx == PLATE_ALL_IDX && filename.empty()) {
-        filename = _L("Untitled");
-    }
+    wxString filename = m_plater->get_export_gcode_filename_for_plate(m_print_plate_idx, "", true);
 
     if (filename.empty()) {
-        filename = m_plater->get_export_gcode_filename("", true);
-        if (filename.empty()) filename = _L("Untitled");
+        filename = _L("Untitled");
     }
 
     fs::path filename_path(filename.c_str());
@@ -5330,7 +5523,12 @@ void SelectMachineDialog::set_default()
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
         reset_and_sync_ams_list();
-        set_default_normal(m_plater->get_partplate_list().get_curr_plate()->thumbnail_data);
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        if (plate == nullptr) {
+            show_error(this, _L("Normal dispatch has no explicit plate."), false);
+            return;
+        }
+        set_default_normal(plate->thumbnail_data);
     }
     else if (m_print_type == PrintFromType::FROM_SDCARD_VIEW) {
         update_page_turn_state(true);
@@ -5375,32 +5573,30 @@ void SelectMachineDialog::reset_and_sync_ams_list()
     std::vector<std::string> display_materials;
     std::vector<std::string> m_filaments_id;
     auto                     preset_bundle = wxGetApp().preset_bundle;
-
-    for (auto filament_name : preset_bundle->filament_presets) {
-        for (int f_index = 0; f_index < preset_bundle->filaments.size(); f_index++) {
-            PresetCollection *filament_presets = &wxGetApp().preset_bundle->filaments;
-            Preset *          preset           = &filament_presets->preset(f_index);
-            int size = preset_bundle->filaments.size();
-            if (preset && filament_name.compare(preset->name) == 0) {
-                std::string display_filament_type;
-                std::string filament_type = preset->config.get_filament_type(display_filament_type);
-                std::string m_filament_id = preset->filament_id;
-                display_materials.push_back(display_filament_type);
-                materials.push_back(filament_type);
-                m_filaments_id.push_back(m_filament_id);
-
-                std::string m_vendor_name = "";
-                auto        vendor        = dynamic_cast<ConfigOptionStrings *>(preset->config.option("filament_vendor"));
-                if (vendor && (vendor->values.size() > 0)) {
-                    std::string vendor_name = vendor->values[0];
-                    m_vendor_name           = vendor_name;
-                }
-                brands.push_back(m_vendor_name);
-            }
-        }
+    PartPlate              *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return;
     }
 
-    auto           extruders = wxGetApp().plater()->get_partplate_list().get_curr_plate()->get_used_filaments();
+    for (const Preset *preset : resolved.filament_presets) {
+        std::string display_filament_type;
+        DynamicPrintConfig filament_config = preset->config;
+        const std::string filament_type = filament_config.get_filament_type(display_filament_type);
+        display_materials.push_back(display_filament_type);
+        materials.push_back(filament_type);
+        m_filaments_id.push_back(preset->filament_id);
+
+        std::string vendor_name;
+        if (const auto *vendor = dynamic_cast<const ConfigOptionStrings *>(preset->config.option("filament_vendor"));
+            vendor && !vendor->values.empty())
+            vendor_name = vendor->values.front();
+        brands.push_back(vendor_name);
+    }
+
+    auto           extruders = plate->get_used_filaments();
     BitmapCache    bmcache;
     MaterialHash::iterator iter = m_materialList.begin();
     while (iter != m_materialList.end()) {
@@ -5416,14 +5612,12 @@ void SelectMachineDialog::reset_and_sync_ams_list()
     m_filaments.clear();
     m_ams_tooltip =_L("Upper half area:  Original\nLower half area:  Filament in AMS\nAnd you can click it to modify");
 
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    size_t nozzle_nums = full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+    size_t nozzle_nums = resolved.config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
 
     bool use_double_extruder = nozzle_nums > 1 ? true : false;
     if (use_double_extruder)
     {
-        const auto& project_config = preset_bundle->project_config;
-        m_filaments_map = wxGetApp().plater()->get_partplate_list().get_curr_plate()->get_real_filament_maps(project_config);
+        m_filaments_map = plate->get_real_filament_maps(resolved.config);
     }
 
     bool          selected_any      = false;
@@ -5432,7 +5626,7 @@ void SelectMachineDialog::reset_and_sync_ams_list()
 
     for (auto i = 0; i < extruders.size(); i++) {
         auto          extruder = extruders[i] - 1;
-        auto          colour   = wxGetApp().preset_bundle->project_config.opt_string("filament_colour", (unsigned int) extruder);
+        auto          colour   = resolved.config.opt_string("filament_colour", (unsigned int) extruder);
         unsigned char rgb[4];
         bmcache.parse_color4(colour, rgb);
 
@@ -5496,7 +5690,7 @@ void SelectMachineDialog::reset_and_sync_ams_list()
             // update ams data
             DeviceManager *dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
             if (!dev_manager) return;
-            MachineObject *obj_ = dev_manager->get_selected_machine();
+            MachineObject *obj_ = resolve_machine_exact(dev_manager, m_printer_last_select);
             m_mapping_popup.set_show_type(get_filament_mapping_show_type(obj_, extruder));
             if (obj_) {
                 if (m_mapping_popup.IsShown()) return;
@@ -5565,9 +5759,9 @@ void SelectMachineDialog::reset_and_sync_ams_list()
     }
 
     // Orca: a filament switch feeds both extruders, so the per-nozzle material items collapse into
-    // the single panel. Reposition once the selected machine's switch state is known (no-op otherwise).
+    // the single panel. Reposition once the exact dialog target's switch state is known.
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    update_material_item_pos(dev ? dev->get_selected_machine() : nullptr);
+    update_material_item_pos(resolve_machine_exact(dev, m_printer_last_select));
 
     // reset_ams_material();//show "-"
 }
@@ -5816,8 +6010,13 @@ void SelectMachineDialog::final_deal_edge_pixels_data(ThumbnailData &data)
 void SelectMachineDialog::updata_thumbnail_data_after_connected_printer()
 {
     // change thumbnail_data
-    ThumbnailData &input_data          = m_plater->get_partplate_list().get_curr_plate()->thumbnail_data;
-    ThumbnailData &no_light_data = m_plater->get_partplate_list().get_curr_plate()->no_light_thumbnail_data;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    if (plate == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": normal dispatch has no explicit plate";
+        return;
+    }
+    ThumbnailData &input_data = plate->thumbnail_data;
+    ThumbnailData &no_light_data = plate->no_light_thumbnail_data;
     if (input_data.width == 0 || input_data.height == 0 || no_light_data.width == 0 || no_light_data.height == 0) {
         wxGetApp().plater()->update_all_plate_thumbnails(false);
     }
@@ -5928,29 +6127,29 @@ void SelectMachineDialog::set_default_normal(const ThumbnailData &data)
     m_basic_panel->Layout();
     m_basic_panel->Fit();
 
-    // disable pei bed
-    DeviceManager *dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
-    if (!dev_manager) return;
-    MachineObject *obj_       = dev_manager->get_selected_machine();
-    wxSize         screenSize = wxGetDisplaySize();
-    auto           dialogSize = this->GetSize();
-
-#ifdef __WINDOWS__
-
-#endif // __WXOSX_MAC__
     // basic info
-    auto       aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
-    wxString   time;
-    PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
-    if (plate) {
-        if (plate->get_slice_result()) { time = wxString::Format("%s", short_time(get_time_dhms(plate->get_slice_result()->print_statistics.modes[0].time))); }
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    if (plate == nullptr || plate->get_slice_result() == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained slice result";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
     }
+    float  print_time_seconds = 0.f;
+    double weight_grams       = 0.;
+    if (!plate->get_retained_print_statistics(print_time_seconds, weight_grams)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained statistics";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
+    }
+    wxString time = wxString::Format("%s", short_time(get_time_dhms(print_time_seconds)));
 
     char weight[64];
     if (wxGetApp().app_config->get("use_inches") == "1") {
-        ::sprintf(weight, "%.2f oz", aprint_stats.total_weight * 0.035274); // ORCA remove spacing before text
+        ::sprintf(weight, "%.2f oz", weight_grams * 0.035274); // ORCA remove spacing before text
     } else {
-        ::sprintf(weight, "%.2f g", aprint_stats.total_weight); // ORCA remove spacing before text
+        ::sprintf(weight, "%.2f g", weight_grams); // ORCA remove spacing before text
     }
 
     m_stext_time->SetLabel(time);
@@ -5961,7 +6160,9 @@ void SelectMachineDialog::set_default_from_sdcard()
 {
     DeviceManager *dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev_manager) return;
-    MachineObject *obj_ = dev_manager->get_selected_machine();
+    MachineObject *selected = dev_manager->get_selected_machine();
+    m_printer_last_select = selected != nullptr ? selected->get_dev_id() : std::string();
+    MachineObject *obj_ = resolve_machine_exact(dev_manager, m_printer_last_select);
     if (!obj_) { return; };
 
     m_printer_box->SetPrinterName(wxString::FromUTF8(obj_->get_dev_name()));
@@ -6208,12 +6409,6 @@ bool SelectMachineDialog::Show(bool show)
         m_options_other->Show();
         m_refresh_timer->Start(LIST_REFRESH_INTERVAL);
 
-        //set a default machine when obj is null
-        if (DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager()) {
-            if (!dev->get_selected_machine()) {
-                dev->load_last_machine();
-            }
-        };
     } else {
         m_refresh_timer->Stop();
         return DPIDialog::Show(false);
@@ -6222,11 +6417,24 @@ bool SelectMachineDialog::Show(bool show)
     show_status(PrintDialogStatus::PrintStatusInit);
 
 
-    PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
-    const auto& project_config = preset_bundle.project_config;
-
     const t_config_enum_values &enum_keys_map = ConfigOptionEnum<BedType>::get_enum_values();
-    const ConfigOptionEnum<BedType>* bed_type=project_config.option<ConfigOptionEnum<BedType>>("curr_bed_type");
+    const ConfigOptionEnum<BedType> *bed_type = nullptr;
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (m_print_type == PrintFromType::FROM_NORMAL) {
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        if (!resolve_plate_slicing_context(plate, resolved, context_error)) {
+            show_error(this, from_u8(context_error), false);
+            return false;
+        }
+        bed_type = resolved.config.option<ConfigOptionEnum<BedType>>("curr_bed_type");
+    } else {
+        bed_type = m_required_data_config.option<ConfigOptionEnum<BedType>>("curr_bed_type");
+    }
+    if (bed_type == nullptr) {
+        show_error(this, _L("The sliced plate has no bed type."), false);
+        return false;
+    }
     std::string plate_name;
     for (auto& elem : enum_keys_map) {
         if (elem.second == bed_type->value)

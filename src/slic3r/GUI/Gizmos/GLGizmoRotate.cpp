@@ -600,7 +600,11 @@ void GLGizmoRotate3D::data_changed(bool is_serializing) {
 
     bool is_wipe_tower = selection.is_wipe_tower();
     if (is_wipe_tower) {
-        DynamicPrintConfig& config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error))
+            throw RuntimeError(error);
+        const DynamicPrintConfig& config = resolved.config;
         float wipe_tower_rotation_angle =
             dynamic_cast<const ConfigOptionFloat *>(
                 config.option("wipe_tower_rotation_angle"))

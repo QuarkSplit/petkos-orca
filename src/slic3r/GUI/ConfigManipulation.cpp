@@ -205,7 +205,9 @@ void ConfigManipulation::check_filament_max_volumetric_speed(DynamicPrintConfig 
 
 void ConfigManipulation::check_chamber_temperature(DynamicPrintConfig* config)
 {
-   bool support_chamber_temp_control=GUI::wxGetApp().preset_bundle->printers.get_selected_preset().config.opt_bool("support_chamber_temp_control");
+    if (printer_config == nullptr)
+        throw RuntimeError("ConfigManipulation has no printer context");
+    bool support_chamber_temp_control = printer_config->opt_bool("support_chamber_temp_control");
     if (support_chamber_temp_control&&config->has("chamber_temperature")) {
         std::string filament_type = config->option<ConfigOptionStrings>("filament_type")->get_at(0);
         int chamber_min_temp, chamber_max_temp;
@@ -259,7 +261,8 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
 
     // layer_height shouldn't be equal to zero
     auto layer_height = config->opt_float("layer_height");
-    auto gpreset = GUI::wxGetApp().preset_bundle->printers.get_edited_preset();
+    if (printer_config == nullptr)
+        throw RuntimeError("ConfigManipulation has no printer context");
     if (layer_height < EPSILON)
     {
         const wxString msg_text = _(L("Layer height too small\nIt has been reset to 0.2"));
@@ -273,7 +276,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     }
 
     //BBS: limite the max layer_herght
-    auto max_lh = gpreset.config.opt_float("max_layer_height",0);
+    auto max_lh = printer_config->opt_float("max_layer_height",0);
     if (max_lh > 0.2 && layer_height > max_lh+ EPSILON)
     {
         const wxString msg_text = wxString::Format(L"Too large layer height.\nReset to %0.3f.", max_lh);
@@ -359,7 +362,7 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     }
 
     if (config->option<ConfigOptionBool>("enable_wrapping_detection")->value) {
-        std::string printer_type = wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+        const std::string printer_type = printer_config->opt_string("printer_model");
         if (!DevPrinterConfigUtil::support_wrapping_detection(printer_type)) {
             DynamicPrintConfig new_conf = *config;
             new_conf.set_key_value("enable_wrapping_detection", new ConfigOptionBool(false));
@@ -626,9 +629,9 @@ void ConfigManipulation::apply_null_fff_config(DynamicPrintConfig *config, std::
 
 void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, int variant_index, const bool is_global_config)
 {
-    PresetBundle *preset_bundle  = wxGetApp().preset_bundle;
-
-    const GCodeFlavor gcflavor = preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value;
+    if (printer_config == nullptr)
+        throw RuntimeError("ConfigManipulation has no printer context");
+    const GCodeFlavor gcflavor = printer_config->option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value;
 
     // Orca: use booleans to avoid repeated comparisons with enum values
     const bool gcf_is_marlin_firmware = gcflavor == GCodeFlavor::gcfMarlinFirmware;
@@ -773,7 +776,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     bool machine_supports_junction_deviation = false;
     if (gcf_is_marlin_firmware) {
-        if (const auto *machine_jd = preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("machine_max_junction_deviation")) {
+        if (const auto *machine_jd = printer_config->option<ConfigOptionFloats>("machine_max_junction_deviation")) {
             machine_supports_junction_deviation = !machine_jd->values.empty() && machine_jd->values.front() > 0.0;
         }
     }
@@ -920,8 +923,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     toggle_field("single_extruder_multi_material", !is_BBL_Printer);
 
-    auto bSEMM = preset_bundle->printers.get_edited_preset().config.opt_bool("single_extruder_multi_material");
-    const bool supports_wipe_tower_2 = !is_BBL_Printer && preset_bundle->printers.get_edited_preset().config.opt_enum<WipeTowerType>("wipe_tower_type") == WipeTowerType::Type2;
+    auto bSEMM = printer_config->opt_bool("single_extruder_multi_material");
+    const bool supports_wipe_tower_2 = !is_BBL_Printer && printer_config->opt_enum<WipeTowerType>("wipe_tower_type") == WipeTowerType::Type2;
 
     toggle_field("ooze_prevention", !bSEMM);
     bool have_ooze_prevention = config->opt_bool("ooze_prevention");
@@ -937,7 +940,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("enable_tower_interface_cooldown_during_tower",
                 have_prime_tower && config->opt_bool("enable_tower_interface_features"));
 
-    bool purge_in_primetower = preset_bundle->printers.get_edited_preset().config.opt_bool("purge_in_prime_tower");
+    bool purge_in_primetower = printer_config->opt_bool("purge_in_prime_tower");
 
     for (auto el : {"wipe_tower_rotation_angle", "wipe_tower_cone_angle",
                     "wipe_tower_extra_spacing", "wipe_tower_max_purge_speed",
@@ -1077,7 +1080,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     
     toggle_line("infill_overhang_angle", config->opt_enum<InfillPattern>("sparse_infill_pattern") == InfillPattern::ipLateralHoneycomb);
 
-    std::string printer_type = wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+    const std::string printer_type = printer_config->opt_string("printer_model");
     toggle_line("enable_wrapping_detection", DevPrinterConfigUtil::support_wrapping_detection(printer_type));
 
     // Orca: wave-overhangs conditional visibility.
@@ -1220,7 +1223,9 @@ void ConfigManipulation::toggle_print_sla_options(DynamicPrintConfig* config)
 int ConfigManipulation::show_spiral_mode_settings_dialog(bool is_object_config)
 {
     wxString msg_text = _(L("Spiral mode only works when wall loops is 1, support is disabled, clumping detection by probing is disabled, top shell layers is 0, sparse infill density is 0 and timelapse type is traditional."));
-    auto printer_structure_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+    if (printer_config == nullptr)
+        throw RuntimeError("ConfigManipulation has no printer context");
+    auto printer_structure_opt = printer_config->option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
     if (printer_structure_opt && printer_structure_opt->value == PrinterStructure::psI3) {
         msg_text += _(L(" But machines with I3 structure will not generate timelapse videos."));
     }

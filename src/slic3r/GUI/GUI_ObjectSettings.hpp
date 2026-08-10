@@ -65,7 +65,8 @@ public:
      * Example: if Infill is set to 100%, and Fill Pattern is missed in config_to,
      * we should add sparse_infill_pattern to avoid endless loop in update
      */
-    bool        add_missed_options(ModelConfig *config_to, const DynamicPrintConfig &config_from);
+    bool        add_missed_options(ModelConfig *config_to, const DynamicPrintConfig &config_from,
+                                   const DynamicPrintConfig &plate_config);
     void        update_config_values(ModelConfig *config);
     void        UpdateAndShow(const bool show);
     void        msw_rescale();

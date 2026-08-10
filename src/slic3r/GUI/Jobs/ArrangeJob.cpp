@@ -69,6 +69,40 @@ static WipeTower get_wipe_tower(const Plater &plater, int plate_idx)
     return WipeTower{plater.canvas3D()->get_wipe_tower_info(plate_idx)};
 }
 
+static ResolvedPlateSlicingConfig resolve_arrange_plate(PartPlate *plate)
+{
+    PresetBundle &bundle = *wxGetApp().preset_bundle;
+    PlateSlicingContext context;
+    std::vector<int> filament_maps;
+    std::vector<int> volume_maps;
+    if (plate != nullptr) {
+        context       = plate->get_slicing_context();
+        filament_maps = plate->get_real_filament_maps(bundle.project_config);
+        volume_maps   = plate->get_real_filament_volume_maps(bundle.project_config);
+    } else {
+        const auto *maps = bundle.project_config.option<ConfigOptionInts>("filament_map");
+        const auto *volumes = bundle.project_config.option<ConfigOptionInts>("filament_volume_map");
+        if (maps != nullptr)
+            filament_maps = maps->values;
+        if (volumes != nullptr)
+            volume_maps = volumes->values;
+    }
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!bundle.resolve_plate_slicing_config(context, filament_maps, volume_maps,
+                                             resolved, error)) {
+        if (plate != nullptr) {
+            plate->update_apply_result_invalid(true);
+            throw RuntimeError((boost::format("Plate %1% has an unresolved slicing context: %2%")
+                                % (plate->get_index() + 1) % error).str());
+        }
+        throw RuntimeError("The Project-row slicing context is unresolved: " + error);
+    }
+    if (plate != nullptr)
+        resolved.config.apply(*plate->config(), true);
+    return resolved;
+}
+
 arrangement::ArrangePolygon get_wipetower_arrange_poly(WipeTower* tower)
 {
     ArrangePolygon ap = tower->get_arrange_polygon();
@@ -100,11 +134,15 @@ void ArrangeJob::clear_input()
     current_plate_index = 0;
 }
 
-ArrangePolygon ArrangeJob::prepare_arrange_polygon(void* model_instance)
+ArrangePolygon ArrangeJob::prepare_arrange_polygon(int object_idx, int instance_idx)
 {
-    ModelInstance* instance = (ModelInstance*)model_instance;
-    const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
-    return get_instance_arrange_poly(instance, config);
+    PartPlateList &plates = m_plater->get_partplate_list();
+    int plate_idx = only_on_partplate ? current_plate_index : plates.find_instance_belongs(object_idx, instance_idx);
+    if (plate_idx < 0)
+        plate_idx = only_on_partplate ? current_plate_index : plates.find_instance(object_idx, instance_idx);
+
+    const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(plate_idx < 0 ? nullptr : plates.get_plate(plate_idx));
+    return get_instance_arrange_poly(m_plater->model().objects[object_idx]->instances[instance_idx], resolved.config);
 }
 
 void ArrangeJob::prepare_selected() {
@@ -137,7 +175,7 @@ void ArrangeJob::prepare_selected() {
 
         for (size_t i = 0; i < inst_sel.size(); ++i) {
             ModelInstance* mi = mo->instances[i];
-            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
+            ArrangePolygon&& ap = prepare_arrange_polygon((int)oidx, (int)i);
             //BBS: partplate_list preprocess
             //remove the locked plate's instances, neither in selected, nor in un-selected
             bool locked = plate_list.preprocess_arrange_polygon(oidx, i, ap, inst_sel[i]);
@@ -209,7 +247,7 @@ void ArrangeJob::prepare_all() {
 
         for (size_t i = 0; i < mo->instances.size(); ++i) {
             ModelInstance * mi = mo->instances[i];
-            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[i]);
+            ArrangePolygon&& ap = prepare_arrange_polygon((int)oidx, (int)i);
             //BBS: partplate_list preprocess
             //remove the locked plate's instances, neither in selected, nor in un-selected
             bool locked = plate_list.preprocess_arrange_polygon(oidx, i, ap, true);
@@ -247,26 +285,26 @@ void ArrangeJob::prepare_all() {
 
     prepare_wipe_tower();
 
-    const DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    bool   enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
+    const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
+    const bool enable_wrapping = project.config.opt_bool("enable_wrapping_detection");
 
     // add the virtual object into unselect list if has
     plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, MAX_NUM_PLATES);
 }
 
-arrangement::ArrangePolygon estimate_wipe_tower_info(int plate_index, std::set<int>& extruder_ids)
+arrangement::ArrangePolygon estimate_wipe_tower_info(int                                plate_index,
+                                                      PartPlate                         *geometry_plate,
+                                                      const ResolvedPlateSlicingConfig &resolved,
+                                                      std::set<int>                    &extruder_ids)
 {
-    PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    int plate_count = ppl.get_plate_count();
-    int plate_index_valid = std::min(plate_index, plate_count - 1);
-
     // we have to estimate the depth using the extruder number of all plates
     int extruder_size = extruder_ids.size();
 
     Vec3d wipe_tower_size, wipe_tower_pos;
-    int nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
-    auto arrange_poly = ppl.get_plate(plate_index_valid)->estimate_wipe_tower_polygon(full_config, plate_index, wipe_tower_pos, wipe_tower_size, nozzle_nums, extruder_size);
+    const auto *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    const int nozzle_nums = nozzles == nullptr ? 0 : (int)nozzles->values.size();
+    auto arrange_poly = geometry_plate->estimate_wipe_tower_polygon(resolved.config, plate_index, wipe_tower_pos,
+                                                                    wipe_tower_size, nozzle_nums, extruder_size);
     arrange_poly.bed_idx = plate_index;
     return arrange_poly;
 }
@@ -284,17 +322,6 @@ arrangement::ArrangePolygon estimate_wipe_tower_info(int plate_index, std::set<i
 void ArrangeJob::prepare_wipe_tower()
 {
     bool need_wipe_tower = false;
-
-    // if wipe tower is explicitly disabled, no need to estimate
-    DynamicPrintConfig& current_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    auto                op = current_config.option("enable_prime_tower");
-    bool enable_prime_tower = op && op->getBool();
-    if (!enable_prime_tower || params.is_seq_print) return;
-
-    bool smooth_timelapse = false;
-    auto sop = current_config.option("timelapse_type");
-    if (sop) { smooth_timelapse = sop->getInt() == TimelapseType::tlSmooth; }
-    if (smooth_timelapse) { need_wipe_tower = true; }
 
     // estimate if we need wipe tower for all plates:
     // need wipe tower if some object has multiple extruders (has paint-on colors or support material)
@@ -329,8 +356,6 @@ void ArrangeJob::prepare_wipe_tower()
     wipe_tower_ap.name = "WipeTower";
     wipe_tower_ap.is_virt_object = true;
     wipe_tower_ap.is_wipe_tower = true;
-    const GLCanvas3D* canvas3D = static_cast<const GLCanvas3D*>(m_plater->canvas3D());
-
     std::set<int> extruder_ids;
     PartPlateList& ppl = wxGetApp().plater()->get_partplate_list();
     int plate_count = ppl.get_plate_count();
@@ -338,25 +363,47 @@ void ArrangeJob::prepare_wipe_tower()
         extruder_ids = ppl.get_extruders(true);
     }
 
-    int bedid_unlocked = 0;
-    for (int bedid = 0; bedid < MAX_NUM_PLATES; bedid++) {
-        int plate_index_valid = std::min(bedid, plate_count - 1);
-        PartPlate* pl = ppl.get_plate(plate_index_valid);
-        if(bedid<plate_count && pl->is_locked())
-            continue;
-        if (auto wti = get_wipe_tower(*m_plater, bedid)) {
-            // wipe tower is already there
-            wipe_tower_ap = get_wipetower_arrange_poly(&wti);
-            wipe_tower_ap.bed_idx = bedid_unlocked;
-            m_unselected.emplace_back(wipe_tower_ap);
+    PartPlate *project_template = nullptr;
+    for (int i = 0; i < plate_count; ++i) {
+        PartPlate *candidate = ppl.get_plate(i);
+        if (!candidate->has_printer_assignment()) {
+            project_template = candidate;
+            break;
         }
-        else if (need_wipe_tower) {
-            if (only_on_partplate) {
+    }
+
+    int bedid_unlocked = 0;
+    const int bed_limit = project_template == nullptr ? plate_count : MAX_NUM_PLATES;
+    for (int bedid = 0; bedid < bed_limit; bedid++) {
+        const bool future_project_plate = bedid >= plate_count;
+        PartPlate* pl = future_project_plate ? project_template : ppl.get_plate(bedid);
+        if (!future_project_plate && pl->is_locked())
+            continue;
+        const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(future_project_plate ? nullptr : pl);
+        const bool enable_prime_tower = resolved.config.opt_bool("enable_prime_tower");
+        const bool smooth_timelapse = resolved.config.opt_enum<TimelapseType>("timelapse_type") == TimelapseType::tlSmooth;
+        const bool sequential = future_project_plate
+            ? resolved.config.opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject
+            : pl->get_real_print_seq() == PrintSequence::ByObject;
+        const bool plate_needs_wipe_tower = enable_prime_tower && !sequential && (need_wipe_tower || smooth_timelapse);
+        if (!future_project_plate) {
+            auto wti = get_wipe_tower(*m_plater, bedid);
+            if (wti) {
+                // wipe tower is already there
+                wipe_tower_ap = get_wipetower_arrange_poly(&wti);
+                wipe_tower_ap.bed_idx = bedid_unlocked;
+                m_unselected.emplace_back(wipe_tower_ap);
+                bedid_unlocked++;
+                continue;
+            }
+        }
+        if (plate_needs_wipe_tower) {
+            if (!future_project_plate) {
                 auto plate_extruders = pl->get_extruders(true);
                 extruder_ids.clear();
                 extruder_ids.insert(plate_extruders.begin(), plate_extruders.end());
             }
-            wipe_tower_ap = estimate_wipe_tower_info(bedid, extruder_ids);
+            wipe_tower_ap = estimate_wipe_tower_info(bedid, pl, resolved, extruder_ids);
             wipe_tower_ap.bed_idx = bedid_unlocked;
             m_unselected.emplace_back(wipe_tower_ap);
         }
@@ -397,7 +444,7 @@ void ArrangeJob::prepare_partplate() {
         for (size_t inst_idx = 0; inst_idx < mo->instances.size(); ++inst_idx)
         {
             bool             in_plate = plate->contain_instance(oidx, inst_idx) || plate->intersect_instance(oidx, inst_idx);
-            ArrangePolygon&& ap = prepare_arrange_polygon(mo->instances[inst_idx]);
+            ArrangePolygon&& ap = prepare_arrange_polygon((int)oidx, (int)inst_idx);
 
             ArrangePolygons& cont = mo->instances[inst_idx]->printable ?
                 (in_plate ? m_selected : m_unselected) :
@@ -424,8 +471,8 @@ void ArrangeJob::prepare_partplate() {
         m_unselected.emplace_back(std::move(ap));
     }
 
-    const DynamicPrintConfig &current_config  = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    bool   enable_wrapping = current_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
+    const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(plate);
+    const bool enable_wrapping = resolved.config.opt_bool("enable_wrapping_detection");
 
     // add the virtual object into unselect list if has
     plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, current_plate_index + 1);
@@ -441,10 +488,12 @@ void ArrangeJob::prepare()
     params = init_arrange_params(m_plater);
 
     //BBS update extruder params and speed table before arranging
-    const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
+    PartPlate *current_plate = m_plater->get_partplate_list().get_curr_plate();
+    const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(current_plate);
+    const Slic3r::DynamicPrintConfig& config = resolved.config;
     auto& print = wxGetApp().plater()->get_partplate_list().get_current_fff_print();
     auto print_config = print.config();
-    int numExtruders = wxGetApp().preset_bundle->filament_presets.size();
+    int numExtruders = (int)resolved.filament_presets.size();
 
     Model::setExtruderParams(config, numExtruders);
     Model::setPrintSpeedTable(config, print_config);
@@ -551,24 +600,6 @@ void ArrangeJob::process(Ctl &ctl)
 
     auto & partplate_list = m_plater->get_partplate_list();
 
-    const Slic3r::DynamicPrintConfig& global_config = wxGetApp().preset_bundle->full_config();
-    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    const bool is_bbl = wxGetApp().preset_bundle->is_bbl_vendor();
-    if (is_bbl && params.avoid_extrusion_cali_region && global_config.opt_bool("scan_first_layer"))
-        partplate_list.preprocess_nonprefered_areas(m_unselected, MAX_NUM_PLATES);
-
-    update_arrange_params(params, m_plater->config(), m_selected);
-    update_selected_items_inflation(m_selected, m_plater->config(), params);
-    update_unselected_items_inflation(m_unselected, m_plater->config(), params);
-    update_selected_items_axis_align(m_selected, m_plater->config(), params);
-
-    Points      bedpts = get_shrink_bedpts(m_plater->config(),params);
-
-    bool   enable_wrapping = global_config.option<ConfigOptionBool>("enable_wrapping_detection")->value;
-    partplate_list.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scale_(1));
-
-    BOOST_LOG_TRIVIAL(debug) << "arrange bedpts:" << bedpts[0].transpose() << ", " << bedpts[1].transpose() << ", " << bedpts[2].transpose() << ", " << bedpts[3].transpose();
-
     params.stopcondition = [&ctl]() { return ctl.was_canceled(); };
 
     params.progressind = [this, &ctl](unsigned num_finished, std::string str = "") {
@@ -604,8 +635,26 @@ void ArrangeJob::process(Ctl &ctl)
         }
     }
 
+    const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
+    const DynamicPrintConfig &project_config = project.config;
+    const bool enable_wrapping = project_config.opt_bool("enable_wrapping_detection");
+    Points bedpts;
+    if (!per_plate_beds) {
+        if (project.is_bbl_printer && params.avoid_extrusion_cali_region && project_config.opt_bool("scan_first_layer"))
+            partplate_list.preprocess_nonprefered_areas(m_unselected, MAX_NUM_PLATES);
+
+        update_arrange_params(params, &project_config, m_selected);
+        update_selected_items_inflation(m_selected, &project_config, params);
+        update_unselected_items_inflation(m_unselected, &project_config, params);
+        update_selected_items_axis_align(m_selected, &project_config, params);
+        bedpts = get_shrink_bedpts(&project_config, params);
+        partplate_list.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scale_(1));
+        BOOST_LOG_TRIVIAL(debug) << "arrange bedpts:" << bedpts[0].transpose() << ", " << bedpts[1].transpose()
+                                 << ", " << bedpts[2].transpose() << ", " << bedpts[3].transpose();
+    }
+
     if (per_plate_beds)
-        arrange_per_plate(ctl, bedpts, enable_wrapping);
+        arrange_per_plate(ctl, enable_wrapping);
     else
         arrangement::arrange(m_selected, m_unselected, bedpts, params);
 
@@ -639,7 +688,7 @@ void ArrangeJob::process(Ctl &ctl)
 }
 
 //Arrange with per-plate beds. Sticky first, pool second; see the header comment.
-void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool enable_wrapping)
+void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
 {
     PartPlateList& ppl = m_plater->get_partplate_list();
 
@@ -664,9 +713,9 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
             pool_beds.push_back(g);
     }
 
-    //group the selected items by where they came from. Items on no plate at all
-    //join the pool, where arrange is free to place them anywhere; if every plate
-    //is assigned there is no pool, so they go to the first sticky bed instead.
+    // Group selected items by their existing target. Items without a plate may
+    // enter the Project-row pool, but are never silently assigned to an arbitrary
+    // physical plate when the project has no unassigned plates.
     std::map<int, std::vector<size_t>> sticky_groups;
     std::vector<size_t> pool_items;
     auto is_sticky_bed = [&sticky_beds](int g) {
@@ -678,8 +727,11 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
             sticky_groups[src].push_back(k);
         else if (!pool_beds.empty())
             pool_items.push_back(k);
-        else if (!sticky_beds.empty())
-            sticky_groups[(src >= 0 && src < unlocked_count) ? src : sticky_beds.front()].push_back(k);
+        else {
+            m_selected[k].bed_idx = arrangement::UNARRANGED;
+            BOOST_LOG_TRIVIAL(error) << "arrange: " << m_selected[k].name
+                                     << " has no target plate and the project has no Project-row plate";
+        }
     }
 
     //progress spans all the sub-arranges as if they were one
@@ -704,19 +756,18 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
 
         const int plate_idx = logical_to_plate[g];
         PartPlate* plate = ppl.get_plate(plate_idx);
+        const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(plate);
+        const DynamicPrintConfig &plate_config = resolved.config;
+        const bool plate_enable_wrapping = plate_config.opt_bool("enable_wrapping_detection");
 
         //this plate's own outline, shrunk the same way the project bed is
         Points bed_g;
         const Pointfs& local_shape = plate->get_local_shape();
-        if (local_shape.empty()) {
-            //never been given a bed of its own; behave as if unassigned
-            bed_g = project_bedpts;
-        }
-        else {
-            for (const Vec2d& p : local_shape)
-                bed_g.emplace_back(scaled(p.x()), scaled(p.y()));
-            bed_g = arrangement::get_shrink_bedpts(std::move(bed_g), params);
-        }
+        if (local_shape.empty())
+            throw RuntimeError((boost::format("Plate %1% is assigned to printer '%2%' but has no resolved bed geometry")
+                                % (plate_idx + 1) % plate->get_printer_preset_name()).str());
+        for (const Vec2d& p : local_shape)
+            bed_g.emplace_back(scaled(p.x()), scaled(p.y()));
 
         //fixed items living on this bed keep their geometry; the plate-shape-derived
         //regions are rebuilt from this plate's own bed
@@ -727,12 +778,22 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
             unsel_g.emplace_back(ap);
             unsel_g.back().bed_idx = 0;
         }
-        ppl.preprocess_exclude_areas(unsel_g, enable_wrapping, 1, 0, plate_idx);
+        ppl.preprocess_exclude_areas(unsel_g, plate_enable_wrapping, 1, 0, plate_idx);
+        if (resolved.is_bbl_printer && params.avoid_extrusion_cali_region && plate_config.opt_bool("scan_first_layer"))
+            ppl.preprocess_nonprefered_areas(unsel_g, 1);
 
         arrangement::ArrangeParams params_g = params;
-        params_g.printable_height = (float)plate->get_printable_height();
+        params_g.clearance_height_to_rod = plate_config.opt_float("extruder_clearance_height_to_rod");
+        params_g.clearance_height_to_lid = plate_config.opt_float("extruder_clearance_height_to_lid");
+        params_g.clearance_radius        = plate_config.opt_float("extruder_clearance_radius");
+        params_g.printable_height        = (float)plate_config.opt_float("printable_height");
+        params_g.nozzle_height           = plate_config.opt_float("nozzle_height");
+        params_g.align_center            = plate_config.option<ConfigOptionPoint>("best_object_pos")->value;
+        params_g.is_seq_print            = plate->get_real_print_seq() == PrintSequence::ByObject;
+        params_g.bed_shrink_x            = params_g.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
+        params_g.bed_shrink_y            = params_g.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
         params_g.excluded_regions.clear();
-        ppl.preprocess_exclude_areas(params_g.excluded_regions, enable_wrapping, 1, scale_(1), plate_idx);
+        ppl.preprocess_exclude_areas(params_g.excluded_regions, plate_enable_wrapping, 1, scale_(1), plate_idx);
         params_g.progressind = make_progress(done);
 
         ArrangePolygons sel_g;
@@ -750,6 +811,11 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
         }
 
         if (!sel_g.empty()) {
+            update_arrange_params(params_g, &plate_config, sel_g);
+            update_selected_items_inflation(sel_g, &plate_config, params_g);
+            update_unselected_items_inflation(unsel_g, &plate_config, params_g);
+            update_selected_items_axis_align(sel_g, &plate_config, params_g);
+            bed_g = arrangement::get_shrink_bedpts(std::move(bed_g), params_g);
             BOOST_LOG_TRIVIAL(info) << boost::format("arrange: plate %1% ('%2%'): %3% items on its own bed")
                 % (plate_idx + 1) % plate->get_printer_preset_name() % sel_g.size();
             arrangement::arrange(sel_g, unsel_g, bed_g, params_g);
@@ -815,7 +881,18 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
         const int geometry_plate = logical_to_plate[pool_beds.front()];
         ppl.preprocess_exclude_areas(unsel_pool, enable_wrapping, MAX_NUM_PLATES, 0, geometry_plate);
 
+        const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
+        const DynamicPrintConfig &project_config = project.config;
         arrangement::ArrangeParams params_pool = params;
+        params_pool.clearance_height_to_rod = project_config.opt_float("extruder_clearance_height_to_rod");
+        params_pool.clearance_height_to_lid = project_config.opt_float("extruder_clearance_height_to_lid");
+        params_pool.clearance_radius        = project_config.opt_float("extruder_clearance_radius");
+        params_pool.printable_height        = project_config.opt_float("printable_height");
+        params_pool.nozzle_height           = project_config.opt_float("nozzle_height");
+        params_pool.align_center            = project_config.option<ConfigOptionPoint>("best_object_pos")->value;
+        params_pool.is_seq_print            = project_config.opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject;
+        params_pool.bed_shrink_x            = params_pool.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
+        params_pool.bed_shrink_y            = params_pool.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
         params_pool.excluded_regions.clear();
         ppl.preprocess_exclude_areas(params_pool.excluded_regions, enable_wrapping, 1, scale_(1), geometry_plate);
         params_pool.progressind = make_progress(done);
@@ -825,9 +902,17 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool 
         for (size_t k : pool_items)
             sel_pool.emplace_back(m_selected[k]);
 
+        if (project.is_bbl_printer && params_pool.avoid_extrusion_cali_region && project_config.opt_bool("scan_first_layer"))
+            ppl.preprocess_nonprefered_areas(unsel_pool, MAX_NUM_PLATES);
+        update_arrange_params(params_pool, &project_config, sel_pool);
+        update_selected_items_inflation(sel_pool, &project_config, params_pool);
+        update_unselected_items_inflation(unsel_pool, &project_config, params_pool);
+        update_selected_items_axis_align(sel_pool, &project_config, params_pool);
+        const Points project_bed = get_shrink_bedpts(&project_config, params_pool);
+
         BOOST_LOG_TRIVIAL(info) << boost::format("arrange: pool of %1% unassigned plates: %2% items on the project bed")
             % pool_beds.size() % sel_pool.size();
-        arrangement::arrange(sel_pool, unsel_pool, project_bedpts, params_pool);
+        arrangement::arrange(sel_pool, unsel_pool, project_bed, params_pool);
 
         std::map<int, size_t> by_itemid;
         for (size_t k : pool_items)

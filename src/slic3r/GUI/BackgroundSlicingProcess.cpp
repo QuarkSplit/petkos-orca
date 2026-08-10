@@ -86,9 +86,14 @@ std::pair<std::string, std::vector<size_t>> SlicingProcessCompletedEvent::format
         error     = ex.what();
         monospace = ex.objectId();
     } catch (SlicingErrors& exs) {
+        // SlicingErrors is a container: its own what() is a placeholder, and every message that names an
+        // object and its remedy lives in the elements. Assigning here instead of appending kept only the last
+        // one, so a plate with two unprintable objects reported one and the user fixed it twice.
         std::vector<size_t> ids;
         for (auto& ex : exs.errors_) {
-            error     = ex.what();
+            if (!error.empty())
+                error += "\n";
+            error += ex.what();
             monospace = ex.objectId();
             ids.push_back(monospace);
         }
@@ -192,8 +197,8 @@ std::string BackgroundSlicingProcess::output_filepath_for_project(const boost::f
 void BackgroundSlicingProcess::process_fff()
 {
     assert(m_print == m_fff_print);
-    PresetBundle& preset_bundle   = *wxGetApp().preset_bundle;
-    m_fff_print->is_BBL_printer() = preset_bundle.is_bbl_vendor();
+    PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
+    m_fff_print->is_BBL_printer() = m_is_bbl_printer;
     // BBS: add the logic to process from an existed gcode file
     if (m_print->finished()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file") % __LINE__;
@@ -701,16 +706,22 @@ StringObjectException BackgroundSlicingProcess::validate(std::vector<StringObjec
     assert(m_print != nullptr);
     assert(m_print == m_fff_print);
 
-    m_fff_print->is_BBL_printer() = wxGetApp().preset_bundle->is_bbl_vendor();
+    m_fff_print->is_BBL_printer() = m_is_bbl_printer;
     return m_print->validate(warnings, collison_polygons, height_polygons);
 }
 
 // Apply config over the print. Returns false, if the new config values caused any of the already
 // processed steps to be invalidated, therefore the task will need to be restarted.
-Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const DynamicPrintConfig& config)
+Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const DynamicPrintConfig& config, bool is_bbl_printer)
 {
     assert(m_print != nullptr);
     assert(config.opt_enum<PrinterTechnology>("printer_technology") == m_print->technology());
+    // Keep this beside the config: both are properties of the plate being sliced.
+    // Looking at PresetBundle here loses that relationship as soon as another plate
+    // uses a different printer (or the project preset is embedded and has no vendor).
+    m_is_bbl_printer = is_bbl_printer;
+    if (m_fff_print != nullptr)
+        m_fff_print->is_BBL_printer() = m_is_bbl_printer;
     // TODO: add partplate config
     DynamicPrintConfig new_config = config;
     new_config.apply(*m_current_plate->config());

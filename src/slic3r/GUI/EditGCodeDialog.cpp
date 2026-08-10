@@ -29,6 +29,25 @@
 namespace Slic3r {
 namespace GUI {
 
+static DynamicPrintConfig current_plate_gcode_config()
+{
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for custom G-code editing" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    return std::move(resolved.config);
+}
+
 //------------------------------------------
 //          EditGCodeDialog
 //------------------------------------------
@@ -252,7 +271,7 @@ wxDataViewItem EditGCodeDialog::add_presets_placeholders()
     const std::set<std::string> print_options    = get_set_from_vec(is_fff ? Preset::print_options()    : Preset::sla_print_options());
     const std::set<std::string> material_options = get_set_from_vec(is_fff ? Preset::filament_options() : Preset::sla_material_options());
     const std::set<std::string> printer_options  = get_set_from_vec(is_fff ? Preset::printer_options()  : Preset::sla_printer_options());
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
+    const auto full_config = current_plate_gcode_config();
     const auto& tab_list    = wxGetApp().tabs_list;
 
     Tab* tab_print = nullptr;
@@ -361,7 +380,7 @@ void EditGCodeDialog::selection_changed(wxDataViewEvent& evt)
         // This allows custom placeholders to override the default ones for this dialog
         // Override custom def if selection is within the preset category
         if (!def || m_params_list->GetSelectedTopLevelCategory() == "Presets") {
-            const auto& full_config = wxGetApp().preset_bundle->full_config();
+            const auto full_config = current_plate_gcode_config();
             if (const ConfigDef* config_def = full_config.def(); config_def && config_def->has(opt_key)) {
                 def = config_def->get(opt_key);
             }

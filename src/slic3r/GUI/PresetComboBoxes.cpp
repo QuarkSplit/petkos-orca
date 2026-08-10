@@ -1537,8 +1537,15 @@ void PlaterPresetComboBox::msw_rescale()
 
 FilamentColor PlaterPresetComboBox::get_cur_color_info()
 {
-    std::vector<std::string> filaments_multi_color = Slic3r::GUI::wxGetApp().plater()->get_filament_colors_render_info();
-    std::vector<std::string> filament_color_type = Slic3r::GUI::wxGetApp().plater()->get_filament_color_render_type();
+    //filament colours are a property of the current plate now, so unlike the project
+    //config they used to come from, they need a plater that exists and is past its own
+    //construction. Filament combos are built from inside it.
+    Slic3r::GUI::Plater *plater = Slic3r::GUI::wxGetApp().plater();
+    if (plater == nullptr || !plater->is_initialized())
+        return FilamentColor();
+
+    std::vector<std::string> filaments_multi_color = plater->get_filament_colors_render_info();
+    std::vector<std::string> filament_color_type = plater->get_filament_color_render_type();
 
     if (m_filament_idx < 0 || m_filament_idx >= static_cast<int>(filaments_multi_color.size())) {
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": m_filament_idx %1% out of range %2%") % m_filament_idx % filaments_multi_color.size();

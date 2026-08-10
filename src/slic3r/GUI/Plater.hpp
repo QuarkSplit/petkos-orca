@@ -54,6 +54,7 @@ class BackgroundSlicingProcess;
 enum SLAPrintObjectStep : unsigned int;
 enum class ConversionType : int;
 class DevAms;
+struct ResolvedPlateSlicingConfig;
 
 using ModelInstancePtrs = std::vector<ModelInstance*>;
 
@@ -165,6 +166,16 @@ public:
     void update_all_preset_comboboxes();
     //void update_partplate(PartPlateList& list);
     void update_presets(Slic3r::Preset::Type preset_type);
+    //The one sink for a current-plate change. Idempotent, so a double delivery costs
+    //nothing. PartPlateList::m_current_plate stays the sole owner of the selection;
+    //the board renders it and never stores it.
+    void on_plate_selection_changed(int current_plate);
+    //Rebuild the board's rows from the plate list.
+    void refresh_plate_board();
+    //The collapsed printer-section title: the project printer when the project holds
+    //one plate or every plate inherits, and "N machines" otherwise. Replaces reading
+    //the project combo's displayed string, which cannot describe a fleet.
+    wxString printer_summary_text() const;
     //BBS
     const std::vector<BedType>& get_cur_combox_bed_types() { return m_cur_combox_bed_types; }
     void update_presets_from_to(Slic3r::Preset::Type preset_type, std::string from, std::string to);
@@ -193,6 +204,7 @@ public:
     // BBS
     void on_bed_type_change(BedType bed_type);
     void load_ams_list(MachineObject* obj);
+    const std::string& ams_list_device() const;
     std::map<int, DynamicPrintConfig> build_filament_ams_list(MachineObject* obj);
     void sync_ams_list(bool is_from_big_sync_btn = false);
     bool sync_extruder_list();
@@ -374,6 +386,9 @@ public:
     void force_update_all_plate_thumbnails();
 
     const VendorProfile::PrinterModel * get_curr_printer_model();
+    //Same, for an explicitly named plate. A dialog opened from a plate's own icon is
+    //about that plate, which need not be the current one.
+    const VendorProfile::PrinterModel * get_plate_printer_model(int plate_index);
     std::map<std::string, std::string> get_bed_texture_maps();
     bool                               get_enable_wrapping_detection();
 
@@ -533,7 +548,9 @@ public:
     /* -1: send current gcode if not specified
      * -2: send all gcode to target machine */
     int send_gcode(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
-    void send_gcode_legacy(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
+    //plate_idx is required and concrete: no default that means "whichever plate is
+    //current when this runs". Callers resolve the current plate at the event boundary.
+    void send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn = nullptr);
     int export_config_3mf(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
     //BBS jump to nonitor after print job finished
     void send_calibration_job_finished(wxCommandEvent &evt);
@@ -541,6 +558,18 @@ public:
     void send_job_finished(wxCommandEvent& evt);
     void publish_job_finished(wxCommandEvent& evt);
     void open_platesettings_dialog(wxCommandEvent& evt);
+    //The one write path for a plate's printer assignment. Every caller (the plate
+    //settings dialog, the plate board) goes through here, so the consequences of a
+    //reassignment — undo snapshot, bed update, bounds re-check, slice invalidation,
+    //dirty marking — are handled in exactly one place. An empty preset_name clears
+    //the assignment back to "follow the project printer".
+    void set_plate_printer(int plate_index, std::string preset_name);
+    // Physical dispatch target is independent from the slicing preset and does
+    // not invalidate an unchanged slice.
+    void set_plate_physical_printer(int plate_index, std::string device_id);
+    //Batch assignment: one undo snapshot for the whole batch and one trailing
+    //layout reflow, instead of one of each per plate.
+    void set_plate_printers(const std::vector<int>& plate_indices, std::string preset_name);
     void open_filament_map_setting_dialog(wxCommandEvent &evt);
     void on_change_color_mode(SimpleEvent& evt);
 	void eject_drive();
@@ -608,6 +637,8 @@ public:
 
     wxString get_project_filename(const wxString& extension = wxEmptyString) const;
     wxString get_export_gcode_filename(const wxString& extension = wxEmptyString, bool only_filename = false, bool export_all = false) const;
+    wxString get_export_gcode_filename_for_plate(int plate_index, const wxString& extension = wxEmptyString,
+                                                  bool only_filename = false) const;
     void set_project_filename(const wxString& filename);
     void update_print_error_info(int code, std::string msg, std::string extra);
 
@@ -717,8 +748,21 @@ public:
     const Camera& get_camera() const;
     Camera& get_camera();
 
+    //False until Plater's constructor body runs. priv builds the Sidebar and the menu
+    //factory inside its own construction, and both call back into Plater before
+    //Plater::p exists. Anything reachable from there must ask this first.
+    //
+    //It cannot be written as `p != nullptr`: while `p(new priv(...))` is being
+    //evaluated, p is uninitialised storage rather than a null pointer, so that test
+    //can read garbage, answer yes, and hand out a dangling priv.
+    bool is_initialized() const { return m_priv_ready; }
+
     //BBS: partplate list related functions
     PartPlateList& get_partplate_list();
+    bool resolve_plate_slicing_config(PartPlate *plate, ResolvedPlateSlicingConfig &resolved,
+                                      std::string &error, bool apply_plate_overrides = true) const;
+    bool resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &resolved,
+                                              std::string &error, bool apply_plate_overrides = true) const;
     void validate_current_plate(bool& model_fits, bool& validate_error);
     // Rebuild the missing-plugin sets from the active presets and (re)show/close their notifications.
     // Returns true when slicing must be blocked (a referenced plugin is still missing); sets
@@ -741,6 +785,9 @@ public:
     bool plugins_block_slicing() const;
     //BBS: select the plate by index
     int select_plate(int plate_index, bool need_slice = false);
+    //Called from inside PartPlateList::select_plate, which is the one function every
+    //selection path goes through. Forwards to the sidebar's sink.
+    void notify_plate_selection_changed(int current_plate);
     //BBS: update progress result
     void apply_background_progress();
     //BBS: select the plate by hover_id
@@ -964,6 +1011,12 @@ public:
     void clear_plate_toolbar_image_dirty();
 
 private:
+    //MUST stay declared before p. Members initialise in declaration order, and during
+    //the evaluation of p(new priv(...)) the unique_ptr p is not merely null, it is raw
+    //uninitialised memory: comparing it against nullptr can read garbage and say yes.
+    //This flag is already false by then, and only the constructor body sets it.
+    bool m_priv_ready = false;
+
     struct priv;
     std::unique_ptr<priv> p;
     std::string           m_3mf_path;

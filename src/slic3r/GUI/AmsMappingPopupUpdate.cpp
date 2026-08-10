@@ -452,8 +452,11 @@ void AmsMapingPopup::update_ams_data_multi_machines()
 
 void AmsMapingPopup::update_title(MachineObject* obj)
 {
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    size_t nozzle_nums = full_config.option<ConfigOptionFloatsNullable>("nozzle_diameter")->values.size();
+    const size_t nozzle_nums = source_nozzle_count(obj);
+    if (nozzle_nums == 0) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": neither a source plate nor a device supplied a nozzle count";
+        return;
+    }
     if (nozzle_nums > 1) {
         m_split_line_panel->Show();
         if (m_show_type == ShowType::LEFT) {
@@ -480,8 +483,7 @@ void AmsMapingPopup::update_title(MachineObject* obj)
 
 void AmsMapingPopup::update_ams_tips(MachineObject* obj)
 {
-    const auto& full_config = wxGetApp().preset_bundle->full_config();
-    size_t nozzle_nums = full_config.option<ConfigOptionFloatsNullable>("nozzle_diameter")->values.size();
+    const size_t nozzle_nums = source_nozzle_count(obj);
     if (m_ams_tips_msg_panel) {
         m_ams_tips_msg_panel->Clear();
         if (nozzle_nums == 2 && m_show_type != ShowType::LEFT_AND_RIGHT) {
@@ -498,6 +500,41 @@ void AmsMapingPopup::update_ams_tips(MachineObject* obj)
         m_ams_tips_msg_panel->Fit();
         m_ams_tips_msg_panel->Show(m_ams_tips_msg_panel->GetMessageCount() > 0);
     }
+}
+
+size_t AmsMapingPopup::source_nozzle_count(MachineObject *obj) const
+{
+    if (m_source_plate_nozzle_count != 0)
+        return m_source_plate_nozzle_count;
+    if (obj != nullptr && obj->GetExtderSystem() != nullptr)
+        return size_t(obj->GetExtderSystem()->GetTotalExtderCount());
+    return 0;
+}
+
+void AmsMapingPopup::set_source_plate_config(const std::string &printer_model_id, const DynamicPrintConfig &config)
+{
+    const ConfigOptionFloats *nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzles == nullptr || nozzles->values.empty())
+        throw Slic3r::RuntimeError("The source plate has no exact nozzle configuration");
+
+    m_source_printer_model_id = printer_model_id;
+    m_source_plate_nozzle_count = nozzles->values.size();
+    m_left_tip_text = wxString::Format(_L("Select filament that installed to the %s"),
+        _L(DevPrinterConfigUtil::get_toolhead_display_name(m_source_printer_model_id, DEPUTY_EXTRUDER_ID,
+            ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase)));
+    m_right_tip_text = wxString::Format(_L("Select filament that installed to the %s"),
+        _L(DevPrinterConfigUtil::get_toolhead_display_name(m_source_printer_model_id, MAIN_EXTRUDER_ID,
+            ToolHeadComponent::Nozzle, ToolHeadNameCase::LowerCase)));
+    if (m_left_tips != nullptr)
+        m_left_tips->SetLabel(m_left_tip_text);
+    if (m_right_tips != nullptr)
+        m_right_tips->SetLabel(m_right_tip_text);
+}
+
+void AmsMapingPopup::clear_source_plate_config()
+{
+    m_source_printer_model_id.clear();
+    m_source_plate_nozzle_count = 0;
 }
 
 void AmsMapingPopup::update_rack_select(MachineObject* obj, bool use_dynamic_switch, std::optional<PrintFromType> print_from_type)
@@ -705,4 +742,4 @@ void AmsMapingPopup::add_ext_ams_mapping(TrayData tray_data, MappingItem* item)
     item->set_tray_index("Ext");
 }
 
-} // namespace Slic3r::GUI
+} // namespace Slic3r::GUI

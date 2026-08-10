@@ -783,9 +783,8 @@ bool is_compatible_with_print(const PresetWithVendorProfile &preset, const Prese
         try {
             return PlaceholderParser::evaluate_boolean_expression(condition, active_print.preset.config);
         } catch (const std::runtime_error &err) {
-            //FIXME in case of an error, return "compatible with everything".
             printf("Preset::is_compatible_with_print - parsing error of compatible_prints_condition %s:\n%s\n", active_print.preset.name.c_str(), err.what());
-            return true;
+            return false;
         }
     }
     return preset.preset.is_default || active_print.preset.name.empty() || ! has_compatible_prints ||
@@ -831,9 +830,8 @@ bool is_compatible_with_printer(const PresetWithVendorProfile &preset, const Pre
         try {
             return PlaceholderParser::evaluate_boolean_expression(condition, active_printer.preset.config, extra_config);
         } catch (const std::runtime_error &err) {
-            //FIXME in case of an error, return "compatible with everything".
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": parsing error of compatible_printers_condition %1%: %2%")%active_printer.preset.name %err.what();
-            return true;
+            return false;
         }
     }
     return preset.preset.is_default || active_printer.preset.name.empty() || !has_compatible_printers ||
@@ -888,11 +886,10 @@ std::string Preset::get_filament_type(std::string &display_filament_type)
     return config.get_filament_type(display_filament_type);
 }
 
-std::string Preset::get_printer_type(PresetBundle *preset_bundle)
+std::string Preset::get_printer_type(PresetBundle *preset_bundle) const
 {
     if (preset_bundle) {
-        auto config = &preset_bundle->printers.get_edited_preset().config;
-        const auto& printer_model = config->opt_string("printer_model");
+        const auto& printer_model = config.opt_string("printer_model");
         for (const auto& vendor_profile : preset_bundle->vendors) {
             for (const auto& vendor_model : vendor_profile.second.models)
                 if (vendor_model.name == printer_model)
@@ -904,19 +901,9 @@ std::string Preset::get_printer_type(PresetBundle *preset_bundle)
     return "";
 }
 
-std::string Preset::get_current_printer_type(PresetBundle *preset_bundle)
+std::string Preset::get_current_printer_type(PresetBundle *preset_bundle) const
 {
-    if (preset_bundle) {
-        auto config = &(this->config);
-        const auto& printer_model = config->opt_string("printer_model");
-        for (const auto& vendor_profile : preset_bundle->vendors) {
-            for (const auto& vendor_model : vendor_profile.second.models)
-                if (vendor_model.name == printer_model) {
-                    return vendor_model.model_id;
-                }
-        }
-    }
-    return "";
+    return get_printer_type(preset_bundle);
 }
 
 void Preset::get_extruder_names_and_keysets(Type type, std::string& extruder_id_name, std::string& extruder_variant_name, std::set<std::string>** p_key_set1, std::set<std::string>** p_key_set2)

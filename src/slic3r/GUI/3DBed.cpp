@@ -437,7 +437,13 @@ std::tuple<Bed3D::Type, std::string, std::string> Bed3D::detect_type(const Point
 {
     auto bundle = wxGetApp().preset_bundle;
     if (bundle != nullptr) {
-        const Preset* curr = &bundle->printers.get_selected_preset();
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error, false)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return {Type::Custom, {}, {}};
+        }
+        const Preset* curr = resolved.printer_preset;
         while (curr != nullptr) {
             if (curr->config.has("printable_area")) {
                 std::string texture_filename, model_filename;

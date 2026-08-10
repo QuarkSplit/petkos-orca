@@ -150,22 +150,30 @@ void PrintJob::process(Ctl &ctl)
     ctl.update_status(0, msg);
     ctl.call_on_main_thread([this] { prepare(); }).wait();
 
+    if (m_print_type == "from_normal" && job_data.plate_idx < 0) {
+        BOOST_LOG_TRIVIAL(error) << "Normal dispatch requires one explicit plate";
+        ctl.update_status(curr_percent, check_gcode_failed_str);
+        return;
+    }
+
     int result = -1;
     std::string http_body;
 
     int total_plate_num = plate_data.plate_count;
     if (!plate_data.is_valid) {
         total_plate_num =  m_plater->get_partplate_list().get_plate_count();
-        PartPlate *plate = m_plater->get_partplate_list().get_plate(job_data.plate_idx);
-        if (plate == nullptr) {
-            plate = m_plater->get_partplate_list().get_curr_plate();
-            if (plate == nullptr) return;
-        }
+        if (m_print_type == "from_normal") {
+            PartPlate *plate = m_plater->get_partplate_list().get_plate(job_data.plate_idx);
+            if (plate == nullptr) {
+                BOOST_LOG_TRIVIAL(error) << "Print job references an invalid plate index " << job_data.plate_idx;
+                ctl.update_status(curr_percent, check_gcode_failed_str);
+                return;
+            }
 
-        /* check gcode is valid */
-        if (!plate->is_valid_gcode_file() && m_print_type == "from_normal") {
-            ctl.update_status(curr_percent, check_gcode_failed_str);
-            return;
+            if (!plate->is_valid_gcode_file()) {
+                ctl.update_status(curr_percent, check_gcode_failed_str);
+                return;
+            }
         }
 
         if (ctl.was_canceled()) {
@@ -178,25 +186,19 @@ void PrintJob::process(Ctl &ctl)
     int curr_plate_idx = 0;
 
     if (m_print_type == "from_normal") {
-        if (plate_data.is_valid)
-            curr_plate_idx = plate_data.cur_plate_index;
-        if (job_data.plate_idx >= 0)
-            curr_plate_idx = job_data.plate_idx + 1;
-        else if (job_data.plate_idx == PLATE_CURRENT_IDX)
-            curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
-        else if (job_data.plate_idx == PLATE_ALL_IDX)
-            curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
-        else
-            curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
+        curr_plate_idx = job_data.plate_idx + 1;
     }
     else if(m_print_type == "from_sdcard_view") {
         curr_plate_idx = m_print_from_sdc_plate_idx;
     }
 
-    PartPlate* curr_plate = m_plater->get_partplate_list().get_curr_plate();
-    if (curr_plate) {
+    PartPlate* curr_plate = m_print_type == "from_normal"
+        ? m_plater->get_partplate_list().get_plate(job_data.plate_idx)
+        : nullptr;
+    if (m_print_type == "from_normal")
         this->task_bed_type = bed_type_to_gcode_string(plate_data.is_valid ? plate_data.bed_type : curr_plate->get_bed_type(true));
-    }
+    else if (plate_data.is_valid)
+        this->task_bed_type = bed_type_to_gcode_string(plate_data.bed_type);
 
     PrintParams params;
 
@@ -207,37 +209,35 @@ void PrintJob::process(Ctl &ctl)
     params.username = "bblp";
     params.password = m_access_code;
 
+    const std::string disable_emmc_value = config != nullptr ? config->get("disable_emmc_print") : std::string();
+    const bool use_emmc = could_emmc_print && (disable_emmc_value == "0" || disable_emmc_value == "false");
+
     // check access code and ip address
     if (this->connection_type == "lan" && m_print_type == "from_normal") {
-        bool emmc_ok = false;
-        bool ftp_ok = false;
-        if (could_emmc_print) {
+        bool connection_ok = false;
+        if (use_emmc) {
             std::string devIP = m_dev_ip;
             std::string accessCode = m_access_code;
             std::string url = "bambu:///local/" + devIP + "?port=6000&user=" + "bblp" + "&passwd=" + accessCode;
             try {
                 std::unique_ptr<FileTransferTunnel> tunnel = std::make_unique<FileTransferTunnel>(module(), url);
-                emmc_ok = tunnel->sync_start_connect();
+                connection_ok = tunnel->sync_start_connect();
             } catch (const std::exception &e) {
-                BOOST_LOG_TRIVIAL(warning) << "eMMC tunnel unavailable, falling back to FTP: " << e.what();
-                emmc_ok = false;
+                BOOST_LOG_TRIVIAL(error) << "eMMC tunnel verification failed: " << e.what();
             }
-        }
-        {
+        } else {
             params.dev_id = m_dev_id;
             params.project_name = "verify_job";
             params.filename = job_data._temp_path.string();
             params.connection_type = this->connection_type;
 
             result = m_agent->start_send_gcode_to_sdcard(params, nullptr, nullptr, nullptr);
-
-            ftp_ok = result == 0;
+            connection_ok = result == 0;
         }
-        if (!emmc_ok && !ftp_ok) {
+        if (!connection_ok) {
             bool legacy_mode = BBLNetworkPlugin::instance().use_legacy_network();
             BOOST_LOG_TRIVIAL(error) << "LAN connection verification failed:"
-                << " emmc_ok=" << emmc_ok
-                << ", ftp_ok=" << ftp_ok
+                << " transport=" << (use_emmc ? "emmc" : "ftp")
                 << ", ftp_result=" << result
                 << ", dev_ip=" << m_dev_ip
                 << ", dev_id=" << m_dev_id
@@ -277,17 +277,7 @@ void PrintJob::process(Ctl &ctl)
     params.auto_offset_cali     = this->auto_offset_cali;
     params.extruder_cali_manual_mode = this->extruder_cali_manual_mode;
     params.task_ext_change_assist = this->task_ext_change_assist;
-    // Allow disabling the eMMC print path via AppConfig. Plugin 02.03.00.62's
-    // eMMC tunnel code hangs indefinitely at the upload phase with some
-    // printers (e.g., Bambu H2D), so we default to disabled. Users with
-    // working eMMC support can opt-in by setting disable_emmc_print = 0.
-    bool disable_emmc = true;
-    if (wxGetApp().app_config) {
-        auto v = wxGetApp().app_config->get("disable_emmc_print");
-        if (v == "0" || v == "false")
-            disable_emmc = false;
-    }
-    params.try_emmc_print         = this->could_emmc_print && !disable_emmc;
+    params.try_emmc_print         = use_emmc;
 
     if (m_print_type == "from_sdcard_view") {
         params.dst_file = m_dst_path;
@@ -489,7 +479,9 @@ void PrintJob::process(Ctl &ctl)
 
 
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj = dev->get_selected_machine();
+    MachineObject* obj = dev == nullptr || m_dev_id.empty() ? nullptr : dev->get_my_machine(m_dev_id);
+    if (obj == nullptr)
+        throw std::runtime_error("The print job's exact physical printer '" + m_dev_id + "' is unavailable");
 
     auto wait_fn = [this, &ctl, curr_percent, &obj](int state, std::string job_info) {
             BOOST_LOG_TRIVIAL(info) << "print_job: get_job_info = " << job_info;

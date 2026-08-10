@@ -641,7 +641,21 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
     if (!mo) return;
 
     const DynamicPrintConfig& obj_cfg = mo->config.get();
-    const DynamicPrintConfig& glb_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for brim editing" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    const DynamicPrintConfig& plate_cfg = resolved.config;
     const float win_h = ImGui::GetWindowHeight();
     y                 = std::min(y, bottom_limit - win_h);
     GizmoImguiSetNextWIndowPos(x, y, ImGuiCond_Always, 0.0f, 0.0f);
@@ -770,7 +784,7 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
     }
 
     bool brim_not_painted = (obj_cfg.option("brim_type")) ? (obj_cfg.opt_enum<BrimType>("brim_type") != btPainted) :
-                                                            (glb_cfg.opt_enum<BrimType>("brim_type") != btPainted);
+                                                            (plate_cfg.opt_enum<BrimType>("brim_type") != btPainted);
     bool has_invalid_ears = !m_single_brim.empty();
 
     if (brim_not_painted || has_invalid_ears) {
@@ -1157,9 +1171,24 @@ void GLGizmoBrimEars::reset_all_pick() { std::map<GLVolume *, std::shared_ptr<Pi
 
 float GLGizmoBrimEars::get_brim_default_radius() const
 {
-    const double              nozzle_diameter = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0);
-    const DynamicPrintConfig &pring_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    return pring_cfg.get_abs_value("initial_layer_line_width", nozzle_diameter) * 16.0f;
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for brim editing" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    const ConfigOptionFloats *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzles == nullptr || nozzles->values.empty())
+        throw RuntimeError("The plate's printer has no nozzle definition");
+    return resolved.config.get_abs_value("initial_layer_line_width", nozzles->get_at(0)) * 16.0f;
 }
 
 ExPolygon GLGizmoBrimEars::make_polygon(BrimPoint point, const Geometry::Transformation &trsf)

@@ -125,17 +125,9 @@ namespace {
 	{
 		std::vector<std::string> allowed_tags = { "FFF", "MMU", "SLA" };
 		if (std::find(allowed_tags.begin(), allowed_tags.end(), tag) != allowed_tags.end()) {
-			const PrinterTechnology tech = wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology();
-			if (tech == ptFFF) {
-				// MMU / FFF
-				bool is_mmu = wxGetApp().extruders_edited_cnt() > 1;
-				if (tag == "MMU") return (is_mmu ? TagCheckAffirmative : TagCheckNegative);
-				return (tag == "FFF" ? TagCheckAffirmative : TagCheckNegative);
-			}
-			else {
-				// SLA
-				return (tag == "SLA" ? TagCheckAffirmative : TagCheckNegative);
-			}
+			const bool is_mmu = wxGetApp().plater()->get_extruders_colors().size() > 1;
+			if (tag == "MMU") return (is_mmu ? TagCheckAffirmative : TagCheckNegative);
+			return (tag == "FFF" ? TagCheckAffirmative : TagCheckNegative);
 		}
 		return TagCheckNotCompatible;
 	}

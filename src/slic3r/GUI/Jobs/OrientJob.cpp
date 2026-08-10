@@ -229,7 +229,46 @@ orientation::OrientMesh OrientJob::get_orient_mesh(ModelInstance* instance)
     auto obj = instance->get_object();
     om.name = obj->name;
     om.mesh = obj->mesh(); // don't know the difference to obj->raw_mesh(). Both seem OK
-    const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
+
+    Plater *plater = wxGetApp().plater();
+    PartPlateList &plates = plater->get_partplate_list();
+    const auto obj_it = std::find(plater->model().objects.begin(), plater->model().objects.end(), obj);
+    const auto instance_it = std::find(obj->instances.begin(), obj->instances.end(), instance);
+    PartPlate *plate = nullptr;
+    if (obj_it != plater->model().objects.end() && instance_it != obj->instances.end()) {
+        const int object_idx = (int)std::distance(plater->model().objects.begin(), obj_it);
+        const int instance_idx = (int)std::distance(obj->instances.begin(), instance_it);
+        int plate_idx = plates.find_instance_belongs(object_idx, instance_idx);
+        if (plate_idx < 0)
+            plate_idx = plates.find_instance(object_idx, instance_idx);
+        if (plate_idx >= 0)
+            plate = plates.get_plate(plate_idx);
+    }
+
+    PresetBundle &bundle = *wxGetApp().preset_bundle;
+    PlateSlicingContext context;
+    std::vector<int> filament_maps;
+    std::vector<int> volume_maps;
+    if (plate != nullptr) {
+        context = plate->get_slicing_context();
+        filament_maps = plate->get_real_filament_maps(bundle.project_config);
+        volume_maps = plate->get_real_filament_volume_maps(bundle.project_config);
+    } else {
+        if (const auto *maps = bundle.project_config.option<ConfigOptionInts>("filament_map"))
+            filament_maps = maps->values;
+        if (const auto *maps = bundle.project_config.option<ConfigOptionInts>("filament_volume_map"))
+            volume_maps = maps->values;
+    }
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!bundle.resolve_plate_slicing_config(context, filament_maps, volume_maps, resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error);
+    }
+    if (plate != nullptr)
+        resolved.config.apply(*plate->config(), true);
+    const DynamicPrintConfig &config = resolved.config;
     if (obj->config.has("support_threshold_angle"))
         om.overhang_angle = obj->config.opt_int("support_threshold_angle");
     else {

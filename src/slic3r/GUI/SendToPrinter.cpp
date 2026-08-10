@@ -733,6 +733,8 @@ void SendToPrinterDialog::sending_mode()
 
 void SendToPrinterDialog::prepare(int print_plate_idx)
 {
+    if (print_plate_idx < 0)
+        throw Slic3r::RuntimeError("Send-to-printer requires one explicit plate");
     m_print_plate_idx = print_plate_idx;
 }
 
@@ -822,7 +824,7 @@ void SendToPrinterDialog::on_ok(wxCommandEvent &event)
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
 
-    MachineObject *obj_ = dev->get_selected_machine();
+    MachineObject *obj_ = dev->get_my_machine(m_printer_last_select);
 
     if (obj_ == nullptr) {
         m_printer_last_select = "";
@@ -1129,10 +1131,14 @@ void SendToPrinterDialog::update_user_printer()
 
     m_comboBox_printer->Set(machine_list_name);
 
-    MachineObject* obj = dev->get_selected_machine();
-    if (!obj) {
-        dev->load_last_machine();
-        obj = dev->get_selected_machine();
+    PartPlate *target_plate = nullptr;
+    if (m_plater != nullptr && m_print_plate_idx >= 0)
+        target_plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+
+    MachineObject* obj = nullptr;
+    if (target_plate != nullptr && !target_plate->get_physical_printer_id().empty()) {
+        m_printer_last_select = target_plate->get_physical_printer_id();
+        obj = dev->get_my_machine(m_printer_last_select);
     }
 
     if (obj) {
@@ -1142,14 +1148,6 @@ void SendToPrinterDialog::update_user_printer()
     }
 
     if (m_list.size() > 0) {
-        // select a default machine
-        if (m_printer_last_select.empty()) {
-            m_printer_last_select = m_list[0]->get_dev_id();
-            m_comboBox_printer->SetSelection(0);
-            wxCommandEvent event(wxEVT_COMBOBOX);
-            event.SetEventObject(m_comboBox_printer);
-            wxPostEvent(m_comboBox_printer, event);
-        }
         for (auto i = 0; i < m_list.size(); i++) {
             if (m_list[i]->get_dev_id() == m_printer_last_select) {
                 m_comboBox_printer->SetSelection(i);
@@ -1195,6 +1193,8 @@ void SendToPrinterDialog::on_selection_changed(wxCommandEvent &event)
         if (i == selection) {
             m_printer_last_select = m_list[i]->get_dev_id();
             obj = m_list[i];
+            if (m_plater != nullptr)
+                m_plater->set_plate_physical_printer(m_print_plate_idx, m_printer_last_select);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "for send task, current printer id =  " << m_printer_last_select << std::endl;
             break;
         }
@@ -1203,13 +1203,7 @@ void SendToPrinterDialog::on_selection_changed(wxCommandEvent &event)
     if (obj && !obj->get_lan_mode_connection_state()) {
         obj->command_get_version();
         obj->command_request_push_all();
-        if (!dev->get_selected_machine()) {
-            dev->set_selected_machine(m_printer_last_select);
-
-        }else if (dev->get_selected_machine()->get_dev_id() != m_printer_last_select) {
-            update_storage_list(std::vector<std::string>());
-            dev->set_selected_machine(m_printer_last_select);
-        }
+        update_storage_list(std::vector<std::string>());
     }
     else {
         BOOST_LOG_TRIVIAL(error) << "on_selection_changed dev_id not found";
@@ -1333,16 +1327,27 @@ bool SendToPrinterDialog::is_blocking_printing(MachineObject* obj_)
     if (!dev) return true;
 
     PresetBundle* preset_bundle = wxGetApp().preset_bundle;
-    auto source_model = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
-    auto target_model = obj_->printer_type;
-
-    if (source_model != target_model) {
-        std::vector<std::string> compatible_machine = obj_->get_compatible_machine();
-        vector<std::string>::iterator it = find(compatible_machine.begin(), compatible_machine.end(), source_model);
-        if (it == compatible_machine.end()) {
+    const auto blocks_plate = [&](PartPlate *plate) {
+        if (plate == nullptr)
+            return true;
+        const std::vector<int> filament_maps = plate->get_real_filament_maps(preset_bundle->project_config);
+        const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(preset_bundle->project_config);
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!preset_bundle->resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+                                                         resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
             return true;
         }
-    }
+        const std::string source_model = resolved.printer_preset->get_printer_type(preset_bundle);
+        if (source_model == obj_->printer_type)
+            return false;
+        const std::vector<std::string> compatible_machine = obj_->get_compatible_machine();
+        return std::find(compatible_machine.begin(), compatible_machine.end(), source_model) == compatible_machine.end();
+    };
+
+    if (blocks_plate(m_plater->get_partplate_list().get_plate(m_print_plate_idx)))
+        return true;
 
     return false;
 }
@@ -1528,18 +1533,21 @@ void SendToPrinterDialog::on_dpi_changed(const wxRect &suggested_rect)
 
 void SendToPrinterDialog::set_default()
 {
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (!m_plater->resolve_plate_slicing_config(plate, resolved, context_error)) {
+        show_error(this, from_u8(context_error), false);
+        return;
+    }
+
     //project name
     m_rename_switch_panel->SetSelection(0);
 
-    wxString filename = m_plater->get_export_gcode_filename("", true, m_print_plate_idx == PLATE_ALL_IDX ? true : false);
-
-    if (m_print_plate_idx == PLATE_ALL_IDX && filename.empty()) {
-        filename = _L("Untitled");
-    }
+    wxString filename = m_plater->get_export_gcode_filename_for_plate(m_print_plate_idx, "", true);
 
     if (filename.empty()) {
-        filename = m_plater->get_export_gcode_filename("", true);
-        if (filename.empty()) filename = _L("Untitled");
+        filename = _L("Untitled");
     }
 
     fs::path filename_path(filename.c_str());
@@ -1573,7 +1581,7 @@ void SendToPrinterDialog::set_default()
 
     // thumbmail
     //wxBitmap bitmap;
-    ThumbnailData &data   = m_plater->get_partplate_list().get_curr_plate()->thumbnail_data;
+    ThumbnailData &data = plate->thumbnail_data;
     if (data.is_valid()) {
         wxImage image(data.width, data.height);
         image.InitAlpha();
@@ -1588,23 +1596,16 @@ void SendToPrinterDialog::set_default()
         image  = image.Rescale(FromDIP(256), FromDIP(256));
         m_thumbnailPanel->set_thumbnail(image);
     } else {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " : thumbnail_data invalid." << "current plater: " << m_plater->get_partplate_list().get_curr_plate_index();
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " : thumbnail_data invalid for plate " << m_print_plate_idx;
     }
 
     std::vector<std::string> materials;
     std::vector<std::string> display_materials;
-    {
-        auto preset_bundle = wxGetApp().preset_bundle;
-        for (auto filament_name : preset_bundle->filament_presets) {
-            for (auto iter = preset_bundle->filaments.lbegin(); iter != preset_bundle->filaments.end(); iter++) {
-                if (filament_name.compare(iter->name) == 0) {
-                    std::string display_filament_type;
-                    std::string filament_type = iter->config.get_filament_type(display_filament_type);
-                    display_materials.push_back(display_filament_type);
-                    materials.push_back(filament_type);
-                }
-            }
-        }
+    for (const Preset *filament : resolved.filament_presets) {
+        std::string display_filament_type;
+        std::string filament_type = filament->config.get_filament_type(display_filament_type);
+        display_materials.push_back(display_filament_type);
+        materials.push_back(filament_type);
     }
 
     m_scrollable_region->Layout();
@@ -1618,18 +1619,27 @@ void SendToPrinterDialog::set_default()
 
 
     // basic info
-    auto       aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
-    wxString   time;
-    PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
-    if (plate) {
-        if (plate->get_slice_result()) { time = wxString::Format("%s", short_time(get_time_dhms(plate->get_slice_result()->print_statistics.modes[0].time))); }
+    if (plate->get_slice_result() == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained slice result";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
     }
+    float  print_time_seconds = 0.f;
+    double weight_grams       = 0.;
+    if (!plate->get_retained_print_statistics(print_time_seconds, weight_grams)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained statistics";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
+    }
+    wxString time = wxString::Format("%s", short_time(get_time_dhms(print_time_seconds)));
 
     char weight[64];
     if (wxGetApp().app_config->get("use_inches") == "1") {
-        ::sprintf(weight, "%.2f oz", aprint_stats.total_weight*0.035274); // ORCA remove spacing before text
+        ::sprintf(weight, "%.2f oz", weight_grams * 0.035274); // ORCA remove spacing before text
     }else{
-        ::sprintf(weight, "%.2f g", aprint_stats.total_weight); // ORCA remove spacing before text
+        ::sprintf(weight, "%.2f g", weight_grams); // ORCA remove spacing before text
     }
 
     m_stext_time->SetLabel(time);
@@ -1666,16 +1676,20 @@ void SendToPrinterDialog::GetConnection()
 {
     DeviceManager *dm  = GUI::wxGetApp().getDeviceManager();
 
-    MachineObject *obj = dm->get_selected_machine();
+    MachineObject *obj = dm == nullptr || m_printer_last_select.empty()
+        ? nullptr
+        : dm->get_my_machine(m_printer_last_select);
     if (obj == nullptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << " : obj is empty";
         m_connection_status = ConnectionStatus::NOT_START;
+        return;
     }
 
     int remote_proto = obj->get_file_remote();
     if (!remote_proto) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << " : remote_proto is not support";
         m_connection_status = ConnectionStatus::NOT_START;
+        return;
     }
 
     if (obj->is_camera_busy_off()) {

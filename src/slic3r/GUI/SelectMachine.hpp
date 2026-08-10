@@ -611,6 +611,9 @@ private:
     void start_timelapse_storage_check(MachineObject* obj);
     void on_timelapse_storage_check_timer(wxTimerEvent& event);
     void on_timelapse_storage_check_result();
+    //A storage check that times out or fails still lets the print go: it is a maybe,
+    //and a maybe must not block a definite. This is how it says so out loud.
+    void notify_timelapse_check_unanswered(const wxString &message);
     void show_timelapse_storage_dialog(MachineObject* obj);
     void navigate_to_timelapse_page();
 

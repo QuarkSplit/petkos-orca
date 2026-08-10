@@ -526,7 +526,7 @@ class Print;
         static const float Wipe_Width;
         static const float Wipe_Height;
 
-        static bool s_IsBBLPrinter;
+        static thread_local bool s_IsBBLPrinter;
 
     private:
         using AxisCoords = std::array<double, 4>;

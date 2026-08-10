@@ -6886,14 +6886,9 @@ bool Tab::select_preset(
 
         const bool is_selected = m_presets->select_preset_by_name(preset_name, false) || delete_current;
         assert(m_presets->get_edited_preset().name == preset_name || ! is_selected);
-        // Mark the print & filament enabled if they are compatible with the currently selected preset.
-        // The following method should not discard changes of current print or filament presets on change of a printer profile,
-        // if they are compatible with the current printer.
-        auto update_compatible_type = [delete_current](bool technology_changed, bool on_page, bool show_incompatible_presets) {
-        	return (delete_current || technology_changed) ? PresetSelectCompatibleType::Always :
-        	       on_page                                ? PresetSelectCompatibleType::Never  :
-        	       show_incompatible_presets              ? PresetSelectCompatibleType::OnlyIfWasCompatible : PresetSelectCompatibleType::Always;
-        };
+        // Compatibility changes visibility and validation state; it does not choose a
+        // different process or filament identity for the user.
+        auto update_compatible_type = [](bool, bool, bool) { return PresetSelectCompatibleType::Never; };
         if (current_dirty || delete_current || print_tab || printer_tab)
             m_preset_bundle->update_compatible(
             	update_compatible_type(technology_changed, print_tab,   (print_tab ? this : wxGetApp().get_tab(Preset::TYPE_PRINT))->m_show_incompatible_presets),
@@ -6956,9 +6951,11 @@ bool Tab::select_preset(
                     preset_bundle->prints.delete_preset(preset.name);
                 }
 
-                preset_bundle->update_compatible(PresetSelectCompatibleType::Always);
-                preset_bundle->filaments.select_preset_by_name(old_filament_name, true);
-                preset_bundle->prints.select_preset_by_name(old_process_name, true);
+                preset_bundle->update_compatible(PresetSelectCompatibleType::Never);
+                if (!preset_bundle->filaments.select_preset_by_name(old_filament_name, false))
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": deleted filament preset remains unresolved: " << old_filament_name;
+                if (!preset_bundle->prints.select_preset_by_name(old_process_name, false))
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": deleted process preset remains unresolved: " << old_process_name;
                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " old filament name is:" << old_filament_name << " old process name is: " << old_process_name;
 
             });
@@ -9011,7 +9008,13 @@ ConfigManipulation Tab::get_config_manipulation()
         return on_value_change(opt_key, value);
     };
 
-    return ConfigManipulation(load_config, cb_toggle_field, cb_toggle_line, cb_value_change, nullptr, this);
+    ConfigManipulation manipulation(load_config, cb_toggle_field, cb_toggle_line, cb_value_change, nullptr, this);
+    //wxGetApp().preset_bundle, not m_preset_bundle: this runs from Tab's constructor,
+    //and m_preset_bundle is not assigned until create_preset_tab(), 30-odd lines later.
+    //Reading it here stored a pointer derived from a null bundle, and the first read
+    //through it faulted at startup inside update_print_fff_config.
+    manipulation.set_printer_config(&wxGetApp().preset_bundle->printers.get_edited_preset().config);
+    return manipulation;
 }
 
 

@@ -630,6 +630,12 @@ std::vector<size_t> Print::layers_sorted_for_object(float start, float end, std:
 StringObjectException Print::sequential_print_clearance_valid(const Print &print, Polygons *polygons, std::vector<std::pair<Polygon, float>>* height_polygons)
 {
     StringObjectException single_object_exception;
+    // Advisory unless proven otherwise. The proximity tests below compare 2D convex hulls inflated by a
+    // scalar clearance radius: they approximate the toolhead rather than model it, and they say so in their
+    // own wording ("may be caused"). A maybe must not block a definite, because the user is looking at the
+    // plate and can see what the hulls only estimate. The one test that describes a certainty rather than a
+    // risk, the gantry-height violation below, clears this flag and keeps its gate.
+    single_object_exception.is_warning = true;
     const auto& print_config = print.config();
     Polygons exclude_polys = get_bed_excluded_area(print_config);
     const Vec3d print_origin = print.get_plate_origin();
@@ -926,6 +932,11 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
         }
 
         if (too_tall_instances.size() > 0) {
+            // Kept fatal. In "by object" sequence the toolhead travels over finished objects, so an object
+            // taller than the declared clearance height is not a proximity estimate but a gantry strike on a
+            // known geometry against a number the printer profile states. Emitting this G-code damages the
+            // machine, which is the whole bar for refusing to emit it.
+            single_object_exception.is_warning = false;
             //return {, inst->model_instance->get_object()};
             for (auto& iter: too_tall_instances) {
                 if (single_object_exception.string.empty()) {
@@ -943,6 +954,23 @@ StringObjectException Print::sequential_print_clearance_valid(const Print &print
     }
 
     return single_object_exception;
+}
+
+// Collect a clearance advisory without gating the slice. Each message names the object it is about and the
+// first offender is retained as the jump-to target, so the notification can still take the user to the thing
+// it is talking about. Messages accumulate rather than replace, because a plate with two problems that
+// reports one of them sends the user round the loop twice.
+static void add_clearance_warning(StringObjectException *warning, const ObjectBase *object, const std::string &msg)
+{
+    if (warning == nullptr)
+        return;
+    if (!warning->string.empty())
+        warning->string += "\n";
+    warning->string += msg;
+    if (warning->object == nullptr)
+        warning->object = object;
+    warning->is_warning = true;
+    warning->type       = STRING_EXCEPT_OBJECT_COLLISION_IN_LAYER_PRINT;
 }
 
 //BBS
@@ -976,20 +1004,24 @@ static StringObjectException layered_print_cleareance_valid(const Print &print, 
                                                                                   inst->model_instance->get_scaling_factor(), inst->model_instance->get_mirror()));
             volume_hull.translate(inst->shift - inst->print_object->center_offset());
 
+            // Advisory, not a gate. Overlapping a declared exclusion rectangle is a proximity estimate whose
+            // own wording is "may", and the rectangle is drawn on the bed, so the user has already seen what
+            // this test infers. Returning here also aborted the loop, so a second offending object was never
+            // even named; accumulating instead reports every one of them and lets the slice proceed.
             if (!intersection(exclude_polys, volume_hull).empty()) {
-                // return {inst->model_instance->get_object()->name + L(" is too close to exclusion area, there may be collisions when printing.") + "\n",
-                //        inst->model_instance->get_object()};
                 //ORCA: Pass ModelInstance instead of ModelObject
-                return {inst->model_instance->get_object()->name + L(" is too close to exclusion area, there may be collisions when printing.") + "\n",
-                        inst->model_instance};
+                add_clearance_warning(warning, inst->model_instance,
+                                      inst->model_instance->get_object()->name +
+                                          L(" is too close to exclusion area, there may be collisions when printing."));
             }
 
             if (print_config.enable_wrapping_detection.value && !intersection(wrapping_poly, volume_hull).empty()) {
-                // return {inst->model_instance->get_object()->name + L(" is too close to clumping detection area, there may be collisions when printing.") + "\n",
-                //        inst->model_instance->get_object()};
+                // Advisory for the same reason, and weaker still: the clumping region feeds failure
+                // detection, so overlapping it degrades monitoring rather than risking the machine.
                 //ORCA: Pass ModelInstance instead of ModelObject
-                return {inst->model_instance->get_object()->name + L(" is too close to clumping detection area, there may be collisions when printing.") + "\n",
-                        inst->model_instance};
+                add_clearance_warning(warning, inst->model_instance,
+                                      inst->model_instance->get_object()->name +
+                                          L(" is too close to clumping detection area, there may be collisions when printing."));
             }
             current_instance_hulls.emplace_back(volume_hull);
         }
@@ -1054,14 +1086,16 @@ static StringObjectException layered_print_cleareance_valid(const Print &print, 
             warning->string += L("Prime Tower") + L(" is too close to others, and collisions may be caused.\n");
         }
     }
+    // Advisory, for the same reason as the per-object exclusion test above: this is the identical
+    // hull-versus-rectangle intersection, so the certainty its wording claimed was never backed by a
+    // different measurement. The prime tower is also movable from the plate view the user is already in.
     if (!intersection(exclude_polys, convex_hulls_temp).empty()) {
-        /*if (warning) {
-            warning->string += L("Prime Tower is too close to exclusion area, there may be collisions when printing.\n");
-        }*/
-        return {L("Prime Tower") + L(" is too close to an exclusion area, and collisions will be caused.\n")};
+        add_clearance_warning(warning, nullptr,
+                              L("Prime Tower") + L(" is too close to an exclusion area, there may be collisions when printing."));
     }
     if (print_config.enable_wrapping_detection.value && !intersection({wrapping_poly}, convex_hulls_temp).empty()) {
-        return {L("Prime Tower") + L(" is too close to clumping detection area, and collisions will be caused.\n")};
+        add_clearance_warning(warning, nullptr,
+                              L("Prime Tower") + L(" is too close to clumping detection area, there may be collisions when printing."));
     }
     return {};
 }
@@ -1327,7 +1361,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         auto ret = sequential_print_clearance_valid(*this, collison_polygons, height_polygons);
         if (!ret.string.empty()) {
             ret.type = STRING_EXCEPT_OBJECT_COLLISION_IN_SEQ_PRINT;
-            return ret;
+            // Same split the filament check above already uses: an advisory result informs and the slice
+            // continues, a fatal one still stops it. The helper decides which it produced.
+            if (ret.is_warning)
+                add_warning(ret);
+            else
+                return ret;
         }
     }
     else {

@@ -317,7 +317,7 @@ public:
     wxDataViewItem      add_layer_root_item(const wxDataViewItem obj_item);
     wxDataViewItem      add_settings_item(wxDataViewItem parent_item, const DynamicPrintConfig* config);
 
-    DynamicPrintConfig  get_default_layer_config(const int obj_idx);
+    DynamicPrintConfig  get_default_layer_config(const int obj_idx, const DynamicPrintConfig &plate_config);
     bool                get_volume_by_item(const wxDataViewItem& item, ModelVolume*& volume);
     bool                is_splittable(bool to_objects);
     bool                selected_instances_of_same_object();

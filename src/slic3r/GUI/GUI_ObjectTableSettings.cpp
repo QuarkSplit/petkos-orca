@@ -11,6 +11,7 @@
 #include "Plater.hpp"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/log/trivial.hpp>
 
 #include "I18N.hpp"
 #include "ConfigManipulation.hpp"
@@ -88,12 +89,15 @@ bool ObjectTableSettings::update_settings_list(bool is_object, bool is_multiple_
     if (!config || is_multiple_selection || !object)
         return false;
 
-    const auto printer_technology   = wxGetApp().plater()->printer_technology();
-
     // update config values according to configuration hierarchy
-    m_current_config   = printer_technology == ptFFF ?
-                                        wxGetApp().preset_bundle->prints.get_edited_preset().config :
-                                        wxGetApp().preset_bundle->sla_prints.get_edited_preset().config;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    m_current_config = resolved.config;
+    m_is_bbl_printer = resolved.is_bbl_printer;
 
     //ConfigManipulation config_manipulation(load_config, toggle_field, nullptr, config);
 
@@ -297,11 +301,9 @@ bool ObjectTableSettings::update_settings_list(bool is_object, bool is_multiple_
         };
         ConfigManipulation config_manipulation(nullptr, toggle_field, toggle_line, nullptr, &m_current_config);
 
-        bool is_BBL_printer = wxGetApp().preset_bundle->is_bbl_vendor();
-        config_manipulation.set_is_BBL_Printer(is_BBL_printer);
-
-        printer_technology == ptFFF  ?  config_manipulation.toggle_print_fff_options(&m_current_config, 0) :
-                                        config_manipulation.toggle_print_sla_options(&m_current_config) ;
+        config_manipulation.set_printer_config(&m_current_config);
+        config_manipulation.set_is_BBL_Printer(m_is_bbl_printer);
+        config_manipulation.toggle_print_fff_options(&m_current_config, 0);
         optgroup->update_visibility(wxGetApp().get_mode());
     }
 
@@ -319,14 +321,11 @@ bool ObjectTableSettings::update_settings_list(bool is_object, bool is_multiple_
 bool ObjectTableSettings::add_missed_options(ModelConfig* config_to, const DynamicPrintConfig& config_from)
 {
     bool is_added = false;
-    if (wxGetApp().plater()->printer_technology() == ptFFF)
+    if (config_to->has("sparse_infill_density") && !config_to->has("sparse_infill_pattern"))
     {
-        if (config_to->has("sparse_infill_density") && !config_to->has("sparse_infill_pattern"))
-        {
-            if (config_from.option<ConfigOptionPercent>("sparse_infill_density")->value == 100) {
-                config_to->set_key_value("sparse_infill_pattern", config_from.option("sparse_infill_pattern")->clone());
-                is_added = true;
-            }
+        if (config_from.option<ConfigOptionPercent>("sparse_infill_density")->value == 100) {
+            config_to->set_key_value("sparse_infill_pattern", config_from.option("sparse_infill_pattern")->clone());
+            is_added = true;
         }
     }
 
@@ -372,8 +371,6 @@ int ObjectTableSettings::update_extra_column_visible_status(ConfigOptionsGroup* 
 void ObjectTableSettings::update_config_values(bool is_object, ModelObject* object, ModelConfig* config, const std::string& category)
 {
     int different_count = 0;
-    const auto printer_technology   = wxGetApp().plater()->printer_technology();
-
     if (!object || !config)
         return;
 
@@ -401,13 +398,10 @@ void ObjectTableSettings::update_config_values(bool is_object, ModelObject* obje
 
     ConfigManipulation config_manipulation(nullptr, toggle_field, toggle_line, nullptr, &m_current_config);
 
-    config_manipulation.set_is_BBL_Printer(wxGetApp().preset_bundle->is_bbl_vendor());
-
-    printer_technology == ptFFF  ?  config_manipulation.update_print_fff_config(&main_config) :
-                                    config_manipulation.update_print_sla_config(&main_config) ;
-
-    printer_technology == ptFFF  ?  config_manipulation.toggle_print_fff_options(&main_config, 0) :
-                                    config_manipulation.toggle_print_sla_options(&main_config) ;
+    config_manipulation.set_printer_config(&m_current_config);
+    config_manipulation.set_is_BBL_Printer(m_is_bbl_printer);
+    config_manipulation.update_print_fff_config(&main_config);
+    config_manipulation.toggle_print_fff_options(&main_config, 0);
     for (auto og : m_og_settings) {
         og->update_visibility(wxGetApp().get_mode());
     }

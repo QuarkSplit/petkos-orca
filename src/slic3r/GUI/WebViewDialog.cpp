@@ -7,10 +7,13 @@
 #include "libslic3r_version.h"
 #include "../Utils/Http.hpp"
 
+#include <boost/log/trivial.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 
 #include <wx/sizer.h>
+#include <wx/utils.h>
+#include <wx/filefn.h>
 #include <wx/toolbar.h>
 #include <wx/textdlg.h>
 #include <wx/url.h>
@@ -32,6 +35,52 @@ namespace GUI {
     END_EVENT_TABLE()
 
 
+
+//Where the library index and the resolver live. Both are data about Petko's own folders
+//rather than about the slicer, so they are configurable and their absence is not an error:
+//an installation without them simply has no library to file into.
+static wxString library_script_path()
+{
+    wxString from_env;
+    if (wxGetEnv("PETKOS_ORCA_INGEST", &from_env) && !from_env.empty())
+        return from_env;
+    return wxString::FromUTF8("E:\\3D-Printing\\Scripts\\ingest.py");
+}
+
+//Identifying a model means reading its embedded design id and matching it against the
+//collection manifests, which is a body of logic that already exists and is tested. Calling
+//it is a smaller and more honest dependency than reimplementing it here, where it would
+//immediately drift from the copy that files downloads.
+bool WebViewPanel::IngestDroppedFiles(const wxArrayString &paths)
+{
+    const wxString script = library_script_path();
+    if (!wxFileExists(script)) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": no ingest script at "
+                                << script.ToUTF8().data() << ", ignoring drop";
+        return false;
+    }
+
+    wxString cmd = wxString::Format("python \"%s\" --apply", script);
+    for (const wxString &p : paths)
+        cmd += wxString::Format(" \"%s\"", p);
+
+    //Synchronous on purpose. The page is reloaded straight afterwards to show the result,
+    //and a reload that races the filing shows the library exactly as it was.
+    const long rc = wxExecute(cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ingest returned " << rc
+                            << " for " << paths.GetCount() << " file(s)";
+    if (rc != 0)
+        return false;
+
+    if (m_browser != nullptr)
+        m_browser->Reload();
+    return true;
+}
+
+bool HomePageDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString &filenames)
+{
+    return m_panel != nullptr && m_panel->IngestDroppedFiles(filenames);
+}
 
 WebViewPanel::WebViewPanel(wxWindow *parent)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize)
@@ -90,6 +139,12 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
     }
     m_browser->Hide();
     SetSizer(topsizer);
+
+    //Dropping a model onto the home page files it into the library rather than opening it.
+    //The webview cannot do this itself: a page only receives the dropped file's BYTES, not
+    //its path, so it can neither identify the file from what is on disk beside it nor move
+    //it. A wxFileDropTarget receives real paths, which is the whole difference.
+    SetDropTarget(new HomePageDropTarget(this));
 
     topsizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
 

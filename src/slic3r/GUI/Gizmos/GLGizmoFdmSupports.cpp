@@ -539,10 +539,25 @@ int GLGizmoFdmSupports::get_selection_support_threshold_angle()
         return -1;
 
     const DynamicPrintConfig& obj_cfg = sel_info->model_object()->config.get();
-    const DynamicPrintConfig& glb_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    bool enable_support = obj_cfg.option("enable_support") ? obj_cfg.opt_bool("enable_support") : glb_cfg.opt_bool("enable_support");
-    SupportType support_type = obj_cfg.option("support_type") ? obj_cfg.opt_enum<SupportType>("support_type") : glb_cfg.opt_enum<SupportType>("support_type");
-    int support_threshold_angle = obj_cfg.option("support_threshold_angle") ? obj_cfg.opt_int("support_threshold_angle") : glb_cfg.opt_int("support_threshold_angle");
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return -1;
+    }
+    resolved.config.apply(*plate->config(), true);
+    const DynamicPrintConfig& plate_cfg = resolved.config;
+    bool enable_support = obj_cfg.option("enable_support") ? obj_cfg.opt_bool("enable_support") : plate_cfg.opt_bool("enable_support");
+    SupportType support_type = obj_cfg.option("support_type") ? obj_cfg.opt_enum<SupportType>("support_type") : plate_cfg.opt_enum<SupportType>("support_type");
+    int support_threshold_angle = obj_cfg.option("support_threshold_angle") ? obj_cfg.opt_int("support_threshold_angle") : plate_cfg.opt_int("support_threshold_angle");
 
     bool auto_support = enable_support && is_auto(support_type);
     return auto_support ? support_threshold_angle : 0;

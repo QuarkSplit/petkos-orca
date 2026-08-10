@@ -1,0 +1,226 @@
+/* Project library. Colours come from the existing home page variables so the panel
+   follows the light/dark switch without a second theme to maintain. */
+
+/* Nothing on this page sets a text colour on the document, so uncoloured text falls back
+   to the browser default, which is black under either theme. Anchoring the panel to the
+   theme-aware variable is what keeps the meta lines and the pickup list legible when the
+   dark stylesheet paints the body dark; without it they are black on near-black. */
+#LibraryArea { padding: 0 24px 40px 24px; color: var(--fg-color-text); }
+
+#LibHeader {
+    display: flex; align-items: baseline; gap: 12px;
+    margin: 6px 0 14px 0; flex-wrap: wrap;
+}
+#LibHeader .Content-Title { margin: 0; }
+#LibCount { opacity: 0.6; font-size: 12px; }
+#LibRebuildTip { opacity: 0.45; font-size: 11px; margin-left: auto; }
+
+#LibControls {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;
+}
+#LibSearch {
+    flex: 1 1 220px; min-width: 160px; padding: 7px 10px; border-radius: 6px;
+    border: 1px solid rgba(128, 128, 128, 0.35); background: transparent;
+    color: inherit; font-size: 13px; outline: none;
+}
+#LibSearch:focus { border-color: #00A26E; }
+#LibGroup, #LibSort {
+    padding: 7px 8px; border-radius: 6px; font-size: 13px; color: inherit;
+    border: 1px solid rgba(128, 128, 128, 0.35); background: transparent; outline: none;
+}
+#LibGroup option, #LibSort option { color: #222; }
+
+#LibChips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.LibChip {
+    padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer;
+    border: 1px solid rgba(128, 128, 128, 0.35); user-select: none; white-space: nowrap;
+}
+.LibChip b { opacity: 0.55; font-weight: 600; margin-left: 3px; }
+.LibChip:hover { border-color: #00A26E; }
+.LibChipOn { background: #00A26E; border-color: #00A26E; color: #fff; }
+.LibChipOn b { opacity: 0.8; }
+
+#LibGrid {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+}
+
+.LibCard { cursor: pointer; position: relative; }
+.LibThumb {
+    position: relative; border-radius: 8px; overflow: hidden;
+    background: rgba(128, 128, 128, 0.12); aspect-ratio: 1 / 1;
+    display: flex; align-items: center; justify-content: center;
+}
+.LibThumb img { width: 100%; height: 100%; object-fit: contain; }
+.LibCard:hover .LibThumb { outline: 2px solid #00A26E; }
+
+/* The badge is the point of the card, so it is legible against any thumbnail rather
+   than tinted to match one. */
+.LibBadge {
+    position: absolute; left: 6px; bottom: 6px; padding: 2px 7px; border-radius: 4px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+    color: #fff; background: #555;
+}
+.LibBadgeSliced  { background: #00A26E; }
+.LibBadgePrepped { background: #2F7DD1; }
+.LibBadgeColour  { background: #D98A00; }
+.LibBadgeForeign { background: #7A4FBF; }
+.LibBadgeMesh    { background: #6B7280; }
+.LibBadgeSent    { background: #0E7C5A; }
+.LibBadgeBad     { background: #C0392B; }
+
+.LibName {
+    margin-top: 7px; font-size: 13px; line-height: 1.25;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.LibMeta {
+    font-size: 11px; opacity: 0.55; margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.LibFacts { display: flex; align-items: center; gap: 4px; }
+.LibSwatch {
+    display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+    border: 1px solid rgba(128, 128, 128, 0.5); flex: 0 0 auto;
+}
+.LibTags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.LibTag {
+    font-size: 10px; padding: 1px 5px; border-radius: 3px;
+    border: 1px solid rgba(128, 128, 128, 0.4); opacity: 0.7;
+}
+.LibTagWarn { border-color: #D98A00; color: #D98A00; opacity: 1; }
+
+/* Filaments on a card.
+
+   The swatch row is a control, so it says so on hover and swallows its own click. Without
+   that, asking what colour something is opens the project in the slicer. */
+.LibSwatchRow { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.LibSwatchRow:hover { opacity: 1; }
+.LibFacts:hover .LibSwatchRow { opacity: 1; }
+.LibCaret { font-size: 8px; opacity: 0.6; font-style: normal; }
+
+.LibFilRows {
+    margin-top: 5px; padding: 5px 6px; border-radius: 5px; cursor: default;
+    border: 1px solid rgba(128, 128, 128, 0.3); background: rgba(128, 128, 128, 0.08);
+}
+.LibFilRow {
+    display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+    font-size: 10px; line-height: 1.5; opacity: 0.85;
+}
+.LibFilRow + .LibFilRow { border-top: 1px solid rgba(128, 128, 128, 0.18); margin-top: 3px;
+                          padding-top: 3px; }
+.LibFilHex { font-family: monospace; opacity: 0.75; }
+.LibFilType { font-weight: 600; }
+.LibFilG { margin-left: auto; }
+/* Absent measurements are stated, never rounded to zero: a zero would read as "prints
+   without filament" and would be believed. */
+.LibFilNone { opacity: 0.5; font-style: italic; }
+.LibFilProfile {
+    flex: 1 0 100%; opacity: 0.55; font-size: 9px; line-height: 1.35;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Ticking is on the thumbnail because that is where the pointer already is, opposite the
+   state badge so neither hides the other. */
+.LibPick {
+    position: absolute; top: 6px; right: 6px; width: 16px; height: 16px;
+    border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.8);
+    background: rgba(0, 0, 0, 0.35); color: #fff; font-size: 11px; line-height: 15px;
+    text-align: center; cursor: pointer; opacity: 0; transition: opacity 0.12s;
+}
+.LibCard:hover .LibPick, .LibPick.LibPickOn { opacity: 1; }
+.LibPickOn { background: #00A26E; border-color: #00A26E; }
+.LibCardPicked .LibThumb { outline: 2px solid #00A26E; }
+
+/* Pickup list. It sits in the flow and takes its colour from tints of the page's own
+   foreground, so the runtime dark-mode switch carries it with no second theme. */
+#LibPickup {
+    margin-bottom: 18px; padding: 12px 14px; border-radius: 8px;
+    border: 1px solid rgba(128, 128, 128, 0.35); background: rgba(128, 128, 128, 0.08);
+}
+#LibPickHead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#LibPickHead b { font-size: 14px; }
+.LibPickFrom { font-size: 11px; opacity: 0.6; }
+.LibPickSpacer { flex: 1 1 auto; }
+
+#LibPickTotal {
+    font-size: 12px; opacity: 0.75; margin: 8px 0 4px 0;
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+#LibPickTotal b { font-size: 17px; opacity: 1; }
+/* The floor warning is coloured, not hidden in the prose. A total read as complete when
+   it is a floor is the one failure that costs a second trip. */
+.LibPickWarn { color: #D98A00; font-size: 11px; }
+
+.LibPickRow {
+    display: flex; align-items: flex-start; gap: 10px; padding: 8px 0;
+    border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
+.LibSwatchBig {
+    display: block; width: 26px; height: 26px; border-radius: 5px; flex: 0 0 auto;
+    border: 1px solid rgba(128, 128, 128, 0.6);
+}
+.LibPickMain { flex: 1 1 auto; min-width: 0; }
+.LibPickTitle { font-size: 13px; text-transform: capitalize; }
+.LibPickHex {
+    font-family: monospace; font-size: 11px; opacity: 0.5; margin-left: 6px;
+    text-transform: none;
+}
+.LibPickSub { font-size: 11px; opacity: 0.6; line-height: 1.5; }
+.LibPickAmt { text-align: right; flex: 0 0 auto; display: flex; flex-direction: column; }
+.LibPickAmt b { font-size: 15px; }
+.LibPickAmt span { font-size: 10px; opacity: 0.55; }
+.LibPickAmt .LibPickWarn { opacity: 1; }
+
+#LibPickText {
+    width: 100%; height: 130px; margin-top: 10px; padding: 8px; border-radius: 6px;
+    border: 1px solid rgba(128, 128, 128, 0.35); background: transparent; color: inherit;
+    font-family: monospace; font-size: 11px; line-height: 1.45; resize: vertical;
+    outline: none; box-sizing: border-box;
+}
+
+#LibMore {
+    margin: 22px auto 0 auto; display: none; width: max-content;
+    padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    border: 1px solid rgba(128, 128, 128, 0.35);
+}
+#LibMore:hover { border-color: #00A26E; }
+
+.LibEmpty { opacity: 0.55; font-size: 13px; padding: 30px 0; grid-column: 1 / -1; }
+
+.LibTagMachine { border-color: #2F7DD1; color: #2F7DD1; opacity: 1; }
+
+/* Thumbnail slide deck. The arrows sit on the image rather than beside it, because the card
+   is already a click target for opening the project and a second row of controls would push
+   the grid taller for a feature most cards do not have. */
+.SlideNav { position: absolute; inset: 0; pointer-events: none; }
+.SlideArrow {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 26px; height: 34px; padding: 0; pointer-events: auto; cursor: pointer;
+    font: 600 17px/1 var(--sans, system-ui); color: #fff;
+    background: rgba(20, 22, 20, .42); border: 0;
+    opacity: 0; transition: opacity .12s, background .12s;
+}
+.LibCard:hover .SlideArrow, .SlideArrow:focus-visible { opacity: 1; }
+.SlideArrow:hover { background: rgba(20, 22, 20, .72); }
+.SlideArrow:focus-visible { outline: 2px solid #00A26E; outline-offset: -2px; }
+.SlideLeft  { left: 0;  border-radius: 0 4px 4px 0; }
+.SlideRight { right: 0; border-radius: 4px 0 0 4px; }
+
+/* Dots say how many views exist without a click. They stay visible so a card with plate
+   renders is distinguishable from one with only a cover photo at a glance. */
+.SlideDots {
+    position: absolute; left: 0; right: 0; bottom: 5px;
+    display: flex; justify-content: center; gap: 4px; pointer-events: none;
+}
+.SlideDot {
+    width: 5px; height: 5px; border-radius: 50%; pointer-events: auto; cursor: pointer;
+    background: rgba(255, 255, 255, .45); box-shadow: 0 0 2px rgba(0, 0, 0, .6);
+}
+.SlideDotOn { background: #fff; }
+.SlideLabel {
+    position: absolute; right: 6px; top: 6px; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; color: #fff; background: rgba(20, 22, 20, .55);
+    opacity: 0; transition: opacity .12s; pointer-events: none; white-space: nowrap;
+}
+.LibCard:hover .SlideLabel { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .SlideArrow, .SlideLabel { transition: none; } }

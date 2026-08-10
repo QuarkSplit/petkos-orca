@@ -12,6 +12,8 @@ function OnInit()
 	SendMsg_GetBambuLoginInfo();
 	SendMsg_GetRecentFile();
 	SendMsg_GetStaffPick();
+
+	LibInit();
 }
 
 //------最佳打开文件的右键菜单功能----------
@@ -234,10 +236,14 @@ function ShowRecentFileList( pList )
 		strHtml+=TmpHtml;
 	}
 	
-	$("#FileList").html(strHtml);	
-	
+	$("#FileList").html(strHtml);
+
     Set_RecentFile_MouseRightBtn_Event();
 	UpdateRecentClearBtnDisplay();
+
+	// The hidden recent grid still renders, because its right-click menu (open, explore,
+	// delete) is wired to it. What the library needs from it is only the set of paths.
+	LibNoteRecent(pList);
 }
 
 function ShowRecnetFileContextMenu()

@@ -1,0 +1,37 @@
+# graphify ignore — vendored / generated trees only.
+# .gitignore already excludes build/ and build_*/ but NOT deps_src/ or deps/.
+# deps/ holds ~111k third-party source files, deps_src/ ~1.7k. Never index these.
+
+# Vendored C/C++ dependency sources bundled in-tree
+deps_src/
+
+# CMake superbuild for third-party libs: Boost, CGAL, OpenSSL, OCCT, wxWidgets,
+# OpenCV, OpenVDB, TBB, python3, ... plus DL_CACHE tarballs and its own build tree
+deps/
+
+# Build output (also gitignored, listed here so --no-gitignore stays safe)
+build/
+build_*/
+build-linux/
+_build/
+.uv/
+
+# Localisation catalogues and packaged resources
+localization/
+resources/profiles/
+resources/i18n/
+
+# Editor / VCS / tooling caches
+.git/
+.vs/
+.vscode/
+.idea/
+.cache/
+__pycache__/
+*.pyc
+
+# Virtualenvs — never index
+.venv/
+venv/
+env/
+node_modules/

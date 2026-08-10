@@ -53,7 +53,7 @@ class SendDeviceItem : public DeviceItem
 {
 
 public:
-    SendDeviceItem(wxWindow* parent, MachineObject* obj);
+    SendDeviceItem(wxWindow* parent, MachineObject* obj, std::string source_model);
     ~SendDeviceItem() {};
 
     void DrawTextWithEllipsis(wxDC& dc, const wxString& text, int maxWidth, int left, int top = 0);
@@ -97,6 +97,7 @@ private:
     Plater*                             m_plater{ nullptr };
 
     int                                 m_print_plate_idx;
+    std::string                         m_source_model;
     bool                                m_is_canceled{ false };
     bool                                m_export_3mf_cancel{ false };
     AppConfig*                          app_config;
@@ -162,7 +163,7 @@ public:
     SendMultiMachinePage(Plater* plater = nullptr);
     ~SendMultiMachinePage();
 
-    void prepare(int plate_idx);
+    bool prepare(int plate_idx);
 
     void on_dpi_changed(const wxRect& suggested_rect);
     void on_sys_color_changed();
@@ -170,7 +171,7 @@ public:
     void on_send(wxCommandEvent& event);
     bool Show(bool show);
 
-    PrintParams request_params(MachineObject* obj);
+    bool request_params(MachineObject* obj, PrintParams &params);
 
     bool get_ams_mapping_result(std::string &mapping_array_str, std::string &mapping_array_str2, std::string &ams_mapping_info);
     wxBoxSizer* create_item_title(wxString title, wxWindow* parent, wxString tooltip);

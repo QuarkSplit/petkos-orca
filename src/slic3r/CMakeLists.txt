@@ -407,6 +407,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/PhysicalPrinterDialog.hpp
     GUI/Plater.cpp
     GUI/Plater.hpp
+    GUI/PlateBoard.cpp
+    GUI/PlateBoard.hpp
     GUI/PlateSettingsDialog.cpp
     GUI/PlateSettingsDialog.hpp
     GUI/Preferences.cpp

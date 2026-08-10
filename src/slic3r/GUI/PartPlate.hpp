@@ -23,6 +23,7 @@
 #include "3DBed.hpp"
 #include "MeshUtils.hpp"
 #include "libslic3r/ParameterUtils.hpp"
+#include "libslic3r/PlateSlicingContext.hpp"
 
 class GLUquadric;
 typedef class GLUquadric GLUquadricObject;
@@ -81,6 +82,7 @@ struct PlateBed
 {
     Pointfs              shape;
     Pointfs              exclude_areas;
+    Pointfs              wrapping_exclude_areas;
     std::vector<Pointfs> extruder_areas;
     std::vector<double>  extruder_heights;
     double               printable_height { 0.0 };
@@ -140,6 +142,7 @@ private:
     // hand us the profile geometry again.
     Pointfs m_shape_local;
     Pointfs m_exclude_area_local;
+    Pointfs m_wrapping_exclude_area_local;
     std::vector<Pointfs> m_extruder_areas_local;
     BoundingBoxf3 m_bounding_box;
     BoundingBoxf3 m_extended_bounding_box;
@@ -177,12 +180,17 @@ private:
 
     // BBS
     DynamicPrintConfig m_config;
+    // Exact effective configuration that produced the retained G-code. Live
+    // plate overrides are resolved separately and never overwrite this snapshot.
+    DynamicPrintConfig m_sliced_config;
 
-    // Name of the printer preset this plate is assigned to, empty meaning "follow
-    // the project's printer". Held as its own member rather than a key in m_config
-    // because m_config is a DynamicPrintConfig and applying a key with no entry in
-    // the print config definition throws.
+    // Plate-owned context. Empty fields explicitly inherit the corresponding
+    // Project-row defaults; named presets are always resolved exactly.
     std::string m_printer_preset_name;
+    std::string m_printer_vendor_id;
+    std::string m_print_preset_name;
+    std::vector<std::string> m_filament_preset_names;
+    std::string m_physical_printer_id;
 
     // Printable height of the assigned printer, 0 meaning "follow the project
     // printer". Applied inside set_pos_and_size so that every code path that
@@ -274,6 +282,7 @@ public:
     void reset_skirt_start_angle();
 
     DynamicPrintConfig* config() { return &m_config; }
+    const DynamicPrintConfig* config() const { return &m_config; }
 
     // set print sequence per plate
     //bool print_seq_same_global = true;
@@ -333,7 +342,7 @@ public:
     void set_index(int index);
 
     //get the plate's index
-    int get_index() { return m_plate_index; }
+    int get_index() const { return m_plate_index; }
 
     // SoftFever
     //get the plate's name
@@ -350,10 +359,36 @@ public:
         if (m_printer_preset_name == name)
             return;
         m_printer_preset_name = name;
+        m_printer_vendor_id.clear();
         //the plate renders its machine next to its name, so the name texture is stale now
         invalidate_plate_name_texture();
     }
     bool has_printer_assignment() const { return !m_printer_preset_name.empty(); }
+    bool has_slicing_context_assignment() const
+    {
+        return !m_printer_preset_name.empty() || !m_printer_vendor_id.empty()
+            || !m_print_preset_name.empty() || !m_filament_preset_names.empty();
+    }
+
+    PlateSlicingContext get_slicing_context() const
+    {
+        return {m_printer_preset_name, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id};
+    }
+    void set_slicing_context(const PlateSlicingContext &context)
+    {
+        const bool printer_changed = m_printer_preset_name != context.printer_preset_name;
+        m_printer_preset_name      = context.printer_preset_name;
+        m_printer_vendor_id        = context.printer_vendor_id;
+        m_print_preset_name        = context.print_preset_name;
+        m_filament_preset_names    = context.filament_preset_names;
+        m_physical_printer_id      = context.physical_printer_id;
+        if (printer_changed)
+            invalidate_plate_name_texture();
+    }
+    const std::string& get_print_preset_name() const { return m_print_preset_name; }
+    const std::string& get_printer_vendor_id() const { return m_printer_vendor_id; }
+    const std::vector<std::string>& get_filament_preset_names() const { return m_filament_preset_names; }
+    const std::string& get_physical_printer_id() const { return m_physical_printer_id; }
 
     //How tall this plate can print: the assigned printer's height when it has one,
     //otherwise whatever the plate was last sized to (the project printer's height).
@@ -438,6 +473,14 @@ public:
     //update instance exclude state
     void update_instance_exclude_status(int obj_id, int instance_id, BoundingBoxf3* bounding_box = nullptr);
 
+    //Re-run the outside-the-bed check for every instance on this plate against the
+    //plate's current bed, refreshing instance_outside_set and the ready-for-slice
+    //state. Needed after the bed changes under the parts (per-plate printer
+    //reassignment): the parts keep their world coordinates, so nothing else would
+    //notice they no longer fit. Returns the instances now outside so the caller can
+    //name the objects instead of failing silently.
+    std::vector<std::pair<int, int>> update_instances_outside_state();
+
     //update object's index caused by original object deleted
     void update_object_index(int obj_idx_removed, int obj_idx_max);
 
@@ -446,6 +489,11 @@ public:
 
     //whether it is empty
     bool empty() { return obj_to_instance_set.empty(); }
+
+    //How many instances sit on this plate, and whether any of them fell off its bed.
+    //Read-only, so a reporting caller can say both without reaching into the sets.
+    int  instance_count() const { return (int) obj_to_instance_set.size(); }
+    bool has_instances_outside() const { return !instance_outside_set.empty(); }
 
     int printable_instance_size();
 
@@ -463,6 +511,8 @@ public:
     // The untranslated profile geometry backing this plate.
     const Pointfs& get_local_shape() const { return m_shape_local; }
     const Pointfs& get_local_exclude_area() const { return m_exclude_area_local; }
+    const Pointfs& get_local_wrapping_exclude_area() const { return m_wrapping_exclude_area_local; }
+    void set_local_wrapping_exclude_area(const Pointfs& area) { m_wrapping_exclude_area_local = area; m_wrapping_detection_triangles.reset(); }
     const std::vector<Pointfs>& get_local_extruder_areas() const { return m_extruder_areas_local; }
     // Footprint of this plate's own bed, independent of any neighbour.
     Vec2d get_local_size() const;
@@ -522,15 +572,19 @@ public:
     }
 
     //is slice result valid or not
-    bool is_slice_result_valid() const
-    {
-        return m_slice_result_valid;
-    }
+    bool is_slice_result_valid() const;
+    bool has_retained_slice_result() const { return m_slice_result_valid && !m_sliced_config.keys().empty(); }
+    //Print time and filament weight of THIS plate's own retained slice. Both are read
+    //from the plate's GCodeResult, so they survive a reopen and never report another
+    //plate's figures; the Print object they used to come from is rebuilt per slice.
+    bool get_retained_print_statistics(float &print_time_seconds, double &weight_grams) const;
+    void set_sliced_config(const DynamicPrintConfig &config) { m_sliced_config = config; }
+    const DynamicPrintConfig &get_sliced_config() const { return m_sliced_config; }
 
     //is slice result ready for print
     bool is_slice_result_ready_for_print() const
     {
-        bool result = m_slice_result_valid;
+        bool result = is_slice_result_valid();
         if (result)
             result = m_gcode_result ?
 			(!m_gcode_result->toolpath_outside && m_gcode_result->gcode_check_result.error_code == 0 && !m_gcode_result->filament_printable_reuslt.has_value()) :
@@ -599,7 +653,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -617,7 +671,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {
@@ -820,9 +874,14 @@ public:
     //int delete_plate(PartPlate* plate);
     void delete_selected_plate();
 
-    bool check_all_plate_local_bed_type(const std::vector<BedType>& cur_bed_types);
     //get a plate pointer by index
     PartPlate* get_plate(int index);
+    //const overload, so a read-only caller can name an exact plate without either
+    //casting the constness away or giving up its own const
+    const PartPlate* get_plate(int index) const
+    {
+        return (index < 0 || index >= (int) m_plate_list.size()) ? nullptr : m_plate_list[index];
+    }
 
     void get_height_limits(float& height_to_lid, float& height_to_rod)
     {
@@ -955,24 +1014,28 @@ public:
     //is not installed, which is normal when opening a project authored elsewhere; the
     //caller then falls back to the project printer's bed.
     //NOTE: not static and not usable headless. It reads the GUI preset bundle, and in
-    //CLI mode there is no wxApp instance to read it from, so it reports failure there
-    //and every plate falls back to the project bed.
+    //CLI mode there is no wxApp instance to read it from, so a named assignment reports
+    //failure instead of being substituted.
     bool resolve_printer_bed(const std::string &preset_name, PlateBed &bed) const;
-    //Give one plate the bed of whatever printer it is assigned to, falling back to the
-    //project bed when it has no assignment or the assigned preset is missing.
-    bool apply_printer_to_plate(int index);
+    //Give one plate the bed of its exact assigned printer. An empty assignment explicitly
+    //inherits the Project row; a missing named preset is an error.
+    //reflow=false skips the per-plate relayout so a caller applying several beds in a
+    //row can do one trailing reflow_layout() instead of N visible shuffles.
+    bool apply_printer_to_plate(int index, bool reflow = true);
     //Re-apply every plate's assignment, e.g. straight after loading a project.
     void apply_printer_assignments();
 
     //give a single plate a bed of its own, leaving every other plate alone.
-    //triggers a relayout because the neighbours have to shuffle around the new footprint.
+    //triggers a relayout because the neighbours have to shuffle around the new
+    //footprint, unless reflow=false defers that to the caller.
     bool set_plate_shape(int                         index,
                          const Pointfs              &shape,
                          const Pointfs              &exclude_areas,
                          const std::vector<Pointfs> &extruder_areas,
                          const std::vector<double>  &extruder_heights,
                          float                       height_to_lid,
-                         float                       height_to_rod);
+                         float                       height_to_rod,
+                         bool                        reflow = true);
     void set_hover_id(int id);
     void reset_hover_id();
     bool intersects(const BoundingBoxf3 &bb);

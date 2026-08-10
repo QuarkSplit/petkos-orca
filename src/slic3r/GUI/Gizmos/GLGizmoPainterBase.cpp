@@ -1099,8 +1099,7 @@ bool GLGizmoPainterBase::on_is_activable() const
 {
     const Selection& selection = m_parent.get_selection();
 
-    if (wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() != ptFFF
-        || !selection.is_single_full_instance()/* || wxGetApp().get_mode() == comSimple*/)
+    if (!selection.is_single_full_instance()/* || wxGetApp().get_mode() == comSimple*/)
         return false;
 
     // BBS
@@ -1118,7 +1117,7 @@ bool GLGizmoPainterBase::on_is_selectable() const
     //BBS
     /*return (wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() == ptFFF
          && wxGetApp().get_mode() != comSimple );*/
-    return (wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() == ptFFF);
+    return true;
 }
 
 

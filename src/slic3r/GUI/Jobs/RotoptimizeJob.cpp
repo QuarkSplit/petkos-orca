@@ -31,7 +31,11 @@ void RotoptimizeJob::prepare()
     m_accuracy = std::max(0.f, std::min(m_accuracy, 1.f));
     m_method_id = std::max(size_t(0), std::min(get_methods_count() - 1, m_method_id));
 
-    m_default_print_cfg = wxGetApp().preset_bundle->full_config();
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (!m_plater->resolve_current_plate_slicing_config(resolved, context_error))
+        throw Slic3r::RuntimeError("Unable to prepare rotation optimization: " + context_error);
+    m_default_print_cfg = std::move(resolved.config);
 
     const auto &sel = m_plater->get_selection().get_content();
 

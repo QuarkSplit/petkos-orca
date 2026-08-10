@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "homepage",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8731", "--directory", "resources/web"],
+      "port": 8731,
+      "url": "http://localhost:8731"
+    }
+  ]
+}

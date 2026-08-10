@@ -155,7 +155,9 @@ public:
                               const wxArrayString&           groups,
                               const wxArrayString&           storage_paths,
                               const wxArrayString&           storage_names,
-                              bool                           switch_to_device_tab);
+                              bool                           switch_to_device_tab,
+                              std::string                    printer_model_id,
+                              BedType                        plate_bed_type);
 
     virtual void EndModal(int ret) override;
     int          timeLapse() const { return m_timeLapse; }
@@ -186,6 +188,8 @@ private:
     int     m_timeLapse;
     int     m_heatedBedLeveling;
     BedType m_BedType;
+    std::string m_printer_model_id;
+    BedType m_plate_bed_type;
 };
 
 class CrealityPrintHostSendDialog : public PrintHostSendDialog
@@ -197,7 +201,8 @@ public:
                                 const wxArrayString&           storage_paths,
                                 const wxArrayString&           storage_names,
                                 bool                           switch_to_device_tab,
-                                PrintHost*                     printhost);
+                                PrintHost*                     printhost,
+                                DynamicPrintConfig             plate_config);
 
     virtual void                               init() override;
     virtual std::map<std::string, std::string> extendedInfo() const;
@@ -207,6 +212,7 @@ private:
 
     bool        m_enableSelfTest;
     PrintHost*  m_printhost;
+    DynamicPrintConfig m_plate_config;
 
     struct SlotInfo {
         std::string tool_id;   // e.g. "T1A"

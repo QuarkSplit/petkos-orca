@@ -16,6 +16,7 @@
 #include "wx/webviewfshandler.h"
 #include "wx/numdlg.h"
 #include "wx/infobar.h"
+#include <wx/dnd.h>
 #include "wx/filesys.h"
 #include "wx/fs_arc.h"
 #include "wx/fs_mem.h"
@@ -33,11 +34,32 @@ class NetworkAgent;
 namespace GUI {
 
 
+class WebViewPanel;
+
+//A drop onto the home page files the model into the library instead of opening it. The
+//distinction matters: opening a loose download leaves it loose, and the reason a library
+//exists is that a model nobody filed is a model nobody finds again.
+class HomePageDropTarget : public wxFileDropTarget
+{
+public:
+    explicit HomePageDropTarget(WebViewPanel *panel) : m_panel(panel) {
+        this->SetDefaultAction(wxDragCopy);
+    }
+    bool OnDropFiles(wxCoord x, wxCoord y, const wxArrayString &filenames) override;
+
+private:
+    WebViewPanel *m_panel {nullptr};
+};
+
 class WebViewPanel : public wxPanel
 {
 public:
     WebViewPanel(wxWindow *parent);
     virtual ~WebViewPanel();
+
+    //Resolve, file and re-index dropped models. Returns false when nothing was filed, so
+    //the drop is refused and the file stays where the user left it.
+    bool IngestDroppedFiles(const wxArrayString &paths);
 
     void load_url(wxString& url);
 

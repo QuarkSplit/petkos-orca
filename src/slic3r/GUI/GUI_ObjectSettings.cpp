@@ -12,6 +12,7 @@
 #include "libslic3r/Model.hpp"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/log/trivial.hpp>
 
 #include "I18N.hpp"
 #include "ConfigManipulation.hpp"
@@ -309,14 +310,12 @@ bool ObjectSettings::update_settings_list()
 
 #endif
 
-bool ObjectSettings::add_missed_options(ModelConfig* config_to, const DynamicPrintConfig& config_from)
+bool ObjectSettings::add_missed_options(ModelConfig* config_to, const DynamicPrintConfig& config_from,
+                                        const DynamicPrintConfig& plate_config)
 {
-    const DynamicPrintConfig& print_config = wxGetApp().plater()->printer_technology() == ptFFF ?
-                                             wxGetApp().preset_bundle->prints.get_edited_preset().config :
-                                             wxGetApp().preset_bundle->sla_prints.get_edited_preset().config;
     bool is_added = false;
 
-    for (auto opt_key : config_from.diff(print_config))
+    for (auto opt_key : config_from.diff(plate_config))
         if (!config_to->has(opt_key)) {
             config_to->set_key_value(opt_key, config_from.option(opt_key)->clone());
             is_added = true;
@@ -329,24 +328,29 @@ void ObjectSettings::update_config_values(ModelConfig* config)
 {
     const auto objects_model        = wxGetApp().obj_list()->GetModel();
     const auto item                 = wxGetApp().obj_list()->GetSelection();
-    const auto printer_technology   = wxGetApp().plater()->printer_technology();
-    const bool is_object_settings   = objects_model->GetItemType(objects_model->GetParent(item)) == itObject;
 
     if (!item || !objects_model->IsSettingsItem(item) || !config)
         return;
+    const bool is_object_settings = objects_model->GetItemType(objects_model->GetParent(item)) == itObject;
+
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return;
+    }
+    const DynamicPrintConfig plate_config = resolved.config;
 
     // update config values according to configuration hierarchy
-    DynamicPrintConfig  main_config   = printer_technology == ptFFF ?
-                                        wxGetApp().preset_bundle->prints.get_edited_preset().config :
-                                        wxGetApp().preset_bundle->sla_prints.get_edited_preset().config;
+    DynamicPrintConfig main_config = plate_config;
 
-    auto load_config = [this, config, &main_config]()
+    auto load_config = [this, config, &main_config, &plate_config]()
     {
         /* Additional check for overrided options.
          * There is a case, when some options should to be added, 
          * to avoid check loop in the next configuration update
          */
-        bool is_added = add_missed_options(config, main_config);
+        bool is_added = add_missed_options(config, main_config, plate_config);
 
         // load checked values from main_config to config
         config->apply_only(main_config, config->keys(), true);
@@ -391,7 +395,8 @@ void ObjectSettings::update_config_values(ModelConfig* config)
     //BBS: change local config to DynamicPrintConfig
     ConfigManipulation config_manipulation(load_config, toggle_field, nullptr, nullptr, &(config->get()));
 
-    config_manipulation.set_is_BBL_Printer(wxGetApp().preset_bundle->is_bbl_vendor());
+    config_manipulation.set_printer_config(&plate_config);
+    config_manipulation.set_is_BBL_Printer(resolved.is_bbl_printer);
 
     if (!is_object_settings)
     {
@@ -403,11 +408,8 @@ void ObjectSettings::update_config_values(ModelConfig* config)
     }
 
     main_config.apply(config->get(), true);
-    printer_technology == ptFFF  ?  config_manipulation.update_print_fff_config(&main_config) :
-                                    config_manipulation.update_print_sla_config(&main_config) ;
-
-    printer_technology == ptFFF  ?  config_manipulation.toggle_print_fff_options(&main_config, 0) :
-                                    config_manipulation.toggle_print_sla_options(&main_config) ;
+    config_manipulation.update_print_fff_config(&main_config);
+    config_manipulation.toggle_print_fff_options(&main_config, 0);
 }
 
 void ObjectSettings::UpdateAndShow(const bool show)

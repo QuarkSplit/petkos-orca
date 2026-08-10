@@ -51,6 +51,8 @@ using namespace nlohmann;
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Config.hpp"
+// SlicingErrors must be catchable by type here, or its per-object messages collapse to a placeholder.
+#include "libslic3r/Exception.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCode.hpp"
 #include "libslic3r/Model.hpp"
@@ -69,6 +71,7 @@ using namespace nlohmann;
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/BlacklistedLibraryCheck.hpp"
 #include "libslic3r/FlushVolCalc.hpp"
+#include "libslic3r/PresetBundle.hpp"
 
 #include "libslic3r/Orient.hpp"
 #include "libslic3r/PNGReadWrite.hpp"
@@ -3718,8 +3721,110 @@ int CLI::run(int argc, char **argv)
         }
     }
 
+    const auto find_project_preset = [&project_presets](Preset::Type type, const std::string &name) -> const Preset* {
+        for (const Preset *preset : project_presets)
+            if (preset != nullptr && preset->type == type && preset->name == name)
+                return preset;
+        return nullptr;
+    };
+
+    const auto resolve_cli_plate_config = [&](Slic3r::GUI::PartPlate *plate,
+                                              DynamicPrintConfig      &resolved,
+                                              std::string             &vendor_id,
+                                              std::string             &error) -> bool {
+        resolved = m_print_config;
+        vendor_id.clear();
+        error.clear();
+        const PlateSlicingContext context = plate->get_slicing_context();
+        const Preset *resolved_printer_preset = nullptr;
+
+        const auto apply_named = [&](Preset::Type type, const std::string &name, const char *settings_key,
+                                     const char *label) -> bool {
+            if (name.empty())
+                return true;
+            if (const Preset *preset = find_project_preset(type, name)) {
+                resolved.apply(preset->config, true);
+                if (type == Preset::TYPE_PRINTER)
+                    resolved_printer_preset = preset;
+                return true;
+            }
+            const ConfigOptionString *selected = resolved.option<ConfigOptionString>(settings_key);
+            if (selected != nullptr && selected->value == name)
+                return true;
+            error = std::string(label) + " preset '" + name + "' is not embedded or loaded";
+            return false;
+        };
+
+        if (!apply_named(Preset::TYPE_PRINTER, context.printer_preset_name, "printer_settings_id", "Printer") ||
+            !apply_named(Preset::TYPE_PRINT, context.print_preset_name, "print_settings_id", "Process"))
+            return false;
+
+        if (!context.filament_preset_names.empty()) {
+            bool already_selected = false;
+            if (const ConfigOptionStrings *selected = resolved.option<ConfigOptionStrings>("filament_settings_id"))
+                already_selected = selected->values == context.filament_preset_names;
+            if (!already_selected) {
+                std::vector<Preset> filaments;
+                filaments.reserve(context.filament_preset_names.size());
+                for (const std::string &name : context.filament_preset_names) {
+                    const Preset *preset = find_project_preset(Preset::TYPE_FILAMENT, name);
+                    if (preset == nullptr) {
+                        error = "Filament preset '" + name + "' is not embedded or loaded";
+                        return false;
+                    }
+                    filaments.emplace_back(*preset);
+                }
+                Preset effective_printer(Preset::TYPE_PRINTER, context.printer_preset_name, false);
+                Preset effective_process(Preset::TYPE_PRINT, context.print_preset_name, false);
+                effective_printer.config = resolved;
+                effective_process.config = resolved;
+                DynamicPrintConfig project;
+                const std::vector<int> filament_maps = plate->get_real_filament_maps(m_print_config);
+                const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(m_print_config);
+                resolved = PresetBundle::construct_full_config(effective_printer, effective_process, project,
+                                                               filaments, false, filament_maps, volume_maps);
+            }
+        }
+
+        resolved.apply(*plate->config(), true);
+        resolved.apply(m_extra_config, true);
+        const ConfigOptionFloats *nozzles = resolved.option<ConfigOptionFloats>("nozzle_diameter");
+        if (nozzles == nullptr || nozzles->values.empty()) {
+            error = "The resolved printer has no nozzle definition";
+            return false;
+        }
+
+        std::string printer_name;
+        if (const ConfigOptionString *name = resolved.option<ConfigOptionString>("printer_settings_id"))
+            printer_name = name->value;
+
+        std::string actual_vendor_id;
+        if (resolved_printer_preset != nullptr && resolved_printer_preset->vendor != nullptr)
+            actual_vendor_id = resolved_printer_preset->vendor->id;
+        if (actual_vendor_id.empty())
+            actual_vendor_id = PresetBundle::find_preset_vendor(printer_name, Preset::TYPE_PRINTER);
+        if (actual_vendor_id.empty()) {
+            if (const ConfigOptionString *inherits = resolved.option<ConfigOptionString>("inherits"))
+                actual_vendor_id = PresetBundle::find_preset_vendor(inherits->value, Preset::TYPE_PRINTER);
+        }
+        if (actual_vendor_id.empty()) {
+            error = "Printer preset '" + printer_name + "' has no exact vendor identity";
+            return false;
+        }
+        if (!context.printer_vendor_id.empty() && context.printer_vendor_id != actual_vendor_id) {
+            error = "Printer preset '" + printer_name + "' belongs to vendor '" + actual_vendor_id
+                  + "', not the plate's recorded vendor '" + context.printer_vendor_id + "'";
+            return false;
+        }
+        vendor_id = std::move(actual_vendor_id);
+        resolved.option<ConfigOptionString>("printer_vendor_id", true)->value = vendor_id;
+        return true;
+    };
+
     //BBS: partplate list
     Slic3r::GUI::PartPlateList partplate_list(NULL, m_models.data(), printer_technology);
+    std::vector<DynamicPrintConfig> plate_print_configs;
+    std::vector<std::string> plate_vendor_ids;
     //use Pointfs insteadof Points
     Pointfs current_printable_area = m_print_config.opt<ConfigOptionPoints>("printable_area")->values;
     Pointfs current_exclude_area = m_print_config.opt<ConfigOptionPoints>("bed_exclude_area")->values;
@@ -4074,16 +4179,60 @@ int CLI::run(int argc, char **argv)
         partplate_list.load_from_3mf_structure(plate_data_src);
 
         int plate_count = partplate_list.get_plate_count();
+        plate_print_configs.resize(plate_count);
+        plate_vendor_ids.resize(plate_count);
         plate_obj_size_infos.resize(plate_count, plate_obj_size_info_t());
         for (int index = 0; index < plate_count; index ++) {
             Slic3r::GUI::PartPlate* cur_plate = (Slic3r::GUI::PartPlate *)partplate_list.get_plate(index);
 
-            check_plate_wipe_tower(cur_plate, index, m_print_config, plate_obj_size_infos[index]);
+            std::string context_error;
+            if (!resolve_cli_plate_config(cur_plate, plate_print_configs[index], plate_vendor_ids[index], context_error)) {
+                const std::string message = (boost::format("Plate %1% has an unresolved slicing context: %2%")
+                                             % (index + 1) % context_error).str();
+                BOOST_LOG_TRIVIAL(error) << message;
+                record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, index + 1, message, sliced_info);
+                flush_and_exit(CLI_CONFIG_FILE_ERROR);
+            }
+
+            const DynamicPrintConfig &plate_cfg = plate_print_configs[index];
+            const Pointfs shape = plate_cfg.option<ConfigOptionPoints>("printable_area")->values;
+            const Pointfs excludes = plate_cfg.option<ConfigOptionPoints>("bed_exclude_area")->values;
+            const auto *wrapping_opt = plate_cfg.option<ConfigOptionPoints>("wrapping_exclude_area");
+            const auto *areas_opt = plate_cfg.option<ConfigOptionPointsGroups>("extruder_printable_area");
+            const auto *heights_opt = plate_cfg.option<ConfigOptionFloatsNullable>("extruder_printable_height");
+            const std::vector<Pointfs> areas = areas_opt != nullptr ? areas_opt->values : std::vector<Pointfs>();
+            const std::vector<double> heights = heights_opt != nullptr ? heights_opt->values : std::vector<double>();
+            cur_plate->set_printable_height(plate_cfg.opt_float("printable_height"));
+            cur_plate->set_local_wrapping_exclude_area(wrapping_opt != nullptr ? wrapping_opt->values : Pointfs());
+            partplate_list.set_plate_shape(index, shape, excludes, areas, heights,
+                                           (float)plate_cfg.opt_float("extruder_clearance_height_to_lid"),
+                                           (float)plate_cfg.opt_float("extruder_clearance_height_to_rod"), false);
+            cur_plate->update_apply_result_invalid(false);
+
+            check_plate_wipe_tower(cur_plate, index, plate_print_configs[index], plate_obj_size_infos[index]);
             BOOST_LOG_TRIVIAL(info) << boost::format("plate %1%,  has_wipe_tower %2%, wipe_x %3%, wipe_y %4%, width %5%, depth %6%")
                 %(index+1) %plate_obj_size_infos[index].has_wipe_tower %plate_obj_size_infos[index].wipe_x %plate_obj_size_infos[index].wipe_y %plate_obj_size_infos[index].wipe_width %plate_obj_size_infos[index].wipe_depth;
         }
 
-        translate_models(partplate_list, m_print_config);
+        partplate_list.reflow_layout();
+        const bool has_assigned_printer = std::any_of(partplate_list.get_plate_list().begin(), partplate_list.get_plate_list().end(),
+            [](const Slic3r::GUI::PartPlate *plate) { return plate != nullptr && plate->has_printer_assignment(); });
+        if (!has_assigned_printer)
+            translate_models(partplate_list, m_print_config);
+        else if (translate_old || shrink_to_new_bed > 0)
+            BOOST_LOG_TRIVIAL(info) << "Project-wide bed translation is not applicable to plates with exact printer assignments; each plate keeps its resolved printer geometry";
+    }
+    else {
+        plate_print_configs.assign(partplate_list.get_plate_count(), m_print_config);
+        plate_vendor_ids.resize(partplate_list.get_plate_count());
+        for (int index = 0; index < partplate_list.get_plate_count(); ++index) {
+            std::string context_error;
+            if (!resolve_cli_plate_config(partplate_list.get_plate(index), plate_print_configs[index],
+                                          plate_vendor_ids[index], context_error)) {
+                record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, index + 1, context_error, sliced_info);
+                flush_and_exit(CLI_CONFIG_FILE_ERROR);
+            }
+        }
     }
 
     /*for (ModelObject *model_object : m_models[0].objects)
@@ -4266,7 +4415,7 @@ int CLI::run(int argc, char **argv)
 
     // Loop through transform options.
     bool user_center_specified = false;
-    Points beds = get_bed_shape(m_print_config);
+    Points beds;
     ArrangeParams arrange_cfg;
 
     BOOST_LOG_TRIVIAL(info) << "will start transforms, commands count " << m_transforms.size() << "\n";
@@ -4593,10 +4742,11 @@ int CLI::run(int argc, char **argv)
     }
     else if (plate_to_slice > 0){
         Slic3r::GUI::PartPlate* cur_plate = (Slic3r::GUI::PartPlate *)partplate_list.get_plate(plate_to_slice-1);
+        DynamicPrintConfig &plate_cfg = plate_print_configs.at(plate_to_slice - 1);
         PrintSequence curr_plate_seq = cur_plate->get_print_seq();
 
         if (curr_plate_seq == PrintSequence::ByDefault) {
-            auto seq_print  = m_print_config.option<ConfigOptionEnum<PrintSequence>>("print_sequence");
+            auto seq_print  = plate_cfg.option<ConfigOptionEnum<PrintSequence>>("print_sequence");
             if (seq_print && (seq_print->value == PrintSequence::ByObject)) {
                 BOOST_LOG_TRIVIAL(info) << boost::format("Check whether need to arrange by print_sequence: plate %1% print by object, set from global")%plate_to_slice;
                 is_seq_print_for_curr_plate = true;
@@ -4608,7 +4758,7 @@ int CLI::run(int argc, char **argv)
         }
 
         if (duplicate_count > 0) {
-            const ConfigOptionBool* spiral_vase = m_print_config.option<ConfigOptionBool>("spiral_mode");
+            const ConfigOptionBool* spiral_vase = plate_cfg.option<ConfigOptionBool>("spiral_mode");
             if ((spiral_vase != nullptr) && spiral_vase->value)
             {
                 //spiral mode can only be duplicated with by-object
@@ -4625,14 +4775,18 @@ int CLI::run(int argc, char **argv)
 
     if ((!need_arrange) && is_bbl_3mf && !shrink_to_new_bed && (plate_to_slice > 0))
     {
-        if (((old_height_to_rod != 0.f) && (old_height_to_rod != height_to_rod))
-            || ((old_height_to_lid != 0.f) && (old_height_to_lid != height_to_lid))
-            || ((old_max_radius != 0.f) && (old_max_radius != clearance_radius)))
+        const DynamicPrintConfig &plate_cfg = plate_print_configs.at(plate_to_slice - 1);
+        const double plate_height_to_rod = plate_cfg.opt_float("extruder_clearance_height_to_rod");
+        const double plate_height_to_lid = plate_cfg.opt_float("extruder_clearance_height_to_lid");
+        const double plate_clearance_radius = plate_cfg.opt_float("extruder_clearance_radius");
+        if (((old_height_to_rod != 0.f) && (old_height_to_rod != plate_height_to_rod))
+            || ((old_height_to_lid != 0.f) && (old_height_to_lid != plate_height_to_lid))
+            || ((old_max_radius != 0.f) && (old_max_radius != plate_clearance_radius)))
         {
             if (is_seq_print_for_curr_plate) {
                 need_arrange = true;
                 BOOST_LOG_TRIVIAL(info) << boost::format("old_height_to_rod %1%, old_height_to_lid %2%,  old_max_radius %3%, current height_to_rod %4%, height_to_lid %5%, clearance_radius %6%, need arrange!")
-                    %old_height_to_rod %old_height_to_lid %old_max_radius %height_to_rod %height_to_lid %clearance_radius;
+                    %old_height_to_rod %old_height_to_lid %old_max_radius %plate_height_to_rod %plate_height_to_lid %plate_clearance_radius;
             }
         }
     }
@@ -4698,8 +4852,11 @@ int CLI::run(int argc, char **argv)
                 //do arrange for plate
                 ArrangePolygons selected, unselected;
                 Model& model = m_models[0];
+                DynamicPrintConfig &plate_cfg = plate_print_configs.at(i);
+                const bool plate_enable_wrapping = plate_cfg.opt_bool("enable_wrapping_detection");
+                const bool plate_avoid_extrusion_cali = avoid_extrusion_cali_region && plate_vendor_ids.at(i) == "BBL";
                 arrange_cfg = ArrangeParams();  // reset all params
-                get_print_sequence(cur_plate, m_print_config, arrange_cfg.is_seq_print);
+                get_print_sequence(cur_plate, plate_cfg, arrange_cfg.is_seq_print);
 
                 //Step-1: prepare the arranged data
                 partplate_list.lock_plate(i, false);
@@ -4713,20 +4870,21 @@ int CLI::run(int argc, char **argv)
                     for (size_t inst_idx = 0; inst_idx < mo->instances.size(); ++inst_idx)
                     {
                         ModelInstance* minst = mo->instances[inst_idx];
-                        ArrangePolygon   ap = get_instance_arrange_poly(minst, m_print_config);
+                        ArrangePolygon   ap = get_instance_arrange_poly(minst, plate_cfg);
                         ap.itemid = selected.size();
                         selected.emplace_back(std::move(ap));
                         BOOST_LOG_TRIVIAL(debug) << boost::format("plate %1%: add object %2%  object index %3%, into selected") % (i+1) % ap.name %(oidx+1);
                     }
                 }
 
-                if (!arrange_cfg.is_seq_print && (assemble_plate.filaments_count > 1)||(enable_wrapping_detect && !current_wrapping_exclude_area.empty()))
+                if ((!arrange_cfg.is_seq_print && assemble_plate.filaments_count > 1)
+                    || (plate_enable_wrapping && !cur_plate->get_local_wrapping_exclude_area().empty()))
                 {
                     //prepare the wipe tower
                     int plate_count = partplate_list.get_plate_count();
 
-                    auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
-                    const float tower_brim_width = m_print_config.option<ConfigOptionFloat>("prime_tower_width", true)->value;
+                    auto printer_structure_opt = plate_cfg.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+                    const float tower_brim_width = plate_cfg.option<ConfigOptionFloat>("prime_tower_width", true)->value;
                     const float tower_margin = WIPE_TOWER_MARGIN + tower_brim_width;
 
                     // set the default position, the same with print config(left top)
@@ -4744,12 +4902,12 @@ int CLI::run(int argc, char **argv)
                     }
 
                     //create the options using default if necessary
-                    ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                    ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
-                    ConfigOptionFloat* width_option = m_print_config.option<ConfigOptionFloat>("prime_tower_width", true);
-                    ConfigOptionFloat* rotation_angle_option = m_print_config.option<ConfigOptionFloat>("wipe_tower_rotation_angle", true);
-                    ConfigOptionFloat* volume_option = m_print_config.option<ConfigOptionFloat>("prime_volume", true);
-                    ConfigOptionEnum<WipeTowerWallType> *prime_tower_rib_wall_option = m_print_config.option<ConfigOptionEnum<WipeTowerWallType>>("wipe_tower_wall_type", true);
+                    ConfigOptionFloats* wipe_x_option = plate_cfg.option<ConfigOptionFloats>("wipe_tower_x", true);
+                    ConfigOptionFloats* wipe_y_option = plate_cfg.option<ConfigOptionFloats>("wipe_tower_y", true);
+                    ConfigOptionFloat* width_option = plate_cfg.option<ConfigOptionFloat>("prime_tower_width", true);
+                    ConfigOptionFloat* rotation_angle_option = plate_cfg.option<ConfigOptionFloat>("wipe_tower_rotation_angle", true);
+                    ConfigOptionFloat* volume_option = plate_cfg.option<ConfigOptionFloat>("prime_volume", true);
+                    ConfigOptionEnum<WipeTowerWallType> *prime_tower_rib_wall_option = plate_cfg.option<ConfigOptionEnum<WipeTowerWallType>>("wipe_tower_wall_type", true);
 
                     BOOST_LOG_TRIVIAL(info) << boost::format("prime_tower_width %1% wipe_tower_rotation_angle %2% prime_volume %3%, rib_wall %4%") % width_option->value % rotation_angle_option->value % volume_option->value %prime_tower_rib_wall_option->value;
 
@@ -4760,7 +4918,7 @@ int CLI::run(int argc, char **argv)
                     wipe_y_option->set_at(&wt_y_opt, i, 0);
 
                     Vec3d wipe_tower_size, wipe_tower_pos;
-                    ArrangePolygon wipe_tower_ap = cur_plate->estimate_wipe_tower_polygon(m_print_config, i, wipe_tower_pos, wipe_tower_size, new_extruder_count, assemble_plate.filaments_count, true);
+                    ArrangePolygon wipe_tower_ap = cur_plate->estimate_wipe_tower_polygon(plate_cfg, i, wipe_tower_pos, wipe_tower_size, new_extruder_count, assemble_plate.filaments_count, true);
 
                     //update the new wp position
                     wt_x_opt.value = wipe_tower_pos(0);
@@ -4775,35 +4933,35 @@ int CLI::run(int argc, char **argv)
                 }
 
                 // add the virtual object into unselect list if has
-                partplate_list.preprocess_exclude_areas(unselected, enable_wrapping_detect, i + 1);
-                if (avoid_extrusion_cali_region)
-                    partplate_list.preprocess_nonprefered_areas(unselected, i + 1);
+                partplate_list.preprocess_exclude_areas(unselected, plate_enable_wrapping, 1, 0, (int)i);
+                if (plate_avoid_extrusion_cali)
+                    partplate_list.preprocess_nonprefered_areas(unselected, 1);
 
                 //Step-2:prepare the arrange params
                 arrange_cfg.allow_rotations = allow_rotations;
                 arrange_cfg.allow_multi_materials_on_same_plate = allow_multicolor_oneplate;
-                arrange_cfg.avoid_extrusion_cali_region = avoid_extrusion_cali_region;
-                arrange_cfg.clearance_height_to_rod = height_to_rod;
-                arrange_cfg.clearance_height_to_lid = height_to_lid;
-                arrange_cfg.clearance_radius = clearance_radius;
-                arrange_cfg.printable_height = print_height;
+                arrange_cfg.avoid_extrusion_cali_region = plate_avoid_extrusion_cali;
+                arrange_cfg.clearance_height_to_rod = plate_cfg.opt_float("extruder_clearance_height_to_rod");
+                arrange_cfg.clearance_height_to_lid = plate_cfg.opt_float("extruder_clearance_height_to_lid");
+                arrange_cfg.clearance_radius = plate_cfg.opt_float("extruder_clearance_radius");
+                arrange_cfg.printable_height = plate_cfg.opt_float("printable_height");
                 arrange_cfg.min_obj_distance = 0;
                 if (arrange_cfg.is_seq_print) {
                     arrange_cfg.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
                     arrange_cfg.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
                 }
-                if (auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
+                if (auto printer_structure_opt = plate_cfg.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
                     arrange_cfg.align_to_y_axis = (printer_structure_opt->value == PrinterStructure::psI3);
                 }
 
-                arrangement::update_arrange_params(arrange_cfg, &m_print_config, selected);
-                arrangement::update_selected_items_inflation(selected, &m_print_config, arrange_cfg);
-                arrangement::update_unselected_items_inflation(unselected, &m_print_config, arrange_cfg);
-                arrangement::update_selected_items_axis_align(selected, &m_print_config, arrange_cfg);
+                arrangement::update_arrange_params(arrange_cfg, &plate_cfg, selected);
+                arrangement::update_selected_items_inflation(selected, &plate_cfg, arrange_cfg);
+                arrangement::update_unselected_items_inflation(unselected, &plate_cfg, arrange_cfg);
+                arrangement::update_selected_items_axis_align(selected, &plate_cfg, arrange_cfg);
 
-                beds = get_shrink_bedpts(&m_print_config, arrange_cfg);
+                beds = get_shrink_bedpts(&plate_cfg, arrange_cfg);
 
-                partplate_list.preprocess_exclude_areas(arrange_cfg.excluded_regions, enable_wrapping_detect, 1, scale_(1));
+                partplate_list.preprocess_exclude_areas(arrange_cfg.excluded_regions, plate_enable_wrapping, 1, scale_(1), (int)i);
 
                 {
                     BOOST_LOG_TRIVIAL(debug) << "arrange bedpts:" << beds[0].transpose() << ", " << beds[1].transpose() << ", " << beds[2].transpose() << ", " << beds[3].transpose();
@@ -4850,6 +5008,7 @@ int CLI::run(int argc, char **argv)
                 cur_plate->lock(true);
             }
             else {
+                DynamicPrintConfig &plate_cfg = plate_print_configs.at(i);
                 size_t plate_obj_count = assemble_plate.loaded_obj_list.size();
                 Vec3d plate_origin = cur_plate->get_origin();
 
@@ -4863,12 +5022,12 @@ int CLI::run(int argc, char **argv)
                 }
 
                 bool is_seq_print = false;
-                get_print_sequence(cur_plate, m_print_config, is_seq_print);
+                get_print_sequence(cur_plate, plate_cfg, is_seq_print);
 
                 if (!is_seq_print && (assemble_plate.filaments_count > 1) && !has_wipe_tower_position)
                 {
                     //prepare the wipe tower
-                    auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+                    auto printer_structure_opt = plate_cfg.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
                     // set the default position, the same with print config(left top)
                     float x = WIPE_TOWER_DEFAULT_X_POS;
                     float y = WIPE_TOWER_DEFAULT_Y_POS;
@@ -4884,8 +5043,8 @@ int CLI::run(int argc, char **argv)
                     }
 
                     //create the options using default if necessary
-                    ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                    ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
+                    ConfigOptionFloats* wipe_x_option = plate_cfg.option<ConfigOptionFloats>("wipe_tower_x", true);
+                    ConfigOptionFloats* wipe_y_option = plate_cfg.option<ConfigOptionFloats>("wipe_tower_y", true);
                     ConfigOptionFloat wt_x_opt(x);
                     ConfigOptionFloat wt_y_opt(y);
 
@@ -4918,6 +5077,26 @@ int CLI::run(int argc, char **argv)
             Slic3r::GUI::PartPlate* cur_plate = nullptr;
             int low_duplicate_count = 0, up_duplicate_count = duplicate_count, arrange_count = 0;
             float orig_wipe_x = 0.f, orig_wipe_y = 0.f;
+            DynamicPrintConfig &arrange_print_config = plate_to_slice > 0
+                ? plate_print_configs.at(plate_to_slice - 1)
+                : m_print_config; // plate 0 means the explicit Project-row arrangement pool
+            int arrange_geometry_plate = plate_to_slice > 0 ? plate_to_slice - 1 : -1;
+            std::vector<bool> original_plate_locks;
+            if (plate_to_slice == 0) {
+                original_plate_locks.reserve(partplate_list.get_plate_count());
+                for (int index = 0; index < partplate_list.get_plate_count(); ++index) {
+                    Slic3r::GUI::PartPlate *plate = partplate_list.get_plate(index);
+                    original_plate_locks.push_back(plate->is_locked());
+                    if (plate->has_slicing_context_assignment())
+                        plate->lock(true);
+                    else if (arrange_geometry_plate < 0)
+                        arrange_geometry_plate = index;
+                }
+                if (arrange_geometry_plate < 0) {
+                    BOOST_LOG_TRIVIAL(info) << "Global arrange has no Project-context plate pool; all explicitly configured plates remain in place";
+                    finished_arrange = true;
+                }
+            }
 
             if (duplicate_count > 0) {
                 original_model = model;
@@ -4933,7 +5112,7 @@ int CLI::run(int argc, char **argv)
                     //copy model objects and instances on plate
                     if (!first_run) {
                         BOOST_LOG_TRIVIAL(info) << boost::format("restore model object and plate, new duplicate_count %1%, arrange_count=%2%")%duplicate_count%arrange_count;
-                        beds = get_bed_shape(m_print_config);
+                        beds = get_bed_shape(arrange_print_config);
                         model.clear_objects();
                         model.clear_materials();
                         model = original_model;
@@ -4947,8 +5126,8 @@ int CLI::run(int argc, char **argv)
                     else {
                         first_run = false;
                         if (plate_to_slice > 0) {
-                            ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x");
-                            ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y");
+                            ConfigOptionFloats* wipe_x_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_x");
+                            ConfigOptionFloats* wipe_y_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_y");
 
                             if (wipe_x_option && (wipe_x_option->size() > (plate_to_slice-1))) {
                                 orig_wipe_x = wipe_x_option->get_at(plate_to_slice-1);
@@ -4970,7 +5149,7 @@ int CLI::run(int argc, char **argv)
                 }
 
                 if (cur_plate) {
-                    get_print_sequence(cur_plate, m_print_config, arrange_cfg.is_seq_print);
+                    get_print_sequence(cur_plate, arrange_print_config, arrange_cfg.is_seq_print);
                 }
 
                 //Step-1: prepare arrange polygons
@@ -4983,7 +5162,7 @@ int CLI::run(int argc, char **argv)
                         for (size_t inst_idx = 0; inst_idx < mo->instances.size(); ++inst_idx)
                         {
                             ModelInstance* minst = mo->instances[inst_idx];
-                            ArrangePolygon ap = get_instance_arrange_poly(minst, m_print_config);
+                            ArrangePolygon ap = get_instance_arrange_poly(minst, arrange_print_config);
 
                             //preprocess by partplate list
                             //remove the locked plate's instances, neither in selected, nor in un-selected
@@ -5006,22 +5185,23 @@ int CLI::run(int argc, char **argv)
                         }
                     }
 
-                    if (m_print_config.has("print_sequence")) {
-                        PrintSequence seq = m_print_config.option<ConfigOptionEnum<PrintSequence>>("print_sequence")->value;
+                    if (arrange_print_config.has("print_sequence")) {
+                        PrintSequence seq = arrange_print_config.option<ConfigOptionEnum<PrintSequence>>("print_sequence")->value;
                         arrange_cfg.is_seq_print = (seq == PrintSequence::ByObject);
                     }
 
                     //add the virtual object into unselect list if has
-                    partplate_list.preprocess_exclude_areas(unselected, enable_wrapping_detect);
+                    const bool project_enable_wrapping = arrange_print_config.opt_bool("enable_wrapping_detection");
+                    partplate_list.preprocess_exclude_areas(unselected, project_enable_wrapping,
+                                                            MAX_PLATE_COUNT, 0, arrange_geometry_plate);
 
                     if (used_filament_set.size() > 0)
                     {
                         //prepare the wipe tower
-                        int plate_count = partplate_list.get_plate_count();
                         int extruder_size = used_filament_set.size();
 
-                        auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
-                        const float tower_brim_width      = m_print_config.option<ConfigOptionFloat>("prime_tower_width", true)->value;
+                        auto printer_structure_opt = arrange_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+                        const float tower_brim_width      = arrange_print_config.option<ConfigOptionFloat>("prime_tower_width", true)->value;
                         const float tower_margin          = WIPE_TOWER_MARGIN + tower_brim_width;
                         // set the default position, the same with print config(left top)
                         float x = WIPE_TOWER_DEFAULT_X_POS;
@@ -5041,35 +5221,32 @@ int CLI::run(int argc, char **argv)
                         ConfigOptionFloat wt_y_opt(y);
 
                         //create the options using default if necessary
-                        ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                        ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
-                        ConfigOptionFloat* width_option = m_print_config.option<ConfigOptionFloat>("prime_tower_width", true);
-                        ConfigOptionFloat* rotation_angle_option = m_print_config.option<ConfigOptionFloat>("wipe_tower_rotation_angle", true);
-                        ConfigOptionFloat* volume_option = m_print_config.option<ConfigOptionFloat>("prime_volume", true);
+                        ConfigOptionFloats* wipe_x_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
+                        ConfigOptionFloats* wipe_y_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
+                        ConfigOptionFloat* width_option = arrange_print_config.option<ConfigOptionFloat>("prime_tower_width", true);
+                        ConfigOptionFloat* rotation_angle_option = arrange_print_config.option<ConfigOptionFloat>("wipe_tower_rotation_angle", true);
+                        ConfigOptionFloat* volume_option = arrange_print_config.option<ConfigOptionFloat>("prime_volume", true);
 
                         BOOST_LOG_TRIVIAL(info) << boost::format("prime_tower_width %1% wipe_tower_rotation_angle %2% prime_volume %3%")%width_option->value %rotation_angle_option->value %volume_option->value ;
 
 
                         for (int bedid = 0; bedid < MAX_PLATE_COUNT; bedid++) {
-                            int plate_index_valid = std::min(bedid, plate_count - 1);
-                            if (bedid < plate_count) {
-                                wipe_x_option->set_at(&wt_x_opt, plate_index_valid, 0);
-                                wipe_y_option->set_at(&wt_y_opt, plate_index_valid, 0);
-                            }
+                            wipe_x_option->set_at(&wt_x_opt, bedid, 0);
+                            wipe_y_option->set_at(&wt_y_opt, bedid, 0);
 
                             Vec3d wipe_tower_size, wipe_tower_pos;
-                            ArrangePolygon wipe_tower_ap = partplate_list.get_plate(plate_index_valid)->estimate_wipe_tower_polygon(m_print_config, plate_index_valid, wipe_tower_pos, wipe_tower_size, new_extruder_count, extruder_size, true);
+                            ArrangePolygon wipe_tower_ap = partplate_list.get_plate(arrange_geometry_plate)->estimate_wipe_tower_polygon(
+                                arrange_print_config, bedid, wipe_tower_pos, wipe_tower_size,
+                                new_extruder_count, extruder_size, true);
 
                             //update the new wp position
-                            if (bedid < plate_count) {
-                                wt_x_opt.value = wipe_tower_pos(0);
-                                wt_y_opt.value = wipe_tower_pos(1);
+                            wt_x_opt.value = wipe_tower_pos(0);
+                            wt_y_opt.value = wipe_tower_pos(1);
 
-                                wipe_x_option->set_at(&wt_x_opt, plate_index_valid, 0);
-                                wipe_y_option->set_at(&wt_y_opt, plate_index_valid, 0);
+                            wipe_x_option->set_at(&wt_x_opt, bedid, 0);
+                            wipe_y_option->set_at(&wt_y_opt, bedid, 0);
 
-                                BOOST_LOG_TRIVIAL(info) << boost::format("%1%, after estimate_wipe_tower_polygon,  pos {%2%, %3%}, size {%4%, %5%}, plate %6%")%__LINE__ % wipe_tower_pos(0) % wipe_tower_pos(1) % wipe_tower_size(0) %wipe_tower_size(1) %bedid;
-                            }
+                            BOOST_LOG_TRIVIAL(info) << boost::format("%1%, after estimate_wipe_tower_polygon,  pos {%2%, %3%}, size {%4%, %5%}, plate %6%")%__LINE__ % wipe_tower_pos(0) % wipe_tower_pos(1) % wipe_tower_size(0) %wipe_tower_size(1) %bedid;
 
                             wipe_tower_ap.bed_idx = bedid;
                             unselected.emplace_back(wipe_tower_ap);
@@ -5090,7 +5267,7 @@ int CLI::run(int argc, char **argv)
                         {
                             ModelInstance*   minst = mo->instances[inst_idx];
                             bool             in_plate = cur_plate->contain_instance(oidx, inst_idx) || cur_plate->intersect_instance(oidx, inst_idx);
-                            ArrangePolygon   ap = get_instance_arrange_poly(minst, m_print_config);
+                            ArrangePolygon   ap = get_instance_arrange_poly(minst, arrange_print_config);
 
                             ArrangePolygons& cont = mo->instances[inst_idx]->printable ?
                                 (in_plate ? selected : unselected) :
@@ -5117,11 +5294,11 @@ int CLI::run(int argc, char **argv)
                         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": found single object mode");
                     }
 
-                    if (m_print_config.has("wipe_tower_x") && (is_smooth_timelapse || !arrange_cfg.is_seq_print || (selected.size() <= 1))) {
+                    if (arrange_print_config.has("wipe_tower_x") && (is_smooth_timelapse || !arrange_cfg.is_seq_print || (selected.size() <= 1))) {
                         float x;
                         float y;
                         if (duplicate_count > 0) {
-                            auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+                            auto printer_structure_opt = arrange_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
                             x = WIPE_TOWER_DEFAULT_X_POS;
                             y = WIPE_TOWER_DEFAULT_Y_POS;
                             if (printer_structure_opt && printer_structure_opt->value == PrinterStructure::psI3) {
@@ -5131,44 +5308,47 @@ int CLI::run(int argc, char **argv)
                         }
                         else {
                             //keep the original
-                            x = dynamic_cast<const ConfigOptionFloats *>(m_print_config.option("wipe_tower_x"))->get_at(plate_to_slice-1);
-                            y = dynamic_cast<const ConfigOptionFloats *>(m_print_config.option("wipe_tower_y"))->get_at(plate_to_slice-1);
+                            x = dynamic_cast<const ConfigOptionFloats *>(arrange_print_config.option("wipe_tower_x"))->get_at(plate_to_slice-1);
+                            y = dynamic_cast<const ConfigOptionFloats *>(arrange_print_config.option("wipe_tower_y"))->get_at(plate_to_slice-1);
                         }
-                        float w = dynamic_cast<const ConfigOptionFloat *>(m_print_config.option("prime_tower_width"))->value;
-                        float a = dynamic_cast<const ConfigOptionFloat *>(m_print_config.option("wipe_tower_rotation_angle"))->value;
-                        float v = dynamic_cast<const ConfigOptionFloat *>(m_print_config.option("prime_volume"))->value;
+                        float w = dynamic_cast<const ConfigOptionFloat *>(arrange_print_config.option("prime_tower_width"))->value;
+                        float a = dynamic_cast<const ConfigOptionFloat *>(arrange_print_config.option("wipe_tower_rotation_angle"))->value;
+                        float v = dynamic_cast<const ConfigOptionFloat *>(arrange_print_config.option("prime_volume"))->value;
                         unsigned int filaments_cnt = plate_data_src[plate_to_slice-1]->slice_filaments_info.size();
                         if ((filaments_cnt == 0) || need_skip)
                         {
                             // slice filaments info invalid
-                            std::vector<int> extruders = cur_plate->get_extruders_under_cli(true, m_print_config);
+                            std::vector<int> extruders = cur_plate->get_extruders_under_cli(true, arrange_print_config);
                             filaments_cnt = extruders.size();
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("arrange: slice filaments info invalid or need_skip, get from partplate: filament_count %1%")%filaments_cnt;
                         }
 
-                        if ((filaments_cnt <= 1) && !is_smooth_timelapse && (!enable_wrapping_detect || current_wrapping_exclude_area.empty()))
+                        const bool plate_enable_wrapping = arrange_print_config.opt_bool("enable_wrapping_detection");
+                        if ((filaments_cnt <= 1) && !is_smooth_timelapse
+                            && (!plate_enable_wrapping || cur_plate->get_local_wrapping_exclude_area().empty()))
                         {
                             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format("arrange: not a multi-color object anymore, drop the wipe tower before arrange.");
                         }
                         else
                         {
                             float layer_height = 0.2;
-                            ConfigOption* layer_height_opt = m_print_config.option("layer_height");
+                            ConfigOption* layer_height_opt = arrange_print_config.option("layer_height");
                             if (layer_height_opt)
                                 layer_height = layer_height_opt->getFloat();
 
                             //float depth = v * (filaments_cnt - 1) / (layer_height * w);
 
-                            const ConfigOptionBool *wrapping_detection = m_print_config.option<ConfigOptionBool>("enable_wrapping_detection");
+                            const ConfigOptionBool *wrapping_detection = arrange_print_config.option<ConfigOptionBool>("enable_wrapping_detection");
                             bool   enable_wrapping    = (wrapping_detection != nullptr) && wrapping_detection->value;
 
-                            Vec3d wipe_tower_size = cur_plate->estimate_wipe_tower_size(m_print_config, w, v, new_extruder_count, filaments_cnt, false, enable_wrapping);
+                            Vec3d wipe_tower_size = cur_plate->estimate_wipe_tower_size(arrange_print_config, w, v, new_extruder_count, filaments_cnt, false, enable_wrapping);
                             Vec3d plate_origin = cur_plate->get_origin();
-                            int plate_width, plate_depth, plate_height;
-                            partplate_list.get_plate_size(plate_width, plate_depth, plate_height);
+                            const Vec2d plate_size = cur_plate->get_local_size();
+                            const int plate_width = (int)plate_size.x();
+                            const int plate_depth = (int)plate_size.y();
                             float depth = wipe_tower_size(1);
                             float margin = 15.f, wp_brim_width = 0.f;
-                            ConfigOption *wipe_tower_brim_width_opt = m_print_config.option("prime_tower_brim_width");
+                            ConfigOption *wipe_tower_brim_width_opt = arrange_print_config.option("prime_tower_brim_width");
                             if (wipe_tower_brim_width_opt ) {
                                 wp_brim_width = wipe_tower_brim_width_opt->getFloat();
                                 if (wp_brim_width < 0) wp_brim_width = WipeTower::get_auto_brim_by_height((float) wipe_tower_size.z());
@@ -5196,8 +5376,8 @@ int CLI::run(int argc, char **argv)
                             //update wipe_tower_x and wipe_tower_y
                             ConfigOptionFloat wt_x_opt(x);
                             ConfigOptionFloat wt_y_opt(y);
-                            ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                            ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
+                            ConfigOptionFloats* wipe_x_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
+                            ConfigOptionFloats* wipe_y_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
 
                             wipe_x_option->set_at(&wt_x_opt, plate_to_slice-1, 0);
                             wipe_y_option->set_at(&wt_y_opt, plate_to_slice-1, 0);
@@ -5225,35 +5405,39 @@ int CLI::run(int argc, char **argv)
                     }
 
                     // add the virtual object into unselect list if has
-                    partplate_list.preprocess_exclude_areas(unselected, enable_wrapping_detect, plate_to_slice);
+                    const bool plate_enable_wrapping = arrange_print_config.opt_bool("enable_wrapping_detection");
+                    partplate_list.preprocess_exclude_areas(unselected, plate_enable_wrapping, 1, 0, plate_to_slice - 1);
                 }
 
 
                 //Step-2:prepare the arrange params
                 arrange_cfg.allow_rotations  = allow_rotations;
                 arrange_cfg.allow_multi_materials_on_same_plate = allow_multicolor_oneplate;
-                arrange_cfg.avoid_extrusion_cali_region         = avoid_extrusion_cali_region;
-                arrange_cfg.clearance_height_to_rod             = height_to_rod;
-                arrange_cfg.clearance_height_to_lid             = height_to_lid;
-                arrange_cfg.clearance_radius                   = clearance_radius;
-                arrange_cfg.printable_height                    = print_height;
+                arrange_cfg.avoid_extrusion_cali_region = avoid_extrusion_cali_region
+                    && arrange_print_config.opt_string("printer_vendor_id") == "BBL";
+                arrange_cfg.clearance_height_to_rod = arrange_print_config.opt_float("extruder_clearance_height_to_rod");
+                arrange_cfg.clearance_height_to_lid = arrange_print_config.opt_float("extruder_clearance_height_to_lid");
+                arrange_cfg.clearance_radius = arrange_print_config.opt_float("extruder_clearance_radius");
+                arrange_cfg.printable_height = arrange_print_config.opt_float("printable_height");
                 arrange_cfg.min_obj_distance = 0;
                 if (arrange_cfg.is_seq_print) {
                     arrange_cfg.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
                     arrange_cfg.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
                 }
-                if (auto printer_structure_opt = m_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
+                if (auto printer_structure_opt = arrange_print_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
                     arrange_cfg.align_to_y_axis = (printer_structure_opt->value == PrinterStructure::psI3);
                 }
 
-                arrangement::update_arrange_params(arrange_cfg, &m_print_config, selected);
-                arrangement::update_selected_items_inflation(selected, &m_print_config, arrange_cfg);
-                arrangement::update_unselected_items_inflation(unselected, &m_print_config, arrange_cfg);
-                arrangement::update_selected_items_axis_align(selected, &m_print_config, arrange_cfg);
+                arrangement::update_arrange_params(arrange_cfg, &arrange_print_config, selected);
+                arrangement::update_selected_items_inflation(selected, &arrange_print_config, arrange_cfg);
+                arrangement::update_unselected_items_inflation(unselected, &arrange_print_config, arrange_cfg);
+                arrangement::update_selected_items_axis_align(selected, &arrange_print_config, arrange_cfg);
 
-                beds=get_shrink_bedpts(&m_print_config, arrange_cfg);
+                beds=get_shrink_bedpts(&arrange_print_config, arrange_cfg);
 
-                partplate_list.preprocess_exclude_areas(arrange_cfg.excluded_regions, enable_wrapping_detect, 1, scale_(1));
+                const bool arrange_enable_wrapping = arrange_print_config.opt_bool("enable_wrapping_detection");
+                partplate_list.preprocess_exclude_areas(arrange_cfg.excluded_regions, arrange_enable_wrapping,
+                                                        1, scale_(1), arrange_geometry_plate);
 
                 {
                     BOOST_LOG_TRIVIAL(debug) << "arrange bedpts:" << beds[0].transpose() << ", " << beds[1].transpose() << ", " << beds[2].transpose() << ", " << beds[3].transpose();
@@ -5419,8 +5603,8 @@ int CLI::run(int argc, char **argv)
                             {
                                 ConfigOptionFloat wt_x_opt(orig_wipe_x);
                                 ConfigOptionFloat wt_y_opt(orig_wipe_y);
-                                ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                                ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
+                                ConfigOptionFloats* wipe_x_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
+                                ConfigOptionFloats* wipe_y_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
 
                                 wipe_x_option->set_at(&wt_x_opt, plate_to_slice-1, 0);
                                 wipe_y_option->set_at(&wt_y_opt, plate_to_slice-1, 0);
@@ -5446,8 +5630,8 @@ int CLI::run(int argc, char **argv)
                             {
                                 ConfigOptionFloat wt_x_opt(orig_wipe_x);
                                 ConfigOptionFloat wt_y_opt(orig_wipe_y);
-                                ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
-                                ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
+                                ConfigOptionFloats* wipe_x_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
+                                ConfigOptionFloats* wipe_y_option = arrange_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
 
                                 wipe_x_option->set_at(&wt_x_opt, plate_to_slice-1, 0);
                                 wipe_y_option->set_at(&wt_y_opt, plate_to_slice-1, 0);
@@ -5527,9 +5711,48 @@ int CLI::run(int argc, char **argv)
                 }
                 finished_arrange = true;
             }
+            if (plate_to_slice == 0) {
+                const int restore_count = std::min((int)original_plate_locks.size(), partplate_list.get_plate_count());
+                for (int index = 0; index < restore_count; ++index)
+                    partplate_list.get_plate(index)->lock(original_plate_locks[index]);
+            }
             original_model.clear_objects();
             original_model.clear_materials();
         }
+    }
+
+    if (need_arrange || !assemble_plate_info_list.empty()) {
+        const int arranged_plate_count = partplate_list.get_plate_count();
+        plate_print_configs.resize(arranged_plate_count);
+        plate_vendor_ids.resize(arranged_plate_count);
+        plate_obj_size_infos.resize(arranged_plate_count);
+        for (int index = 0; index < arranged_plate_count; ++index) {
+            Slic3r::GUI::PartPlate *plate = partplate_list.get_plate(index);
+            std::string context_error;
+            if (!resolve_cli_plate_config(plate, plate_print_configs[index], plate_vendor_ids[index], context_error)) {
+                const std::string message = (boost::format("Plate %1% has an unresolved slicing context after arrangement: %2%")
+                                             % (index + 1) % context_error).str();
+                BOOST_LOG_TRIVIAL(error) << message;
+                record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, index + 1, message, sliced_info);
+                flush_and_exit(CLI_CONFIG_FILE_ERROR);
+            }
+
+            const DynamicPrintConfig &plate_cfg = plate_print_configs[index];
+            const auto *areas_opt = plate_cfg.option<ConfigOptionPointsGroups>("extruder_printable_area");
+            const auto *heights_opt = plate_cfg.option<ConfigOptionFloatsNullable>("extruder_printable_height");
+            const auto *wrapping_opt = plate_cfg.option<ConfigOptionPoints>("wrapping_exclude_area");
+            plate->set_printable_height(plate_cfg.opt_float("printable_height"));
+            plate->set_local_wrapping_exclude_area(wrapping_opt != nullptr ? wrapping_opt->values : Pointfs());
+            partplate_list.set_plate_shape(index,
+                plate_cfg.option<ConfigOptionPoints>("printable_area")->values,
+                plate_cfg.option<ConfigOptionPoints>("bed_exclude_area")->values,
+                areas_opt != nullptr ? areas_opt->values : std::vector<Pointfs>(),
+                heights_opt != nullptr ? heights_opt->values : std::vector<double>(),
+                (float)plate_cfg.opt_float("extruder_clearance_height_to_lid"),
+                (float)plate_cfg.opt_float("extruder_clearance_height_to_rod"), false);
+            check_plate_wipe_tower(plate, index, plate_print_configs[index], plate_obj_size_infos[index]);
+        }
+        partplate_list.reflow_layout();
     }
 
     // All transforms have been dealt with. Now ensure that the objects are on bed.
@@ -5712,6 +5935,19 @@ int CLI::run(int argc, char **argv)
                         Slic3r::GUI::PartPlate* part_plate = partplate_list.get_plate(index);
                         part_plate->get_print(&print, &gcode_result, &print_index);
 
+                        DynamicPrintConfig new_print_config = plate_print_configs.at(index);
+                        new_print_config.apply(*part_plate->config(), true);
+                        new_print_config.apply(m_extra_config, true);
+                        const ConfigOptionFloats *plate_nozzles = new_print_config.option<ConfigOptionFloats>("nozzle_diameter");
+                        const int plate_extruder_count = (int)plate_nozzles->values.size();
+                        const ConfigOptionStrings *plate_filament_types = new_print_config.option<ConfigOptionStrings>("filament_type");
+                        if (plate_filament_types == nullptr || plate_filament_types->values.empty()) {
+                            record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, index + 1,
+                                              "Resolved plate context has no filament definitions", sliced_info);
+                            flush_and_exit(CLI_CONFIG_FILE_ERROR);
+                        }
+                        const int filament_count = (int)plate_filament_types->values.size();
+
                         print_fff = dynamic_cast<Print *>(print);
                         /*if (outfile_config.empty())
                         {
@@ -5731,7 +5967,10 @@ int CLI::run(int argc, char **argv)
                         BOOST_LOG_TRIVIAL(info) << boost::format("print_volume {%1%,%2%,%3%}->{%4%, %5%, %6%}") % print_volume.min(0) % print_volume.min(1)
                             % print_volume.min(2) % print_volume.max(0) % print_volume.max(1) % print_volume.max(2) << std::endl;
 #else
-                        BuildVolume build_volume(part_plate->get_shape(), print_height, part_plate->get_extruder_areas(), current_extruder_print_heights);
+                        const auto *plate_extruder_heights = new_print_config.option<ConfigOptionFloatsNullable>("extruder_printable_height");
+                        BuildVolume build_volume(part_plate->get_shape(), new_print_config.opt_float("printable_height"),
+                                                 part_plate->get_extruder_areas(),
+                                                 plate_extruder_heights != nullptr ? plate_extruder_heights->values : std::vector<double>());
                         //model.update_print_volume_state(build_volume);
                         unsigned int count = model.update_print_volume_state(build_volume);
 
@@ -5744,7 +5983,7 @@ int CLI::run(int argc, char **argv)
                             long long triangle_count = 0;
                             int printable_instances = 0;
                             int skipped_count = 0;
-                            std::vector<std::set<int>> unprintable_filament_ids(new_extruder_count, std::set<int>());
+                            std::vector<std::set<int>> unprintable_filament_ids(plate_extruder_count, std::set<int>());
                             for (ModelObject* model_object : model.objects)
                                 for (ModelInstance *i : model_object->instances)
                                 {
@@ -5809,7 +6048,7 @@ int CLI::run(int argc, char **argv)
                                                     flush_and_exit(CLI_TRIANGLE_COUNT_EXCEEDS_LIMIT);
                                                 }
 
-                                                if (new_extruder_count > 1) {
+                                                if (plate_extruder_count > 1) {
                                                     BoundingBoxf3 bbox = vol->get_convex_hull().transformed_bounding_box(inst_matrix * vol->get_matrix());
                                                     std::vector<bool> inside_extruders;
                                                     BuildVolume::ObjectState state = build_volume.check_volume_bbox_state_with_extruder_areas(bbox, inside_extruders);
@@ -5840,25 +6079,25 @@ int CLI::run(int argc, char **argv)
                                 flush_and_exit(CLI_NO_SUITABLE_OBJECTS_AFTER_SKIP);
                             }
 
-                            std::vector<int> plate_filaments = part_plate->get_extruders_under_cli(true, m_print_config);
+                            std::vector<int> plate_filaments = part_plate->get_extruders_under_cli(true, new_print_config);
                             std::vector<int> used_tpu_filaments;
                             for (int f_index = 0; f_index < plate_filaments.size(); f_index++) {
                                 if (plate_filaments[f_index] <= filament_count) {
                                     std::string filament_type;
-                                    m_print_config.get_filament_type(filament_type, plate_filaments[f_index]-1);
+                                    new_print_config.get_filament_type(filament_type, plate_filaments[f_index]-1);
                                     if (filament_type == "TPU") {
                                         used_tpu_filaments.push_back(plate_filaments[f_index]);
                                     }
                                 }
                             }
-                            bool tpu_valid = part_plate->check_tpu_printable_status(m_print_config, used_tpu_filaments);
+                            bool tpu_valid = part_plate->check_tpu_printable_status(new_print_config, used_tpu_filaments);
                             if (!tpu_valid) {
                                 BOOST_LOG_TRIVIAL(error) << boost::format("plate %1% : Found 2 or more tpu filaments on plate ") % (index + 1);
                                 record_exit_reson(outfile_dir, CLI_ONLY_ONE_TPU_SUPPORTED, index + 1, cli_errors[CLI_ONLY_ONE_TPU_SUPPORTED], sliced_info);
                                 flush_and_exit(CLI_ONLY_ONE_TPU_SUPPORTED);
                             }
 
-                            if (new_extruder_count > 1) {
+                            if (plate_extruder_count > 1) {
                                 std::vector<std::vector<int>> unprintable_filament_vec;
                                 for (const std::set<int>& filamnt_ids : unprintable_filament_ids) {
                                     unprintable_filament_vec.emplace_back(std::vector<int>(filamnt_ids.begin(), filamnt_ids.end()));
@@ -5868,11 +6107,11 @@ int CLI::run(int argc, char **argv)
                                 if (m_extra_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode"))
                                     mode = m_extra_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->value;
                                 else
-                                    mode = part_plate->get_real_filament_map_mode(m_print_config);
+                                    mode = part_plate->get_real_filament_map_mode(new_print_config);
                                 BOOST_LOG_TRIVIAL(info) << boost::format("%1% :filament map mode is %2% ") % __LINE__ %(int)mode;
                                 if (mode < FilamentMapMode::fmmManual) {
                                     std::vector<int> conflict_filament_vector;
-                                    for (int index = 0; index < new_extruder_count; index++)
+                                    for (int index = 0; index < plate_extruder_count; index++)
                                     {
                                         if (!unprintable_filament_vec[index].empty())
                                         {
@@ -5946,14 +6185,14 @@ int CLI::run(int argc, char **argv)
                                         part_plate->set_filament_maps(filament_maps);
                                     }
                                     else
-                                        filament_maps = part_plate->get_real_filament_maps(m_print_config);
+                                        filament_maps = part_plate->get_real_filament_maps(new_print_config);
 
                                     // Multi-nozzle printers need the per-filament volume assignment as a grouping
                                     // input in the manual modes: synthesize it from the per-extruder flow types when
                                     // the caller did not provide one (an extruder whose nozzle stats span several
                                     // volume types keeps the per-filament choice), and require explicit maps in
                                     // nozzle-manual mode.
-                                    auto max_nozzle_counts_opt = m_print_config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
+                                    auto max_nozzle_counts_opt = new_print_config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
                                     // Skip nil entries: a nullable-int nil is INT_MAX (> 1) and would otherwise falsely pass the gate.
                                     bool support_multi_nozzle =
                                         max_nozzle_counts_opt &&
@@ -5977,10 +6216,10 @@ int CLI::run(int argc, char **argv)
                                             // print with that extruder's volume; a mixed-volume extruder keeps the
                                             // per-filament choice (default Standard).
                                             std::vector<NozzleVolumeType> using_nozzle_volume_type = new_nozzle_volume_type;
-                                            using_nozzle_volume_type.resize(new_extruder_count, nvtStandard);
-                                            if (auto extruder_nozzle_stats_opt = m_print_config.option<ConfigOptionStrings>("extruder_nozzle_stats")) {
+                                            using_nozzle_volume_type.resize(plate_extruder_count, nvtStandard);
+                                            if (auto extruder_nozzle_stats_opt = new_print_config.option<ConfigOptionStrings>("extruder_nozzle_stats")) {
                                                 auto nozzle_stats = get_extruder_nozzle_stats(extruder_nozzle_stats_opt->values);
-                                                for (int e_index = 0; e_index < new_extruder_count && e_index < (int) nozzle_stats.size(); e_index++) {
+                                                for (int e_index = 0; e_index < plate_extruder_count && e_index < (int) nozzle_stats.size(); e_index++) {
                                                     if (nozzle_stats[e_index].size() > 1) {
                                                         using_nozzle_volume_type[e_index] = nvtHybrid;
                                                         BOOST_LOG_TRIVIAL(info) << boost::format("%1% : extruder %2%, set nozzle_volume_type to hybrid ") % __LINE__ % (e_index + 1);
@@ -5992,7 +6231,7 @@ int CLI::run(int argc, char **argv)
                                             manual_volume_maps.resize(filament_count, (int) (nvtStandard));
                                             for (int f_index = 0; f_index < filament_count && f_index < (int) filament_maps.size(); f_index++) {
                                                 int f_extruder_index = filament_maps[f_index] - 1;
-                                                if (f_extruder_index >= 0 && f_extruder_index < new_extruder_count &&
+                                                if (f_extruder_index >= 0 && f_extruder_index < plate_extruder_count &&
                                                     using_nozzle_volume_type[f_extruder_index] != nvtHybrid) {
                                                     manual_volume_maps[f_index] = int(using_nozzle_volume_type[f_extruder_index]);
                                                     BOOST_LOG_TRIVIAL(info) << boost::format("%1% : filament %2% extruder %3%, set filament_volume_map to %4% ") % __LINE__ % (f_index + 1) % (f_extruder_index + 1) % manual_volume_maps[f_index];
@@ -6030,8 +6269,8 @@ int CLI::run(int argc, char **argv)
                                             if (plate_filaments[f_index] <= filament_count) {
                                                 int filament_extruder = filament_maps[plate_filaments[f_index] - 1];
                                                 std::string filament_type;
-                                                m_print_config.get_filament_type(filament_type, plate_filaments[f_index] - 1);
-                                                auto *filament_printable_status = dynamic_cast<const ConfigOptionInts *>(m_print_config.option("filament_printable"));
+                                                new_print_config.get_filament_type(filament_type, plate_filaments[f_index] - 1);
+                                                auto *filament_printable_status = dynamic_cast<const ConfigOptionInts *>(new_print_config.option("filament_printable"));
                                                 if (filament_printable_status && (filament_printable_status->values.size() >= plate_filaments[f_index])) {
                                                     int status = filament_printable_status->values.at(plate_filaments[f_index] - 1);
                                                     if (!(status >> (filament_extruder - 1) & 1)) {
@@ -6058,30 +6297,32 @@ int CLI::run(int argc, char **argv)
                         //BOOST_LOG_TRIVIAL(info) << boost::format("print_volume {%1%,%2%,%3%}->{%4%, %5%, %6%}, has %7% printables") % print_volume.min(0) % print_volume.min(1)
                         //    % print_volume.min(2) % print_volume.max(0) % print_volume.max(1) % print_volume.max(2) % count << std::endl;
 #endif
-                        DynamicPrintConfig new_print_config = m_print_config;
-                        new_print_config.apply(*part_plate->config());
-                        new_print_config.apply(m_extra_config, true);
-						if (m_print_config.option<ConfigOptionFloat>("layer_height"))
-                            sliced_info.layer_height = m_print_config.option<ConfigOptionFloat>("layer_height")->value;
-						if (m_print_config.option<ConfigOptionInt>("wall_loops"))
-                            sliced_info.wall_loops = m_print_config.option<ConfigOptionInt>("wall_loops")->value;
-                        if (m_print_config.option<ConfigOptionPercent>("sparse_infill_density"))
-                            sliced_info.sparse_infill_density = m_print_config.option<ConfigOptionPercent>("sparse_infill_density")->value;
-                        if (new_extruder_count > 1) {
+                        if (new_print_config.option<ConfigOptionFloat>("layer_height"))
+                            sliced_info.layer_height = new_print_config.option<ConfigOptionFloat>("layer_height")->value;
+                        if (new_print_config.option<ConfigOptionInt>("wall_loops"))
+                            sliced_info.wall_loops = new_print_config.option<ConfigOptionInt>("wall_loops")->value;
+                        if (new_print_config.option<ConfigOptionPercent>("sparse_infill_density"))
+                            sliced_info.sparse_infill_density = new_print_config.option<ConfigOptionPercent>("sparse_infill_density")->value;
+                        if (plate_extruder_count > 1) {
                             FilamentMapMode map_mode = fmmAutoForFlush;
                             if (new_print_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode"))
                                 map_mode = new_print_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->value;
 
                             if (map_mode < fmmManual) {
                                 //set default params for auto map
-                                std::vector<std::string> extruder_ams_count(new_extruder_count, "");
-                                std::vector<std::vector<DynamicPrintConfig>> extruder_filament_info(new_extruder_count, std::vector<DynamicPrintConfig>());
+                                std::vector<std::string> extruder_ams_count(plate_extruder_count, "");
+                                std::vector<std::vector<DynamicPrintConfig>> extruder_filament_info(plate_extruder_count, std::vector<DynamicPrintConfig>());
                                 int color_count = 0;
 
-                                const ConfigOptionStrings* filament_type  = dynamic_cast<const ConfigOptionStrings *>(m_print_config.option("filament_type"));
-                                std::vector<std::string> types = filament_type ? filament_type->vserialize() : std::vector<std::string>{"PLA"};
+                                const ConfigOptionStrings* filament_type  = dynamic_cast<const ConfigOptionStrings *>(new_print_config.option("filament_type"));
+                                std::vector<std::string> types = filament_type ? filament_type->vserialize() : std::vector<std::string>();
+                                if (types.empty()) {
+                                    record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, index + 1,
+                                                      "Resolved plate context has no filament types", sliced_info);
+                                    flush_and_exit(CLI_CONFIG_FILE_ERROR);
+                                }
 
-                                for (int e_index = 0; e_index < new_extruder_count; e_index++)
+                                for (int e_index = 0; e_index < plate_extruder_count; e_index++)
                                 {
                                     extruder_ams_count[e_index] = "1#0|4#1";
                                     for (int color_index = 0; color_index < 4; color_index++)
@@ -6111,35 +6352,22 @@ int CLI::run(int argc, char **argv)
                         std::vector<int>& final_filament_maps = new_print_config.option<ConfigOptionInts>("filament_map", true)->values;
                         if (final_filament_maps.size() < filament_count)
                             final_filament_maps.resize(filament_count, 1);
-                        if (new_extruder_count == 1) {
+                        if (plate_extruder_count == 1) {
                             for (int index = 0; index < filament_count; index++)
                                 final_filament_maps[index] = 1;
                         }
                         if(!new_print_config.has("nozzle_volume_type")) {
                             //set default nozzle_volume_type
                             ConfigOptionEnumsGeneric* final_nozzle_volume_type_opt = new_print_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true);
-                            final_nozzle_volume_type_opt->values.resize(new_extruder_count, nvtStandard);
+                            final_nozzle_volume_type_opt->values.resize(plate_extruder_count, nvtStandard);
                         }
                         print->apply(model, new_print_config);
                         BOOST_LOG_TRIVIAL(info) << boost::format("set no_check to %1%:")%no_check;
                         print->set_no_check_flag(no_check);//BBS
 
-                        // Set is_BBL_printer flag before validation as the validation depends on it.
-                        std::string& printer_model_string = new_print_config.opt_string("printer_model", true);
-                        bool is_bbl_vendor_preset = false;
-
-                        if (!printer_model_string.empty()) {
-                            is_bbl_vendor_preset = (printer_model_string.compare(0, 9, "Bambu Lab") == 0);
-                            BOOST_LOG_TRIVIAL(info) << boost::format("printer_model_string: %1%, is_bbl_vendor_preset %2%")%printer_model_string %is_bbl_vendor_preset;
-                        }
-                        else {
-                            if (!new_printer_name.empty())
-                                is_bbl_vendor_preset = (new_printer_name.compare(0, 9, "Bambu Lab") == 0);
-                            else if (!current_printer_system_name.empty())
-                                is_bbl_vendor_preset = (current_printer_system_name.compare(0, 9, "Bambu Lab") == 0);
-                            BOOST_LOG_TRIVIAL(info) << boost::format("new_printer_name: %1%, current_printer_system_name %2%, is_bbl_vendor_preset %3%")%new_printer_name %current_printer_system_name %is_bbl_vendor_preset;
-                        }
-                        (dynamic_cast<Print*>(print))->is_BBL_printer() = is_bbl_vendor_preset;
+                        // Firmware-family behavior belongs to this plate's resolved
+                        // printer identity, never to the globally selected printer.
+                        (dynamic_cast<Print*>(print))->is_BBL_printer() = plate_vendor_ids.at(index) == "BBL";
 
                         std::vector<StringObjectException> warnings;
                         print_fff->set_check_multi_filaments_compatibility(!allow_mix_temp);
@@ -6225,8 +6453,8 @@ int CLI::run(int argc, char **argv)
 
                                 //update information for brim
                                 const PrintConfig& print_config = print_fff->config();
-                                Model::setExtruderParams(m_print_config, filament_count);
-                                Model::setPrintSpeedTable(m_print_config, print_config);
+                                Model::setExtruderParams(new_print_config, filament_count);
+                                Model::setPrintSpeedTable(new_print_config, print_config);
                                 if (load_slicedata) {
                                     std::string plate_dir = load_slice_data_dir+"/"+std::to_string(index+1);
                                     int ret = print->load_cached_data(plate_dir);
@@ -6257,7 +6485,7 @@ int CLI::run(int argc, char **argv)
                                     // plate settings, matching what a GUI slice persists.
                                     // Orca: deliberately gated to multi-extruder printers so single-extruder
                                     // exports keep their plate settings unchanged.
-                                    if (new_extruder_count > 1) {
+                                    if (plate_extruder_count > 1) {
                                         FilamentMapMode current_map_mode = print_fff->config().filament_map_mode.value;
                                         if (is_auto_filament_map_mode(current_map_mode)) {
                                             part_plate->set_filament_maps(print_fff->get_filament_maps());
@@ -6389,6 +6617,21 @@ int CLI::run(int argc, char **argv)
                                     }
                                 }
                                 sliced_info.sliced_plates.push_back(sliced_plate_info);
+                            } catch (const Slic3r::SlicingErrors &exs) {
+                                // Must precede the std::exception handler. SlicingErrors is a container whose
+                                // own what() is a placeholder, so catching it as a plain exception printed
+                                // that placeholder and discarded every message naming an object and its
+                                // remedy. Unpack the elements so the reason survives to stderr.
+                                BOOST_LOG_TRIVIAL(error) << "found slicing or export error for partplate "<<index+1 << std::endl;
+                                std::string detail;
+                                for (const auto &ex : exs.errors_) {
+                                    if (!detail.empty())
+                                        detail += "\n";
+                                    detail += ex.what();
+                                }
+                                boost::nowide::cerr << detail << std::endl;
+                                record_exit_reson(outfile_dir, CLI_SLICING_ERROR, index+1, detail, sliced_info);
+                                flush_and_exit(CLI_SLICING_ERROR);
                             } catch (const std::exception &ex) {
                                 BOOST_LOG_TRIVIAL(error) << "found slicing or export error for partplate "<<index+1 << std::endl;
                                 boost::nowide::cerr << ex.what() << std::endl;
@@ -6494,30 +6737,32 @@ int CLI::run(int argc, char **argv)
         bool need_regenerate_top_thumbnail = oriented_or_arranged || regenerate_thumbnails;
         bool need_create_thumbnail_group = false, need_create_no_light_group = false, need_create_top_group = false;
 
-        // get type and color for platedata
-        auto* filament_types = dynamic_cast<const ConfigOptionStrings*>(m_print_config.option("filament_type"));
-        const ConfigOptionStrings* filament_color = dynamic_cast<const ConfigOptionStrings *>(m_print_config.option("filament_colour"));
-        auto* filament_id = dynamic_cast<const ConfigOptionStrings*>(m_print_config.option("filament_ids"));
-        const ConfigOptionFloats* nozzle_diameter_option = dynamic_cast<const ConfigOptionFloats *>(m_print_config.option("nozzle_diameter"));
-        std::string nozzle_diameter_str;
-        if (nozzle_diameter_option)
-            nozzle_diameter_str = nozzle_diameter_option->serialize();
-
         for (int i = 0; i < plate_data_list.size(); i++) {
             PlateData *plate_data = plate_data_list[i];
             bool skip_this_plate = ((plate_to_slice != 0) && (plate_to_slice != (i + 1)))?true:false;
 
+            plate_data->sliced_config = plate_print_configs.at(i);
+            DynamicPrintConfig &plate_cfg = plate_data->sliced_config;
+            const ConfigOptionStrings *filament_color = plate_cfg.option<ConfigOptionStrings>("filament_colour");
+            const ConfigOptionStrings *filament_id = plate_cfg.option<ConfigOptionStrings>("filament_ids");
+            const ConfigOptionFloats *nozzle_diameter_option = plate_cfg.option<ConfigOptionFloats>("nozzle_diameter");
+
             plate_data->skipped_objects = plate_skipped_objects[i];
-            if (!printer_model_id.empty())
+            plate_data->slicing_context.printer_vendor_id = plate_vendor_ids.at(i);
+            if (plate_data->slicing_context.printer_preset_name.empty() && !printer_model_id.empty())
                 plate_data->printer_model_id = printer_model_id;
-            if (!nozzle_diameter_str.empty())
-                plate_data->nozzle_diameters = nozzle_diameter_str;
+            else if (plate_data_src.size() > i)
+                plate_data->printer_model_id = plate_data_src[i]->printer_model_id;
+            if (nozzle_diameter_option != nullptr)
+                plate_data->nozzle_diameters = nozzle_diameter_option->serialize();
 
             for (auto it = plate_data->slice_filaments_info.begin(); it != plate_data->slice_filaments_info.end(); it++) {
                 std::string display_filament_type;
-                it->type  = m_print_config.get_filament_type(display_filament_type, it->id);
-                it->color = filament_color ? filament_color->get_at(it->id) : "#FFFFFF";
-                it->filament_id = filament_id?filament_id->get_at(it->id):"";
+                it->type = plate_cfg.get_filament_type(display_filament_type, it->id);
+                if (it->id >= 0 && filament_color != nullptr && (size_t)it->id < filament_color->values.size())
+                    it->color = filament_color->values[it->id];
+                if (it->id >= 0 && filament_id != nullptr && (size_t)it->id < filament_id->values.size())
+                    it->filament_id = filament_id->values[it->id];
             }
 
             if (!plate_data->plate_thumbnail.is_valid()) {
@@ -6596,21 +6841,6 @@ int CLI::run(int argc, char **argv)
         }
 
         if (need_regenerate_thumbnail || need_regenerate_no_light_thumbnail || need_regenerate_top_thumbnail) {
-            std::vector<std::string> colors;
-            if (filament_color) {
-                colors= filament_color->vserialize();
-            }
-            else
-                colors.push_back("#FFFFFFFF");
-
-            std::vector<ColorRGBA> colors_out(colors.size());
-            unsigned char rgb_color[4] = {};
-            for (const std::string& color : colors) {
-                Slic3r::GUI::BitmapCache::parse_color4(color, rgb_color);
-                size_t color_idx = &color - &colors.front();
-                colors_out[color_idx] = ColorRGBA(float(rgb_color[0]) / 255.f, float(rgb_color[1]) / 255.f, float(rgb_color[2]) / 255.f, float(rgb_color[3]) / 255.f);
-            }
-
             int gl_major, gl_minor, gl_verbos;
             glfwGetVersion(&gl_major, &gl_minor, &gl_verbos);
             BOOST_LOG_TRIVIAL(info) << boost::format("opengl version %1%.%2%.%3%")%gl_major %gl_minor %gl_verbos;
@@ -6669,6 +6899,7 @@ int CLI::run(int argc, char **argv)
                 else {
                     BOOST_LOG_TRIVIAL(info) << "gladLoadGL Success." << std::endl;
                     GLVolumeCollection glvolume_collection;
+                    std::vector<std::pair<GLVolume *, int>> thumbnail_volumes;
                     Model &model = m_models[0];
                     int obj_extruder_id = 1, volume_extruder_id = 1;
                     for (unsigned int obj_idx = 0; obj_idx < (unsigned int)model.objects.size(); ++ obj_idx) {
@@ -6693,25 +6924,40 @@ int CLI::run(int argc, char **argv)
                                 const ModelInstance &model_instance = *model_object.instances[instance_idx];
                                 glvolume_collection.load_object_volume(&model_object, obj_idx, volume_idx, instance_idx, "volume", true, false, true);
                                 //glvolume_collection.volumes.back()->geometry_id = key.geometry_id;
-                                std::string color = filament_color?filament_color->get_at(volume_extruder_id - 1):"#00FF00FF";
-
-                                BOOST_LOG_TRIVIAL(debug) << boost::format("volume %1%'s color %2%")%volume_idx %color;
-
-                                unsigned char  rgb_color[4] = {};
-                                Slic3r::GUI::BitmapCache::parse_color4(color, rgb_color);
-
-                                ColorRGBA new_color;
-                                new_color.r(float(rgb_color[0]) / 255.f);
-                                new_color.g(float(rgb_color[1]) / 255.f);
-                                new_color.b(float(rgb_color[2]) / 255.f);
-                                new_color.a(float(rgb_color[3]) / 255.f);
-
-                                glvolume_collection.volumes.back()->set_render_color(new_color);
-                                glvolume_collection.volumes.back()->set_color(new_color);
                                 glvolume_collection.volumes.back()->printable = model_instance.printable;
+                                thumbnail_volumes.emplace_back(glvolume_collection.volumes.back(), volume_extruder_id);
                             }
                         }
                     }
+
+                    const auto apply_plate_thumbnail_colors = [&](int plate_index, std::vector<ColorRGBA> &colors_out) -> bool {
+                        const DynamicPrintConfig &plate_cfg = plate_print_configs.at(plate_index);
+                        const ConfigOptionStrings *filament_colors = plate_cfg.option<ConfigOptionStrings>("filament_colour");
+                        if (filament_colors == nullptr || filament_colors->values.empty()) {
+                            BOOST_LOG_TRIVIAL(error) << boost::format("plate %1% has no exact filament colour configuration") % (plate_index + 1);
+                            return false;
+                        }
+
+                        colors_out.resize(filament_colors->values.size());
+                        for (size_t color_index = 0; color_index < filament_colors->values.size(); ++color_index) {
+                            unsigned char rgba[4] = {};
+                            Slic3r::GUI::BitmapCache::parse_color4(filament_colors->values[color_index], rgba);
+                            colors_out[color_index] = ColorRGBA(float(rgba[0]) / 255.f, float(rgba[1]) / 255.f,
+                                                               float(rgba[2]) / 255.f, float(rgba[3]) / 255.f);
+                        }
+
+                        for (const auto &[volume, extruder_id] : thumbnail_volumes) {
+                            if (extruder_id <= 0 || size_t(extruder_id) > colors_out.size()) {
+                                BOOST_LOG_TRIVIAL(error) << boost::format("plate %1% volume references filament %2%, but its exact context has %3% filaments")
+                                    % (plate_index + 1) % extruder_id % colors_out.size();
+                                return false;
+                            }
+                            const ColorRGBA &color = colors_out[size_t(extruder_id - 1)];
+                            volume->set_render_color(color);
+                            volume->set_color(color);
+                        }
+                        return true;
+                    };
 
                     ThumbnailsParams thumbnail_params;
                     GLShaderProgram* shader = opengl_mgr.get_shader("thumbnail");
@@ -6722,6 +6968,12 @@ int CLI::run(int argc, char **argv)
                         for (int i = 0; i < partplate_list.get_plate_count(); i++) {
                             Slic3r::GUI::PartPlate *part_plate      = partplate_list.get_plate(i);
                             PlateData *plate_data = plate_data_list[i];
+                            std::vector<ColorRGBA> colors_out;
+                            if (!apply_plate_thumbnail_colors(i, colors_out)) {
+                                record_exit_reson(outfile_dir, CLI_CONFIG_FILE_ERROR, i + 1,
+                                                  cli_errors[CLI_CONFIG_FILE_ERROR], sliced_info);
+                                flush_and_exit(CLI_CONFIG_FILE_ERROR);
+                            }
                             if (plate_data->plate_thumbnail.is_valid()) {
                                 if ((plate_to_slice != 0) && (plate_to_slice != (i + 1))) {
                                     BOOST_LOG_TRIVIAL(info) << boost::format("Line %1%: regenerate thumbnail, reset plate %2%'s thumbnail.")%__LINE__%(i+1);

@@ -1433,7 +1433,10 @@ static bool construct_error_string(ObjectFilamentResults& object_result, std::st
     return false;
 }
 
-static std::pair<bool, bool> construct_extruder_unprintable_error(ObjectFilamentResults& object_result, std::string& left_extruder_unprintable_text, std::string& right_extruder_unprintable_text)
+static std::pair<bool, bool> construct_extruder_unprintable_error(ObjectFilamentResults& object_result,
+                                                                  const PartPlate *plate,
+                                                                  std::string& left_extruder_unprintable_text,
+                                                                  std::string& right_extruder_unprintable_text)
 {
     left_extruder_unprintable_text.clear();
     right_extruder_unprintable_text.clear();
@@ -1473,15 +1476,14 @@ static std::pair<bool, bool> construct_extruder_unprintable_error(ObjectFilament
         }
     }
 
-    Preset &preset = GUI::wxGetApp().preset_bundle->printers.get_edited_preset();
     float   left_x_min = 0, left_x_max = 0, left_y_min = 0, left_y_max = 0, left_z_min = 0, left_z_max = 0;
     float   right_x_min = 0, right_x_max = 0, right_y_min = 0, right_y_max = 0, right_z_min = 0, right_z_max = 0;
-    auto printable_height_option = preset.config.option<ConfigOptionFloatsNullable>("extruder_printable_height");
-    if (printable_height_option && printable_height_option->values.size() == 2) {
-        left_z_max = (float) printable_height_option->values[0];
-        right_z_max = (float) printable_height_option->values[1];
+    const std::vector<double> printable_heights = plate != nullptr ? plate->get_extruder_heights() : std::vector<double>();
+    if (printable_heights.size() == 2) {
+        left_z_max = (float) printable_heights[0];
+        right_z_max = (float) printable_heights[1];
     }
-    std::vector<Pointfs> printable_areas = preset.config.option<ConfigOptionPointsGroups>("extruder_printable_area")->values;
+    const std::vector<Pointfs> printable_areas = plate != nullptr ? plate->get_extruder_areas() : std::vector<Pointfs>();
     if (printable_areas.size() == 2 && printable_areas[0].size() == 4) {
         left_x_min = printable_areas[0][0][0];
         left_y_min = printable_areas[0][0][1];
@@ -1536,7 +1538,8 @@ ModelInstanceEPrintVolumeState GLCanvas3D::check_volumes_outside_state(ObjectFil
     m_volumes.check_outside_state(m_bed.build_volume(), &state, object_results);
 
     construct_error_string(*object_results, get_object_clashed_text());
-    construct_extruder_unprintable_error(*object_results, get_left_extruder_unprintable_text(), get_right_extruder_unprintable_text());
+    construct_extruder_unprintable_error(*object_results, wxGetApp().plater()->get_partplate_list().get_curr_plate(),
+                                         get_left_extruder_unprintable_text(), get_right_extruder_unprintable_text());
     return state;
 }
 
@@ -2858,20 +2861,37 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
         bool wt = dynamic_cast<const ConfigOptionBool*>(m_config->option("enable_prime_tower"))->value;
         auto co = dynamic_cast<const ConfigOptionEnum<PrintSequence>*>(m_config->option<ConfigOptionEnum<PrintSequence>>("print_sequence"));
 
-        const DynamicPrintConfig &dconfig           = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-        auto timelapse_type = dconfig.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
-        bool need_wipe_tower = timelapse_type ? (timelapse_type->value == TimelapseType::tlSmooth) : false;
-
-        if (dconfig.has("enable_wrapping_detection")) {
-            need_wipe_tower |= dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value;
-        }
-
-        if (wt && (need_wipe_tower || filaments_count > 1) && !wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
+        if (wt && !wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
             for (int plate_id = 0; plate_id < n_plates; plate_id++) {
                 // If print ByObject and there is only one object in the plate, the wipe tower is allowed to be generated.
                 PartPlate* part_plate = ppl.get_plate(plate_id);
+
+                PresetBundle &bundle = *wxGetApp().preset_bundle;
+                const std::vector<int> filament_maps = part_plate->get_real_filament_maps(bundle.project_config);
+                const std::vector<int> volume_maps   = part_plate->get_real_filament_volume_maps(bundle.project_config);
+                ResolvedPlateSlicingConfig resolved;
+                std::string context_error;
+                if (!bundle.resolve_plate_slicing_config(part_plate->get_slicing_context(), filament_maps, volume_maps,
+                                                         resolved, context_error)) {
+                    part_plate->update_apply_result_invalid(true);
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                        << boost::format(": plate %1% context is unresolved: %2%") % (plate_id + 1) % context_error;
+                    continue;
+                }
+                resolved.config.apply(*part_plate->config(), true);
+                const DynamicPrintConfig &plate_cfg = resolved.config;
+                const auto *timelapse_type = plate_cfg.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
+                const auto *wrapping_opt = plate_cfg.option<ConfigOptionBool>("enable_wrapping_detection");
+                const bool enable_wrapping = wrapping_opt != nullptr && wrapping_opt->value;
+                const bool need_wipe_tower = (timelapse_type != nullptr && timelapse_type->value == TimelapseType::tlSmooth) ||
+                                             enable_wrapping;
+                const int plate_filament_count = (int)plate_cfg.option<ConfigOptionStrings>("filament_type")->values.size();
+                if (!need_wipe_tower && plate_filament_count <= 1)
+                    continue;
+
                 if (part_plate->get_print_seq() == PrintSequence::ByObject ||
-                    (part_plate->get_print_seq() == PrintSequence::ByDefault && co != nullptr && co->value == PrintSequence::ByObject)) {
+                    (part_plate->get_print_seq() == PrintSequence::ByDefault &&
+                     plate_cfg.option<ConfigOptionEnum<PrintSequence>>("print_sequence")->value == PrintSequence::ByObject)) {
                     if (ppl.get_plate(plate_id)->printable_instance_size() != 1)
                         continue;
                 }
@@ -2879,21 +2899,19 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                 DynamicPrintConfig& proj_cfg = wxGetApp().preset_bundle->project_config;
                 float x = dynamic_cast<const ConfigOptionFloats*>(proj_cfg.option("wipe_tower_x"))->get_at(plate_id);
                 float y = dynamic_cast<const ConfigOptionFloats*>(proj_cfg.option("wipe_tower_y"))->get_at(plate_id);
-                float w = dynamic_cast<const ConfigOptionFloat*>(m_config->option("prime_tower_width"))->value;
+                float w = plate_cfg.option<ConfigOptionFloat>("prime_tower_width")->value;
                 float a = dynamic_cast<const ConfigOptionFloat*>(proj_cfg.option("wipe_tower_rotation_angle"))->value;
                 // BBS
-                float v = dynamic_cast<const ConfigOptionFloat*>(m_config->option("prime_volume"))->value;
+                float v = plate_cfg.option<ConfigOptionFloat>("prime_volume")->value;
                 Vec3d plate_origin = ppl.get_plate(plate_id)->get_origin();
 
-                const Print* print = m_process->fff_print();
                 const Print* current_print = part_plate->fff_print();
                 if (!need_wipe_tower && part_plate->get_extruders(true).size() < 2) continue;
                 if (part_plate->get_objects_on_this_plate().empty()) continue;
 
-                float brim_width = print->wipe_tower_data(filaments_count).brim_width;
-                const DynamicPrintConfig &print_cfg   = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-                int nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
-                Vec3d wipe_tower_size = ppl.get_plate(plate_id)->estimate_wipe_tower_size(print_cfg, w, v, nozzle_nums, 0, false, dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value);
+                float brim_width = current_print->wipe_tower_data(plate_filament_count).brim_width;
+                int nozzle_nums = (int)plate_cfg.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+                Vec3d wipe_tower_size = part_plate->estimate_wipe_tower_size(plate_cfg, w, v, nozzle_nums, 0, false, enable_wrapping);
 
                 {
                     const float                 margin     = WIPE_TOWER_MARGIN + brim_width;
@@ -2979,7 +2997,9 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             _set_warning_notification(EWarning::PrimeTowerOutside, show_wipe_tower_outside_error);
 
             auto clash_flag = construct_error_string(object_results, get_object_clashed_text());
-            auto unprintable_flag= construct_extruder_unprintable_error(object_results, get_left_extruder_unprintable_text(), get_right_extruder_unprintable_text());
+            auto unprintable_flag= construct_extruder_unprintable_error(object_results, cur_plate,
+                                                                         get_left_extruder_unprintable_text(),
+                                                                         get_right_extruder_unprintable_text());
 
             bool is_flushing_volume_valid = is_flushing_matrix_error();
             _set_warning_notification(EWarning::FlushingVolumeZero, is_flushing_volume_valid);
@@ -2992,7 +3012,10 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             //if (printer_technology != ptSLA || !contained_min_one)
             //    _set_warning_notification(EWarning::SlaSupportsOutside, false);
 
-            auto full_config_temp = wxGetApp().preset_bundle->full_config();
+            // The background print has already been configured for the current plate's
+            // assigned printer. Keep action-button validation on that same configuration;
+            // the globally selected printer may belong to a different plate.
+            const DynamicPrintConfig& full_config_temp = cur_plate->fff_print()->full_print_config();
             bool tpu_valid = cur_plate->check_tpu_printable_status(full_config_temp, wxGetApp().preset_bundle->get_used_tpu_filaments(cur_plate->get_extruders(true)));
             _set_warning_notification(EWarning::TPUPrintableError, !tpu_valid);
 
@@ -3002,7 +3025,15 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             bool mix_pla_and_petg = cur_plate->check_mixture_of_pla_and_petg(full_config_temp);
             _set_warning_notification(EWarning::MixUsePLAAndPETG, !mix_pla_and_petg);
 
-            bool filament_nozzle_compatible = cur_plate->check_compatible_of_nozzle_and_filament(full_config_temp, wxGetApp().preset_bundle->filament_presets, get_nozzle_filament_incompatible_text());
+            //the filament names must come from the same configuration as the nozzle
+            //they are being checked against. full_config_temp is this plate's, so its
+            //own filament_settings_id is the exact list; the Project row's
+            //filament_presets can name filaments this plate does not use.
+            std::vector<std::string> plate_filaments = wxGetApp().preset_bundle->filament_presets;
+            if (const ConfigOptionStrings* plate_filament_ids = full_config_temp.option<ConfigOptionStrings>("filament_settings_id");
+                    plate_filament_ids != nullptr && !plate_filament_ids->values.empty())
+                plate_filaments = plate_filament_ids->values;
+            bool filament_nozzle_compatible = cur_plate->check_compatible_of_nozzle_and_filament(full_config_temp, plate_filaments, get_nozzle_filament_incompatible_text());
             _set_warning_notification(EWarning::NozzleFilamentIncompatible, !filament_nozzle_compatible);
 
             bool filament_mixture_compatible = cur_plate->check_mixture_filament_compatible(full_config_temp, get_filament_mixture_warning_text());
@@ -5394,6 +5425,22 @@ void GLCanvas3D::update_ui_from_settings()
 GLCanvas3D::WipeTowerInfo GLCanvas3D::get_wipe_tower_info(int plate_idx) const
 {
     WipeTowerInfo wti;
+    PartPlate* plate = wxGetApp().plater()->get_partplate_list().get_plate(plate_idx);
+    if (plate == nullptr)
+        return wti;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const std::vector<int> filament_maps = plate->get_real_filament_maps(bundle->project_config);
+    const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle->project_config);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!bundle->resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+                                              resolved, error)) {
+        plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return wti;
+    }
+    resolved.config.apply(*plate->config(), true);
 
     for (const GLVolume* vol : m_volumes.volumes) {
         if (vol->is_wipe_tower && vol->object_idx() - 1000 == plate_idx) {
@@ -5403,20 +5450,14 @@ GLCanvas3D::WipeTowerInfo GLCanvas3D::get_wipe_tower_info(int plate_idx) const
             // BBS: don't support rotation
             //wti.m_rotation = (M_PI/180.) * proj_cfg->opt_float("wipe_tower_rotation_angle");
 
-            auto& preset = wxGetApp().preset_bundle->prints.get_edited_preset();
-            float wt_brim_width = preset.config.opt_float("prime_tower_brim_width");
+            float wt_brim_width = resolved.config.opt_float("prime_tower_brim_width");
 
             const BoundingBoxf3& bb = vol->bounding_box();
             if (wt_brim_width < 0) wt_brim_width = WipeTower::get_auto_brim_by_height((float)bb.max.z());
             wti.m_bb = BoundingBoxf{to_2d(bb.min), to_2d(bb.max)};
             wti.m_bb.offset(wt_brim_width);
 
-            float brim_width = wxGetApp().preset_bundle->prints.get_edited_preset().config.opt_float("prime_tower_brim_width");
-            if (brim_width < 0) brim_width = WipeTower::get_auto_brim_by_height((float) bb.max.z());
-            wti.m_bb.offset((brim_width));
-
             // BBS: the wipe tower pos might be outside bed
-            PartPlate* plate = wxGetApp().plater()->get_partplate_list().get_plate(plate_idx);
             Vec2d plate_size = plate->get_size();
             wti.m_pos.x() = std::clamp(wti.m_pos.x(), 0.0, plate_size(0) - wti.m_bb.size().x());
             wti.m_pos.y() = std::clamp(wti.m_pos.y(), 0.0, plate_size(1) - wti.m_bb.size().y());
@@ -5962,10 +6003,28 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         settings_changed = true;
     }
 
-    // only show this option if the printer has micro Lidar and can do first layer scan
-    DynamicPrintConfig &current_config = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-    const bool has_lidar = wxGetApp().preset_bundle->is_bbl_vendor();
-    auto                op             = current_config.option("scan_first_layer");
+    ResolvedPlateSlicingConfig resolved_plate;
+    const DynamicPrintConfig  *current_config = nullptr;
+    bool                       has_lidar = false;
+    if (ptech == ptFFF && m_process != nullptr && m_process->get_current_plate() != nullptr) {
+        PartPlate *plate = m_process->get_current_plate();
+        PresetBundle &bundle = *wxGetApp().preset_bundle;
+        const std::vector<int> filament_maps = plate->get_real_filament_maps(bundle.project_config);
+        const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle.project_config);
+        std::string error;
+        if (bundle.resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+                                                resolved_plate, error)) {
+            resolved_plate.config.apply(*plate->config(), true);
+            current_config = &resolved_plate.config;
+            has_lidar = resolved_plate.is_bbl_printer;
+        } else {
+            plate->update_apply_result_invalid(true);
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        }
+    }
+
+    // only show this option if this plate's printer has micro Lidar and can do first layer scan
+    const ConfigOption *op = current_config == nullptr ? nullptr : current_config->option("scan_first_layer");
     if (has_lidar && op && op->getBool()) {
         if (imgui->bbl_checkbox(_L("Avoid extrusion calibration region"), settings.avoid_extrusion_cali_region)) {
             settings_out.avoid_extrusion_cali_region = settings.avoid_extrusion_cali_region;
@@ -6007,11 +6066,11 @@ bool GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         //BBS: add specific arrange settings
         if (seq_print) settings_out.is_seq_print = true;
 
-        if (auto printer_structure_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure")) {
+        if (current_config != nullptr) {
+            auto printer_structure_opt = current_config->option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+            if (printer_structure_opt != nullptr)
             settings_out.align_to_y_axis = (printer_structure_opt->value == PrinterStructure::psI3);
         }
-        else
-            settings_out.align_to_y_axis = false;
 
         appcfg->set("arrange", dist_key, float_to_string_decimal_point(settings_out.distance));
         appcfg->set("arrange", rot_key, settings_out.enable_rotation ? "1" : "0");
@@ -8251,11 +8310,12 @@ void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with
         shader = wxGetApp().get_shader("gouraud");
     ECanvasType canvas_type = this->m_canvas_type;
     bool                 partly_inside_enable = canvas_type == ECanvasType::CanvasAssembleView ? false : true;
-    // The edited printer's per-extruder printable heights feed the object shader's
-    // extruder_printable_heights uniform. Empty for single-extruder printers, so the shader flag stays
-    // 0.0 and rendering is pixel-identical there (see GLVolumeCollection::render).
-    auto printable_height_option = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloatsNullable>("extruder_printable_height");
-    std::vector<double>* printable_heights = printable_height_option ? &printable_height_option->values : nullptr;
+    // Shader limits follow the plate being rendered, not the Project-row printer.
+    PartPlate *rendered_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    std::vector<double> rendered_plate_heights = rendered_plate != nullptr
+        ? rendered_plate->get_extruder_heights()
+        : std::vector<double>();
+    std::vector<double> *printable_heights = rendered_plate_heights.empty() ? nullptr : &rendered_plate_heights;
     if (shader != nullptr) {
         shader->start_using();
 
@@ -10404,7 +10464,8 @@ void GLCanvas3D::_set_warning_notification(EWarning warning, bool state)
                 }
             }
             std::string extruder_name;
-            if(wxGetApp().preset_bundle->is_bbl_vendor()){
+            PartPlate *warning_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+            if (warning_plate != nullptr && warning_plate->fff_print()->is_BBL_printer()) {
                 extruder_name = extruder_name_list[extruder_id-1];
             }
             else{
@@ -10670,9 +10731,18 @@ bool GLCanvas3D::is_flushing_matrix_error() {
     if (!Sidebar::should_show_SEMM_buttons())
         return false;
 
-    const auto                &project_config = wxGetApp().preset_bundle->project_config;
-    const std::vector<double> &config_matrix  = (project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values;
-    const std::vector<double> &config_multiplier = (project_config.option<ConfigOptionFloats>("flush_multiplier"))->values;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return true;
+    }
+    const auto *matrix_option = resolved.config.option<ConfigOptionFloats>("flush_volumes_matrix");
+    const auto *multiplier_option = resolved.config.option<ConfigOptionFloats>("flush_multiplier");
+    if (matrix_option == nullptr || multiplier_option == nullptr || multiplier_option->values.empty())
+        return true;
+    const std::vector<double> &config_matrix = matrix_option->values;
+    const std::vector<double> &config_multiplier = multiplier_option->values;
 
     for (auto multiplier : config_multiplier) {
         if (multiplier == 0) return true;

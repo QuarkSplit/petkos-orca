@@ -542,8 +542,19 @@ std::vector<wxBitmap*> get_extruder_color_icons(bool thin_icon/* = false*/)
 {
     // Create the bitmap with color bars.
     std::vector<wxBitmap*> bmps;
-    std::vector<std::string> filaments_color_info = Slic3r::GUI::wxGetApp().plater()->get_filament_colors_render_info();
-    std::vector<std::string> ctype = Slic3r::GUI::wxGetApp().plater()->get_filament_color_render_type();
+
+    // The menu factory is built from inside Plater::priv's constructor, so this runs
+    // before wxGetApp().plater() has been assigned. The colours used to come from the
+    // project config and this call could survive a null plater; they now come from the
+    // current plate, so the plater has to exist and be past its own construction.
+    // Nothing is lost: MenuFactory::filament_action_menu() rebuilds these icons every
+    // time the menu is opened.
+    Slic3r::GUI::Plater *plater = Slic3r::GUI::wxGetApp().plater();
+    if (plater == nullptr || !plater->is_initialized())
+        return bmps;
+
+    std::vector<std::string> filaments_color_info = plater->get_filament_colors_render_info();
+    std::vector<std::string> ctype = plater->get_filament_color_render_type();
 
     if (!filaments_color_info.empty() && !ctype.empty() && ctype.size() == filaments_color_info.size()) {
         std::vector<std::vector<std::string>> readable_color_info = read_color_pack(filaments_color_info);

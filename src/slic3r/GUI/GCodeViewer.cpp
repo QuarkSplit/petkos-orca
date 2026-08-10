@@ -1000,25 +1000,9 @@ void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
     if (m_gl_data_initialized)
         return;
 
-    // initializes tool marker
-    std::string filename;
-    if (preset_bundle != nullptr) {
-        const Preset* curr = &preset_bundle->printers.get_selected_preset();
-        if (curr->is_system)
-            filename = PresetUtils::system_printer_hotend_model(*curr);
-        else {
-            auto *printer_model = curr->config.opt<ConfigOptionString>("printer_model");
-            if (printer_model != nullptr && ! printer_model->value.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(printer_model->value);
-            }
-
-            if (filename.empty()) {
-                filename = preset_bundle->get_hotend_model_for_printer_model(PresetBundle::ORCA_DEFAULT_PRINTER_MODEL);
-            }
-        }
-    }
-
-    m_sequential_view.marker.init(filename);
+    // A neutral marker is replaced from the exact Print when a plate is loaded.
+    // Initialization has no plate identity and must not borrow the Project printer.
+    m_sequential_view.marker.init({});
 
     // initializes point sizes
     std::array<int, 2> point_sizes;
@@ -1047,7 +1031,7 @@ void GCodeViewer::init(ConfigOptionMode mode, PresetBundle* preset_bundle)
     // Orca:
     // Default view type at first slice.
     // May be overridden in load() once we know how many tools are actually used in the G-code.
-    m_nozzle_nums = preset_bundle ? preset_bundle->get_printer_extruder_count() : 1;
+    m_nozzle_nums = 0;
     auto it = std::find(view_type_items.begin(), view_type_items.end(), libvgcode::EViewType::FeatureType);
     m_view_type_sel = (it != view_type_items.end()) ? std::distance(view_type_items.begin(), it) : 0;
     set_view_type(libvgcode::EViewType::FeatureType);
@@ -1128,6 +1112,25 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
                 const std::vector<BoundingBoxf3>& exclude_bounding_box, ConfigOptionMode mode, bool only_gcode)
 {
     m_loaded_as_preview = false;
+
+    // The hotend marker belongs to the plate being previewed. Resolve only the
+    // printer recorded in this Print; an unavailable model keeps the neutral
+    // marker instead of substituting an unrelated default printer.
+    std::string marker_filename;
+    if (PresetBundle *bundle = wxGetApp().preset_bundle) {
+        const DynamicPrintConfig &print_config = print.full_print_config();
+        const ConfigOptionString *settings_id = print_config.option<ConfigOptionString>("printer_settings_id");
+        const Preset *printer = settings_id != nullptr && !settings_id->value.empty()
+            ? bundle->printers.find_preset(settings_id->value, false)
+            : nullptr;
+        if (printer != nullptr && printer->is_system) {
+            marker_filename = PresetUtils::system_printer_hotend_model(*printer);
+        } else if (const ConfigOptionString *printer_model = print_config.option<ConfigOptionString>("printer_model");
+                   printer_model != nullptr && !printer_model->value.empty()) {
+            marker_filename = bundle->get_hotend_model_for_printer_model(printer_model->value);
+        }
+    }
+    m_sequential_view.marker.init(marker_filename);
 
     const bool current_top_layer_only = m_viewer.is_top_layer_only_view_range();
     const bool required_top_layer_only = get_app_config()->get_bool("seq_top_layer_only");

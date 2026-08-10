@@ -29,8 +29,8 @@ public:
     bool ShouldScrollToChildOnFocus(wxWindow* child) override { return false; }
 };
 
-SendDeviceItem::SendDeviceItem(wxWindow* parent,  MachineObject* obj)
-    : DeviceItem(parent, obj)
+SendDeviceItem::SendDeviceItem(wxWindow* parent, MachineObject* obj, std::string source_model)
+    : DeviceItem(parent, obj, std::move(source_model))
 {
     SetBackgroundColour(*wxWHITE);
     m_bitmap_check_disable = ScalableBitmap(this, "check_off_disabled", 18);
@@ -315,10 +315,25 @@ SendMultiMachinePage::~SendMultiMachinePage()
     delete m_refresh_timer;
 }
 
-void SendMultiMachinePage::prepare(int plate_idx)
+bool SendMultiMachinePage::prepare(int plate_idx)
 {
-	// TODO
+    PartPlate *plate = plate_idx >= 0 ? m_plater->get_partplate_list().get_plate(plate_idx) : nullptr;
+    if (plate == nullptr) {
+        show_error(this, _L("Multi-machine sending requires one explicit plate."), false);
+        return false;
+    }
+
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!m_plater->resolve_plate_slicing_config(plate, resolved, error)) {
+        show_error(this, from_u8(error), false);
+        return false;
+    }
+
     m_print_plate_idx = plate_idx;
+    m_source_model = resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle);
+    m_mapping_popup->set_source_plate_config(m_source_model, resolved.config);
+    return true;
 }
 
 void SendMultiMachinePage::on_dpi_changed(const wxRect& suggested_rect)
@@ -391,7 +406,7 @@ void SendMultiMachinePage::refresh_user_device()
     std::vector<SendDeviceItem*> dev_temp;
 
     for (auto it = user_machine.begin(); it != user_machine.end(); ++it) {
-        SendDeviceItem* di = new SendDeviceItem(scroll_macine_list, it->second);
+        SendDeviceItem* di = new SendDeviceItem(scroll_macine_list, it->second, m_source_model);
         if (m_device_items.find(it->first) != m_device_items.end()) {
             auto item = m_device_items[it->first];
             if (item->state_selected == 1 && di->state_printable <= 2)
@@ -439,9 +454,9 @@ void SendMultiMachinePage::refresh_user_device()
     Fit();
 }
 
-PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
+bool SendMultiMachinePage::request_params(MachineObject* obj, PrintParams &params)
 {
-    PrintParams params;
+    params = {};
 
     //get all setting
     bool bed_leveling = app_config->get("print", "bed_leveling") == "1" ? true : false;
@@ -473,16 +488,6 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
     BOOST_LOG_TRIVIAL(trace) << "sned_job: check_access_code_path = " << check_access_code_path;
     job_data._temp_path = fs::path(check_access_code_path);
 
-    int curr_plate_idx;
-    if (job_data.plate_idx >= 0)
-        curr_plate_idx = job_data.plate_idx + 1;
-    else if (job_data.plate_idx == PLATE_CURRENT_IDX)
-        curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
-    else if (job_data.plate_idx == PLATE_ALL_IDX)
-        curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
-    else
-        curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
-
     params.dev_ip = obj->get_dev_ip();
     params.dev_id = obj->get_dev_id();
     params.dev_name = obj->get_dev_name();
@@ -491,7 +496,7 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
     params.print_type = "from_normal";
     params.filename =  job_data._3mf_path.string();
     params.config_filename = job_data._3mf_config_path.string();
-    params.plate_index = curr_plate_idx;
+    params.plate_index = m_print_plate_idx + 1;
     params.task_bed_leveling = bed_leveling;
     params.task_flow_cali = flow_cali;
     params.task_vibration_cali = false;
@@ -502,7 +507,8 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
         std::string ams_array;
         std::string ams_array2;
         std::string mapping_info;
-        get_ams_mapping_result(ams_array, ams_array2, mapping_info);
+        if (!get_ams_mapping_result(ams_array, ams_array2, mapping_info))
+            return false;
         params.ams_mapping = ams_array;
         params.ams_mapping2 = ams_array2;
         params.ams_mapping_info = mapping_info;
@@ -519,7 +525,7 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
             info.ams_id = VIRTUAL_AMS_DEPUTY_ID_STR;
             info.slot_id = "0";
         }
-        get_ams_mapping_result(ams_array, temp, mapping_info);
+        const bool old_mapping_valid = get_ams_mapping_result(ams_array, temp, mapping_info);
 
         // change to new version
         for(auto &info : m_ams_mapping_result){
@@ -529,7 +535,7 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
         }
         temp.clear();
         mapping_info.clear();
-        get_ams_mapping_result(temp, ams_array2, mapping_info);
+        const bool new_mapping_valid = get_ams_mapping_result(temp, ams_array2, mapping_info);
 
         // restore
         for(auto &info : m_ams_mapping_result){
@@ -537,6 +543,9 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
             info.ams_id = "";
             info.slot_id = "";
         }
+
+        if (!old_mapping_valid || !new_mapping_valid)
+            return false;
 
         params.ams_mapping = ams_array;
         params.ams_mapping2 = ams_array2;
@@ -546,26 +555,21 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
     params.connection_type = obj->connection_type();
     params.task_use_ams = use_ams;
 
-    PartPlate* curr_plate = m_plater->get_partplate_list().get_curr_plate();
+    PartPlate* curr_plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
     if (curr_plate) {
         params.task_bed_type = bed_type_to_gcode_string( curr_plate->get_bed_type(true));
     }
 
     wxString filename;
     if (m_current_project_name.IsEmpty()) {
-        filename = m_plater->get_export_gcode_filename("", true, m_print_plate_idx == PLATE_ALL_IDX ? true : false);
+        filename = m_plater->get_export_gcode_filename_for_plate(m_print_plate_idx, "", true);
     }
     else {
         filename = m_current_project_name;
     }
 
-    if (m_print_plate_idx == PLATE_ALL_IDX && filename.empty()) {
-        filename = _L("Untitled");
-    }
-
     if (filename.empty()) {
-        filename = m_plater->get_export_gcode_filename("", true);
-        if (filename.empty()) filename = _L("Untitled");
+        filename = _L("Untitled");
     }
 
     if (params.preset_name.empty()) { params.preset_name = wxString::Format("%s_plate_%d", filename, m_print_plate_idx).ToStdString(); }
@@ -602,7 +606,7 @@ PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
             params.comments = "no_password";
     }
 
-    return params;
+    return true;
 }
 
 bool SendMultiMachinePage::get_ams_mapping_result(std::string &mapping_array_str, std::string &mapping_array_str2, std::string &ams_mapping_info)
@@ -625,21 +629,16 @@ bool SendMultiMachinePage::get_ams_mapping_result(std::string &mapping_array_str
         json mapping_v1_json   = json::array();
         json mapping_info_json = json::array();
 
-        /* get filament maps */
-        std::vector<int> filament_maps;
-        Plater *         plater = wxGetApp().plater();
-        if (plater) {
-            PartPlate *curr_plate = plater->get_partplate_list().get_curr_plate();
-            if (curr_plate) {
-                filament_maps = curr_plate->get_filament_maps();
-            } else {
-                BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, curr_plate is nullptr";
-            }
-        } else {
-            BOOST_LOG_TRIVIAL(error) << "get_ams_mapping_result, plater is nullptr";
+        PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+        ResolvedPlateSlicingConfig resolved;
+        std::string context_error;
+        if (!m_plater->resolve_plate_slicing_config(plate, resolved, context_error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+            return false;
         }
+        const std::vector<int> filament_maps = plate->get_filament_maps();
 
-        for (int i = 0; i < wxGetApp().preset_bundle->filament_presets.size(); i++) {
+        for (int i = 0; i < resolved.filament_presets.size(); i++) {
             int  tray_id = -1;
             json mapping_item_v1;
             mapping_item_v1["ams_id"]  = 0xff;
@@ -654,12 +653,19 @@ bool SendMultiMachinePage::get_ams_mapping_result(std::string &mapping_array_str
                     tray_id                      = m_ams_mapping_result[k].tray_id;
                     mapping_item["ams"]          = tray_id;
                     mapping_item["filamentType"] = m_filaments[k].type;
-                    if (i >= 0 && i < wxGetApp().preset_bundle->filament_presets.size()) {
-                        auto it = wxGetApp().preset_bundle->filaments.find_preset(wxGetApp().preset_bundle->filament_presets[i]);
-                        if (it != nullptr) { mapping_item["filamentId"] = it->filament_id; }
+                    mapping_item["filamentId"] = resolved.filament_presets[size_t(i)]->filament_id;
+                    if (size_t(i) >= filament_maps.size()) {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate filament map is incomplete";
+                        return false;
                     }
-                    /* nozzle id */
-                    mapping_item["nozzleId"] = 0;
+                    if (filament_maps[size_t(i)] == int(FilamentMapNozzleId::NOZZLE_LEFT))
+                        mapping_item["nozzleId"] = int(CloudTaskNozzleId::NOZZLE_LEFT);
+                    else if (filament_maps[size_t(i)] == int(FilamentMapNozzleId::NOZZLE_RIGHT))
+                        mapping_item["nozzleId"] = int(CloudTaskNozzleId::NOZZLE_RIGHT);
+                    else {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate filament map contains an invalid nozzle id";
+                        return false;
+                    }
 
                     // convert #RRGGBB to RRGGBBAA
                     mapping_item["sourceColor"] = m_filaments[k].color;
@@ -675,7 +681,10 @@ bool SendMultiMachinePage::get_ams_mapping_result(std::string &mapping_array_str
                             mapping_item_v1["ams_id"]  = std::stoi(m_ams_mapping_result[k].ams_id);
                             mapping_item_v1["slot_id"] = std::stoi(m_ams_mapping_result[k].slot_id);
                         }
-                    } catch (...) {}
+                    } catch (const std::exception &ex) {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid AMS mapping: " << ex.what();
+                        return false;
+                    }
                 }
             }
             mapping_v0_json.push_back(tray_id);
@@ -738,7 +747,11 @@ void SendMultiMachinePage::on_send(wxCommandEvent& event)
         if (obj && obj->is_online() && !obj->can_abort() && !obj->is_in_upgrading() && it->second->get_state_selected() == 1 && it->second->state_printable <= 2) {
 
             if (!it->second->is_blocking_printing(obj)) {
-                PrintParams params = request_params(obj);
+                PrintParams params;
+                if (!request_params(obj, params)) {
+                    show_error(this, _L("The selected plate has an invalid or incomplete printer/filament mapping."), false);
+                    return;
+                }
                 print_params.push_back(params);
             }
         }
@@ -1412,33 +1425,34 @@ void SendMultiMachinePage::sync_ams_list()
     std::vector<std::string> brands;
     std::vector<std::string> display_materials;
     std::vector<std::string> m_filaments_id;
-    auto                     preset_bundle = wxGetApp().preset_bundle;
-
-    for (auto filament_name : preset_bundle->filament_presets) {
-        for (int f_index = 0; f_index < preset_bundle->filaments.size(); f_index++) {
-            PresetCollection* filament_presets = &wxGetApp().preset_bundle->filaments;
-            Preset* preset = &filament_presets->preset(f_index);
-
-            if (preset && filament_name.compare(preset->name) == 0) {
-                std::string display_filament_type;
-                std::string filament_type = preset->config.get_filament_type(display_filament_type);
-                std::string m_filament_id = preset->filament_id;
-                display_materials.push_back(display_filament_type);
-                materials.push_back(filament_type);
-                m_filaments_id.push_back(m_filament_id);
-
-                std::string m_vendor_name = "";
-                auto        vendor = dynamic_cast<ConfigOptionStrings*>(preset->config.option("filament_vendor"));
-                if (vendor && (vendor->values.size() > 0)) {
-                    std::string vendor_name = vendor->values[0];
-                    m_vendor_name = vendor_name;
-                }
-                brands.push_back(m_vendor_name);
-            }
-        }
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!m_plater->resolve_plate_slicing_config(plate, resolved, error)) {
+        show_error(this, from_u8(error), false);
+        return;
+    }
+    const auto *filament_colours = resolved.config.option<ConfigOptionStrings>("filament_colour");
+    if (filament_colours == nullptr) {
+        show_error(this, _L("The plate slicing context has no filament colours."), false);
+        return;
     }
 
-    auto           extruders = wxGetApp().plater()->get_partplate_list().get_curr_plate()->get_used_filaments();
+    for (const Preset *preset : resolved.filament_presets) {
+        const std::string filament_type = preset->config.get_filament_type();
+        const std::string display_filament_type = filament_type;
+        display_materials.push_back(display_filament_type);
+        materials.push_back(filament_type);
+        m_filaments_id.push_back(preset->filament_id);
+
+        std::string vendor_name;
+        if (const auto *vendor = preset->config.option<ConfigOptionStrings>("filament_vendor");
+            vendor != nullptr && !vendor->values.empty())
+            vendor_name = vendor->values.front();
+        brands.push_back(vendor_name);
+    }
+
+    auto           extruders = plate->get_used_filaments();
     BitmapCache    bmcache;
     MaterialHash::iterator iter = m_material_list.begin();
     while (iter != m_material_list.end()) {
@@ -1456,12 +1470,16 @@ void SendMultiMachinePage::sync_ams_list()
 
     for (auto i = 0; i < extruders.size(); i++) {
         auto          extruder = extruders[i] - 1;
-        auto          colour = wxGetApp().preset_bundle->project_config.opt_string("filament_colour", (unsigned int)extruder);
+        if (extruder < 0 || size_t(extruder) >= filament_colours->values.size() ||
+            size_t(extruder) >= materials.size() || size_t(extruder) >= display_materials.size()) {
+            show_error(this, _L("The plate filament assignments do not match its slicing context."), false);
+            return;
+        }
+        const std::string &colour = filament_colours->values[size_t(extruder)];
         unsigned char rgb[4];
         bmcache.parse_color4(colour, rgb);
 
         auto colour_rgb = wxColour((int)rgb[0], (int)rgb[1], (int)rgb[2], (int)rgb[3]);
-        if (extruder >= materials.size() || extruder < 0 || extruder >= display_materials.size()) continue;
 
         MaterialItem* item = new MaterialItem(m_main_page, colour_rgb, _L(display_materials[extruder]));
         //item->set_ams_info(wxColour("#CECECE"), "A1", 0, std::vector<wxColour>());
@@ -1548,20 +1566,30 @@ void SendMultiMachinePage::set_default_normal(const ThumbnailData& data)
     m_main_scroll->Layout();
     m_main_scroll->Fit();
 
-    // basic info
-    auto aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
-    wxString   time;
-    PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
-    if (plate) {
-        if (plate->get_slice_result()) { time = wxString::Format("%s", short_time(get_time_dhms(plate->get_slice_result()->print_statistics.modes[0].time))); }
+    // basic info from the exact retained plate result
+    PartPlate* plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    if (plate == nullptr || plate->get_slice_result() == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained slice result";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
     }
+    float  print_time_seconds = 0.f;
+    double weight_grams       = 0.;
+    if (!plate->get_retained_print_statistics(print_time_seconds, weight_grams)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the explicit plate has no retained statistics";
+        m_stext_time->SetLabel(wxEmptyString);
+        m_stext_weight->SetLabel(wxEmptyString);
+        return;
+    }
+    wxString time = wxString::Format("%s", short_time(get_time_dhms(print_time_seconds)));
 
     char weight[64];
     if (wxGetApp().app_config->get("use_inches") == "1") {
-        ::sprintf(weight, "  %.2f oz", aprint_stats.total_weight * 0.035274);
+        ::sprintf(weight, "  %.2f oz", weight_grams * 0.035274);
     }
     else {
-        ::sprintf(weight, "  %.2f g", aprint_stats.total_weight);
+        ::sprintf(weight, "  %.2f g", weight_grams);
     }
 
     m_stext_time->SetLabel(time);
@@ -1570,14 +1598,10 @@ void SendMultiMachinePage::set_default_normal(const ThumbnailData& data)
 
 void SendMultiMachinePage::set_default()
 {
-    wxString filename = m_plater->get_export_gcode_filename("", true, m_print_plate_idx == PLATE_ALL_IDX ? true : false);
-    if (m_print_plate_idx == PLATE_ALL_IDX && filename.empty()) {
-        filename = _L("Untitled");
-    }
+    wxString filename = m_plater->get_export_gcode_filename_for_plate(m_print_plate_idx, "", true);
 
     if (filename.empty()) {
-        filename = m_plater->get_export_gcode_filename("", true);
-        if (filename.empty()) filename = _L("Untitled");
+        filename = _L("Untitled");
     }
 
     fs::path filename_path(filename.c_str());
@@ -1603,8 +1627,13 @@ void SendMultiMachinePage::set_default()
 
     m_task_name->SetLabel(m_current_project_name);
 
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_print_plate_idx);
+    if (plate == nullptr) {
+        show_error(this, _L("Multi-machine sending requires one explicit plate."), false);
+        return;
+    }
     sync_ams_list();
-    set_default_normal(m_plater->get_partplate_list().get_curr_plate()->thumbnail_data);
+    set_default_normal(plate->thumbnail_data);
 }
 
 void SendMultiMachinePage::on_rename_enter()

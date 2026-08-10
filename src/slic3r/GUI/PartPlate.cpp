@@ -80,6 +80,37 @@ namespace GUI {
 
 class Bed3D;
 
+static bool resolve_plate_context(const PartPlate *plate, ResolvedPlateSlicingConfig &resolved,
+                                  bool apply_plate_overrides = true)
+{
+    if (plate == nullptr || wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
+        return false;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const std::vector<int> filament_maps = plate->get_real_filament_maps(bundle->project_config);
+    const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle->project_config);
+    std::string error;
+    if (!bundle->resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+                                              resolved, error)) {
+        const_cast<PartPlate *>(plate)->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": plate %1% context is unresolved: %2%") % (plate->get_index() + 1) % error;
+        return false;
+    }
+    if (apply_plate_overrides)
+        resolved.config.apply(*plate->config(), true);
+    return true;
+}
+
+static bool plate_uses_dual_bbl(const PartPlate *plate)
+{
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_plate_context(plate, resolved))
+        return false;
+    const ConfigOptionFloats *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    return resolved.is_bbl_printer && nozzles != nullptr && nozzles->values.size() == 2;
+}
+
 ColorRGBA PartPlate::SELECT_COLOR		= { 0.2666f, 0.2784f, 0.2784f, 1.0f }; //{ 0.4196f, 0.4235f, 0.4235f, 1.0f };
 ColorRGBA PartPlate::UNSELECT_COLOR		= { 0.82f, 0.82f, 0.82f, 1.0f };
 ColorRGBA PartPlate::UNSELECT_DARK_COLOR		= { 0.384f, 0.384f, 0.412f, 1.0f };
@@ -255,20 +286,18 @@ void PartPlate::set_print_seq(PrintSequence print_seq)
     assert(m_plater != nullptr);
 
     // update slice state
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_plate_context(this, resolved, false))
+        return;
+
     PrintSequence old_real_print_seq = get_print_seq();
-    if (old_real_print_seq == PrintSequence::ByDefault) {
-        auto curr_preset_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-        if (curr_preset_config.has(print_seq_key))
-            old_real_print_seq = curr_preset_config.option<ConfigOptionEnum<PrintSequence>>(print_seq_key)->value;
-    }
+    if (old_real_print_seq == PrintSequence::ByDefault && resolved.config.has(print_seq_key))
+        old_real_print_seq = resolved.config.option<ConfigOptionEnum<PrintSequence>>(print_seq_key)->value;
 
     PrintSequence new_real_print_seq = print_seq;
 
-    if (print_seq == PrintSequence::ByDefault) {
-        auto curr_preset_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-        if (curr_preset_config.has(print_seq_key))
-            new_real_print_seq = curr_preset_config.option<ConfigOptionEnum<PrintSequence>>(print_seq_key)->value;
-    }
+    if (print_seq == PrintSequence::ByDefault && resolved.config.has(print_seq_key))
+        new_real_print_seq = resolved.config.option<ConfigOptionEnum<PrintSequence>>(print_seq_key)->value;
 
     if (old_real_print_seq != new_real_print_seq) {
         update_slice_result_valid_state(false);
@@ -295,7 +324,14 @@ PrintSequence PartPlate::get_print_seq() const
 
 PrintSequence PartPlate::get_real_print_seq(bool* plate_same_as_global) const
 {
-	PrintSequence global_print_seq = wxGetApp().global_print_sequence();
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_plate_context(this, resolved, false)) {
+        if (plate_same_as_global)
+            *plate_same_as_global = false;
+        return PrintSequence::ByDefault;
+    }
+
+	PrintSequence global_print_seq = resolved.config.opt_enum<PrintSequence>("print_sequence");
     PrintSequence curr_plate_seq = get_print_seq();
     if (curr_plate_seq == PrintSequence::ByDefault) {
 		curr_plate_seq = global_print_seq;
@@ -357,27 +393,19 @@ bool PartPlate::get_spiral_vase_mode() const
 	if (m_config.has(key)) {
 		return m_config.opt_bool(key);
 	}
-	else {
-		DynamicPrintConfig* global_config = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
-		if (global_config->has(key))
-			return global_config->opt_bool(key);
-	}
+	ResolvedPlateSlicingConfig resolved;
+	if (resolve_plate_context(this, resolved) && resolved.config.has(key))
+		return resolved.config.opt_bool(key);
 	return false;
 }
 
 std::vector<Vec2d> PartPlate::get_plate_wrapping_detection_area() const
 {
-    DynamicPrintConfig  gconfig                  = wxGetApp().preset_bundle->printers.get_edited_preset().config;
-    ConfigOptionPoints *wrapping_exclude_area_opt = gconfig.option<ConfigOptionPoints>("wrapping_exclude_area");
-    if (wrapping_exclude_area_opt) {
-        std::vector<Vec2d> wrapping_area = wrapping_exclude_area_opt->values;
-        for (Vec2d& pt : wrapping_area) {
-            pt += Vec2d(m_origin.x(), m_origin.y());
-        }
-        return wrapping_area;
+    std::vector<Vec2d> wrapping_area = m_wrapping_exclude_area_local;
+    for (Vec2d& pt : wrapping_area) {
+        pt += Vec2d(m_origin.x(), m_origin.y());
     }
-
-    return std::vector<Vec2d>();
+    return wrapping_area;
 }
 
 void PartPlate::set_spiral_vase_mode(bool spiral_mode, bool as_global)
@@ -872,7 +900,16 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
             curr_bed_type = proj_cfg.opt_enum<BedType>(std::string("curr_bed_type"));
 	}
 	int bed_type_idx = (int)curr_bed_type;
-    auto is_single_extruder = wxGetApp().preset_bundle->get_printer_extruder_count() == 1;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_plate_context(this, resolved))
+        return;
+    const auto *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzles == nullptr || nozzles->values.empty()) {
+        update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate context has no nozzle definition";
+        return;
+    }
+    const bool is_single_extruder = nozzles->values.size() == 1;
     if (!is_single_extruder) {
         if (m_partplate_list->m_allow_bed_type_in_double_nozzle.find(bed_type_idx) == m_partplate_list->m_allow_bed_type_in_double_nozzle.end()) {
             bed_type_idx = 0;
@@ -1179,8 +1216,7 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
                     render_icon_texture(m_lock_icon.model, m_partplate_list->m_lockopen_texture);
             }
 
-            PresetBundle* preset = wxGetApp().preset_bundle;
-            bool dual_bbl = (preset->is_bbl_vendor() && preset->get_printer_extruder_count() == 2);
+            const bool dual_bbl = plate_uses_dual_bbl(this);
             if (dual_bbl) {
                 if (hover_id == PLATE_FILAMENT_MAP_ID){
                     render_icon_texture(m_plate_filament_map_icon.model, m_partplate_list->m_plate_set_filament_map_hovered_texture);
@@ -1513,8 +1549,7 @@ void PartPlate::register_raycasters_for_picking(GLCanvas3D &canvas)
     register_model_for_picking(canvas, m_move_front_icon, picking_id_component(7));
 
     // Only register filament map button for H2D (dual-extruder Bambu Lab) printers
-    PresetBundle* preset = wxGetApp().preset_bundle;
-    bool dual_bbl = (preset && preset->is_bbl_vendor() && preset->get_printer_extruder_count() == 2);
+    const bool dual_bbl = plate_uses_dual_bbl(this);
     if (dual_bbl)
         register_model_for_picking(canvas, m_plate_filament_map_icon, picking_id_component(PLATE_FILAMENT_MAP_ID));
 }
@@ -1531,7 +1566,10 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
         return plate_extruders;
     }
 	// if 3mf file
-	const DynamicPrintConfig& glb_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+	ResolvedPlateSlicingConfig resolved;
+	if (!resolve_plate_context(this, resolved))
+		return {};
+	const DynamicPrintConfig& glb_config = resolved.config;
 	int glb_support_intf_extr = glb_config.opt_int("support_interface_filament");
 	int glb_support_extr = glb_config.opt_int("support_filament");
 	int glb_outer_wall_extr = glb_config.opt_int("outer_wall_filament_id");
@@ -1661,7 +1699,7 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
 	if (conside_custom_gcode) {
 		//BBS
         int nums_extruders = 0;
-        if (const ConfigOptionStrings *color_option = dynamic_cast<const ConfigOptionStrings *>(wxGetApp().preset_bundle->project_config.option("filament_colour"))) {
+        if (const ConfigOptionStrings *color_option = dynamic_cast<const ConfigOptionStrings *>(glb_config.option("filament_colour"))) {
             nums_extruders = color_option->values.size();
 			if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
 				for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
@@ -1858,8 +1896,10 @@ std::vector<int> PartPlate::get_extruders_without_support(bool conside_custom_gc
     if (check_objects_empty_and_gcode3mf(plate_extruders)) {
         return plate_extruders;
     }
-	// if 3mf file
-	const DynamicPrintConfig& glb_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+	ResolvedPlateSlicingConfig resolved;
+	if (!resolve_plate_context(this, resolved))
+		return {};
+	const DynamicPrintConfig& plate_config = resolved.config;
 
 	for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
 		if (!contain_instance_totally(obj_idx, 0))
@@ -1875,7 +1915,7 @@ std::vector<int> PartPlate::get_extruders_without_support(bool conside_custom_gc
 	if (conside_custom_gcode) {
 		//BBS
 		int nums_extruders = 0;
-		if (const ConfigOptionStrings* color_option = dynamic_cast<const ConfigOptionStrings*>(wxGetApp().preset_bundle->project_config.option("filament_colour"))) {
+		if (const ConfigOptionStrings* color_option = dynamic_cast<const ConfigOptionStrings*>(plate_config.option("filament_colour"))) {
 			nums_extruders = color_option->values.size();
 			if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
 				for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
@@ -1904,7 +1944,7 @@ std::vector<int> PartPlate::get_extruders_without_support(bool conside_custom_gc
 int PartPlate::get_physical_extruder_by_filament_id(const DynamicConfig& g_config, int idx) const
 {
 	const std::vector<int>& filament_map = get_real_filament_maps(g_config);
-	if (filament_map.size() < idx)
+	if (idx <= 0 || idx > static_cast<int>(filament_map.size()))
 	{
 		return -1;
 	}
@@ -1915,7 +1955,9 @@ int PartPlate::get_physical_extruder_by_filament_id(const DynamicConfig& g_confi
 		return -1;
 	}
 
-	int zero_base_logical_idx = filament_map[idx - 1] - 1;
+	const int zero_base_logical_idx = filament_map[idx - 1] - 1;
+	if (zero_base_logical_idx < 0 || zero_base_logical_idx >= static_cast<int>(the_map->values.size()))
+		return -1;
 	return the_map->values[zero_base_logical_idx];
 }
 
@@ -1962,18 +2004,22 @@ bool PartPlate::check_filament_printable(const DynamicPrintConfig &config, wxStr
         const std::vector<std::string>& filament_types      = config.option<ConfigOptionStrings>("filament_type")->values;
         const std::vector<int>&         filament_printables = config.option<ConfigOptionInts>("filament_printable")->values;
         const std::vector<int>&         filament_map        = get_real_filament_maps(config);
-        // This runs synchronously mid printer-switch (load_current_preset -> reload_scene), before the
-        // filament-count reconciliation clears stale per-object assignments, so the plate objects can
-        // still reference filament indices beyond the freshly selected printer config. Skip those to
-        // avoid an out-of-range access. Matches BambuStudio's guards in the same function.
         const int filament_count = std::min({(int) filament_types.size(), (int) filament_printables.size(), (int) filament_map.size()});
         for (auto filament_idx : used_filaments) {
             int filament_id = filament_idx - 1;
-            if (filament_id < 0 || filament_id >= filament_count)
-                continue;
+            if (filament_id < 0 || filament_id >= filament_count) {
+                error_message = wxString::Format(
+                    _L("Plate filament %d is not defined by this plate's slicing context."), filament_idx);
+                return false;
+            }
             std::string filament_type = filament_types[filament_id];
             int filament_printable_status = filament_printables[filament_id];
             int extruder_idx = filament_map[filament_id] - 1;
+            if (extruder_idx < 0) {
+                error_message = wxString::Format(
+                    _L("Plate filament %d has an invalid nozzle assignment."), filament_idx);
+                return false;
+            }
             if (!(filament_printable_status >> extruder_idx & 1)) {
                 wxString extruder_name = extruder_idx == 0 ? _L("left") : _L("right");
                 error_message  = wxString::Format(_L("The %s nozzle can not print %s."), extruder_name, filament_type);
@@ -2535,6 +2581,28 @@ void PartPlate::set_plate_name(const std::string& name)
 	invalidate_plate_name_texture();
 }
 
+//Figures for this plate's own retained slice, taken from its GCodeResult and nowhere
+//else. Weight is recomposed from the result's per-filament volumes and densities
+//(the same arithmetic the G-code viewer uses) rather than read from a Print object,
+//because a Print carries the statistics of whichever plate was sliced last and is
+//empty again after a project is reopened, while the retained result is plate-owned.
+bool PartPlate::get_retained_print_statistics(float &print_time_seconds, double &weight_grams) const
+{
+	if (m_gcode_result == nullptr)
+		return false;
+
+	const PrintEstimatedStatistics &stats = m_gcode_result->print_statistics;
+	print_time_seconds = stats.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)].time;
+
+	weight_grams = 0.;
+	for (const std::pair<const size_t, double> &volume : stats.total_volumes_per_extruder) {
+		if (volume.first >= m_gcode_result->filament_densities.size())
+			continue;
+		weight_grams += volume.second * double(m_gcode_result->filament_densities[volume.first]) * 0.001;
+	}
+	return true;
+}
+
 //get the print's object, result and index
 void PartPlate::get_print(PrintBase** print, GCodeResult** result, int* index)
 {
@@ -2956,6 +3024,22 @@ void PartPlate::update_instance_exclude_status(int obj_id, int instance_id, Boun
 	}
 }
 
+//re-check every instance on this plate against the plate's current bed. The bed can
+//change under the parts (per-plate printer reassignment) while the parts keep their
+//world coordinates, so the cached outside state is stale until this runs.
+std::vector<std::pair<int, int>> PartPlate::update_instances_outside_state()
+{
+	for (const std::pair<int, int>& pair : obj_to_instance_set) {
+		if (valid_instance(pair.first, pair.second))
+			update_instance_exclude_status(pair.first, pair.second);
+	}
+
+	//refresh m_ready_for_slice from the rebuilt instance_outside_set
+	update_states();
+
+	return std::vector<std::pair<int, int>>(instance_outside_set.begin(), instance_outside_set.end());
+}
+
 //update object's index caused by original object deleted
 void PartPlate::update_object_index(int obj_idx_removed, int obj_idx_max)
 {
@@ -2995,7 +3079,10 @@ void PartPlate::set_vase_mode_related_object_config(int obj_id) {
 	else
 		obj_ptrs = get_objects_on_this_plate();
 
-	DynamicPrintConfig* global_config = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
+	ResolvedPlateSlicingConfig resolved;
+	if (!resolve_plate_context(this, resolved))
+		return;
+	const DynamicPrintConfig& plate_config = resolved.config;
 	DynamicPrintConfig new_conf;
 	new_conf.set_key_value("wall_loops", new ConfigOptionInt(1));
 	new_conf.set_key_value("top_shell_layers", new ConfigOptionInt(0));
@@ -3005,7 +3092,7 @@ void PartPlate::set_vase_mode_related_object_config(int obj_id) {
 	new_conf.set_key_value("detect_thin_wall", new ConfigOptionBool(false));
 	new_conf.set_key_value("timelapse_type", new ConfigOptionEnum<TimelapseType>(tlTraditional));
 	new_conf.set_key_value("overhang_reverse", new ConfigOptionBool(false));
-	auto applying_keys = global_config->diff(new_conf);
+	auto applying_keys = plate_config.diff(new_conf);
 
 	for (ModelObject* object : obj_ptrs) {
 		ModelConfigObject& config = object->config;
@@ -3112,12 +3199,10 @@ void PartPlate::generate_logo_polygon(ExPolygon &logo_polygon)
 {
 	if (m_shape.size() == 4)
 	{
-        bool is_bbl_vendor = false;
-
-		if (m_plater) {
-            if (auto preset_bundle = wxGetApp().preset_bundle; preset_bundle)
-                is_bbl_vendor = preset_bundle->is_bbl_vendor();
-		}
+        ResolvedPlateSlicingConfig resolved;
+        if (m_plater == nullptr || !resolve_plate_context(this, resolved))
+            return;
+        const bool is_bbl_vendor = resolved.is_bbl_printer;
 
         //rectangle case
 		for (int i = 0; i < 4; i++)
@@ -3308,9 +3393,7 @@ bool PartPlate::set_shape(const Pointfs& shape, const Pointfs& exclude_areas, co
 			calc_vertex_for_icons(3, m_lock_icon);
 			calc_vertex_for_icons(4, m_plate_settings_icon);
 			// ORCA also change bed_icon_count number in calc_vertex_for_icons() after adding or removing icons for circular shaped beds that uses vertical alingment for icons
-			bool dual_bbl = false;
-			PresetBundle* preset = wxGetApp().preset_bundle;
-			dual_bbl = (preset->is_bbl_vendor() && preset->get_printer_extruder_count() == 2);
+			const bool dual_bbl = plate_uses_dual_bbl(this);
 			calc_vertex_for_icons(dual_bbl ? 5 : 6, m_plate_filament_map_icon);
 			calc_vertex_for_icons(dual_bbl ? 6 : 5, m_move_front_icon);
 
@@ -3524,6 +3607,29 @@ void PartPlate::update_slice_result_valid_state(bool valid)
     }
 }
 
+bool PartPlate::is_slice_result_valid() const
+{
+    if (!m_slice_result_valid || m_sliced_config.keys().empty())
+        return false;
+
+    // Headless serialization may inspect retained state without a GUI bundle.
+    if (wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
+        return true;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig current;
+    std::string error;
+    if (!bundle->resolve_plate_slicing_config(
+            get_slicing_context(),
+            get_real_filament_maps(bundle->project_config),
+            get_real_filament_volume_maps(bundle->project_config),
+            current, error))
+        return false;
+
+    current.config.apply(m_config, true);
+    return m_sliced_config.diff(current.config).empty() && current.config.diff(m_sliced_config).empty();
+}
+
 //update current slice context into backgroud slicing process
 void PartPlate::update_slice_context(BackgroundSlicingProcess & process)
 {
@@ -3578,20 +3684,24 @@ int PartPlate::load_gcode_from_file(const std::string& filename)
 
 	// process gcode
 	auto& preset_bundle = wxGetApp().preset_bundle;
-	std::vector<int>   filament_maps = this->get_filament_maps();
-	// Inject the plate's volume map (or the per-extruder defaults) exactly like the apply-time
-	// composition, so the config applied over the loaded slice result matches the next
-	// background-process apply and does not invalidate the embedded g-code.
-	std::vector<int> f_volume_maps = this->get_filament_volume_maps();
-	if (f_volume_maps.empty()) {
-		f_volume_maps = preset_bundle->get_default_nozzle_volume_types_for_filaments(filament_maps);
+	const std::vector<int> filament_maps = get_real_filament_maps(preset_bundle->project_config);
+	const std::vector<int> volume_maps   = get_real_filament_volume_maps(preset_bundle->project_config);
+	ResolvedPlateSlicingConfig resolved;
+	std::string context_error;
+	const bool context_resolved = preset_bundle->resolve_plate_slicing_config(
+		get_slicing_context(), filament_maps, volume_maps, resolved, context_error);
+	if (context_resolved) {
+		resolved.config.apply(m_config, true);
+		m_print->apply(*m_model, resolved.config, false);
+		update_apply_result_invalid(false);
+	} else {
+		// The retained G-code is still durable project data. It may be exported or
+		// inspected, but reslicing is blocked until its exact context is available.
+		update_apply_result_invalid(true);
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+			<< boost::format(": plate %1% retained with unresolved context: %2%")
+			   % (m_plate_index + 1) % context_error;
 	}
-	DynamicPrintConfig full_config   = preset_bundle->full_config(false, filament_maps, f_volume_maps);
-	full_config.apply(m_config, true);
-	m_print->apply(*m_model, full_config, false);
-	//BBS: need to apply two times, for after the first apply, the m_print got its object,
-	//which will affect the config when new_full_config.normalize_fdm(used_filaments);
-	m_print->apply(*m_model, full_config, false);
 
 	// BBS: use backup path to save temp gcode
     // auto path = get_tmp_gcode_path();
@@ -3936,11 +4046,10 @@ void PartPlate::clear_filament_map_mode()
 void PartPlate::on_extruder_count_changed(int extruder_count)
 {
     if (extruder_count < 2) {
-        std::vector<int> f_map = wxGetApp().plater()->get_global_filament_map();
+        const DynamicPrintConfig &project_config = wxGetApp().preset_bundle->project_config;
+        std::vector<int> f_map = get_real_filament_maps(project_config);
         std::fill(f_map.begin(), f_map.end(), 1);
-        wxGetApp().plater()->set_global_filament_map(f_map);
-        // clear filament map and mode in single extruder mode
-        clear_filament_map();
+        set_filament_maps(f_map);
         //clear_filament_map_mode();
         // do not clear mode now, reset to default mode
         m_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = FilamentMapMode::fmmAutoForFlush;
@@ -3981,10 +4090,14 @@ void PartPlate::on_filament_added()
         std::vector<int>& filament_volume_map = m_config.option<ConfigOptionInts>("filament_volume_map")->values;
         // A new filament defaults onto the first extruder, so seed its volume value from
         // that extruder's flow type.
-        int volume_type = static_cast<int>(NozzleVolumeType::nvtStandard);
-        auto nozzle_volumes = wxGetApp().preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-        if (nozzle_volumes && !nozzle_volumes->values.empty())
-            volume_type = nozzle_volumes->values[0];
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!wxGetApp().plater()->resolve_plate_slicing_config(this, resolved, error))
+            throw Slic3r::RuntimeError("Unable to add a filament to the plate: " + error);
+        const auto *nozzle_volumes = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+        if (nozzle_volumes == nullptr || nozzle_volumes->values.empty())
+            throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
+        int volume_type = nozzle_volumes->values[0];
         // Orca: never store the Hybrid marker as a per-filament value; on a Hybrid extruder
         // each filament still prints with a concrete flow, defaulting to Standard.
         if (volume_type == static_cast<int>(NozzleVolumeType::nvtHybrid))
@@ -4249,7 +4362,7 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 	//a project can name a printer this installation does not have
 	const Preset* preset = bundle->printers.find_preset(preset_name, false);
 	if (preset == nullptr) {
-		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": printer preset '%1%' not installed, falling back to the project printer") % preset_name;
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": printer preset '%1%' is not installed") % preset_name;
 		return false;
 	}
 
@@ -4264,6 +4377,9 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 
 	const ConfigOptionPoints* exclude_opt = cfg.option<ConfigOptionPoints>("bed_exclude_area");
 	bed.exclude_areas = (exclude_opt != nullptr) ? exclude_opt->values : Pointfs();
+
+	const ConfigOptionPoints* wrapping_opt = cfg.option<ConfigOptionPoints>("wrapping_exclude_area");
+	bed.wrapping_exclude_areas = (wrapping_opt != nullptr) ? wrapping_opt->values : Pointfs();
 
 	const ConfigOptionPointsGroups* ext_area_opt = cfg.option<ConfigOptionPointsGroups>("extruder_printable_area");
 	bed.extruder_areas = (ext_area_opt != nullptr) ? ext_area_opt->values : std::vector<Pointfs>();
@@ -4292,9 +4408,9 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 	return true;
 }
 
-//Give one plate its assigned printer's bed. Plates with no assignment, or whose
-//assigned preset is not installed, keep the project bed.
-bool PartPlateList::apply_printer_to_plate(int index)
+// Give one plate its effective printer bed. An empty assignment explicitly
+// inherits the Project row. A named assignment must resolve exactly.
+bool PartPlateList::apply_printer_to_plate(int index, bool reflow)
 {
 	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
 		return false;
@@ -4302,11 +4418,19 @@ bool PartPlateList::apply_printer_to_plate(int index)
 	PartPlate* plate = m_plate_list[index];
 
 	PlateBed bed;
-	const bool honoured = resolve_printer_bed(plate->get_printer_preset_name(), bed);
-	if (!honoured) {
-		//project bed
+	const bool inherited = !plate->has_printer_assignment();
+	const bool resolved  = inherited || resolve_printer_bed(plate->get_printer_preset_name(), bed);
+	if (!resolved) {
+		plate->update_apply_result_invalid(true);
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+			<< boost::format(": plate %1% printer '%2%' is unresolved")
+			   % (index + 1) % plate->get_printer_preset_name();
+		return false;
+	}
+	if (inherited) {
 		bed.shape = m_shape;
 		bed.exclude_areas = m_exclude_areas;
+		bed.wrapping_exclude_areas = m_wrapping_exclude_areas;
 		bed.extruder_areas = m_extruder_areas;
 		bed.extruder_heights = m_extruder_heights;
 		bed.printable_height = 0.0;
@@ -4314,13 +4438,14 @@ bool PartPlateList::apply_printer_to_plate(int index)
 
 	//record the height before reshaping so set_pos_and_size inside set_plate_shape
 	//already applies it; 0 clears the override and the plate follows the project again
-	plate->set_printable_height(honoured ? bed.printable_height : 0.0);
+	plate->set_printable_height(inherited ? 0.0 : bed.printable_height);
 
 	//set_plate_shape reports whether the bed actually moved, which is a different
 	//question from whether we honoured the assignment. Callers care about the latter.
-	set_plate_shape(index, bed.shape, bed.exclude_areas, bed.extruder_areas, bed.extruder_heights, m_height_to_lid, m_height_to_rod);
+	set_plate_shape(index, bed.shape, bed.exclude_areas, bed.extruder_areas, bed.extruder_heights, m_height_to_lid, m_height_to_rod, reflow);
+	plate->set_local_wrapping_exclude_area(bed.wrapping_exclude_areas);
 
-	return honoured;
+	return true;
 }
 
 void PartPlateList::apply_printer_assignments()
@@ -4331,19 +4456,12 @@ void PartPlateList::apply_printer_assignments()
 			continue;
 
 		any_assigned = true;
-		if (!apply_printer_to_plate(i)) {
-			//The plate asked for a machine we could not give it, so it is silently
-			//sitting on the project bed. That can hand back gcode for a bed the target
-			//machine does not have, so say so loudly rather than let it pass.
-			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
-				<< boost::format(": plate %1% is assigned to printer '%2%' but that bed could not be applied; "
-				                 "the plate is using the project printer's bed instead")
-				   % (i + 1) % m_plate_list[i]->get_printer_preset_name();
-		}
+		//reflow=false: one trailing reflow below instead of one per assigned plate
+		apply_printer_to_plate(i, false);
 	}
 
-	//set_plate_shape reflows per call; one more pass costs little and guarantees the
-	//final arrangement accounts for every plate whose footprint changed
+	//each apply above deferred its reflow, so this single pass is the only one and it
+	//accounts for every plate whose footprint changed
 	if (any_assigned)
 		reflow_layout();
 }
@@ -4354,7 +4472,8 @@ bool PartPlateList::set_plate_shape(int                         index,
                                     const std::vector<Pointfs> &extruder_areas,
                                     const std::vector<double>  &extruder_heights,
                                     float                       height_to_lid,
-                                    float                       height_to_rod)
+                                    float                       height_to_rod,
+                                    bool                        reflow)
 {
 	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
 		return false;
@@ -4380,7 +4499,8 @@ bool PartPlateList::set_plate_shape(int                         index,
 	Vec3d origin(current_origin.x(), current_origin.y(), 0.0);
 	plate->set_pos_and_size(origin, (int)new_size.x(), (int)new_size.y(), m_plate_height, true);
 
-	reflow_layout();
+	if (reflow)
+		reflow_layout();
 
 	return true;
 }
@@ -4633,7 +4753,22 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
     wipe_tower_x->values.resize(m_plate_list.size(), wipe_tower_x->values.front());
     wipe_tower_y->values.resize(m_plate_list.size(), wipe_tower_y->values.front());
 
-    auto printer_structure_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+    PartPlate *part_plate = get_plate(plate_idx);
+    const std::vector<int> filament_maps = part_plate->get_real_filament_maps(proj_cfg);
+    const std::vector<int> volume_maps   = part_plate->get_real_filament_volume_maps(proj_cfg);
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().preset_bundle->resolve_plate_slicing_config(part_plate->get_slicing_context(),
+                                                                filament_maps, volume_maps, resolved, error)) {
+        part_plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": plate %1% context is unresolved: %2%") % (plate_idx + 1) % error;
+        return;
+    }
+
+    resolved.config.apply(*part_plate->config(), true);
+    const DynamicPrintConfig &full_config = resolved.config;
+    auto printer_structure_opt = full_config.option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
     // set the default position, the same with print config(left top)
     float x = WIPE_TOWER_DEFAULT_X_POS;
     float y = WIPE_TOWER_DEFAULT_Y_POS;
@@ -4642,13 +4777,12 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
         y = I3_WIPE_TOWER_DEFAULT_Y_POS;
     }
 
-    std::string printer_type = wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
+    std::string printer_type = resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle);
     // Note: printer_type == "N9" and printer_structure_opt->value == PrinterStructure::psI3 can both be true
     if (printer_type == "N9") {
         y = N9_WIPE_TOWER_DEFAULT_Y_POS;
     }
 
-    PartPlate *part_plate = get_plate(plate_idx);
     Vec3d plate_origin = part_plate->get_origin();
     BoundingBoxf3 plate_bbox = part_plate->get_bounding_box();
     BoundingBoxf plate_bbox_2d(Vec2d(plate_bbox.min(0), plate_bbox.min(1)), Vec2d(plate_bbox.max(0), plate_bbox.max(1)));
@@ -4663,22 +4797,13 @@ void PartPlateList::set_default_wipe_tower_pos_for_plate(int plate_idx, bool ini
     coordf_t plate_bbox_x_max_local_coord = plate_bbox_2d.max(0) - plate_origin(0);
     coordf_t plate_bbox_y_max_local_coord = plate_bbox_2d.max(1) - plate_origin(1);
 
-    std::vector<int> filament_maps = part_plate->get_real_filament_maps(proj_cfg);
-    // Keep this composition consistent with the apply-time injection (plate volume map, else
-    // per-extruder defaults); the config below currently only feeds scalar reads, but a
-    // divergent volume map would silently mis-resolve any future per-filament read here.
-    std::vector<int> f_volume_maps = part_plate->get_filament_volume_maps();
-    if (f_volume_maps.empty()) {
-        f_volume_maps = wxGetApp().preset_bundle->get_default_nozzle_volume_types_for_filaments(filament_maps);
-    }
-    DynamicPrintConfig full_config = wxGetApp().preset_bundle->full_config(false, filament_maps, f_volume_maps);
-    const DynamicPrintConfig &print_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    const DynamicPrintConfig &print_cfg = full_config;
     float w = dynamic_cast<const ConfigOptionFloat *>(print_cfg.option("prime_tower_width"))->value;
     float v = dynamic_cast<const ConfigOptionFloat *>(full_config.option("prime_volume"))->value;
     bool enable_wrapping = false;
     const ConfigOptionBool *wrapping_opt = dynamic_cast<const ConfigOptionBool *>(full_config.option("enable_wrapping_detection"));
     if (wrapping_opt) enable_wrapping = wrapping_opt->value;
-    int nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
+    int nozzle_nums = (int)full_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
     Vec3d wipe_tower_size = part_plate->estimate_wipe_tower_size(print_cfg, w, v, nozzle_nums, init_pos ? 2 : 0, false, enable_wrapping);
 
     if (!init_pos && (is_approx(wipe_tower_size(0), 0.0) || is_approx(wipe_tower_size(1), 0.0))) {
@@ -5098,32 +5223,6 @@ void PartPlateList::delete_selected_plate()
 	delete_plate(m_current_plate);
 }
 
-bool PartPlateList::check_all_plate_local_bed_type(const std::vector<BedType> &cur_bed_types)
-{
-    std::string bed_type_key = "curr_bed_type";
-    bool        is_ok        = true;
-    for (int i = 0; i < m_plate_list.size(); i++) {
-        PartPlate *plate = m_plate_list[i];
-        if (plate->config()  && plate->config()->has(bed_type_key)) {
-            BedType bed_type = plate->config()->opt_enum<BedType>(bed_type_key);
-            if (bed_type == BedType::btDefault)
-                continue;
-            bool    find     = false;
-            for (auto tmp_type : cur_bed_types) {
-                if (bed_type == tmp_type) {
-                    find = true;
-                    break;
-                }
-            }
-            if (!find) {
-                plate->set_bed_type(BedType::btDefault);
-                is_ok = false;
-            }
-        }
-    }
-    return is_ok;
-}
-
 //get a plate pointer by index
 PartPlate* PartPlateList::get_plate(int index)
 {
@@ -5187,35 +5286,49 @@ std::set<int> PartPlateList::get_extruders(bool conside_custom_gcode) const
 //select plate
 int PartPlateList::select_plate(int index)
 {
-	const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
-	if (m_plate_list.empty() || index >= m_plate_list.size()) {
-		return -1;
+	//scoped, so the notify below runs with m_plates_mutex released. The sink reaches
+	//sidebar code that can lay out and repaint, and render() takes this same
+	//non-recursive mutex; notifying under the lock would make that a deadlock rather
+	//than a slow frame.
+	{
+		const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
+		if (m_plate_list.empty() || index >= m_plate_list.size()) {
+			return -1;
+		}
+
+		// BBS: erase unnecessary snapshot
+		if (get_curr_plate_index() != index && m_intialized) {
+			if (m_plater)
+				m_plater->take_snapshot("select partplate!");
+		}
+
+		std::vector<PartPlate *>::iterator it = m_plate_list.begin();
+		for (it = m_plate_list.begin(); it != m_plate_list.end(); it++) {
+			(*it)->set_unselected();
+		}
+
+		m_current_plate = index;
+		m_plate_list[m_current_plate]->set_selected();
+
+		//BBS
+		if(m_model)
+			m_model->curr_plate_index = index;
+
+		//BBS update bed origin
+		if (m_intialized && m_plater) {
+			Vec2d pos = compute_shape_position(index, m_plate_cols);
+			m_plater->set_bed_position(pos);
+			//wxQueueEvent(m_plater, new SimpleEvent(EVT_GLCANVAS_PLATE_SELECT));
+		}
 	}
 
-	// BBS: erase unnecessary snapshot
-	if (get_curr_plate_index() != index && m_intialized) {
-		if (m_plater)
-			m_plater->take_snapshot("select partplate!");
-	}
-
-	std::vector<PartPlate *>::iterator it = m_plate_list.begin();
-	for (it = m_plate_list.begin(); it != m_plate_list.end(); it++) {
-		(*it)->set_unselected();
-	}
-
-	m_current_plate = index;
-	m_plate_list[m_current_plate]->set_selected();
-
-	//BBS
-	if(m_model)
-		m_model->curr_plate_index = index;
-
-	//BBS update bed origin
-	if (m_intialized && m_plater) {
-		Vec2d pos = compute_shape_position(index, m_plate_cols);
-        m_plater->set_bed_position(pos);
-		//wxQueueEvent(m_plater, new SimpleEvent(EVT_GLCANVAS_PLATE_SELECT));
-	}
+	//One notify, inside the one function every caller goes through, instead of a
+	//construct-and-call at each call site. The commented queue above stays commented:
+	//posting it would add a second, asynchronous delivery on the paths that already
+	//call directly. The sink is idempotent, so a double delivery would be harmless,
+	//but one source is what stops the board and the plate list disagreeing at all.
+	if (m_plater)
+		m_plater->notify_plate_selection_changed(index);
 
 	return 0;
 }
@@ -5874,15 +5987,17 @@ bool PartPlateList::preprocess_exclude_areas(arrangement::ArrangePolygons &unsel
 	bool added = false;
 
 	if (geometry_from_plate < 0 || geometry_from_plate >= (int)m_plate_list.size())
-		geometry_from_plate = 0;
+		throw RuntimeError("Arrangement requested geometry from an invalid plate index " + std::to_string(geometry_from_plate));
 
 	// wrapping detection area
     if (enable_wrapping_detect)
 	{
-        if (!m_wrapping_exclude_areas.empty())
+		PartPlate *geometry_plate = m_plate_list[geometry_from_plate];
+		const Pointfs &wrapping_exclude_areas = geometry_plate->get_local_wrapping_exclude_area();
+        if (!wrapping_exclude_areas.empty())
 		{
 			Polygon ap{};
-            for (const Vec2d &p : m_wrapping_exclude_areas)
+            for (const Vec2d &p : wrapping_exclude_areas)
 			{
                 ap.append({scale_(p(0)), scale_(p(1))});
             }
@@ -6249,10 +6364,19 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
 		assert(plate != NULL);
 
 		PlateBed plate_bed;
-		const bool own_bed = resolve_printer_bed(plate->get_printer_preset_name(), plate_bed);
-		if (!own_bed) {
+		const bool assigned = plate->has_printer_assignment();
+		const bool own_bed  = assigned && resolve_printer_bed(plate->get_printer_preset_name(), plate_bed);
+		if (assigned && !own_bed) {
+			plate->update_apply_result_invalid(true);
+			BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+				<< boost::format(": plate %1% printer '%2%' is unresolved; existing geometry retained")
+				   % (i + 1) % plate->get_printer_preset_name();
+			continue;
+		}
+		if (!assigned) {
 			plate_bed.shape = shape;
 			plate_bed.exclude_areas = exclude_areas;
+			plate_bed.wrapping_exclude_areas = wrapping_exclude_areas;
 			plate_bed.extruder_areas = extruder_areas;
 			plate_bed.extruder_heights = extruder_heights;
 		}
@@ -6260,6 +6384,7 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
 
 		plate->set_shape(plate_bed.shape, plate_bed.exclude_areas, plate_bed.extruder_areas, plate_bed.extruder_heights,
 		                 get_plate_origin_2d((int)i), height_to_lid, height_to_rod);
+		plate->set_local_wrapping_exclude_area(plate_bed.wrapping_exclude_areas);
 
 		//Only assigned plates get their footprint taken from the bed itself. Unassigned
 		//plates stay on the list-wide size, which is the pre-existing behaviour and is
@@ -6605,7 +6730,7 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 		plate_data_item->locked = m_plate_list[i]->m_locked;
 		plate_data_item->plate_index = m_plate_list[i]->m_plate_index;
 		plate_data_item->plate_name  = m_plate_list[i]->get_plate_name();
-		plate_data_item->printer_preset_name = m_plate_list[i]->get_printer_preset_name();
+		plate_data_item->slicing_context = m_plate_list[i]->get_slicing_context();
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% before load, width %2%, height %3%, size %4%!")
 			%(i+1) %m_plate_list[i]->thumbnail_data.width %m_plate_list[i]->thumbnail_data.height %m_plate_list[i]->thumbnail_data.pixels.size();
 		plate_data_item->plate_thumbnail.load_from(m_plate_list[i]->thumbnail_data);
@@ -6627,10 +6752,14 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 		}
 
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<boost::format(": plate %1%, gcode_filename=%2%, with_slice_info=%3%, slice_valid %4%, object item count %5%.")
-			%i %m_plate_list[i]->m_gcode_result->filename % with_slice_info %m_plate_list[i]->is_slice_result_valid()%plate_data_item->objects_and_instances.size();
+			%i %m_plate_list[i]->m_gcode_result->filename % with_slice_info %m_plate_list[i]->m_slice_result_valid%plate_data_item->objects_and_instances.size();
 
 		if (with_slice_info) {
-			if (m_plate_list[i]->get_slice_result() && m_plate_list[i]->is_slice_result_valid()) {
+			// Persist the retained snapshot even when it is stale against the live
+			// context. Live consumers still use is_slice_result_valid(), which compares
+			// the snapshot exactly before offering print/export.
+			if (m_plate_list[i]->get_slice_result() && m_plate_list[i]->m_slice_result_valid &&
+			    !m_plate_list[i]->m_sliced_config.keys().empty()) {
 				// BBS only include current palte_idx
 				if (plate_idx == i || plate_idx == PLATE_CURRENT_IDX || plate_idx == PLATE_ALL_IDX) {
 					//load calibration thumbnail
@@ -6655,6 +6784,7 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 					Print *print                      = nullptr;
 					m_plate_list[i]->get_print((PrintBase **) &print, nullptr, nullptr);
 					if (print) {
+						plate_data_item->sliced_config = m_plate_list[i]->get_sliced_config();
 						const PrintStatistics &ps = print->print_statistics();
 						if (ps.total_weight != 0.0) {
 							CNumericLocalesSetter locales_setter;
@@ -6696,8 +6826,9 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		int index = create_plate(false);
 		m_plate_list[index]->m_locked = plate_data_list[i]->locked;
 		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
+		m_plate_list[index]->set_sliced_config(plate_data_list[i]->sliced_config);
 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
-		m_plate_list[index]->set_printer_preset_name(plate_data_list[i]->printer_preset_name);
+		m_plate_list[index]->set_slicing_context(plate_data_list[i]->slicing_context);
 		if (plate_data_list[i]->plate_index != index)
 		{
 			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;
@@ -6984,8 +7115,7 @@ void PartPlateList::init_bed_type_info()
             }
         }
     }
-    auto is_single_extruder = wxGetApp().preset_bundle->get_printer_extruder_count() == 1;
-    bool use_double_extruder_texture = !is_single_extruder || use_double_extruder_default_texture == "true";
+    const bool use_double_extruder_texture = m_extruder_areas.size() == 2 || use_double_extruder_default_texture == "true";
     if (use_double_extruder_texture) {
         pte_part1 = BedTextureInfo::TexturePart(57, 300, 236.12f, 10.f, "bbl_bed_pte_middle.svg");
         auto &middle_rect = middle_texture_rect;
@@ -7107,10 +7237,6 @@ bool PartPlateList::calc_extruder_only_area(Rect &left_only_rect, Rect &right_on
         rect.w = pts[1].x() - pts[0].x();
         rect.h = pts[2].y() - pts[1].y();
     };
-    auto is_single_extruder = wxGetApp().preset_bundle->get_printer_extruder_count() ==1;
-    if (is_single_extruder) {
-		return false;
-	}
     if (m_extruder_areas.size() == 2) {
         Rect printable_rect, left_extruder_printable_area, right_extruder_printable_area;
         convert_to_rect(m_shape, printable_rect);

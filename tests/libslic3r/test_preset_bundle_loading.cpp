@@ -464,3 +464,97 @@ TEST_CASE("Profile validator flags dangling and renamed preset references", "[Pr
     }
 }
 
+TEST_CASE("Plate slicing context resolves exact FDM presets without Project-printer fallback", "[Preset][PlateContext]")
+{
+    PresetBundle bundle;
+
+    auto [vendor_it, inserted] = bundle.vendors.emplace("TEST", VendorProfile("TEST"));
+    REQUIRE(inserted);
+
+    Preset &printer = add_inmemory_preset(bundle.printers, "Plate Printer");
+    printer.vendor = &vendor_it->second;
+    printer.printer_technology_ref() = ptFFF;
+    printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+    printer.config.set_key_value("printer_model", new ConfigOptionString("Plate Model"));
+
+    Preset &process = add_inmemory_preset(bundle.prints, "Plate Process");
+    process.config.set_key_value("layer_height", new ConfigOptionFloat(0.27));
+
+    Preset &filament = add_inmemory_preset(bundle.filaments, "Plate Filament");
+    filament.filament_id = "FIL-001";
+
+    // Make the Project row observably different. A named plate context must not
+    // obtain either value from these edited presets.
+    bundle.printers.get_edited_preset().config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.25}));
+    bundle.printers.get_edited_preset().config.set_key_value("printer_model", new ConfigOptionString("Project Model"));
+    bundle.prints.get_edited_preset().config.set_key_value("layer_height", new ConfigOptionFloat(0.11));
+
+    PlateSlicingContext context;
+    context.printer_preset_name   = "Plate Printer";
+    context.printer_vendor_id     = "TEST";
+    context.print_preset_name     = "Plate Process";
+    context.filament_preset_names = {"Plate Filament"};
+
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+
+    SECTION("the complete effective config comes from the named plate presets") {
+        REQUIRE(bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        CHECK(error.empty());
+        REQUIRE(resolved.printer_preset != nullptr);
+        REQUIRE(resolved.print_preset != nullptr);
+        CHECK(resolved.printer_preset->name == "Plate Printer");
+        CHECK(resolved.print_preset->name == "Plate Process");
+        REQUIRE(resolved.filament_presets.size() == 1);
+        CHECK(resolved.filament_presets.front()->name == "Plate Filament");
+        CHECK(resolved.config.opt_string("printer_model") == "Plate Model");
+        CHECK_THAT(resolved.config.opt_float("layer_height"), Catch::Matchers::WithinAbs(0.27, 1e-9));
+        CHECK_THAT(resolved.config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
+                   Catch::Matchers::WithinAbs(0.6, 1e-9));
+        CHECK(resolved.config.opt_string("printer_vendor_id") == "TEST");
+        CHECK(resolved.printer_vendor_id == "TEST");
+        CHECK_FALSE(resolved.is_bbl_printer);
+    }
+
+    SECTION("a missing named printer is an error") {
+        context.printer_preset_name = "Missing Printer";
+        CHECK_FALSE(bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        CHECK(error.find("Missing Printer") != std::string::npos);
+    }
+
+    SECTION("a persisted vendor mismatch is an error") {
+        context.printer_vendor_id = "OTHER";
+        CHECK_FALSE(bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        CHECK(error.find("recorded vendor 'OTHER'") != std::string::npos);
+    }
+
+    SECTION("a non-FDM printer is an error") {
+        printer.printer_technology_ref() = ptSLA;
+        CHECK_FALSE(bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        CHECK(error.find("not an FDM printer") != std::string::npos);
+    }
+
+    SECTION("AMS filament identity is exact and ambiguity is rejected") {
+        REQUIRE(bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+
+        DynamicPrintConfig tray;
+        tray.set_key_value("filament_id", new ConfigOptionStrings({"FIL-001"}));
+        tray.set_key_value("tray_name", new ConfigOptionStrings({"A1"}));
+
+        const Preset *matched = nullptr;
+        REQUIRE(bundle.resolve_ams_filament_preset(tray, resolved, 0, matched, error));
+        REQUIRE(matched != nullptr);
+        CHECK(matched->name == "Plate Filament");
+
+        tray.option<ConfigOptionStrings>("filament_id")->values.front() = "MISSING";
+        CHECK_FALSE(bundle.resolve_ams_filament_preset(tray, resolved, std::nullopt, matched, error));
+        CHECK(error.find("no exact compatible preset") != std::string::npos);
+
+        tray.option<ConfigOptionStrings>("filament_id")->values.front() = "FIL-001";
+        Preset &ambiguous = add_inmemory_preset(bundle.filaments, "Another Plate Filament");
+        ambiguous.filament_id = "FIL-001";
+        CHECK_FALSE(bundle.resolve_ams_filament_preset(tray, resolved, std::nullopt, matched, error));
+        CHECK(error.find("multiple compatible presets") != std::string::npos);
+    }
+}
+

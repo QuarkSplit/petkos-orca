@@ -88,8 +88,12 @@ public:
         CONFIRM_AND_CANCEL = 1,
         MAX_STYLE_NUM = 2
     };
+    //plate_index names the plate this dialog is about. It is not always the current
+    //plate: the pencil icon belongs to a plate, so the dialog can be opened for any
+    //of them, and the bed-type choices have to come from that plate's machine.
     PlateSettingsDialog(
         wxWindow* parent,
+        int plate_index,
         const wxString& title = wxEmptyString,
         bool only_layer_seq = false,
         const wxPoint& pos = wxDefaultPosition,

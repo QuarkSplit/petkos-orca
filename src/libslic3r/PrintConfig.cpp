@@ -6029,6 +6029,12 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionString());
     def->cli = ConfigOptionDef::nocli;
 
+    def = this->add("printer_vendor_id", coString);
+    def->label = L("Printer vendor ID");
+    def->tooltip = L("Canonical vendor identity used to select the printer's G-code dialect.");
+    def->set_default_value(new ConfigOptionString());
+    def->cli = ConfigOptionDef::nocli;
+
     def = this->add("printer_notes", coString);
     def->label = L("Printer notes");
     def->tooltip = L("You can put your notes regarding the printer here.");
@@ -10223,7 +10229,7 @@ std::map<std::string, std::string> DynamicPrintConfig::validate(bool under_cli)
     }
 }
 
-std::string DynamicPrintConfig::get_filament_type(std::string &displayed_filament_type, int id)
+std::string DynamicPrintConfig::get_filament_type(std::string &displayed_filament_type, int id) const
 {
     auto* filament_id = dynamic_cast<const ConfigOptionStrings*>(this->option("filament_id"));
     auto* filament_type = dynamic_cast<const ConfigOptionStrings*>(this->option("filament_type"));

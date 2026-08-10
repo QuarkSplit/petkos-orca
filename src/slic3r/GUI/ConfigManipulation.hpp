@@ -33,6 +33,7 @@ class ConfigManipulation
     std::function<void(const std::string&, const boost::any&)>  cb_value_change = nullptr;
     //BBS: change local config to const DynamicPrintConfig
     const DynamicPrintConfig* local_config = nullptr;
+    const DynamicPrintConfig* printer_config = nullptr;
     //ModelConfig* local_config = nullptr;
     wxWindow*    m_msg_dlg_parent {nullptr};
 
@@ -82,6 +83,7 @@ public:
     void    check_chamber_temperature(DynamicPrintConfig* config);
     void    check_chamber_minimal_temperature(DynamicPrintConfig* config);
     void    set_is_BBL_Printer(bool is_bbl_printer) { is_BBL_Printer = is_bbl_printer; };
+    void    set_printer_config(const DynamicPrintConfig *config) { printer_config = config; }
     bool    get_is_BBL_Printer() { return is_BBL_Printer; };
     // SLA print
     void    update_print_sla_config(DynamicPrintConfig* config, const bool is_global_config = false);

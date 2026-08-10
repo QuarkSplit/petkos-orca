@@ -34,10 +34,11 @@ public:
     int             state_cloud_task{ 0 };  //0-printing 1-printing finish 2-printing failed
     int             state_optional{0}; //0-Not optional 1-Optional
     std::string     m_send_time;
+    std::string     m_source_model;
 
 public:
     
-    DeviceItem(wxWindow* parent, MachineObject* obj);
+    DeviceItem(wxWindow* parent, MachineObject* obj, std::string source_model = {});
     ~DeviceItem() {};
 
     void on_refresh(wxCommandEvent& evt);

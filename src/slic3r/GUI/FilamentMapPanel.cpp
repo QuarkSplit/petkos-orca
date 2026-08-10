@@ -3,9 +3,13 @@
 #include "Plater.hpp"
 #include "Widgets/MultiNozzleSync.hpp" // manuallySetNozzleCount producer for extruder_nozzle_stats
 #include <algorithm>
+#include <map>
+#include <numeric>
+#include <optional>
 #include <wx/dcbuffer.h>
 #include <wx/utils.h>
 #include "wx/graphics.h"
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r { namespace GUI {
 
@@ -24,12 +28,19 @@ static const wxColour TextErrorColor = wxColour("#E14747");
 
 wxDEFINE_EVENT(wxEVT_INVALID_MANUAL_MAP, wxCommandEvent);
 
-// Orca: whether the edited printer has an extruder that can physically carry several nozzles
-// (only such extruders track a per-volume-type nozzle inventory worth validating against).
-static bool printer_has_multi_nozzle_extruder()
+static bool resolve_current_plate_config(ResolvedPlateSlicingConfig &resolved)
 {
-    auto *max_nozzle_counts_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
-    // Skip nil entries: a nullable-int nil is INT_MAX (> 1) and would otherwise falsely pass the gate.
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    return true;
+}
+
+static bool printer_has_multi_nozzle_extruder(const DynamicPrintConfig &config)
+{
+    const auto *max_nozzle_counts_opt = config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
     return max_nozzle_counts_opt &&
            std::any_of(max_nozzle_counts_opt->values.begin(), max_nozzle_counts_opt->values.end(),
                        [](int v) { return v > 1 && v != ConfigOptionIntsNullable::nil_value(); });
@@ -40,14 +51,29 @@ void FilamentMapManualPanel::OnTimer(wxTimerEvent &)
     bool             valid          = true;
     int              invalid_eid    = -1;
     NozzleVolumeType invalid_nozzle = NozzleVolumeType::nvtStandard;
-    auto             preset_bundle  = wxGetApp().preset_bundle;
-    auto             proj_config    = preset_bundle->project_config;
-    auto             nozzle_volume_values = proj_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
+    const auto *nozzle_volume_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    if (nozzle_volume_opt == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected plate has no nozzle_volume_type";
+        return;
+    }
+    const std::vector<int> &nozzle_volume_values = nozzle_volume_opt->values;
+    const auto *stats_opt = resolved.config.option<ConfigOptionStrings>("extruder_nozzle_stats");
+    const auto nozzle_stats = stats_opt == nullptr ? std::vector<std::map<NozzleVolumeType, int>>{}
+                                                    : get_extruder_nozzle_stats(stats_opt->values);
+    auto nozzle_count = [&nozzle_stats](size_t extruder_id, NozzleVolumeType type) {
+        if (extruder_id >= nozzle_stats.size())
+            return 0;
+        const auto it = nozzle_stats[extruder_id].find(type);
+        return it == nozzle_stats[extruder_id].end() ? 0 : it->second;
+    };
     std::vector<int> filament_map        = GetFilamentMaps();
     std::vector<int> filament_volume_map = GetFilamentVolumeMaps();
     // Orca: only multi-nozzle extruders carry a meaningful nozzle inventory; validating a plain
     // dual-extruder printer against it would flag every grouping whenever the stats are stale.
-    if (printer_has_multi_nozzle_extruder()) {
+    if (printer_has_multi_nozzle_extruder(resolved.config)) {
         for (size_t eid = 0; eid < nozzle_volume_values.size(); ++eid) {
             NozzleVolumeType extruder_volume_type = NozzleVolumeType(nozzle_volume_values[eid]);
             bool             extruder_used        = std::find_if(m_filament_list.begin(), m_filament_list.end(),
@@ -60,8 +86,8 @@ void FilamentMapManualPanel::OnTimer(wxTimerEvent &)
             }
 
             if (extruder_volume_type == nvtHybrid) {
-                int standard_count = getExtruderNozzleCount(preset_bundle, eid, NozzleVolumeType::nvtStandard);
-                int highflow_count = getExtruderNozzleCount(preset_bundle, eid, NozzleVolumeType::nvtHighFlow);
+                int standard_count = nozzle_count(eid, NozzleVolumeType::nvtStandard);
+                int highflow_count = nozzle_count(eid, NozzleVolumeType::nvtHighFlow);
 
                 auto has_material_of_type = [this, eid, &filament_map, &filament_volume_map](NozzleVolumeType volume_type) {
                     return std::find_if(m_filament_list.begin(), m_filament_list.end(),
@@ -83,7 +109,7 @@ void FilamentMapManualPanel::OnTimer(wxTimerEvent &)
                     break;
                 }
             } else {
-                int count = getExtruderNozzleCount(preset_bundle, eid, extruder_volume_type);
+                int count = nozzle_count(eid, extruder_volume_type);
                 if (count == 0) {
                     valid          = false;
                     invalid_eid    = eid;
@@ -181,9 +207,13 @@ std::vector<int> FilamentMapManualPanel::GetFilamentVolumeMaps() const
     std::vector<int> right_standard_filaments      = this->GetRightStandardFilaments();
     std::vector<int> right_tpu_high_flow_filaments = this->GetRightTPUHighFlowFilaments();
 
-    auto preset_bundle        = wxGetApp().preset_bundle;
-    auto proj_config          = preset_bundle->project_config;
-    auto nozzle_volume_values = proj_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return {};
+    const auto *nozzle_volume_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    if (nozzle_volume_opt == nullptr)
+        throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
+    const auto &nozzle_volume_values = nozzle_volume_opt->values;
 
     for (int i = 0; i < (int) volume_map.size(); ++i) {
         int filament_id = i + 1;
@@ -351,14 +381,10 @@ FilamentMapManualPanel::FilamentMapManualPanel(wxWindow                       *p
     m_suggestion_panel->Hide();
     suggestion_btn->Bind(wxEVT_BUTTON, &FilamentMapManualPanel::OnSuggestionClicked, this);
 
-    // Multi-nozzle: give the user a reachable way to declare, per extruder, how many
-    // physical nozzles of each volume type a multi-nozzle extruder carries. This is the
-    // fallback "manual" producer of the extruder_nozzle_stats config (the full device nozzle-rack
-    // auto-sync is deferred). Gated on the edited printer preset having an extruder with
-    // extruder_max_nozzle_count > 1, so the trigger is not even created for any single-nozzle or
-    // dual-extruder ({1,1}, H2D) printer - zero UI change for every existing profile.
-    if (printer_has_multi_nozzle_extruder()) {
-        auto *max_nozzle_counts_opt = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
+    // Multi-nozzle printers expose their physical nozzle inventory editor for this plate.
+    ResolvedPlateSlicingConfig resolved;
+    if (resolve_current_plate_config(resolved) && printer_has_multi_nozzle_extruder(resolved.config)) {
+        auto *max_nozzle_counts_opt = resolved.config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
         auto *set_count_link = new Label(this, _L("Set the physical nozzle count..."));
         set_count_link->SetFont(Label::Body_14);
         set_count_link->SetForegroundColour(BorderSelectedColor);
@@ -391,8 +417,13 @@ FilamentMapManualPanel::FilamentMapManualPanel(wxWindow                       *p
 void FilamentMapManualPanel::UpdateNozzleVolumeType()
 {
     auto check_separation = []() {
-        auto preset_bundle        = wxGetApp().preset_bundle;
-        auto nozzle_volume_values = preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values;
+        ResolvedPlateSlicingConfig resolved;
+        if (!resolve_current_plate_config(resolved))
+            return false;
+        const auto *nozzle_volume_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+        if (nozzle_volume_opt == nullptr)
+            throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
+        const auto &nozzle_volume_values = nozzle_volume_opt->values;
         if (nozzle_volume_values.size() <= 1)
             return false;
 
@@ -409,11 +440,13 @@ void FilamentMapManualPanel::UpdateNozzleVolumeType()
 
 void FilamentMapManualPanel::UpdateNozzleCountDisplay()
 {
-    auto preset_bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    if (!resolve_current_plate_config(resolved))
+        return;
 
     // Orca: nozzle counts are only tracked (and only meaningful) for multi-nozzle extruders;
     // plain dual-extruder printers keep their unadorned zone titles.
-    if (!printer_has_multi_nozzle_extruder()) {
+    if (!printer_has_multi_nozzle_extruder(resolved.config)) {
         m_left_panel->UpdateLabel(_L("Left Nozzle"));
         m_right_panel->UpdateLabel(_L("Right Nozzle"));
         return;
@@ -421,17 +454,32 @@ void FilamentMapManualPanel::UpdateNozzleCountDisplay()
 
     // Format the count suffix separately so a translation containing '%' cannot
     // corrupt the wxString::Format output.
-    int      left_count = getExtruderNozzleCountTotal(preset_bundle, 0);
+    const auto *stats_opt = resolved.config.option<ConfigOptionStrings>("extruder_nozzle_stats");
+    if (stats_opt == nullptr)
+        throw Slic3r::RuntimeError("The plate slicing context has no nozzle-count statistics");
+    const auto stats = get_extruder_nozzle_stats(stats_opt->values);
+    auto count = [&stats](int extruder_id, std::optional<NozzleVolumeType> type) {
+        if (extruder_id < 0 || size_t(extruder_id) >= stats.size())
+            throw Slic3r::RuntimeError("The plate nozzle-count statistics do not match its extruders");
+        if (type) {
+            const auto it = stats[size_t(extruder_id)].find(*type);
+            return it == stats[size_t(extruder_id)].end() ? 0 : it->second;
+        }
+        return std::accumulate(stats[size_t(extruder_id)].begin(), stats[size_t(extruder_id)].end(), 0,
+                               [](int sum, const auto &entry) { return sum + entry.second; });
+    };
+
+    int      left_count = count(0, std::nullopt);
     wxString left_title = _L("Left Nozzle") + wxString::Format("(%d)", left_count);
     m_left_panel->UpdateLabel(left_title);
 
     if (m_right_panel->IsUseSeparation()) {
-        int      standard_count = getExtruderNozzleCount(preset_bundle, 1, NozzleVolumeType::nvtStandard);
-        int      highflow_count = getExtruderNozzleCount(preset_bundle, 1, NozzleVolumeType::nvtHighFlow);
+        int      standard_count = count(1, NozzleVolumeType::nvtStandard);
+        int      highflow_count = count(1, NozzleVolumeType::nvtHighFlow);
         wxString right_title    = _L("Right Nozzle") + wxString::Format("(Std: %d, HF: %d)", standard_count, highflow_count);
         m_right_panel->UpdateLabel(right_title);
     } else {
-        int      right_count = getExtruderNozzleCountTotal(preset_bundle, 1);
+        int      right_count = count(1, std::nullopt);
         wxString right_title = _L("Right Nozzle") + wxString::Format("(%d)", right_count);
         m_right_panel->UpdateLabel(right_title);
     }

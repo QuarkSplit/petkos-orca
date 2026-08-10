@@ -578,13 +578,7 @@ public:
 
     std::vector<wxString> m_filaments_name;
     std::vector<wxColour> m_filaments_colors;
-    int m_filaments_count{ 1 };
-    void set_default_filaments_and_colors()
-    {
-        m_filaments_count = 1;
-        m_filaments_colors.push_back(*wxGREEN);
-        m_filaments_name.push_back("Generic PLA");
-    }
+    int m_filaments_count{ 0 };
 
 private:
     wxColour            m_bg_colour;

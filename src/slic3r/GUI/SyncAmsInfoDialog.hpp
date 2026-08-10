@@ -202,6 +202,7 @@ public:
     bool     has_timelapse_warning();
     void     update_timelapse_enable_status();
     bool     is_same_printer_model();
+    MachineObject *target_machine() const;
     bool     is_blocking_printing(MachineObject *obj_);
     bool     is_same_nozzle_type(std::string &filament_type, NozzleType &tag_nozzle_type);
     bool     is_timeout();
@@ -258,6 +259,7 @@ public:
     bool get_is_double_extruder();
     bool is_dirty_filament();
     bool is_need_show();
+    void set_target_device_id(const std::string &device_id) { m_target_device_id = device_id; }
     void set_check_dirty_fialment(bool flag) { m_check_dirty_fialment = flag; };
 
 private:
@@ -281,6 +283,7 @@ private:
 private:
     SyncInfo   m_input_info;
     SyncResult m_result;
+    std::string m_target_device_id;
     Button *   m_button_ok     = nullptr;
     Button *   m_button_cancel = nullptr;
 
@@ -348,6 +351,7 @@ public:
         wxPoint dialog_pos{wxPoint(400, 200)};
         wxPoint ams_btn_pos{wxPoint(400, 200)};
         bool    dialog_pos_align_right{true};
+        size_t  nozzle_count{0};
     };
     SyncNozzleAndAmsDialog(InputInfo &input_info);
     ~SyncNozzleAndAmsDialog() override;

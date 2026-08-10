@@ -5,6 +5,7 @@
 #include "GUI_App.hpp"
 #include "GUI_Colors.hpp"
 #include "Plater.hpp"
+#include "PartPlate.hpp"
 #include "BitmapCache.hpp"
 #include "Camera.hpp"
 
@@ -685,7 +686,7 @@ bool GLVolume::is_sla_pad() const { return this->composite_id.volume_id == -int(
 
 bool GLVolume::is_sinking() const
 {
-    if (is_modifier || GUI::wxGetApp().preset_bundle->printers.get_edited_preset().printer_technology() == ptSLA)
+    if (is_modifier)
         return false;
     const BoundingBoxf3& box = transformed_convex_hull_bounding_box();
     return box.min.z() < SINKING_Z_THRESHOLD && box.max.z() >= SINKING_Z_THRESHOLD;
@@ -992,15 +993,28 @@ GLVolumeWithIdAndZList volumes_to_render(const GLVolumePtrs& volumes, GLVolumeCo
     return list;
 }
 
-// ORCA: Compute slope.normal_z for 3D overhang highlight directly from support settings.
-// If support_threshold_angle is 0, use tree fallback angle (30 deg) for tree supports,
-// and derive an equivalent angle from threshold overlap for normal supports.
+// ORCA: Compute slope.normal_z for 3D overhang highlight directly from the selected plate's
+// support settings. A zero threshold uses the automatic tree-support angle or the normal-support
+// threshold-overlap calculation defined by that exact plate configuration.
 float GLVolumeCollection::get_selection_support_normal_z() const
 {
-    const DynamicPrintConfig& glb_cfg  = GUI::wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    const auto& full_cfg               = GUI::wxGetApp().preset_bundle->full_config();
-    const auto support_type            = glb_cfg.opt_enum<SupportType>("support_type");
-    const int  support_threshold_angle = glb_cfg.opt_int("support_threshold_angle");
+    PresetBundle *bundle = GUI::wxGetApp().preset_bundle;
+    GUI::PartPlate *plate = GUI::wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for support visualization" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    const DynamicPrintConfig& full_cfg = resolved.config;
+    const auto support_type            = full_cfg.opt_enum<SupportType>("support_type");
+    const int  support_threshold_angle = full_cfg.opt_int("support_threshold_angle");
     double angle_rad;
 
     if (support_threshold_angle > 0) {
@@ -1008,15 +1022,15 @@ float GLVolumeCollection::get_selection_support_normal_z() const
         const int effective_support_threshold_angle = std::min(support_threshold_angle + 1, 89);
         angle_rad = Geometry::deg2rad(static_cast<double>(effective_support_threshold_angle));
     } else if (is_tree(support_type)) {
-        angle_rad = Geometry::deg2rad(30.0); // fallback value for tree supports
+        angle_rad = Geometry::deg2rad(30.0); // threshold 0 selects the tree-support automatic angle
     } else { // For normal supports, if the angle is set to 0, calculate normal_z from overlap.
         const double layer_height        = full_cfg.opt_float("layer_height");
         const auto*  nozzle_diameter_opt = full_cfg.option<ConfigOptionFloats>("nozzle_diameter");
         const int    wall_filament_id       = full_cfg.opt_int("outer_wall_filament_id");
         const size_t nozzle_count        = nozzle_diameter_opt->values.size();
-        const size_t wall_extruder_idx   = (wall_filament_id > 0 && wall_filament_id <= static_cast<int>(nozzle_count))
-            ? static_cast<size_t>(wall_filament_id - 1)
-            : 0; // Invalid extruder index falls back to extruder 1.
+        if (nozzle_count == 0 || wall_filament_id < 0 || wall_filament_id > static_cast<int>(nozzle_count))
+            throw RuntimeError("The plate's outer-wall filament does not map to one of its printer nozzles");
+        const size_t wall_extruder_idx = wall_filament_id == 0 ? 0 : static_cast<size_t>(wall_filament_id - 1);
         
         // Use wall extruder's nozzle diameter for better estimation of external perimeter width,
         // which is more relevant to overhang printing than the default nozzle diameter.

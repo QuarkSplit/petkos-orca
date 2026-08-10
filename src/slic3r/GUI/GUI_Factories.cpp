@@ -32,7 +32,7 @@ namespace GUI
 
 static PrinterTechnology printer_technology()
 {
-    return wxGetApp().preset_bundle->printers.get_selected_preset().printer_technology();
+    return ptFFF;
 }
 
 static int filaments_count()
@@ -624,10 +624,16 @@ wxMenu* MenuFactory::append_submenu_add_handy_model(wxMenu* menu, ModelVolumeTyp
                 // This serves as mini tutorial for new users
                 if (model.is_stringhell) {
                     wxGetApp().CallAfter([=] {
-                        DynamicPrintConfig* m_config = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
+                        PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+                        ResolvedPlateSlicingConfig resolved;
+                        std::string context_error;
+                        if (!wxGetApp().plater()->resolve_plate_slicing_config(plate, resolved, context_error)) {
+                            show_error(wxGetApp().plater(), from_u8(context_error), false);
+                            return;
+                        }
 
-                        bool is_only_one_wall_top  = m_config->opt_bool("only_one_wall_top");
-                        auto min_width_top_surface = m_config->option<ConfigOptionFloatOrPercent>("min_width_top_surface")->value;
+                        bool is_only_one_wall_top  = resolved.config.opt_bool("only_one_wall_top");
+                        auto min_width_top_surface = resolved.config.option<ConfigOptionFloatOrPercent>("min_width_top_surface")->value;
                         if (is_only_one_wall_top && min_width_top_surface > 0) {
                             wxString msg_text = _L("This model features text embossment on the top surface. For optimal results, it is "
                                                    "advisable to set the 'One Wall Threshold (min_width_top_surface)' "
@@ -637,9 +643,8 @@ wxMenu* MenuFactory::append_submenu_add_handy_model(wxMenu* menu, ModelVolumeTyp
 
                             MessageDialog dialog(wxGetApp().plater(), msg_text, _L("Suggestion"), wxICON_WARNING | wxYES | wxNO);
                             if (dialog.ShowModal() == wxID_YES) {
-                                m_config->set_key_value("min_width_top_surface", new ConfigOptionFloatOrPercent(0, false));
-                                wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
-                                wxGetApp().get_tab(Preset::TYPE_PRINT)->reload_config();
+                                plate->config()->set_key_value("min_width_top_surface", new ConfigOptionFloatOrPercent(0, false));
+                                plate->update_apply_result_invalid(true);
                             }
                             wxGetApp().plater()->update();
                         }
@@ -1123,61 +1128,73 @@ void MenuFactory::append_menu_items_flush_options(wxMenu* menu)
     if (!show_flush_option_menu)
         return;
 
-    DynamicPrintConfig& global_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    //menus are built from inside Plater::priv's construction, before wxGetApp().plater()
+    //is assigned; these options are per-plate now, so they need a plater that exists
+    if (wxGetApp().plater() == nullptr || !wxGetApp().plater()->is_initialized())
+        return;
+
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (!wxGetApp().plater()->resolve_plate_slicing_config(plate, resolved, context_error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+        return;
+    }
+    auto plate_config = std::make_shared<DynamicPrintConfig>(std::move(resolved.config));
     ModelConfig& select_object_config = object_list->object(selection.get_object_idx())->config;
 
     wxMenu* flush_options_menu = new wxMenu();
-    auto can_flush = [&global_config]() {
-        auto option = global_config.option("enable_prime_tower");
+    auto can_flush = [plate_config]() {
+        auto option = plate_config->option("enable_prime_tower");
         return option ? option->getBool() : false;
     };
     append_menu_check_item(flush_options_menu, wxID_ANY, _L("Flush into objects' infill"), "",
-        [&select_object_config, &global_config](wxCommandEvent&) {
+        [&select_object_config, plate_config](wxCommandEvent&) {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
             }
             select_object_config.set_key_value(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0], new ConfigOptionBool(!option->getBool()));
             wxGetApp().obj_settings()->UpdateAndShow(true);
         }, menu, can_flush,
-        [&select_object_config, &global_config]() {
+        [&select_object_config, plate_config]() {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][0]);
             }
             return option->getBool();
         }, m_parent);
 
     append_menu_check_item(flush_options_menu, wxID_ANY, _L("Flush into this object"), "",
-        [&select_object_config, &global_config](wxCommandEvent&) {
+        [&select_object_config, plate_config](wxCommandEvent&) {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
             }
             select_object_config.set_key_value(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1], new ConfigOptionBool(!option->getBool()));
             wxGetApp().obj_settings()->UpdateAndShow(true);
         }, menu, can_flush,
-        [&select_object_config, &global_config]() {
+        [&select_object_config, plate_config]() {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][1]);
             }
             return option->getBool();
         }, m_parent);
 
     append_menu_check_item(flush_options_menu, wxID_ANY, _L("Flush into objects' support"), "",
-        [&select_object_config, &global_config](wxCommandEvent&) {
+        [&select_object_config, plate_config](wxCommandEvent&) {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
             }
             select_object_config.set_key_value(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2], new ConfigOptionBool(!option->getBool()));
             wxGetApp().obj_settings()->UpdateAndShow(true);
         }, menu, can_flush,
-        [&select_object_config, &global_config]() {
+        [&select_object_config, plate_config]() {
             const ConfigOption* option = select_object_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
             if (!option) {
-                option = global_config.option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
+                option = plate_config->option(FREQ_SETTINGS_BUNDLE_FFF["Flush options"][2]);
             }
             return option->getBool();
         }, m_parent);

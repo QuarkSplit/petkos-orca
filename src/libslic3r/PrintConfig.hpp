@@ -813,7 +813,9 @@ public:
         { PrintConfigDef::handle_legacy_composite(*this); }
 
     //BBS special case Support G/ Support W
-    std::string get_filament_type(std::string &displayed_filament_type, int id = 0);
+    //const: it only reads filament_id/type/is_support. Needed so a resolved plate
+    //context, which hands out const presets, can name its own filament types.
+    std::string get_filament_type(std::string &displayed_filament_type, int id = 0) const;
 
     //BBS
     bool is_using_different_extruders();
@@ -1843,6 +1845,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionStrings,            post_process))
     ((ConfigOptionStrings,            slicing_pipeline_plugin))
     ((ConfigOptionString,             printer_model))
+    ((ConfigOptionString,             printer_vendor_id))
     ((ConfigOptionFloat,              resolution))
     ((ConfigOptionFloats,             retraction_minimum_travel))
     ((ConfigOptionBools,              retract_when_changing_layer))

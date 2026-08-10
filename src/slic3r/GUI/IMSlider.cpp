@@ -1,6 +1,7 @@
 #include "IMSlider.hpp"
 #include "libslic3r/GCode.hpp"
 #include "GUI_App.hpp"
+#include "Plater.hpp"
 #include "NotificationManager.hpp"
 #include "Widgets/StateColor.hpp"
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
@@ -11,6 +12,25 @@
 namespace Slic3r {
 
 namespace GUI {
+
+static DynamicPrintConfig current_plate_slider_config()
+{
+    PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        if (plate != nullptr)
+            plate->update_apply_result_invalid(true);
+        throw RuntimeError(error.empty() ? "No plate is selected for custom G-code editing" : error);
+    }
+    resolved.config.apply(*plate->config(), true);
+    return std::move(resolved.config);
+}
 
 // equal to 25 mm2
 inline double min_delta_area() { return scale_(scale_(25)); }
@@ -72,7 +92,7 @@ bool check_color_change(PrintObject *object, size_t frst_layer_id, size_t layers
 
 static std::string gcode(Type type)
 {
-    Slic3r::DynamicPrintConfig config = wxGetApp().preset_bundle->full_config();
+    Slic3r::DynamicPrintConfig config = current_plate_slider_config();
     switch (type) {
     //BBS
     case Template:    return config.opt_string("template_custom_gcode");
@@ -334,7 +354,7 @@ void IMSlider::SetModeAndOnlyExtruder(const bool is_one_extruder_printed_model, 
 
     m_is_wipe_tower = m_mode != SingleExtruder;
 
-    auto config = wxGetApp().preset_bundle->full_config();
+    auto config = current_plate_slider_config();
     m_is_spiral_vase = config.option<ConfigOptionBool>("spiral_mode")->value;
 
     m_can_change_color = can_change_color && !m_is_spiral_vase;

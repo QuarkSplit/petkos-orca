@@ -48,13 +48,13 @@ extern std::string& get_right_extruder_unprintable_text();
 
 // Orca: minimal smart-filament toggle. When a filament track switch is ready every AMS filament is
 // reachable from both nozzles, so one filament can be assigned to multiple nozzles to maximize
-// savings. The checkbox drives the enable_filament_dynamic_map project flag.
+// savings. The checkbox drives the current plate override.
 class SmartFilamentPanel : public wxPanel
 {
     static constexpr int spacing = 20;
 
 public:
-    SmartFilamentPanel(wxWindow *parent) : wxPanel(parent)
+    SmartFilamentPanel(wxWindow *parent, PartPlate *plate, bool enabled) : wxPanel(parent), m_plate(plate)
     {
         SetBackgroundColour(*wxWHITE);
         wxBoxSizer *main_sizer = new wxBoxSizer(wxVERTICAL);
@@ -68,8 +68,7 @@ public:
         main_sizer->AddSpacer(FromDIP(spacing));
 
         m_smart_filament_checkbox = new CheckBox(this);
-        if (auto *opt = enable_filament_dynamic_map())
-            m_smart_filament_checkbox->SetValue(opt->value);
+        m_smart_filament_checkbox->SetValue(enabled);
         m_smart_filament_checkbox->Bind(wxEVT_TOGGLEBUTTON, &SmartFilamentPanel::on_smart_filament_checkbox, this);
 
         auto *label = new Label(this, _L("Enable smart filament assign: Assign one filament to multiple nozzles to maximize savings"));
@@ -90,28 +89,50 @@ public:
     }
 
 private:
-    static ConfigOptionBool *enable_filament_dynamic_map()
-    {
-        auto &config = wxGetApp().preset_bundle->project_config;
-        return dynamic_cast<ConfigOptionBool *>(config.option("enable_filament_dynamic_map"));
-    }
-
     void on_smart_filament_checkbox(wxCommandEvent &event)
     {
-        if (auto *opt = enable_filament_dynamic_map())
-            opt->value = m_smart_filament_checkbox->GetValue();
+        if (m_plate == nullptr)
+            throw Slic3r::RuntimeError("The smart-filament control has no plate");
+        m_plate->config()->set_key_value("enable_filament_dynamic_map",
+            new ConfigOptionBool(m_smart_filament_checkbox->GetValue()));
+        m_plate->update_apply_result_invalid(true);
         wxGetApp().plater()->update();
         event.Skip();
     }
 
 private:
     CheckBox *m_smart_filament_checkbox{nullptr};
+    PartPlate *m_plate{nullptr};
 };
 
 
 bool try_pop_up_before_slice(bool is_slice_all, Plater* plater_ref, PartPlate* partplate_ref, bool force_pop_up)
 {
-    auto full_config = wxGetApp().preset_bundle->full_config();
+    if (is_slice_all) {
+        for (PartPlate *plate : plater_ref->get_partplate_list().get_plate_list())
+            if (!try_pop_up_before_slice(false, plater_ref, plate, force_pop_up))
+                return false;
+        return true;
+    }
+    if (partplate_ref == nullptr) {
+        show_error(plater_ref, _L("Filament grouping requires one explicit plate."), false);
+        return false;
+    }
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!bundle->resolve_plate_slicing_config(
+            partplate_ref->get_slicing_context(),
+            partplate_ref->get_real_filament_maps(bundle->project_config),
+            partplate_ref->get_real_filament_volume_maps(bundle->project_config),
+            resolved, error)) {
+        partplate_ref->update_apply_result_invalid(true);
+        show_error(plater_ref, from_u8(error), false);
+        return false;
+    }
+    resolved.config.apply(*partplate_ref->config(), true);
+    DynamicPrintConfig &full_config = resolved.config;
     const auto nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
     if (nozzle_diameters->size() <= 1)
         return true;
@@ -120,33 +141,24 @@ bool try_pop_up_before_slice(bool is_slice_all, Plater* plater_ref, PartPlate* p
     // (e.g. H2D) where filaments must be assigned to a left or right nozzle.
     // For toolchangers (≥3 tools) and all non-BBL printers the dialog is irrelevant and
     // confusing; skip it entirely so slicing proceeds without interruption. (#12390)
-    PresetBundle* preset = wxGetApp().preset_bundle;
-    if (!preset || !preset->is_bbl_vendor() || nozzle_diameters->size() != 2)
+    if (!resolved.is_bbl_printer || nozzle_diameters->size() != 2)
         return true;
-
-    bool sync_plate = true;
 
     std::vector<std::string> filament_colors = full_config.option<ConfigOptionStrings>("filament_colour")->values;
     std::vector<std::string> filament_types = full_config.option<ConfigOptionStrings>("filament_type")->values;
-    FilamentMapMode applied_mode = get_applied_map_mode(full_config, plater_ref,partplate_ref, sync_plate);
-    std::vector<int> applied_maps = get_applied_map(full_config, plater_ref, partplate_ref, sync_plate);
-    std::vector<int> applied_volume_maps = get_applied_volume_map(full_config, plater_ref, partplate_ref, sync_plate);
+    FilamentMapMode applied_mode = get_applied_map_mode(full_config, plater_ref, partplate_ref, true);
+    std::vector<int> applied_maps = get_applied_map(full_config, plater_ref, partplate_ref, true);
+    std::vector<int> applied_volume_maps = get_applied_volume_map(full_config, plater_ref, partplate_ref, true);
     applied_maps.resize(filament_colors.size(), 1);
     applied_volume_maps.resize(filament_colors.size(), 0);
 
     if (!force_pop_up && applied_mode != fmmManual)
         return true;
 
-    std::vector<int> filament_lists;
-    if (is_slice_all) {
-        filament_lists.resize(filament_colors.size());
-        std::iota(filament_lists.begin(), filament_lists.end(), 1);
-    }
-    else {
-        filament_lists = partplate_ref->get_extruders();
-    }
+    std::vector<int> filament_lists = partplate_ref->get_extruders();
 
     FilamentMapDialog map_dlg(plater_ref,
+        partplate_ref,
         filament_colors,
         filament_types,
         applied_maps,
@@ -163,31 +175,10 @@ bool try_pop_up_before_slice(bool is_slice_all, Plater* plater_ref, PartPlate* p
         FilamentMapMode new_mode = map_dlg.get_mode();
         std::vector<int> new_maps = map_dlg.get_filament_maps();
         std::vector<int> new_volume_maps = map_dlg.get_filament_volume_maps();
-        if (sync_plate) {
-            if (is_slice_all) {
-                auto plate_list = plater_ref->get_partplate_list().get_plate_list();
-                for (int i = 0; i < plate_list.size(); ++i) {
-                    plate_list[i]->set_filament_map_mode(new_mode);
-                    if (new_mode == fmmManual) {
-                        plate_list[i]->set_filament_maps(new_maps);
-                        plate_list[i]->set_filament_volume_maps(new_volume_maps);
-                    }
-                }
-            }
-            else {
-                partplate_ref->set_filament_map_mode(new_mode);
-                if (new_mode == fmmManual) {
-                    partplate_ref->set_filament_maps(new_maps);
-                    partplate_ref->set_filament_volume_maps(new_volume_maps);
-                }
-            }
-        }
-        else {
-            plater_ref->set_global_filament_map_mode(new_mode);
-            if (new_mode == fmmManual) {
-                plater_ref->set_global_filament_map(new_maps);
-                plater_ref->set_global_filament_volume_map(new_volume_maps);
-            }
+        partplate_ref->set_filament_map_mode(new_mode);
+        if (new_mode == fmmManual) {
+            partplate_ref->set_filament_maps(new_maps);
+            partplate_ref->set_filament_volume_maps(new_volume_maps);
         }
         plater_ref->update();
         // check whether able to slice, if not, return false
@@ -200,6 +191,7 @@ bool try_pop_up_before_slice(bool is_slice_all, Plater* plater_ref, PartPlate* p
 }
 
 FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
+                                     PartPlate                      *plate,
                                      const std::vector<std::string> &filament_color,
                                      const std::vector<std::string> &filament_type,
                                      const std::vector<int>         &filament_map,
@@ -260,7 +252,7 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
 
     auto            panel_sizer       = new wxBoxSizer(wxHORIZONTAL);
 
-    // Orca: fall back to the saving mode whenever Match is unavailable, which now also covers the
+    // Orca: use the saving mode whenever Match is unavailable, which now also covers the
     // filament-track-switch-ready case (auto_match_available folds in !m_fila_switch_ready).
     FilamentMapMode default_auto_mode = mode >= fmmManual ? fmmAutoForFlush :
         mode == fmmAutoForMatch && !auto_match_available ? fmmAutoForFlush :
@@ -293,7 +285,20 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
 
     // Smart filament section, shown only in filament-saving (flush) mode when the switch is ready.
     if (m_fila_switch_ready) {
-        m_smart_filament = new SmartFilamentPanel(this);
+        const auto *dynamic_map = plate != nullptr ?
+            plate->config()->option<ConfigOptionBool>("enable_filament_dynamic_map") : nullptr;
+        bool dynamic_map_enabled = dynamic_map != nullptr ? dynamic_map->value : false;
+        if (plate != nullptr && dynamic_map == nullptr) {
+            ResolvedPlateSlicingConfig resolved;
+            std::string error;
+            if (!wxGetApp().plater()->resolve_plate_slicing_config(plate, resolved, error))
+                throw Slic3r::RuntimeError("Unable to resolve smart-filament state: " + error);
+            const auto *resolved_dynamic_map = resolved.config.option<ConfigOptionBool>("enable_filament_dynamic_map");
+            if (resolved_dynamic_map == nullptr)
+                throw Slic3r::RuntimeError("The plate slicing context has no smart-filament setting");
+            dynamic_map_enabled = resolved_dynamic_map->value;
+        }
+        m_smart_filament = new SmartFilamentPanel(this, plate, dynamic_map_enabled);
         m_smart_filament->Show(get_mode() == fmmAutoForFlush);
         main_sizer->Add(m_smart_filament, 0, wxEXPAND);
     }

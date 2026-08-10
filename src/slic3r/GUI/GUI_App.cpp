@@ -2375,11 +2375,25 @@ bool GUI_App::is_blocking_printing(MachineObject *obj_)
 
     if (!obj_)
     {
-        return false;
+        return true;
     }
 
     PresetBundle *preset_bundle = wxGetApp().preset_bundle;
-    std::string    source_model  = preset_bundle->printers.get_edited_preset().get_printer_type(preset_bundle);
+    PartPlate *plate = plater() != nullptr ? plater()->get_partplate_list().get_curr_plate() : nullptr;
+    if (plate == nullptr)
+        return true;
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (!preset_bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(preset_bundle->project_config),
+            plate->get_real_filament_volume_maps(preset_bundle->project_config),
+            resolved, context_error)) {
+        plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+        return true;
+    }
+    const std::string source_model = resolved.printer_preset->get_printer_type(preset_bundle);
 
     if (source_model != target_model) {
         std::vector<std::string>      compatible_machine = obj_->get_compatible_machine();
@@ -3871,12 +3885,14 @@ void GUI_App::switch_printer_agent()
         return;
     }
 
-    // Read printer_agent from config, falling back to default
-    std::string effective_agent_id = ORCA_PRINTER_AGENT_ID;
-    if (preset_bundle->is_bbl_vendor())
-        effective_agent_id = BBL_PRINTER_AGENT_ID;
-
-    const DynamicPrintConfig& config = preset_bundle->printers.get_edited_preset().config;
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (plater_ == nullptr || !plater_->resolve_current_plate_slicing_config(resolved, context_error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+        return;
+    }
+    const DynamicPrintConfig& config = resolved.config;
+    std::string effective_agent_id = resolved.is_bbl_printer ? BBL_PRINTER_AGENT_ID : ORCA_PRINTER_AGENT_ID;
     if (config.has("printer_agent")) {
         const std::string& value = config.option<ConfigOptionString>("printer_agent")->value;
         if (!value.empty())
@@ -3951,9 +3967,13 @@ void GUI_App::select_machine(const std::string& agent_id)
         return;
     }
 
-    // Get config source (preset or physical printer)
-    const auto& preset = preset_bundle->printers.get_edited_preset();
-    const DynamicPrintConfig* host_cfg = &preset.config;
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (plater_ == nullptr || !plater_->resolve_current_plate_slicing_config(resolved, context_error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << context_error;
+        return;
+    }
+    const DynamicPrintConfig* host_cfg = &resolved.config;
 
     std::string print_host = host_cfg->opt_string("print_host");
     if (print_host.empty()) {
@@ -3985,8 +4005,8 @@ void GUI_App::select_machine(const std::string& agent_id)
         // We use dev_id as dev_ip to store the address (host:port)
         machine.dev_ip = dev_id;
         machine.dev_name = dev_id;
-        machine.printer_type = preset.config.opt_string("printer_model");
-        auto access_code = preset.config.opt_string("printhost_apikey");
+        machine.printer_type = host_cfg->opt_string("printer_model");
+        auto access_code = host_cfg->opt_string("printhost_apikey");
         // Orca expect non empty access code
         if (access_code.empty()) {
             access_code = "88888888";
@@ -9846,33 +9866,50 @@ void GUI_App::start_download(std::string url)
 
 bool is_soluble_filament(int extruder_id)
 {
-    auto &filament_presets = Slic3r::GUI::wxGetApp().preset_bundle->filament_presets;
-    auto &filaments        = Slic3r::GUI::wxGetApp().preset_bundle->filaments;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || !plater->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    if (extruder_id < 0 || extruder_id >= int(resolved.filament_presets.size()))
+        return false;
+    const Preset *filament = resolved.filament_presets[extruder_id];
 
-    if (extruder_id >= filament_presets.size()) return false;
-
-    Slic3r::Preset *filament = filaments.find_preset(filament_presets[extruder_id]);
-    if (filament == nullptr) return false;
-
-    Slic3r::ConfigOptionBools *support_option = dynamic_cast<Slic3r::ConfigOptionBools *>(filament->config.option("filament_soluble"));
+    const ConfigOptionBools *support_option = filament->config.option<ConfigOptionBools>("filament_soluble");
     if (support_option == nullptr) return false;
 
     return support_option->get_at(0);
 };
 
 bool has_filaments(const std::vector<string>& model_filaments) {
-    auto &filament_presets = Slic3r::GUI::wxGetApp().preset_bundle->filament_presets;
-    if (!Slic3r::GUI::wxGetApp().plater()) return false;
-    auto model_objects = Slic3r::GUI::wxGetApp().plater()->model().objects;
-    const Slic3r::DynamicPrintConfig &config = wxGetApp().preset_bundle->full_config();
-    Model::setExtruderParams(config, filament_presets.size());
-
-    auto get_filament_name = [](int id) { return Model::extruderParamsMap.find(id) != Model::extruderParamsMap.end() ? Model::extruderParamsMap.at(id).materialName : "PLA"; };
-    for (const ModelObject *mo : model_objects) {
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr)
+        return false;
+    PartPlateList &plates = plater->get_partplate_list();
+    const ModelObjectPtrs &model_objects = plater->model().objects;
+    for (size_t object_id = 0; object_id < model_objects.size(); ++object_id) {
+        const int plate_id = plates.find_instance_belongs(int(object_id), 0);
+        if (plate_id < 0)
+            continue;
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (!plater->resolve_plate_slicing_config(plates.get_plate(plate_id), resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+            return false;
+        }
+        const ConfigOptionStrings *filament_types = resolved.config.option<ConfigOptionStrings>("filament_type");
+        if (filament_types == nullptr)
+            return false;
+        const ModelObject *mo = model_objects[object_id];
         for (auto vol : mo->volumes) {
             auto ve = vol->get_extruders();
             for (auto id : ve) {
-                auto name = get_filament_name(id);
+                const int slot = std::max(1, id) - 1;
+                if (slot >= int(filament_types->values.size()))
+                    return false;
+                const std::string &name = filament_types->values[slot];
                 if (find(model_filaments.begin(), model_filaments.end(), name) != model_filaments.end()) return true;
             }
         }
@@ -9882,17 +9919,20 @@ bool has_filaments(const std::vector<string>& model_filaments) {
 
 bool is_support_filament(int extruder_id, bool strict_check)
 {
-    auto &filament_presets = Slic3r::GUI::wxGetApp().preset_bundle->filament_presets;
-    auto &filaments        = Slic3r::GUI::wxGetApp().preset_bundle->filaments;
-
-    if (extruder_id >= filament_presets.size()) return false;
-
-    Slic3r::Preset *filament = filaments.find_preset(filament_presets[extruder_id]);
-    if (filament == nullptr) return false;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || !plater->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return false;
+    }
+    if (extruder_id < 0 || extruder_id >= int(resolved.filament_presets.size()))
+        return false;
+    const Preset *filament = resolved.filament_presets[extruder_id];
 
     std::string filament_type = filament->config.option<ConfigOptionStrings>("filament_type")->values[0];
 
-    Slic3r::ConfigOptionBools *support_option = dynamic_cast<Slic3r::ConfigOptionBools *>(filament->config.option("filament_is_support"));
+    const ConfigOptionBools *support_option = filament->config.option<ConfigOptionBools>("filament_is_support");
 
     if(!strict_check &&(filament_type == "PETG" || filament_type == "PLA")) {
         std::vector<string> model_filaments;

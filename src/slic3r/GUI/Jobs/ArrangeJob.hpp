@@ -52,9 +52,9 @@ class ArrangeJob : public Job
     //against their own bed and their items never migrate (moving an item would
     //change which machine prints it); the unassigned plates still form a shared
     //pool over the project bed with the old cross-plate behaviour.
-    void arrange_per_plate(Ctl& ctl, const Points& project_bedpts, bool enable_wrapping);
+    void arrange_per_plate(Ctl& ctl, bool enable_wrapping);
 
-    ArrangePolygon prepare_arrange_polygon(void* instance);
+    ArrangePolygon prepare_arrange_polygon(int object_idx, int instance_idx);
 
 protected:
 

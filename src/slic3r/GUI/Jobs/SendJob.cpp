@@ -146,30 +146,22 @@ void SendJob::process(Ctl &ctl)
         }
     }
 
-    int total_plate_num = m_plater->get_partplate_list().get_plate_count();
+    //A send job carries the plate it is sending. Resolving "current" or "all" HERE
+    //means the job asks, at send time, which plate the user happens to be looking at,
+    //and by then the answer can differ from the one the dialog was showing. The UI
+    //resolves its current plate once, at the event boundary, and hands the concrete
+    //index down; a sentinel arriving this far is a caller bug, not a default.
+    if (job_data.plate_idx < 0) {
+        BOOST_LOG_TRIVIAL(error) << "send job needs an explicit plate index, got sentinel " << job_data.plate_idx;
+        ctl.update_status(curr_percent, check_gcode_failed_str);
+        return;
+    }
 
     PartPlate* plate = m_plater->get_partplate_list().get_plate(job_data.plate_idx);
     if (plate == nullptr) {
-        if (job_data.plate_idx == PLATE_ALL_IDX) {
-            //all plate
-            for (int index = 0; index < total_plate_num; index++)
-            {
-                PartPlate* plate_n = m_plater->get_partplate_list().get_plate(index);
-                if (plate_n && plate_n->is_valid_gcode_file())
-                {
-                    plate = plate_n;
-                    break;
-                }
-            }
-        }
-        else {
-            plate = m_plater->get_partplate_list().get_curr_plate();
-        }
-        if (plate == nullptr) {
-            BOOST_LOG_TRIVIAL(error) << "can not find plate with valid gcode file when sending to print, plate_index="<< job_data.plate_idx;
-            ctl.update_status(curr_percent, check_gcode_failed_str);
-            return;
-        }
+        BOOST_LOG_TRIVIAL(error) << "can not find plate with valid gcode file when sending to print, plate_index="<< job_data.plate_idx;
+        ctl.update_status(curr_percent, check_gcode_failed_str);
+        return;
     }
 
     /* check gcode is valid */
@@ -184,15 +176,25 @@ void SendJob::process(Ctl &ctl)
     }
 
     std::string project_name = wxGetApp().plater()->get_project_name().ToUTF8().data();
-    int curr_plate_idx = 0;
-    if (job_data.plate_idx >= 0)
-        curr_plate_idx = job_data.plate_idx + 1;
-    else if (job_data.plate_idx == PLATE_CURRENT_IDX)
-        curr_plate_idx = m_plater->get_partplate_list().get_curr_plate_index() + 1;
+    const int curr_plate_idx = job_data.plate_idx + 1;
 
     params.dev_id               = m_dev_id;
     params.project_name         = m_project_name + ".gcode.3mf";
-    params.preset_name          = wxGetApp().preset_bundle->prints.get_selected_preset_name();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    ResolvedPlateSlicingConfig resolved;
+    std::string context_error;
+    if (!bundle->resolve_plate_slicing_config(
+            plate->get_slicing_context(),
+            plate->get_real_filament_maps(bundle->project_config),
+            plate->get_real_filament_volume_maps(bundle->project_config),
+            resolved, context_error)) {
+        plate->update_apply_result_invalid(true);
+        BOOST_LOG_TRIVIAL(error) << "Cannot send plate " << (plate->get_index() + 1)
+                                 << ": " << context_error;
+        ctl.update_status(curr_percent, check_gcode_failed_str);
+        return;
+    }
+    params.preset_name = resolved.print_preset->name;
 
     if (wxGetApp().plater()->using_exported_file())
         params.filename = wxGetApp().plater()->get_3mf_filename();

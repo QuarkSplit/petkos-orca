@@ -137,7 +137,10 @@ public:
 
 	// Apply config over the print. Returns false, if the new config values caused any of the already
 	// processed steps to be invalidated, therefore the task will need to be restarted.
-    PrintBase::ApplyStatus apply(const Model &model, const DynamicPrintConfig &config);
+	// Apply the exact printer identity that produced config. Printer identity used to be
+	// re-read from the one globally selected preset during validate/process, which made
+	// per-plate printer configs validate and generate as the wrong firmware family.
+	PrintBase::ApplyStatus apply(const Model &model, const DynamicPrintConfig &config, bool is_bbl_printer);
 	// After calling the apply() function, set_task() may be called to limit the task to be processed by process().
 	// This is useful for calculating SLA supports for a single object only.
 	void 		set_task(const PrintBase::TaskParams &params);
@@ -233,6 +236,7 @@ private:
 	PrintBase				   *m_print 			 = nullptr;
 	// Non-owned pointers to Print instances.
 	Print 					   *m_fff_print 		 = nullptr;
+	bool                        m_is_bbl_printer = false;
 	SLAPrint 				   *m_sla_print			 = nullptr;
 	// Data structure, to which the G-code export writes its annotations.
 	GCodeProcessorResult     *m_gcode_result 		 = nullptr;
