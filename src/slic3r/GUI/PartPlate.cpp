@@ -92,8 +92,16 @@ static bool resolve_plate_context(const PartPlate *plate, ResolvedPlateSlicingCo
     std::string error;
     if (!bundle->resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
                                               resolved, error)) {
-        const_cast<PartPlate *>(plate)->update_apply_result_invalid(true);
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+        // This is a query, and most of its callers are const queries or the render loop.
+        // It therefore reports and does not decide: marking the plate apply-invalid here
+        // wrote a flag that gates slicing, from drawing a frame, with nothing on screen
+        // saying why - and, because no caller writes it back to false on success, a plate
+        // that was only transiently unresolvable kept the mark after the cause was fixed.
+        // The flag belongs to the action paths that can also tell the user: see
+        // Plater::priv::apply_plate_config, which sets it and pushes a notification naming
+        // the plate and the reason, clears it on success, and PartPlate::load_gcode_from_file.
+        // Debug level, not error: this runs once per frame per unresolved plate.
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
             << boost::format(": plate %1% context is unresolved: %2%") % (plate->get_index() + 1) % error;
         return false;
     }
@@ -905,8 +913,10 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
         return;
     const auto *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
     if (nozzles == nullptr || nozzles->values.empty()) {
-        update_apply_result_invalid(true);
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate context has no nozzle definition";
+        // Drawing the bed logo must not decide whether this plate can be sliced. The
+        // resolver already refuses a printer preset with no nozzle definition, so reaching
+        // here means the texture cannot be chosen, nothing more.
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": plate context has no nozzle definition";
         return;
     }
     const bool is_single_extruder = nozzles->values.size() == 1;
@@ -3603,38 +3613,86 @@ void PartPlate::update_states()
 
 /*slice related functions*/
 //invalid sliced result
-void PartPlate::update_slice_result_valid_state(bool valid)
+bool PartPlate::compose_slicing_config(DynamicPrintConfig &config, std::string &error) const
 {
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% , update slice result from %2% to %3%") % m_plate_index %m_slice_result_valid %valid;
-    m_slice_result_valid = valid;
-    if (valid)
-        m_slice_percent = 100.0f;
-    else {
-        m_slice_percent = -1.0f;
-    }
-}
-
-bool PartPlate::is_slice_result_valid() const
-{
-    if (!m_slice_result_valid || m_sliced_config.keys().empty())
+    error.clear();
+    if (wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr) {
+        error = "no preset bundle is available";
         return false;
-
-    // Headless serialization may inspect retained state without a GUI bundle.
-    if (wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
-        return true;
+    }
 
     PresetBundle *bundle = wxGetApp().preset_bundle;
-    ResolvedPlateSlicingConfig current;
-    std::string error;
+    ResolvedPlateSlicingConfig resolved;
     if (!bundle->resolve_plate_slicing_config(
             get_slicing_context(),
             get_real_filament_maps(bundle->project_config),
             get_real_filament_volume_maps(bundle->project_config),
-            current, error))
+            resolved, error))
         return false;
 
-    current.config.apply(m_config, true);
-    return m_sliced_config.diff(current.config).empty() && current.config.diff(m_sliced_config).empty();
+    resolved.config.apply(m_config, true);
+    config = std::move(resolved.config);
+    return true;
+}
+
+void PartPlate::update_slice_result_valid_state(bool valid, bool capture_config)
+{
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1% , update slice result from %2% to %3%") % m_plate_index %m_slice_result_valid %valid;
+    m_slice_result_valid = valid;
+    if (!valid) {
+        m_slice_percent = -1.0f;
+        return;
+    }
+
+    m_slice_percent = 100.0f;
+    if (!capture_config)
+        return;
+
+    // Snapshot on the SAME basis is_slice_result_valid() recomposes: this plate's composed
+    // config. A Print's full_print_config() is not that basis. Print::apply column-selects
+    // print/filament/printer_options_with_variant_1/_2 down to the slots in use whenever the
+    // machine declares more than one extruder variant (every Bambu profile does, including
+    // the single-extruder ones), and process() rebuilds the filament half again; the composed
+    // side is built with apply_extruder = false and keeps the full width. Diffing the two
+    // therefore never came back empty, and every Bambu plate read stale the moment it sliced.
+    std::string error;
+    if (compose_slicing_config(m_sliced_config, error))
+        return;
+
+    // A slice cannot complete against a context that will not resolve, so in the GUI this is
+    // anomalous: keep no snapshot rather than one nothing can vouch for. Headless runs have
+    // no bundle to compose from and are expected here; is_slice_result_valid() answers from
+    // the flag alone in that case.
+    m_sliced_config.clear();
+    if (wxApp::GetInstance() != nullptr && wxGetApp().preset_bundle != nullptr)
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": plate %1% sliced, but its context did not compose (%2%); no snapshot retained")
+               % (m_plate_index + 1) % error;
+}
+
+bool PartPlate::is_slice_result_valid() const
+{
+    if (!m_slice_result_valid)
+        return false;
+
+    // Headless (CLI, serialization): there is no preset bundle to recompose against, so the
+    // flag the slice itself set is the only answer that exists. This test must come before
+    // the snapshot test below - a CLI run never captures one, and answering false there told
+    // the CLI that every plate it had just sliced was stale.
+    if (wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
+        return true;
+
+    // A retained slice with no snapshot predates the per-plate context, or its capture
+    // failed. Either way nothing here can show it is still current, so it is not.
+    if (m_sliced_config.empty())
+        return false;
+
+    DynamicPrintConfig current;
+    std::string        error;
+    if (!compose_slicing_config(current, error))
+        return false;
+
+    return m_sliced_config.diff(current).empty() && current.diff(m_sliced_config).empty();
 }
 
 //update current slice context into backgroud slicing process
@@ -3728,7 +3786,11 @@ int PartPlate::load_gcode_from_file(const std::string& filename)
 		m_gcode_result->filename = filename;
 		m_print->set_gcode_file_ready();
 
-		update_slice_result_valid_state(true);
+		// No recapture: load_from_3mf_structure has already restored the snapshot this
+		// G-code was sliced with. Composing one here would record the configuration the
+		// project is being opened WITH, and a project reopened after a preset change would
+		// claim its old G-code was current.
+		update_slice_result_valid_state(true, false);
 
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": found valid gcode file %1%") % filename.c_str();
 	}
@@ -6766,7 +6828,7 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 			// context. Live consumers still use is_slice_result_valid(), which compares
 			// the snapshot exactly before offering print/export.
 			if (m_plate_list[i]->get_slice_result() && m_plate_list[i]->m_slice_result_valid &&
-			    !m_plate_list[i]->m_sliced_config.keys().empty()) {
+			    !m_plate_list[i]->m_sliced_config.empty()) {
 				// BBS only include current palte_idx
 				if (plate_idx == i || plate_idx == PLATE_CURRENT_IDX || plate_idx == PLATE_ALL_IDX) {
 					//load calibration thumbnail

@@ -172,6 +172,21 @@ public:
     void on_plate_selection_changed(int current_plate);
     //Rebuild the board's rows from the plate list.
     void refresh_plate_board();
+
+    //The scope set. It always contains the current plate and is never empty once the
+    //plater is up, so every consumer can read it with no special case. A single member
+    //is PLATE scope. PROJECT is a separate KIND, not an index in the set, because the
+    //project is not a plate and giving it one would make "is plate -1 selected" a
+    //question the rest of the code has to keep answering.
+    const std::vector<int>& scoped_plates() const { return m_scoped_plates; }
+    bool is_project_scope() const { return m_scope_project; }
+    //Modifier-click on a board row: changes the scope set and never the current plate.
+    //The current plate can never be removed from the set.
+    void toggle_scoped_plate(int plate_index);
+    //Clicking the board's project-wide line. Leaves the current plate alone.
+    void set_project_scope();
+    //Re-assert the invariant above and push the result at the board and the inspector.
+    void refresh_plate_scope();
     //The collapsed printer-section title: the project printer when the project holds
     //one plate or every plate inherits, and "N machines" otherwise. Replaces reading
     //the project combo's displayed string, which cannot describe a fleet.
@@ -290,6 +305,11 @@ private:
 
     wxBoxSizer* m_scrolled_sizer = nullptr;
     bool            m_need_auto_sync_after_connect_printer{false};
+
+    //Owned here, not by the board: the board renders the scope exactly as it renders the
+    //current plate, and storing it in two places is how two lists come to disagree.
+    std::vector<int> m_scoped_plates;
+    bool             m_scope_project{false};
 };
 
 class Plater: public wxPanel
@@ -763,6 +783,18 @@ public:
                                       std::string &error, bool apply_plate_overrides = true) const;
     bool resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &resolved,
                                               std::string &error, bool apply_plate_overrides = true) const;
+    // Read ONE process-preset option for a plate WITHOUT composing that plate's whole config.
+    // resolve_plate_slicing_config is the correct answer wherever a full config is wanted, but it
+    // copies the printer, the process and every filament preset and then applies
+    // FullPrintConfig::defaults() plus four more whole-config passes; a path the renderer walks
+    // cannot pay that per frame. This resolves the same plate-scoped process identity and reads
+    // the single key out of it.
+    //
+    // It substitutes nothing. An empty per-plate process name means the plate explicitly inherits
+    // the Project row, which is the identity the full resolver uses for it too; a named process
+    // preset that is not present is unresolved and yields nullptr rather than the Project's value.
+    // Returns nullptr when the plate, the bundle or the process preset cannot answer.
+    const ConfigOption *get_plate_process_option(const PartPlate *plate, const std::string &opt_key) const;
     void validate_current_plate(bool& model_fits, bool& validate_error);
     // Rebuild the missing-plugin sets from the active presets and (re)show/close their notifications.
     // Returns true when slicing must be blocked (a referenced plugin is still missing); sets

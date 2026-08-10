@@ -742,6 +742,10 @@ struct Sidebar::priv
     //is the Project row: pinned, never scrolling away, and still the only door to
     //changing the project printer.
     PlateBoard* plate_board = nullptr;
+    //The pinned inspector. It sits below the board and above the extruder/AMS groups, so
+    //a growing board never pushes it off the screen — which is the actual failure mode of
+    //a linear list in a narrow column, not the length of the list itself.
+    PlateInspector* plate_inspector = nullptr;
     //The printer the main Print button's routing was last decided from. Switching to a
     //plate on a different machine has to redo that decision, and this says when.
     std::string print_routing_printer;
@@ -842,6 +846,16 @@ void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual)
         if (plate_board == nullptr && plater != nullptr) {
             plate_board = new PlateBoard(m_panel_printer_content, plater);
             vsizer_printer->Add(plate_board, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP,
+                                FromDIP(SidebarProps::ContentMargin()));
+        }
+
+        //The inspector is pinned directly under the board and never scrolls with it. It
+        //is built here, inside the sidebar's construction, so it must not read the plate
+        //list or the resolver until reload() is called; reload() checks
+        //Plater::is_initialized() before it touches either.
+        if (plate_inspector == nullptr && plater != nullptr) {
+            plate_inspector = new PlateInspector(m_panel_printer_content, plater);
+            vsizer_printer->Add(plate_inspector, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP,
                                 FromDIP(SidebarProps::ContentMargin()));
         }
 
@@ -5081,6 +5095,73 @@ void Sidebar::refresh_plate_board()
         if (p->m_panel_printer_content != nullptr)
             p->m_panel_printer_content->Layout();
     }
+
+    //the inspector describes rows the board has just recomputed, so it follows the same
+    //refresh rather than growing a second set of refresh points to keep in step
+    refresh_plate_scope();
+}
+
+//The scope invariant lives in exactly one function: the set always contains the current
+//plate, holds no duplicates and no index the plate list no longer has, and is never
+//empty. Every mutator below ends here, so no caller has to restate it.
+void Sidebar::refresh_plate_scope()
+{
+    if (p == nullptr || p->plater == nullptr || !p->plater->is_initialized())
+        return;
+
+    const PartPlateList& plates  = p->plater->get_partplate_list();
+    const int            current = plates.get_curr_plate_index();
+    const int            count   = plates.get_plate_count();
+
+    std::vector<int> rebuilt;
+    if (current >= 0 && current < count)
+        rebuilt.push_back(current);
+    for (int idx : m_scoped_plates) {
+        if (idx < 0 || idx >= count || idx == current)
+            continue;
+        if (std::find(rebuilt.begin(), rebuilt.end(), idx) == rebuilt.end())
+            rebuilt.push_back(idx);
+    }
+    std::sort(rebuilt.begin(), rebuilt.end());
+    m_scoped_plates = std::move(rebuilt);
+
+    if (p->plate_board != nullptr)
+        p->plate_board->set_scope(m_scoped_plates, m_scope_project);
+    if (p->plate_inspector != nullptr)
+        p->plate_inspector->reload(m_scoped_plates, m_scope_project);
+}
+
+void Sidebar::toggle_scoped_plate(int plate_index)
+{
+    if (p == nullptr || p->plater == nullptr || !p->plater->is_initialized())
+        return;
+
+    //A plate scope and the project scope are different kinds, so extending the plate
+    //selection leaves the project kind rather than adding the project to a set of plates.
+    m_scope_project = false;
+
+    const int current = p->plater->get_partplate_list().get_curr_plate_index();
+    //The current plate can never be removed: the inspector would then be describing
+    //plates the 3D scene is not showing, with nothing on screen saying so.
+    if (plate_index != current) {
+        const std::vector<int>::iterator it = std::find(m_scoped_plates.begin(), m_scoped_plates.end(), plate_index);
+        if (it != m_scoped_plates.end())
+            m_scoped_plates.erase(it);
+        else
+            m_scoped_plates.push_back(plate_index);
+    }
+
+    refresh_plate_scope();
+}
+
+void Sidebar::set_project_scope()
+{
+    if (p == nullptr)
+        return;
+    //the current plate is untouched: pointing the inspector at the project is not a
+    //selection change, and the 3D scene keeps showing what it was showing
+    m_scope_project = true;
+    refresh_plate_scope();
 }
 
 void Sidebar::on_plate_selection_changed(int current_plate)
@@ -5098,6 +5179,14 @@ void Sidebar::on_plate_selection_changed(int current_plate)
         //the row set can have changed with the selection (delete_plate notifies too)
         p->plate_board->reload();
     }
+
+    //Any change to the current plate by any path clears the scope back to that plate
+    //alone. A multi-plate scope is something the user built on purpose; carrying it
+    //across a selection change would leave an inspector editing plates they have since
+    //navigated away from.
+    m_scoped_plates.clear();
+    m_scope_project = false;
+    refresh_plate_scope();
 
     //A plate on a different machine prints through a different route. Redo that
     //decision only when the machine actually changed, so an ordinary plate click does
@@ -6718,13 +6807,18 @@ std::map<std::string, std::string> Plater::get_bed_texture_maps()
     return {};
 }
 
+//PartPlate::render asks this for the selected plate on every render pass, so it is on the
+//interactive path. It used to be one option read off the edited process preset; the per-plate
+//round turned it into a whole composed config, which copies every preset and applies every
+//FullPrintConfig default plus four more whole-config passes each time. The answer still has to
+//be the plate's and not the project's, so the read is narrowed to the one key rather than
+//reverted to a project-scoped source.
 bool Plater::get_enable_wrapping_detection()
 {
-   ResolvedPlateSlicingConfig resolved;
-   std::string error;
-   if (!resolve_current_plate_slicing_config(resolved, error))
+   if (!is_initialized())
        return false;
-   const ConfigOptionBool *wrapping_detection = resolved.config.option<ConfigOptionBool>("enable_wrapping_detection");
+   const ConfigOptionBool *wrapping_detection = dynamic_cast<const ConfigOptionBool *>(
+       get_plate_process_option(p->partplate_list.get_curr_plate(), "enable_wrapping_detection"));
    return  (wrapping_detection != nullptr) && wrapping_detection->value;
 }
 
@@ -19038,6 +19132,45 @@ bool Plater::resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &re
                                         apply_plate_overrides);
 }
 
+//The narrow read. See the comment on the declaration for why it exists: this answers a
+//plate-scoped question about ONE process option without paying for a whole composed config.
+//
+//The lookup order is the order the composition would have produced. construct_full_config
+//applies the printer config, then the process config, then the project config, then the
+//filament config, and resolve_plate_slicing_config applies the plate's own overrides last;
+//process options are carried by the process preset alone (Preset::print_options), so the
+//plate override and then the process preset are the only two places the value can come from.
+const ConfigOption *Plater::get_plate_process_option(const PartPlate *plate, const std::string &opt_key) const
+{
+    //same window as resolve_current_plate_slicing_config: the sidebar asks Plater questions
+    //from inside priv's constructor, before p exists
+    if (!is_initialized() || plate == nullptr)
+        return nullptr;
+    const PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return nullptr;
+
+    //a per-plate override wins, exactly as it does in the composed config
+    if (const ConfigOption *plate_opt = plate->config()->option(opt_key); plate_opt != nullptr)
+        return plate_opt;
+
+    const PresetCollection &prints = bundle->prints;
+    const Preset *          print  = nullptr;
+    if (plate->get_print_preset_name().empty()) {
+        //explicit inheritance from the Project row. An unresolved Project selection is an
+        //error there as much as here, so it is not silently replaced by an edited preset.
+        if (prints.get_selected_idx() == size_t(-1) || prints.get_selected_idx() >= prints.size())
+            return nullptr;
+        print = &prints.get_edited_preset();
+    } else {
+        //exact name, never a nearest match
+        print = prints.find_preset(plate->get_print_preset_name(), false);
+    }
+    if (print == nullptr)
+        return nullptr;
+    return print->config.option(opt_key);
+}
+
 void Plater::apply_background_progress()
 {
     PartPlate* part_plate = p->partplate_list.get_curr_plate();
@@ -19254,15 +19387,38 @@ void Plater::validate_current_plate(bool& model_fits, bool& validate_error)
     model_fits = (state != ModelInstancePVS_Partly_Outside);
 
     PartPlate *cur_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
-    const DynamicPrintConfig& plate_config = p->background_process.fff_print()->full_print_config();
-    if (model_fits) {  // TPU check
-        bool  tpu_valid = cur_plate->check_tpu_printable_status(plate_config, wxGetApp().preset_bundle->get_used_tpu_filaments(cur_plate->get_extruders(true)));
+
+    // Check the current plate against its OWN resolved configuration, not the background
+    // process's Print. Reading background_process.fff_print()->full_print_config() here was
+    // wrong twice over. A plate's Print carries a config only once the background process has
+    // applied one to it, so the checks below could run against a config with no keys at all
+    // and read null options; and once it is populated it belongs to whichever plate the
+    // background process is holding, which is not necessarily cur_plate. can_switch_print()
+    // refuses the swap while a slice is running, so select_plate() skips apply_plate_config()
+    // and the current plate moves while the Print stays where it was, after which this
+    // validated one plate's geometry against another plate's filaments. That is the singular
+    // engine assumption, and it is the same repair GLCanvas3D::reload_scene already carries.
+    ResolvedPlateSlicingConfig resolved_plate;
+    std::string                plate_context_error;
+    const bool plate_context_resolved = resolve_plate_slicing_config(cur_plate, resolved_plate, plate_context_error);
+    if (!plate_context_resolved) {
+        // No substitute config: an unresolved plate cannot answer these questions, so they are
+        // not asked, and model_fits keeps the geometry answer rather than being failed on a
+        // guess. The context error itself is surfaced where it can be acted on, by
+        // apply_plate_config, which names the plate and pushes a validate-error notification.
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": plate "
+                                   << (cur_plate != nullptr ? cur_plate->get_index() + 1 : 0)
+                                   << " is unresolved, skipping the filament checks: " << plate_context_error;
+    }
+
+    if (plate_context_resolved && model_fits) {  // TPU check
+        bool  tpu_valid = cur_plate->check_tpu_printable_status(resolved_plate.config, wxGetApp().preset_bundle->get_used_tpu_filaments(cur_plate->get_extruders(true)));
         model_fits &= tpu_valid;
     }
 
-    if (model_fits) { // Filament printable check
+    if (plate_context_resolved && model_fits) { // Filament printable check
         wxString filament_printable_error_msg;
-        bool filament_printable = cur_plate->check_filament_printable(plate_config, filament_printable_error_msg);
+        bool filament_printable = cur_plate->check_filament_printable(resolved_plate.config, filament_printable_error_msg);
         model_fits &= filament_printable;
     }
 

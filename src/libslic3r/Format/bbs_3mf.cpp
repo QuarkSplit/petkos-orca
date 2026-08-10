@@ -2333,6 +2333,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             plate_data_list[it->first-1]->plate_index = it->second->plate_index-1;
             plate_data_list[it->first-1]->plate_name = it->second->plate_name;
             plate_data_list[it->first-1]->slicing_context = it->second->slicing_context;
+            // The retained slice snapshot and the reason it was dropped travel with the plate.
+            // Without these two lines the parsed snapshot dies in m_plater_data and every reopened
+            // plate reads as never sliced, whatever the file says.
+            plate_data_list[it->first-1]->sliced_config = it->second->sliced_config;
+            plate_data_list[it->first-1]->sliced_config_dropped_reason = it->second->sliced_config_dropped_reason;
             plate_data_list[it->first-1]->obj_inst_map = it->second->obj_inst_map;
             plate_data_list[it->first-1]->gcode_file = (m_load_restore || it->second->gcode_file.empty()) ? it->second->gcode_file : m_backup_path + "/" + it->second->gcode_file;
             plate_data_list[it->first-1]->gcode_prediction = it->second->gcode_prediction;
@@ -2864,11 +2869,23 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             // BBS: use backup path
             //aux directory from model
             boost::filesystem::path dest_path = boost::filesystem::path(m_backup_path + "/" + src_file);
+            // miniz opens the destination with fopen and will not create Metadata/ for us, so a
+            // backup root that exists without its subdirectories (Model::get_backup_path only
+            // creates them when it creates the root) silently lost every retained plate G-code.
+            // The traversal check above already confines dest_path to the backup root, and the
+            // auxiliary-file extractor above does the same thing for the same reason.
+            try {
+                const boost::filesystem::path dest_dir = dest_path.parent_path();
+                if (!dest_dir.empty() && !boost::filesystem::exists(dest_dir))
+                    boost::filesystem::create_directories(dest_dir);
+            } catch (const std::exception &ex) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", failed to create %1%: %2%") % dest_path.parent_path() % ex.what();
+            }
             std::string dest_zip_file = encode_path(dest_path.string().c_str());
             mz_bool res = mz_zip_reader_extract_to_file(&archive, stat.m_file_index, dest_zip_file.c_str(), 0);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", extract  %1% from 3mf %2%, ret %3%\n") % dest_path % stat.m_filename % res;
             if (res == 0) {
-                add_error("Error while extract file to temp directory");
+                add_error("Error while extract file to temp directory: " + dest_path.string());
                 return;
             }
         }
@@ -4486,17 +4503,48 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 m_curr_plater->slicing_context.physical_printer_id = xml_unescape(value.c_str());
             }
             else if (boost::algorithm::starts_with(key, PLATER_SLICED_CONFIG_PREFIX)) {
+                // The retained slice is a cache, not part of the project's identity, so an option
+                // this build cannot read back exactly costs the user that cache and nothing else.
+                // Returning false here failed the whole load, making a project written by a newer
+                // build unopenable. The snapshot is dropped whole rather than left half-read: a
+                // partial one is still diffed against the live config and cannot vouch for the
+                // G-code it claims to describe.
+                //
+                // Read straight into the option rather than through set_deserialize, which begins
+                // with PrintConfigDef::handle_legacy. That is preset migration and it edits what it
+                // reads: it silently drops any key on its obsolete list even when the option still
+                // exists (silent_mode is both in FullPrintConfig and on that list), and it rewrites
+                // legacy-shaped values. This snapshot is machine-written by the exporter above and
+                // exists only to be compared, exactly, against a freshly composed config, so
+                // anything that edits it on the way in is a defect, and "handle_legacy cleared it"
+                // is not the same question as "this build does not have this option".
+                // option(key, true) asks that question directly: it creates the option when this
+                // build defines the key and returns null when it does not.
                 const std::string option_key = key.substr(std::strlen(PLATER_SLICED_CONFIG_PREFIX));
-                if (option_key.empty()) {
-                    add_error("Invalid empty key in retained plate slicing config");
-                    return false;
-                }
-                try {
-                    ConfigSubstitutionContext substitutions { ForwardCompatibilitySubstitutionRule::Disable };
-                    m_curr_plater->sliced_config.set_deserialize(option_key, xml_unescape(value.c_str()), substitutions);
-                } catch (const std::exception &ex) {
-                    add_error("Invalid retained plate slicing option '" + option_key + "': " + ex.what());
-                    return false;
+                if (m_curr_plater->sliced_config_dropped_reason.empty()) {
+                    std::string reason;
+                    if (option_key.empty()) {
+                        reason = "it carries an option with no name";
+                    } else {
+                        try {
+                            ConfigOption *option = m_curr_plater->sliced_config.option(option_key, true);
+                            if (option == nullptr)
+                                reason = "option '" + option_key + "' is not known to this build";
+                            else if (!option->deserialize(value))
+                                reason = "option '" + option_key + "' could not be read back";
+                        } catch (const std::exception &ex) {
+                            reason = std::string("option '") + option_key + "': " + ex.what();
+                        }
+                    }
+                    if (!reason.empty()) {
+                        m_curr_plater->sliced_config.clear();
+                        m_curr_plater->sliced_config_dropped_reason = reason;
+                        // plate_index still holds the 1-based id read from the file here; the
+                        // transfer into plate_data_list is what makes it 0-based.
+                        add_error("Plate " + std::to_string(m_curr_plater->plate_index) +
+                                  ": retained slice dropped because " + reason +
+                                  ". The project and the plate's G-code are unaffected; the plate must be sliced again before it can be printed.");
+                    }
                 }
             }
             else if (key == LOCK_ATTR)
@@ -8074,10 +8122,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 if (!context.physical_printer_id.empty())
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PHYSICAL_PRINTER_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.physical_printer_id.c_str()) << "\"/>\n";
                 if (plate_data->is_sliced_valid) {
+                    // xml_escape leaves newlines, tabs and CRs alone, and an XML parser normalises
+                    // those to spaces inside an attribute value. Custom G-code options are full of
+                    // them, so a snapshot escaped that way comes back altered and can never match
+                    // the config it was taken from. Escape them explicitly; the parser decodes the
+                    // entities, so the reader takes the attribute verbatim and undoes nothing.
                     for (const std::string &key : plate_data->sliced_config.keys()) {
                         stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\""
                                << PLATER_SLICED_CONFIG_PREFIX << key << "\" " << VALUE_ATTR << "=\""
-                               << xml_escape(plate_data->sliced_config.opt_serialize(key).c_str()) << "\"/>\n";
+                               << xml_escape_double_quotes_attribute_value(plate_data->sliced_config.opt_serialize(key)) << "\"/>\n";
                     }
                 }
                 stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << LOCK_ATTR << "\" " << VALUE_ATTR << "=\"" << std::boolalpha<< plate_data->locked<< "\"/>\n";

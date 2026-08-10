@@ -100,6 +100,12 @@ struct PlateData
     // snapshot, not a layer of live overrides, and must never be applied when a
     // plate is reassigned to another printer.
     DynamicPrintConfig sliced_config;
+    // Non-empty when the file carried a retained slice this build could not read back
+    // exactly, in which case sliced_config is cleared rather than half-filled. The project
+    // still loads and the plate keeps its geometry, context and G-code; it simply has no
+    // snapshot to vouch for that G-code, so nothing may treat the slice as current. The text
+    // names the option that could not be read, for the UI to show.
+    std::string     sliced_config_dropped_reason;
     bool            is_support_used {false};
     bool            is_sliced_valid = false;
     bool            toolpath_outside {false};

@@ -573,7 +573,17 @@ public:
 
     //is slice result valid or not
     bool is_slice_result_valid() const;
-    bool has_retained_slice_result() const { return m_slice_result_valid && !m_sliced_config.keys().empty(); }
+    bool has_retained_slice_result() const { return m_slice_result_valid && !m_sliced_config.empty(); }
+    // Compose this plate's exact effective slicing configuration: its resolved context
+    // (printer / process / filament presets, project row, filament maps) with this plate's
+    // own overrides applied on top. Pure query - it mutates no plate state, and on failure
+    // it names the reason so a caller that has somewhere to say it can name the plate too.
+    //
+    // This is the single basis on which a retained slice is judged current. It is what
+    // apply_plate_config hands to the engine, and it is what is captured when a slice
+    // completes. A Print's full_print_config() is deliberately NOT that basis: see
+    // update_slice_result_valid_state.
+    bool compose_slicing_config(DynamicPrintConfig &config, std::string &error) const;
     //Print time and filament weight of THIS plate's own retained slice. Both are read
     //from the plate's GCodeResult, so they survive a reopen and never report another
     //plate's figures; the Print object they used to come from is rebuilt per slice.
@@ -599,7 +609,13 @@ public:
     }
 
     //invalid sliced result
-    void update_slice_result_valid_state(bool valid = false);
+    // capture_config: when a slice has just produced this plate's G-code, capture the
+    // configuration it was produced from, so the plate can later be asked whether it is
+    // still current. The one caller that must pass false is the 3MF load path, which has
+    // already restored the snapshot the file was sliced with; recomposing there would
+    // replace it with whatever is loaded now and every reopened project would read as
+    // current no matter which presets had changed.
+    void update_slice_result_valid_state(bool valid = false, bool capture_config = true);
 
     void update_slicing_percent(float percent)
     {

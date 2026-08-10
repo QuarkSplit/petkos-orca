@@ -2627,6 +2627,67 @@ static inline std::string remove_ini_suffix(const std::string &name)
     return out;
 }
 
+// Rebuild the Project filament row from the names AppConfig persisted for a printer.
+//
+// Those names come from AppConfig, not from a project, and AppConfig can name a preset that no
+// longer exists. The reliable producer of that state is a project-embedded preset: a 3MF carrying
+// no printer_settings_id / print_settings_id (MakerWorld and Printables strip both) is loaded as
+// presets named "<base>(<file>.3mf)" -- with an EMPTY base for the printer and process rows, which
+// is why the name can read as bare "(project.3mf)". Those presets exist only while that project is
+// open and are deleted by reset_project_embedded_presets() when it closes, but export_selections
+// has already persisted their names, so a later restore names presets that cannot be found.
+//
+// A name the filament collection never selected must not enter filament_presets. The two are one
+// identity, and the only thing that inconsistency produces is a throw out of every later
+// full_fff_config(), including the read-only ones: the application terminated inside MainFrame's
+// constructor, before it had a window to report anything in, with the reason only in the log. That
+// is the worst shape a gate can take.
+//
+// Nothing is substituted for a user's choice here. There is no project and no plate on this path;
+// the persisted record is invalid rather than incompatible, and every discarded name is logged. The
+// printer and process rows already behave this way -- select_preset_by_name_strict leaves them on
+// the collection's own installed selection when the persisted name fails -- so this only makes the
+// filament row agree with its neighbours.
+static std::vector<std::string> filament_row_from_app_config(PresetCollection    &filaments,
+                                                             AppConfig           &config,
+                                                             const std::string   &printer_profile_name,
+                                                             const std::string   &initial_filament_profile_name,
+                                                             bool                 filament_selected,
+                                                             const char          *caller)
+{
+    if (!filament_selected && !initial_filament_profile_name.empty())
+        BOOST_LOG_TRIVIAL(error) << caller << ": persisted filament preset '" << initial_filament_profile_name
+                                 << "' is not installed; the Project filament row is taken from the filament collection's selection";
+
+    std::vector<std::string> row = { filaments.get_selected_preset_name() };
+
+    std::vector<std::string> persisted;
+    for (unsigned int i = 1; i < 1000; ++ i) {
+        char name[64];
+        sprintf(name, "filament_%02u", i);
+        std::string f_name = config.get_printer_setting(printer_profile_name, name);
+        if (f_name.empty())
+            break;
+        persisted.emplace_back(remove_ini_suffix(f_name));
+    }
+
+    // A partially valid persisted list is not a valid restore. The slots are positional, so
+    // adopting some and dropping others would silently renumber the rest; either every persisted
+    // slot resolves or none of them are adopted.
+    bool all_installed = true;
+    for (const std::string &name : persisted)
+        if (filaments.find_preset(name, false) == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << caller << ": persisted filament preset '" << name
+                                     << "' is not installed; the persisted filament list is discarded";
+            all_installed = false;
+        }
+    if (all_installed)
+        for (std::string &name : persisted)
+            row.emplace_back(std::move(name));
+
+    return row;
+}
+
 // Set the "enabled" flag for printer vendors, printer models and printer variants
 // based on the user configuration.
 // If the "vendor" section is missing, enable all models and variants of the particular vendor.
@@ -2815,16 +2876,10 @@ void PresetBundle::update_selections(AppConfig &config, bool preserve_project_fi
     // Load it even if the current printer technology is SLA.
     // The possibly excessive filament names will be later removed with this->update_multi_material_filament_presets()
     // once the FFF technology gets selected.
-    this->filament_presets = { filament_selected ? filaments.get_selected_preset_name()
-                                                  : initial_filament_profile_name };
-    for (unsigned int i = 1; i < 1000; ++ i) {
-        char name[64];
-        sprintf(name, "filament_%02u", i);
-        auto f_name = config.get_printer_setting(initial_printer_profile_name, name);
-        if (f_name.empty())
-            break;
-        this->filament_presets.emplace_back(remove_ini_suffix(f_name));
-    }
+    // Same rule as load_selections: this reads the same AppConfig block on every printer change, so
+    // a persisted name that is not installed would reach filament_presets here too.
+    this->filament_presets = filament_row_from_app_config(this->filaments, config, initial_printer_profile_name,
+                                                          initial_filament_profile_name, filament_selected, __FUNCTION__);
 
     // Keep every filament slot the open project had: the remembered list for the new
     // printer may be shorter (or missing entirely on a first switch), and letting the
@@ -2972,16 +3027,10 @@ void PresetBundle::load_selections(AppConfig &config, const PresetPreferences& p
     // Load it even if the current printer technology is SLA.
     // The possibly excessive filament names will be later removed with this->update_multi_material_filament_presets()
     // once the FFF technology gets selected.
-    this->filament_presets = { filament_selected ? filaments.get_selected_preset_name()
-                                                  : initial_filament_profile_name };
-    for (unsigned int i = 1; i < 1000; ++ i) {
-        char name[64];
-        sprintf(name, "filament_%02u", i);
-        auto f_name = config.get_printer_setting(initial_printer_profile_name, name);
-        if (f_name.empty())
-            break;
-        this->filament_presets.emplace_back(remove_ini_suffix(f_name));
-    }
+    // See filament_row_from_app_config: a persisted name that is not installed is discarded and
+    // named, instead of being carried into filament_presets where it makes full_fff_config throw.
+    this->filament_presets = filament_row_from_app_config(this->filaments, config, initial_printer_profile_name,
+                                                          initial_filament_profile_name, filament_selected, __FUNCTION__);
 
     update_filament_count();
 
@@ -3104,8 +3153,23 @@ void PresetBundle::export_selections(AppConfig &config)
 {
 	assert(this->printers.get_edited_preset().printer_technology() != ptFFF || filament_presets.size() >= 1);
 	//assert(this->printers.get_edited_preset().printer_technology() != ptFFF || filament_presets.size() > 1 || filaments.get_selected_preset_name() == filament_presets.front());
-    config.clear_section("presets");
     auto printer_name = printers.get_selected_preset_name();
+
+    // AppConfig records the GLOBAL startup selection. A project-embedded preset ("<base>(<file>.3mf)")
+    // is by construction not one: it exists only while its project is open and is deleted by
+    // reset_project_embedded_presets() when it closes. Persisting one guarantees the next launch
+    // starts with a Project row naming presets that cannot be found, and it also keys the whole
+    // per-printer block below by a project filename, which is how "(BD-1 qadqwLower.3mf)" ended up
+    // as the recorded machine. The persisted selection therefore stays as it was before the project
+    // was opened. This substitutes nothing; it declines to record a name already known to dangle.
+    const Preset *selected_printer = this->printers.find_preset(printer_name, false);
+    if (selected_printer != nullptr && selected_printer->is_project_embedded) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": the selected printer preset '" << printer_name
+                                << "' is embedded in the open project and cannot outlive it; the persisted selections are left unchanged";
+        return;
+    }
+
+    config.clear_section("presets");
     config.set("presets", PRESET_PRINTER_NAME, printer_name);
 
     // Don't persist settings for the built-in "Default Printer" placeholder —
