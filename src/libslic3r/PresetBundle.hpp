@@ -553,6 +553,12 @@ public:
     bool check_preset_references() const;
 
 private:
+    // Select a persisted AppConfig preset name only when it names an installed preset.
+    // select_preset_by_name_strict DESELECTS the collection on a miss, so a stale name
+    // in AppConfig destroys the valid selection load_presets already made; this keeps it.
+    // A member rather than a free function because that setter is protected.
+    static bool select_persisted_or_keep(PresetCollection &collection, const std::string &name, const char *caller);
+
     // Orca: validation only - flag any printer with two or more compatible
     // filament presets sharing one filament_id (ambiguous AMS subtype match).
     bool check_duplicate_filament_subtypes() const;

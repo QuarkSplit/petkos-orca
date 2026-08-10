@@ -2648,6 +2648,29 @@ static inline std::string remove_ini_suffix(const std::string &name)
 // printer and process rows already behave this way -- select_preset_by_name_strict leaves them on
 // the collection's own installed selection when the persisted name fails -- so this only makes the
 // filament row agree with its neighbours.
+//Select a persisted name only when it names an installed preset.
+//
+//select_preset_by_name_strict does NOT leave a failed selection alone: on a miss it sets
+//m_idx_selected to -1, i.e. it DESELECTS the collection. So a stale name in AppConfig does not
+//merely fail to be honoured, it destroys the valid selection load_presets had already made, and
+//every downstream reader then sees "unresolved" or an empty preset name. That empty name is what
+//reached full_fff_config and killed the application at startup.
+//
+//Declining to act on an invalid persisted name is not a fallback: there is no valid name being
+//substituted for, and the selection left in place is the collection's own installed default, not
+//a guess at what the user meant.
+bool PresetBundle::select_persisted_or_keep(PresetCollection &collection, const std::string &name, const char *caller)
+{
+    if (!name.empty() && collection.find_preset(name, false) != nullptr)
+        return collection.select_preset_by_name_strict(name);
+
+    if (!name.empty())
+        BOOST_LOG_TRIVIAL(error) << caller << ": persisted " << Preset::get_type_string(collection.type())
+                                 << " preset '" << name << "' is not installed; keeping the installed selection '"
+                                 << collection.get_selected_preset_name() << "'";
+    return false;
+}
+
 static std::vector<std::string> filament_row_from_app_config(PresetCollection    &filaments,
                                                              AppConfig           &config,
                                                              const std::string   &printer_profile_name,
@@ -2869,8 +2892,8 @@ void PresetBundle::update_selections(AppConfig &config, bool preserve_project_fi
     std::string initial_filament_profile_name     = config.get_printer_setting(initial_printer_profile_name, PRESET_FILAMENT_NAME);
 
     // Selects the profiles, which were selected at the last application close.
-    prints.select_preset_by_name_strict(initial_print_profile_name);
-    const bool filament_selected = filaments.select_preset_by_name_strict(initial_filament_profile_name);
+    select_persisted_or_keep(prints, initial_print_profile_name, __FUNCTION__);
+    const bool filament_selected = select_persisted_or_keep(filaments, initial_filament_profile_name, __FUNCTION__);
 
     // Load the names of the other filament profiles selected for a multi-material printer.
     // Load it even if the current printer technology is SLA.
@@ -2989,9 +3012,7 @@ void PresetBundle::load_selections(AppConfig &config, const PresetPreferences& p
     // If executed due to a Config Wizard update, preferred_printer contains the first newly installed printer, otherwise nullptr.
     const Preset *preferred_printer = printers.find_system_preset_by_model_and_variant(preferred_selection.printer_model_id, preferred_selection.printer_variant);
     const std::string selected_printer_name = preferred_printer ? preferred_printer->name : initial_printer_profile_name;
-    if (!printers.select_preset_by_name_strict(selected_printer_name))
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": printer preset '"
-                                 << selected_printer_name << "' is not installed";
+    select_persisted_or_keep(printers, selected_printer_name, __FUNCTION__);
     CNumericLocalesSetter locales_setter;
 
     // Orca: load from orca_presets
@@ -3018,8 +3039,8 @@ void PresetBundle::load_selections(AppConfig &config, const PresetPreferences& p
     }
 
     // Selects the profile, leaves it to -1 if the initial profile name is empty or if it was not found.
-    prints.select_preset_by_name_strict(initial_print_profile_name);
-    const bool filament_selected = filaments.select_preset_by_name_strict(initial_filament_profile_name);
+    select_persisted_or_keep(prints, initial_print_profile_name, __FUNCTION__);
+    const bool filament_selected = select_persisted_or_keep(filaments, initial_filament_profile_name, __FUNCTION__);
 	// sla_prints.select_preset_by_name_strict(initial_sla_print_profile_name);
     // sla_materials.select_preset_by_name_strict(initial_sla_material_profile_name);
 
