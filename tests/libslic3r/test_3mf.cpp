@@ -396,6 +396,134 @@ SCENARIO("Individually sliced plate G-code survives project save and reopen", "[
     }
 }
 
+// A retained slice snapshot this build cannot read back exactly costs the user that snapshot and
+// nothing else. Two properties are pinned here, and the load path had neither before the strict
+// reader landed:
+//   * the project still loads. A snapshot written by a build with one more option than this one
+//     used to fail the whole 3MF, making the project unopenable rather than un-cached.
+//   * the snapshot is dropped WHOLE, not left half-read. A partial snapshot is still diffed
+//     against a freshly composed config by PartPlate::is_slice_result_valid, so it would vouch
+//     for G-code it does not describe.
+// The plate keeps everything that is actually the project: its geometry, its slicing context and
+// its retained G-code file. Only the claim that the G-code is current is withdrawn.
+SCENARIO("An unreadable retained slice snapshot is dropped and the project still loads", "[3mf][PlateContext][RetainedGcode]") {
+    GIVEN("two sliced plates, one of whose snapshots names an option this build does not define") {
+        Model model;
+        const std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
+        REQUIRE(load_stl(src_file.c_str(), &model));
+        model.add_default_instances();
+
+        const boost::filesystem::path work_dir =
+            boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("orca_dropped_snapshot_%%%%%%%%");
+        const boost::filesystem::path extract_dir = work_dir / "loaded";
+        boost::filesystem::create_directories(extract_dir);
+        model.set_backup_path((work_dir / "source").string());
+        boost::filesystem::create_directories(model.get_backup_path());
+
+        const std::array<std::string, 2> contents = {
+            "; PETKOS_READABLE_SNAPSHOT\nG1 X31 Y31\n",
+            "; PETKOS_DROPPED_SNAPSHOT\nG1 X42 Y42\n"
+        };
+        const std::array<boost::filesystem::path, 2> source_paths = {
+            work_dir / "plate-readable.gcode",
+            work_dir / "plate-dropped.gcode"
+        };
+        for (size_t i = 0; i < source_paths.size(); ++i) {
+            boost::filesystem::ofstream stream(source_paths[i], std::ios::binary);
+            REQUIRE(stream.good());
+            stream << contents[i];
+        }
+
+        // A name no PrintConfigDef in this build carries, so the reader's
+        // `option(key, true)` cannot create it. This stands in for the real case: a project
+        // saved by a build that has an option this one does not.
+        const std::string unreadable_key = "petkos_option_this_build_does_not_have";
+
+        DynamicPrintConfig project_config = DynamicPrintConfig::full_print_config();
+        PlateDataPtrs source_plates;
+        for (int i = 0; i < 2; ++i) {
+            PlateData *plate = new PlateData();
+            plate->plate_index = i;
+            plate->is_sliced_valid = true;
+            plate->gcode_file = source_paths[i].string();
+            plate->sliced_config = project_config;
+            plate->sliced_config.set_key_value("nozzle_diameter", new ConfigOptionFloats({i == 0 ? 0.4 : 0.6}));
+            plate->slicing_context.printer_preset_name = i == 0 ? "Readable Printer 0.4" : "Dropped Printer 0.6";
+            if (i == 1)
+                plate->sliced_config.set_key_value(unreadable_key, new ConfigOptionString("whatever this build meant"));
+            source_plates.push_back(plate);
+        }
+        // The poisoned plate's snapshot must carry readable keys too, or "dropped whole" and
+        // "the one bad key was skipped" would look the same on the way back in.
+        REQUIRE(source_plates[1]->sliced_config.keys().size() > 1);
+
+        WHEN("the project is saved with G-code and loaded into a fresh backup directory") {
+            const boost::filesystem::path project_file = work_dir / "dropped_snapshot.3mf";
+            StoreParams store_params;
+            store_params.path = project_file.string();
+            store_params.model = &model;
+            store_params.config = &project_config;
+            store_params.plate_data_list = source_plates;
+            store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence | SaveStrategy::WithGcode;
+            REQUIRE(store_bbs_3mf(store_params));
+
+            Model loaded_model;
+            loaded_model.set_backup_path(extract_dir.string());
+            DynamicPrintConfig loaded_config;
+            ConfigSubstitutionContext ctxt{ForwardCompatibilitySubstitutionRule::Enable};
+            PlateDataPtrs loaded_plates;
+            std::vector<Preset*> project_presets;
+            bool is_bbl_3mf = false, is_orca_3mf = false;
+            Semver file_version;
+            bool loaded = false;
+            REQUIRE_NOTHROW(loaded = load_bbs_3mf(project_file.string().c_str(), &loaded_config, &ctxt, &loaded_model,
+                                                  &loaded_plates, &project_presets, &is_bbl_3mf, &is_orca_3mf,
+                                                  &file_version, nullptr,
+                                                  LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+
+            THEN("the whole project loads, and only the unreadable plate loses its snapshot") {
+                REQUIRE(loaded);
+                REQUIRE(loaded_plates.size() == 2);
+
+                // The readable plate is untouched by its neighbour's bad snapshot.
+                CHECK(loaded_plates[0]->sliced_config_dropped_reason.empty());
+                CHECK_FALSE(loaded_plates[0]->sliced_config.empty());
+                const auto *readable_nozzles = loaded_plates[0]->sliced_config.option<ConfigOptionFloats>("nozzle_diameter");
+                REQUIRE(readable_nozzles != nullptr);
+                REQUIRE(readable_nozzles->values.size() == 1);
+                CHECK_THAT(readable_nozzles->values.front(), Catch::Matchers::WithinAbs(0.4, 1e-9));
+
+                // The poisoned plate loses the snapshot WHOLE: not one key of it survives,
+                // including the ones that read back perfectly well.
+                CHECK(loaded_plates[1]->sliced_config.empty());
+                CHECK(loaded_plates[1]->sliced_config.option("nozzle_diameter") == nullptr);
+
+                // ...and says why, naming the option, rather than dropping it silently.
+                CHECK_FALSE(loaded_plates[1]->sliced_config_dropped_reason.empty());
+                CHECK(loaded_plates[1]->sliced_config_dropped_reason.find(unreadable_key) != std::string::npos);
+
+                // Everything that is actually the project survives on both plates.
+                for (size_t i = 0; i < loaded_plates.size(); ++i) {
+                    CHECK(loaded_plates[i]->slicing_context == source_plates[i]->slicing_context);
+                    REQUIRE_FALSE(loaded_plates[i]->gcode_file.empty());
+                    REQUIRE(boost::filesystem::exists(loaded_plates[i]->gcode_file));
+                    boost::filesystem::ifstream stream(loaded_plates[i]->gcode_file, std::ios::binary);
+                    const std::string restored((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+                    CHECK(restored == contents[i]);
+                }
+                CHECK_FALSE(loaded_model.objects.empty());
+            }
+
+            release_PlateData_list(loaded_plates);
+            for (Preset *preset : project_presets)
+                delete preset;
+        }
+
+        release_PlateData_list(source_plates);
+        boost::filesystem::remove_all(work_dir);
+    }
+}
+
 // Saved nozzle diameter for a single-nozzle-per-extruder printer with a non-standard nozzle.
 // The grouping result rounds every nozzle diameter to the nearest of {0.2,0.4,0.6,0.8} for its
 // internal matching key. That rounded value must NOT reach the saved <filament>/<nozzle> metadata on

@@ -2323,6 +2323,51 @@ void GLCanvas3D::render_thumbnail(ThumbnailData &                    thumbnail_d
     }
 }
 
+//PETKO'S ORCA: one plate's thumbnail, rendered on demand with this canvas's GL context made
+//current first.
+//
+//Carried because render_thumbnail composes no context of its own: it issues GL directly and
+//is correct only while a context is current. Every existing caller is either inside a render
+//pass (_update_imgui_select_plate_toolbar) or inside a dialog that happens to run after one
+//(SelectMachineDialog, SyncAmsInfoDialog), so the requirement is met by accident rather than
+//stated. The sidebar's plate board asks for a single plate from a wx timer, where nothing has
+//just rendered, so it needs the guarantee written down. Without this the board would be a
+//fourth site relying on whatever the last canvas left bound.
+//
+//One image, not two: update_all_plate_thumbnails renders both thumbnail_data and
+//no_light_thumbnail_data for every plate in the project, which is the right shape for the
+//plate strip that draws them all and the wrong shape for a hover that shows one. The
+//no-light copy is for the device dialogs and nothing on the board reads it.
+//
+//It does NOT touch Plater's plate-toolbar dirty flag. That flag also drives the strip's item
+//list rebuild, so consuming it here would leave the strip drawing stale items.
+bool GLCanvas3D::refresh_plate_thumbnail(int plate_index)
+{
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || m_canvas == nullptr || !m_initialized)
+        return false;
+
+    //A project opened from an exported G-code 3MF carries its plate images in the file and has
+    //no model to render from. What is stored is the only truth there is.
+    if (plater->is_gcode_3mf())
+        return false;
+
+    PartPlate *plate = plater->get_partplate_list().get_plate(plate_index);
+    if (plate == nullptr)
+        return false;
+
+    //The same two conditions render() itself checks before issuing anything. A canvas that is
+    //not on screen cannot be made current on every platform, and asking anyway is how a hidden
+    //canvas turns a hover into a GL error.
+    if (!_is_shown_on_screen() || !_set_current())
+        return false;
+
+    const ThumbnailsParams params = {{}, false, true, true, true, plate_index};
+    render_thumbnail(plate->thumbnail_data, PartPlate::plate_thumbnail_width, PartPlate::plate_thumbnail_height,
+                     params, Camera::EType::Ortho);
+    return plate->thumbnail_data.is_valid();
+}
+
 //BBS
 void GLCanvas3D::select_curr_plate_all()
 {

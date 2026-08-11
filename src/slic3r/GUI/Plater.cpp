@@ -692,7 +692,7 @@ struct Sidebar::priv
     ExtruderGroup *single_extruder = nullptr;
 
     int  FromDIP(int n) { return plater->FromDIP(n); }
-    void layout_printer(bool has_bbl_network, bool isDual, const DynamicPrintConfig *printer_cfg);
+    void layout_printer(bool isDual, const DynamicPrintConfig *printer_cfg);
     //The part of the printer layout that depends on WHICH MACHINE is being described, split
     //out so a plate switch can redo it without also re-running layout_printer's tail, which
     //expands a printer section the user has collapsed.
@@ -753,6 +753,14 @@ struct Sidebar::priv
     //The printer the main Print button's routing was last decided from. Switching to a
     //plate on a different machine has to redo that decision, and this says when.
     std::string print_routing_printer;
+    //The project printer row IS the Project row of the board: it is where PROJECT scope
+    //sends the user, so it has to show when the inspector is describing it. Focus, hover
+    //and scope all want to paint that one panel, and three writers means whichever event
+    //fired last wins - the scope marker would vanish on the next mouse move. So all three
+    //record state here and paint_printer_panel is the only thing that paints.
+    bool                  printer_panel_focused       = false;
+    bool                  printer_panel_project_scope = false;
+    std::function<void()> paint_printer_panel;
     // Filament Track Switch status overlay: an icon floated over the left/single extruder AMS area,
     // shown only when the switch is installed (green when ready, red when not calibrated).
     wxStaticBitmap* extruder_separator_icon = nullptr;
@@ -806,11 +814,9 @@ struct Sidebar::priv
 #endif
 };
 
-//has_bbl_network gates the two Bambu network buttons and nothing else; it used to be
-//named isBBL and was passed use_bbl_network(), so a vendor question and a network
-//question were the same argument. isDual is a property of the printer's extruder
-//count, never of its vendor: this fleet's dual-extruder machines are not Bambu ones,
-//and gating the layout on vendor hid the second extruder from all of them.
+//isDual is a property of the printer's extruder count, never of its vendor: this fleet's
+//dual-extruder machines are not Bambu ones, and gating the layout on vendor hid the second
+//extruder from all of them.
 //
 //printer_cfg is the machine this layout is FOR, supplied by the caller instead of looked up
 //here. It used to read the edited Project printer, which made this function and
@@ -818,10 +824,15 @@ struct Sidebar::priv
 //panel_printer_bed answering about two different machines inside one call chain, with this
 //one running second and winning. Pass the current plate's resolved printer config; pass the
 //Project preset's only where no plate exists yet, i.e. from Sidebar's own constructor.
-//nullptr means the plate did not resolve: the bed and flow controls are then left exactly as
-//they are, because substituting the Project machine is the fallback this fork forbids and
-//hiding them on a missing fact would be a silent gate.
-void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual, const DynamicPrintConfig *printer_cfg)
+//nullptr means the plate did not resolve: the bed, flow and network controls are then left
+//exactly as they are, because substituting the Project machine is the fallback this fork
+//forbids and hiding them on a missing fact would be a silent gate.
+//
+//There is deliberately no separate network argument any more. It was the last survivor of
+//the same two-writers bug: a bool computed from the Project preset by the caller, so the
+//Connect and Bambu-sync buttons still described the project's machine on a plate assigned
+//to another vendor's.
+void Sidebar::priv::layout_printer(bool isDual, const DynamicPrintConfig *printer_cfg)
 {
     // Printer - preset
     if (auto sizer = static_cast<wxBoxSizer *>(panel_printer_preset->GetSizer());
@@ -904,11 +915,6 @@ void Sidebar::priv::layout_printer(bool has_bbl_network, bool isDual, const Dyna
         vsizer_printer->AddSpacer(FromDIP(SidebarProps::ContentMarginV()));
     }
 
-    //btn_connect_printer->Show(!isBBL);
-    m_printer_connect->Show(!has_bbl_network);
-    //btn_sync_printer->Show(isBBL);
-    m_printer_bbl_sync->Show(has_bbl_network);
-
     layout_printer_machine(isDual, printer_cfg);
 
     // ORCA ensure printer section is visible after changing printer from printer selection dialog
@@ -935,6 +941,18 @@ void Sidebar::priv::layout_printer_machine(bool isDual, const DynamicPrintConfig
     // ref: https://github.com/OrcaSlicer/OrcaSlicer/pull/11610#discussion_r2607411847
     PresetBundle &preset_bundle = *wxGetApp().preset_bundle;
     panel_printer_bed->Show(preset_bundle.is_bbl_vendor(*printer_cfg) || printer_cfg->opt_bool("support_multi_bed_types"));
+
+    //Which of the two network buttons is offered says how THIS MACHINE is reached, so it
+    //belongs here with the other machine-dependent controls. It used to live in
+    //layout_printer's tail, decided from a bool the caller computed off the Project
+    //preset: update_all_preset_comboboxes set the buttons from the current plate and
+    //then layout_printer, running second, overwrote that with the project's answer, and
+    //the plate-switch path (which calls only this function) never corrected them at all.
+    const bool has_bbl_network = preset_bundle.use_bbl_network(*printer_cfg);
+    //btn_connect_printer->Show(!isBBL);
+    m_printer_connect->Show(!has_bbl_network);
+    //btn_sync_printer->Show(isBBL);
+    m_printer_bbl_sync->Show(has_bbl_network);
 
     extruder_dual_sizer->Show(isDual);
 
@@ -2576,6 +2594,10 @@ Sidebar::Sidebar(Plater *parent)
             wxColour bd_normal = "#DBDBDB";
             wxColour bd_hover  = "#009688";
             wxColour bd_focus  = "#009688";
+            //the board fills the row the inspector is scoped to; the project printer row is a
+            //row of that same set, so it is marked the same way rather than in a second
+            //vocabulary. Same value as PlateBoard's board_sel().
+            wxColour bg_scope  = "#BFE1DE";
         };
         PanelColors panel_color;
 
@@ -2584,6 +2606,12 @@ Sidebar::Sidebar(Plater *parent)
         p->panel_printer_preset->SetBorderColor(panel_color.bd_normal);
         p->panel_printer_preset->SetMinSize(FromDIP(PRINTER_PANEL_SIZE));
         p->panel_printer_preset->Bind(wxEVT_LEFT_DOWN, [this](auto & evt) {
+            //This row is the Project row of the plate board: the board's rollup was the only
+            //thing that could enter PROJECT scope, and the rollup is zero-height at one plate
+            //and hidden below two, so on a small project the scope was unreachable and the
+            //inspector always read PLATE 01. Clicking the project printer says the same thing
+            //the rollup says, and the picker still opens underneath it.
+            set_project_scope();
             p->combo_printer->wxEvtHandler::ProcessEvent(evt);
         });
         // ORCA Hide Cover automatically if there is not enough space
@@ -2602,6 +2630,27 @@ Sidebar::Sidebar(Plater *parent)
         // hover state data for printer panel
         auto printer_preset_hovered = std::make_shared<std::unordered_set<wxWindow*>>();
 
+        //The one painter for this panel. Focus, hover and PROJECT scope all describe it, and
+        //before this each wrote the colours itself, so the last event to fire decided - which
+        //is fine for two transient states and fatal for a persistent one.
+        p->paint_printer_panel = [this, panel_color, printer_preset_hovered]() {
+            if (p == nullptr || p->panel_printer_preset == nullptr || p->combo_printer == nullptr)
+                return;
+            const bool hovered = !printer_preset_hovered->empty();
+            const wxColour bg  = StateColor::darkModeColorFor(p->printer_panel_focused       ? panel_color.bg_focus :
+                                                              p->printer_panel_project_scope ? panel_color.bg_scope :
+                                                                                               panel_color.bg_normal);
+            p->panel_printer_preset->SetBackgroundColor(bg);
+            p->panel_printer_preset->SetBorderColor(p->printer_panel_focused || hovered || p->printer_panel_project_scope
+                                                        ? panel_color.bd_focus
+                                                        : panel_color.bd_normal);
+            if (p->btn_edit_printer != nullptr)
+                p->btn_edit_printer->SetBackgroundColour(bg);
+            if (p->image_printer != nullptr)
+                p->image_printer->SetBackgroundColour(bg);
+            p->combo_printer->SetBackgroundColour(bg); // paints margins instead combo background
+        };
+
         p->btn_edit_printer = new ScalableButton(p->panel_printer_preset, wxID_ANY, "edit");
         p->btn_edit_printer->SetToolTip(_L("Click to edit preset"));
         p->btn_edit_printer->Hide(); // hide for first launch
@@ -2614,8 +2663,9 @@ Sidebar::Sidebar(Plater *parent)
                 // ORCA clicking edit button not triggers wxEVT_KILL_FOCUS wxEVT_LEAVE_WINDOW make changes manually to prevent stucked colors when opening printer settings
                 if (!p || !p->panel_printer_preset || !p->btn_edit_printer)
                     return;
-				p->panel_printer_preset->SetBorderColor(panel_color.bd_normal);
                 printer_preset_hovered->clear();
+                if (p->paint_printer_panel)
+                    p->paint_printer_panel();
                 p->btn_edit_printer->Hide();
                 p->panel_printer_preset->Layout();
             });
@@ -2631,16 +2681,25 @@ Sidebar::Sidebar(Plater *parent)
         p->combo_printer->SetBorderWidth(0);
         p->combo_printer->SetMaxSize(wxSize(-1, FromDIP(30))); // limiting height makes badge visible
         // ORCA paint whole combobox on focus
-        auto printer_focus_bg = [this, panel_color](bool focused){
-            auto bg_color = StateColor::darkModeColorFor(focused ? panel_color.bg_focus : panel_color.bg_normal);
-            p->panel_printer_preset->SetBackgroundColor(bg_color);
-            p->panel_printer_preset->SetBorderColor(focused ? panel_color.bd_focus : panel_color.bd_normal);
-            p->btn_edit_printer->SetBackgroundColour(bg_color);
-            p->image_printer->SetBackgroundColour(bg_color);
-            p->combo_printer->SetBackgroundColour(bg_color); // paints margins instead combo background
+        auto printer_focus_bg = [this](bool focused){
+            //HasFocus() is not yet updated inside SET_FOCUS/KILL_FOCUS, so the state is
+            //recorded rather than queried, and the painter above decides the colours
+            p->printer_panel_focused = focused;
+            if (p->paint_printer_panel)
+                p->paint_printer_panel();
         };
         p->combo_printer->Bind(wxEVT_SET_FOCUS,  [this, printer_focus_bg](auto& e) {printer_focus_bg(true ); e.Skip();});
         p->combo_printer->Bind(wxEVT_KILL_FOCUS, [this, printer_focus_bg](auto& e) {printer_focus_bg(false); e.Skip();});
+        //The combo covers most of the row, and a mouse event does not travel up to the panel,
+        //so the panel's own binding never sees a click that lands here: without this, clicking
+        //the project printer itself was the one part of the Project row that did not enter
+        //PROJECT scope. Bound rather than hung off SET_FOCUS on purpose - the combo is also
+        //focused programmatically, and scope must follow what the user did, not where focus
+        //drifted. Skip() lets ComboBox's own EVT_LEFT_DOWN table entry open the list as before.
+        //The panel and the printer image both forward their click here as well, so that path
+        //calls this twice; set_project_scope is idempotent and the second call re-asserts the
+        //same invariant.
+        p->combo_printer->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) { set_project_scope(); e.Skip(); });
 
         /* ORCA This part moved to titlebar
         p->btn_connect_printer = new ScalableButton(p->panel_printer_preset, wxID_ANY, "monitor_signal_strong");
@@ -2654,16 +2713,16 @@ Sidebar::Sidebar(Plater *parent)
         */
         // ORCA use Show/Hide to gain text area instead using blank icon. also manages hover effect for border
         for (wxWindow *w : std::initializer_list<wxWindow *>{p->panel_printer_preset, p->btn_edit_printer, p->image_printer, p->combo_printer}) {
-            w->Bind(wxEVT_ENTER_WINDOW, [this, w, panel_color, printer_preset_hovered](wxMouseEvent &e) {
+            w->Bind(wxEVT_ENTER_WINDOW, [this, w, printer_preset_hovered](wxMouseEvent &e) {
                 printer_preset_hovered->insert(w);
-                if(!p->combo_printer->HasFocus())
-                    p->panel_printer_preset->SetBorderColor(panel_color.bd_hover);
+                if (p->paint_printer_panel)
+                    p->paint_printer_panel();
                 e.Skip();
             });
-            w->Bind(wxEVT_LEAVE_WINDOW, [this, w, panel_color, printer_preset_hovered](wxMouseEvent &e) {
+            w->Bind(wxEVT_LEAVE_WINDOW, [this, w, printer_preset_hovered](wxMouseEvent &e) {
                 printer_preset_hovered->erase(w);
-                if (printer_preset_hovered->empty() && !p->combo_printer->HasFocus())
-                    p->panel_printer_preset->SetBorderColor(panel_color.bd_normal);
+                if (p->paint_printer_panel)
+                    p->paint_printer_panel();
                 e.Skip();
             });
         }
@@ -2917,7 +2976,7 @@ Sidebar::Sidebar(Plater *parent)
         //No plate exists yet - Sidebar is built from inside Plater::priv's constructor - so the
         //Project row's machine is not a substitute for a plate here, it is the only machine
         //there is. update_presets(TYPE_PRINTER) lays it out for the current plate afterwards.
-        p->layout_printer(true, true, &wxGetApp().preset_bundle->printers.get_edited_preset().config);
+        p->layout_printer(true, &wxGetApp().preset_bundle->printers.get_edited_preset().config);
         p->m_panel_printer_content->SetSizer(p->vsizer_printer);
         p->m_panel_printer_content->Layout();
         scrolled_sizer->Add(p->m_panel_printer_content, 0, wxEXPAND, 0);
@@ -3340,18 +3399,43 @@ void Sidebar::update_all_preset_comboboxes()
 
     auto p_mainframe = wxGetApp().mainframe;
 
-    //Where the print button sends, which device tab is native and which host URL is
-    //loaded are questions about the machine the CURRENT PLATE is on. Reading them off
-    //the Project preset routed a plate pinned to a Prusa through the Bambu network
-    //because some other plate's printer was the project's.
-    auto cfg = preset_bundle.printers.get_edited_preset().config;
+    //The combos and the board first, and unconditionally: they describe presets and
+    //plates rather than one machine, and the board is where an unresolved plate is both
+    //visible and fixable, so it has to refresh even when nothing below can be decided.
+    if (print_tech == ptFFF) {
+        for (PlaterPresetComboBox* cb : p->combos_filament)
+            cb->update();
+    }
+
+    if (p->combo_printer) {
+        p->combo_printer->update();
+        update_printer_thumbnail();
+    }
+
+    //the project printer is what every inherited row is showing, so a change to it
+    //re-beds and re-labels each of them
+    refresh_plate_board();
+
+    //Where the print button sends, which device tab is native, which host URL is loaded
+    //and whether the bed-type control applies are all questions about the machine the
+    //CURRENT PLATE is on. Reading them off the Project preset routed a plate pinned to a
+    //Prusa through the Bambu network because some other plate's printer was the
+    //project's.
+    //
+    //An unresolved plate is not permission to answer them from the Project row either,
+    //which is what seeding cfg with the edited Project preset did: every control below
+    //this point names one specific machine, so they keep the answer they already have
+    //until the plate resolves, and the board above says which plate is broken.
     ResolvedPlateSlicingConfig resolved_plate;
     std::string                plate_error;
-    if (p->plater != nullptr && p->plater->resolve_current_plate_slicing_config(resolved_plate, plate_error, false) &&
-        resolved_plate.printer_preset != nullptr)
-        cfg = resolved_plate.printer_preset->config;
-    else if (!plate_error.empty())
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << plate_error;
+    if (p->plater == nullptr ||
+        !p->plater->resolve_current_plate_slicing_config(resolved_plate, plate_error, false) ||
+        resolved_plate.printer_preset == nullptr) {
+        if (!plate_error.empty())
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << plate_error;
+        return;
+    }
+    auto cfg = resolved_plate.printer_preset->config;
 
     bool is_bbl_vendor = preset_bundle.is_bbl_vendor(cfg);
     const bool use_native_device_tab = preset_bundle.use_bbl_device_tab(cfg) || NetworkAgentFactory::is_current_printer_agent_plugin();
@@ -3399,8 +3483,10 @@ void Sidebar::update_all_preset_comboboxes()
 
     }
     //remember what this routing was decided from, so a plate switch can tell whether
-    //the decision still holds without reloading the device webview to find out
-    p->print_routing_printer = resolved_plate.printer_preset != nullptr ? resolved_plate.printer_preset->name : std::string();
+    //the decision still holds without reloading the device webview to find out. An
+    //unresolved plate returned above without deciding anything, so this is never written
+    //from a machine the routing was not actually chosen for.
+    p->print_routing_printer = resolved_plate.printer_preset->name;
 
     if (cfg.opt_bool("pellet_modded_printer")) {
 		p->m_staticText_filament_settings->SetLabel(_L("Pellets"));
@@ -3448,26 +3534,8 @@ void Sidebar::update_all_preset_comboboxes()
     // ORCA Hide plate selector if not supported by printer
     p->panel_printer_bed->Show(is_bbl_vendor || cfg.opt_bool("support_multi_bed_types"));
 
-    // Update the print choosers to only contain the compatible presets, update the dirty flags.
-    //BBS
-
-    // Update the printer choosers, update the dirty flags.
-    //p->combo_printer->update();
-    // Update the filament choosers to only contain the compatible presets, update the color preview,
-    // update the dirty flags.
-    if (print_tech == ptFFF) {
-        for (PlaterPresetComboBox* cb : p->combos_filament)
-            cb->update();
-    }
-
-    if (p->combo_printer) {
-        p->combo_printer->update();
-        update_printer_thumbnail();
-    }
-
-    //the project printer is what every inherited row is showing, so a change to it
-    //re-beds and re-labels each of them
-    refresh_plate_board();
+    //The filament and printer choosers and the board are updated at the top of this
+    //function now, before the machine-dependent block that can return early.
 
     p_mainframe->show_device(use_native_device_tab);
     p_mainframe->m_tabpanel->SetSelection(p_mainframe->m_tabpanel->GetSelection());
@@ -3574,7 +3642,7 @@ void Sidebar::update_presets(Preset::Type preset_type)
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": current plate printer is unresolved: " << plate_error;
 
         bool is_dual_extruder = extruder_variants->size() == 2;
-        p->layout_printer(preset_bundle.use_bbl_network(), is_dual_extruder, plate_printer_cfg);
+        p->layout_printer(is_dual_extruder, plate_printer_cfg);
 
         // Update nozzle titles from printer config (e.g. "Main Nozzle" / "Auxiliary Nozzle" for N6)
         // UI left = DEPUTY_EXTRUDER_ID(1), UI right = MAIN_EXTRUDER_ID(0)
@@ -4734,7 +4802,8 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
         m_sync_dlg->set_info(temp_info);
     }
     m_sync_dlg->set_target_device_id(device_id);
-    m_sync_dlg->prepare(plate->get_index());
+    if (!m_sync_dlg->prepare(plate->get_index()))
+        return;
     int dlg_res{(int) wxID_CANCEL};
     if (m_sync_dlg->is_need_show()) {
         m_sync_dlg->deal_only_exist_ext_spool(obj);
@@ -5177,6 +5246,14 @@ void Sidebar::refresh_plate_scope()
         p->plate_board->set_scope(m_scoped_plates, m_scope_project);
     if (p->plate_inspector != nullptr)
         p->plate_inspector->reload(m_scoped_plates, m_scope_project);
+    //The project printer row is the PROJECT scope's destination, so it says when it is the
+    //thing the inspector is describing - exactly as the board's rollup does for itself.
+    //Without this the scope could be entered and nothing on screen said which row was in it.
+    if (p->printer_panel_project_scope != m_scope_project) {
+        p->printer_panel_project_scope = m_scope_project;
+        if (p->paint_printer_panel)
+            p->paint_printer_panel();
+    }
 }
 
 void Sidebar::toggle_scoped_plate(int plate_index)
@@ -6952,23 +7029,27 @@ void Plater::priv::select_view_3D(const std::string& name, bool no_slice)
     else if (name == "Preview") {
         BOOST_LOG_TRIVIAL(info) << "select preview";
         //BBS update extruder params and speed table before slicing
-        auto& print = q->get_partplate_list().get_current_fff_print();
-        const Slic3r::DynamicPrintConfig& config = print.full_print_config();
-        auto print_config = print.config();
-        //the filament count belongs to the plate being previewed, not to the Project
-        //row: a plate whose printer takes fewer filaments than the project library
-        //holds was being given the project's count and sized its extruder params to
-        //filaments it does not have
+        //
+        //Both the filament count AND the config it is applied to belong to the plate being
+        //previewed. The count came from the Project filament list, so a plate whose printer
+        //takes fewer filaments than the project library holds was sized to filaments it does
+        //not have; the config came from the background Print, which carries whichever plate
+        //was sliced last. An unresolved plate leaves the previous parameters exactly as they
+        //are: substituting the Project row is the fallback this fork forbids, and the Preview
+        //repopulates them on the next resolvable plate.
         ResolvedPlateSlicingConfig resolved;
         std::string                error;
-        int numExtruders = (int) wxGetApp().preset_bundle->filament_presets.size();
-        if (q->resolve_current_plate_slicing_config(resolved, error))
-            numExtruders = (int) resolved.filament_presets.size();
-        else
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << error;
-
-        Model::setExtruderParams(config, numExtruders);
-        Model::setPrintSpeedTable(config, print_config);
+        if (q->resolve_current_plate_slicing_config(resolved, error)) {
+            Model::setExtruderParams(resolved.config, (int) resolved.filament_presets.size());
+            //second argument is still the background Print's PrintConfig: setPrintSpeedTable
+            //takes a static PrintConfig and reads bed_exclude_area out of it. Composing a
+            //plate-exact one is a separate change; the speed values it colours by all come
+            //from the first argument, which is now the plate's.
+            Model::setPrintSpeedTable(resolved.config, q->get_partplate_list().get_current_fff_print().config());
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": current plate is unresolved, extruder parameters left unchanged: " << error;
+        }
         set_current_panel(preview, no_slice);
     }
     else if (name == "Assemble") {
@@ -11603,18 +11684,50 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n" ;
     }
 
+    //Which network this plate goes out on is a question about THIS PLATE's machine.
+    //Reading it off the Project printer made the button's label and the button's action
+    //disagree: update_all_preset_comboboxes already labels the button from the current
+    //plate, so a Bambu-assigned plate in a Prusa project said "Print plate" and then
+    //uploaded that plate's G-code to a print host, and the inverse opened the Bambu
+    //dispatch dialog for a machine that is not on that network.
+    //
+    //Resolving here is also what stops SelectMachineDialog::prepare throwing out of a wx
+    //event handler: prepare rejects exactly the two states tested below, and nothing
+    //above this frame catches, so the unresolved case used to terminate the application
+    //instead of saying which plate could not be dispatched.
+    const int plate_idx = partplate_list.get_curr_plate_index();
+    if (plate_idx < 0) {
+        show_error(q, _L("There is no plate to print. Select a plate first."), false);
+        return;
+    }
+    ResolvedPlateSlicingConfig resolved;
+    std::string                error;
+    //apply_plate_overrides is false: only the plate's printer identity is wanted here, and
+    //the dispatch dialog composes the full config for itself
+    if (!q->resolve_current_plate_slicing_config(resolved, error, false) || resolved.printer_preset == nullptr) {
+        show_error(q, format_wxstr(_L("Plate %1% cannot be sent to a printer: %2%\n\nAssign a printer to this "
+                                      "plate before printing it."),
+                                   plate_idx + 1, from_u8(error)),
+                   false);
+        return;
+    }
+
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
-    if (preset_bundle.use_bbl_network()) {
+    if (preset_bundle.use_bbl_network(resolved.printer_preset->config)) {
         // BBS
         if (!m_select_machine_dlg)
             m_select_machine_dlg = new SelectMachineDialog(q);
         m_select_machine_dlg->set_print_type(PrintFromType::FROM_NORMAL);
-        m_select_machine_dlg->prepare(partplate_list.get_curr_plate_index());
+        //prepare() now reports a plate it cannot prepare instead of throwing. Showing the
+        //dialog anyway would leave its filament-mapping popup holding the previous plate's
+        //source config, which is the substitution this fork exists to remove.
+        if (!m_select_machine_dlg->prepare(plate_idx))
+            return;
         m_select_machine_dlg->ShowModal();
     } else {
-        //resolve the current plate here, once, so the upload targets the plate the
-        //user is looking at now rather than whichever is current when it runs
-        q->send_gcode_legacy(partplate_list.get_curr_plate_index(), nullptr);
+        //the plate was resolved once above, so the upload targets the plate the user is
+        //looking at now rather than whichever is current when it runs
+        q->send_gcode_legacy(plate_idx, nullptr);
     }
 }
 
@@ -11692,8 +11805,17 @@ void Plater::priv::on_action_send_to_printer(bool isall)
         show_error(q, _L("Send plates individually. Each plate keeps its own printer target and retained slice."), false);
         return;
     }
+    //SendToPrinterDialog::prepare throws on a negative index and this is a wx event
+    //handler with nothing above it that catches, so an absent current plate terminated
+    //the application. Resolve the index here and say which plate is missing instead.
+    const int plate_idx = partplate_list.get_curr_plate_index();
+    if (plate_idx < 0) {
+        show_error(q, _L("There is no plate to send. Select a plate first."), false);
+        return;
+    }
 	if (!m_send_to_sdcard_dlg) m_send_to_sdcard_dlg = new SendToPrinterDialog(q);
-    m_send_to_sdcard_dlg->prepare(partplate_list.get_curr_plate_index());
+    if (!m_send_to_sdcard_dlg->prepare(plate_idx))
+        return;
 
 	m_send_to_sdcard_dlg->ShowModal();
 }
@@ -12341,12 +12463,11 @@ void Plater::get_print_job_data(PrintPrepareData* data)
 
 void Plater::set_print_job_plate_idx(int plate_idx)
 {
-    if (plate_idx == PLATE_CURRENT_IDX) {
-        p->m_print_job_data.plate_idx = get_partplate_list().get_curr_plate_index();
-    }
-    else {
-        p->m_print_job_data.plate_idx = plate_idx;
-    }
+    //No sentinel substitution. This used to turn PLATE_CURRENT_IDX into the current
+    //plate, so a caller that named no plate stamped whichever one was selected into the
+    //job data and the machine that plate belongs to received a file the request never
+    //asked for. All three callers pass a concrete index resolved at the event boundary.
+    p->m_print_job_data.plate_idx = plate_idx;
 }
 
 
@@ -17701,7 +17822,12 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
     if (!bundle->resolve_plate_slicing_config(target_plate->get_slicing_context(), filament_maps, volume_maps,
                                               resolved, context_error)) {
         target_plate->update_apply_result_invalid(true);
-        show_error(this, from_u8(context_error), false);
+        //Name the plate. This function is only ever reached with one concrete index, and the
+        //resolver's own text says what is wrong with the context but not which plate holds it,
+        //so on a multi-plate project the bare message left the user to guess.
+        show_error(this, format_wxstr(_L("Plate %1% cannot be sent to a printer: %2%"), resolved_plate_idx + 1,
+                                      from_u8(context_error)),
+                   false);
         return;
     }
     DynamicPrintConfig target_config = resolved.config;
@@ -17902,16 +18028,17 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
 int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 {
     int result = 0;
-    /* generate 3mf */
-    set_print_job_plate_idx(plate_idx);
 
-    //no sentinel substitution: "all plates" silently became the current plate here,
-    //so a project-wide request produced one plate's file under a name that claimed
-    //otherwise
+    //Reject BEFORE recording the job's plate. Stamping it first left the pending job
+    //data naming a plate on a call that then failed, so a later step could read a plate
+    //index this call never accepted.
     if (plate_idx < 0) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": needs an explicit plate index, got " << plate_idx;
         return -1;
     }
+    /* generate 3mf */
+    set_print_job_plate_idx(plate_idx);
+
     PartPlate* plate = get_partplate_list().get_plate(plate_idx);
     if (plate == nullptr)
         return -1;
@@ -17940,13 +18067,15 @@ int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
 int Plater::export_config_3mf(int plate_idx, Export3mfProgressFn proFn)
 {
     int result = 0;
-    /* generate 3mf */
-    set_print_job_plate_idx(plate_idx);
 
+    //same ordering as send_gcode: reject before recording the job's plate
     if (plate_idx < 0) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": needs an explicit plate index, got " << plate_idx;
         return -1;
     }
+    /* generate 3mf */
+    set_print_job_plate_idx(plate_idx);
+
     PartPlate* plate = get_partplate_list().get_plate(plate_idx);
     if (plate == nullptr)
         return -1;
@@ -19197,14 +19326,14 @@ bool Plater::resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &re
                                         apply_plate_overrides);
 }
 
-//The narrow read. See the comment on the declaration for why it exists: this answers a
+//The narrow read, forwarded to the one home of the plate-inheritance rule. It answers a
 //plate-scoped question about ONE process option without paying for a whole composed config.
 //
-//The lookup order is the order the composition would have produced. construct_full_config
-//applies the printer config, then the process config, then the project config, then the
-//filament config, and resolve_plate_slicing_config applies the plate's own overrides last;
-//process options are carried by the process preset alone (Preset::print_options), so the
-//plate override and then the process preset are the only two places the value can come from.
+//It used to spell that rule out again here, which is how it came to check less than the
+//resolver does: no FDM gate, no nozzle definition, no recorded-vendor check, so a plate the
+//slicer calls unresolved still handed a process value back to the sidebar. The lookup order is
+//unchanged and is the order the composition would have produced - the plate's own override
+//first, then the process preset - and it now lives in PresetBundle::plate_process_option.
 const ConfigOption *Plater::get_plate_process_option(const PartPlate *plate, const std::string &opt_key) const
 {
     //same window as resolve_current_plate_slicing_config: the sidebar asks Plater questions
@@ -19215,25 +19344,7 @@ const ConfigOption *Plater::get_plate_process_option(const PartPlate *plate, con
     if (bundle == nullptr)
         return nullptr;
 
-    //a per-plate override wins, exactly as it does in the composed config
-    if (const ConfigOption *plate_opt = plate->config()->option(opt_key); plate_opt != nullptr)
-        return plate_opt;
-
-    const PresetCollection &prints = bundle->prints;
-    const Preset *          print  = nullptr;
-    if (plate->get_print_preset_name().empty()) {
-        //explicit inheritance from the Project row. An unresolved Project selection is an
-        //error there as much as here, so it is not silently replaced by an edited preset.
-        if (prints.get_selected_idx() == size_t(-1) || prints.get_selected_idx() >= prints.size())
-            return nullptr;
-        print = &prints.get_edited_preset();
-    } else {
-        //exact name, never a nearest match
-        print = prints.find_preset(plate->get_print_preset_name(), false);
-    }
-    if (print == nullptr)
-        return nullptr;
-    return print->config.option(opt_key);
+    return bundle->plate_process_option(plate->get_slicing_context(), plate->config(), opt_key);
 }
 
 void Plater::apply_background_progress()
@@ -20700,19 +20811,18 @@ bool Plater::can_paste_from_clipboard() const
 {
     if (!IsShown() || !p->is_view3D_shown()) return false;
 
-    const Selection& selection = p->view3D->get_canvas3d()->get_selection();
-    const Selection::Clipboard& clipboard = selection.get_clipboard();
+    const Selection::Clipboard& clipboard = p->view3D->get_canvas3d()->get_selection().get_clipboard();
 
     if (clipboard.is_empty() && p->sidebar->obj_list()->clipboard_is_empty())
         return false;
 
-    Selection::EMode mode = clipboard.get_mode();
-    if ((mode == Selection::Volume) && !selection.is_from_single_instance())
-        return false;
-
-    if ((mode == Selection::Instance) && (selection.get_mode() != Selection::Instance))
-        return false;
-
+    //Nothing else. This predicate held copies of the two gates Selection::paste_from_clipboard
+    //was changed to drop, and it runs first - Plater::paste_from_clipboard returns on it and
+    //the Paste menu item is enabled from it - so those repairs were unreachable: a parts
+    //clipboard with no single destination instance, or an object clipboard while the selection
+    //happens to be in Volume mode, produced a greyed-out menu item and a Ctrl+V that did
+    //nothing at all. Selection::paste_from_clipboard now names what is missing instead of
+    //refusing silently, which is the whole point of removing them from here as well.
     return true;
 }
 

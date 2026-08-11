@@ -1,5 +1,6 @@
 #include "PlateSettingsDialog.hpp"
 #include "MsgDialog.hpp"
+#include "format.hpp"
 #include "Widgets/DialogButtons.hpp"
 
 namespace Slic3r { namespace GUI {
@@ -405,12 +406,27 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, int plate_index, cons
         }
     }
 
+    //THIS dialog's plate, not whichever plate happens to be current. Opening plate 3's
+    //settings while plate 1 was selected listed plate 3's bed types and then enabled or
+    //disabled the control from plate 1's machine.
+    //
+    //It does not throw either. This dialog is the only editor for a plate's printer, so it
+    //is where a user comes to FIX an unresolved plate; a throw from a constructor reaches
+    //generic_exception_handle and terminates the application at exactly that moment.
+    //Unresolved leaves the combo enabled on the plate's stored bed type and says what is
+    //wrong: a missing fact is something to tell the user, never something to gate on.
     ResolvedPlateSlicingConfig plate_context;
-    std::string context_error;
-    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(plate_context, context_error))
-        throw RuntimeError(context_error);
-    if (!plate_context.is_bbl_printer)
-        m_bed_type_choice->Disable();
+    std::string                context_error;
+    const bool plate_resolved = wxGetApp().plater()->resolve_plate_slicing_config(
+        wxGetApp().plater()->get_partplate_list().get_plate(plate_index), plate_context, context_error);
+    if (plate_resolved) {
+        //support_multi_bed_types is the other half of this test, applied by the sidebar's
+        //own bed-type visibility (Plater.cpp) and missing from this copy: a non-Bambu
+        //machine that declares several bed types could not choose one here.
+        const ConfigOptionBool *multi_bed = plate_context.config.option<ConfigOptionBool>("support_multi_bed_types");
+        if (!plate_context.is_bbl_printer && !(multi_bed != nullptr && multi_bed->value))
+            m_bed_type_choice->Disable();
+    }
 
     // Printer this plate prints on. Empty selection means follow the project printer.
     m_printer_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);
@@ -494,6 +510,19 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, int plate_index, cons
     top_sizer->Add(m_drag_canvas, 0, wxALIGN_CENTER_VERTICAL | wxALIGN_RIGHT | wxBOTTOM, FromDIP(10));
 
     m_sizer_main->Add(top_sizer, 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(30));
+
+    //The reason, on screen, when this plate's slicing context does not resolve. Without it
+    //the dialog opens looking normal and the user has no way to know why the plate will not
+    //slice - which is the question that brought them here.
+    if (!plate_resolved) {
+        auto *context_warning = new wxStaticText(this, wxID_ANY,
+                                                 GUI::format_wxstr(_L("This plate cannot be sliced yet: %1%"),
+                                                                   from_u8(context_error)));
+        context_warning->SetFont(Label::Body_12);
+        context_warning->SetForegroundColour(wxColour(0xFF, 0x6F, 0x00));
+        context_warning->Wrap(FromDIP(590));
+        m_sizer_main->Add(context_warning, 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT, FromDIP(30));
+    }
 
     // Other layer filament sequence
     m_other_layers_seq_panel = new OtherLayersSeqPanel(this);

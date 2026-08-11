@@ -69,7 +69,12 @@ static WipeTower get_wipe_tower(const Plater &plater, int plate_idx)
     return WipeTower{plater.canvas3D()->get_wipe_tower_info(plate_idx)};
 }
 
-static ResolvedPlateSlicingConfig resolve_arrange_plate(PartPlate *plate)
+//The resolution itself, reporting failure instead of throwing it. This is the core so the
+//two forms cannot drift: the throwing one below is this plus the throw. A caller that must
+//not refuse the user's gesture (paste) needs the answer "no, and here is why"; an arrange
+//that was asked for explicitly still wants the throw, because there is nothing sensible to
+//arrange against and the message reaches the user through the job's handler.
+static bool try_resolve_arrange_plate(PartPlate *plate, ResolvedPlateSlicingConfig &resolved, std::string &error)
 {
     PresetBundle &bundle = *wxGetApp().preset_bundle;
     PlateSlicingContext context;
@@ -87,19 +92,28 @@ static ResolvedPlateSlicingConfig resolve_arrange_plate(PartPlate *plate)
         if (volumes != nullptr)
             volume_maps = volumes->values;
     }
-    ResolvedPlateSlicingConfig resolved;
-    std::string error;
     if (!bundle.resolve_plate_slicing_config(context, filament_maps, volume_maps,
                                              resolved, error)) {
         if (plate != nullptr) {
             plate->update_apply_result_invalid(true);
-            throw RuntimeError((boost::format("Plate %1% has an unresolved slicing context: %2%")
-                                % (plate->get_index() + 1) % error).str());
+            error = (boost::format("Plate %1% has an unresolved slicing context: %2%")
+                     % (plate->get_index() + 1) % error).str();
+        } else {
+            error = "The Project-row slicing context is unresolved: " + error;
         }
-        throw RuntimeError("The Project-row slicing context is unresolved: " + error);
+        return false;
     }
     if (plate != nullptr)
         resolved.config.apply(*plate->config(), true);
+    return true;
+}
+
+static ResolvedPlateSlicingConfig resolve_arrange_plate(PartPlate *plate)
+{
+    ResolvedPlateSlicingConfig resolved;
+    std::string                error;
+    if (!try_resolve_arrange_plate(plate, resolved, error))
+        throw RuntimeError(error);
     return resolved;
 }
 
@@ -1156,159 +1170,178 @@ PlacementResult place_instances_on_plate(Plater *plater, int plate_idx,
     //Everything this plate's machine says about packing. Resolving the plate rather
     //than the project is the whole point: plate 3 may be a different machine, with a
     //different bed and different exclusion areas, from the plate the copy came from.
-    const ResolvedPlateSlicingConfig resolved     = resolve_arrange_plate(plate);
-    const DynamicPrintConfig &       plate_config = resolved.config;
-    const Vec2d                      plate_origin = ppl.get_plate_origin_2d(plate_idx);
+    //
+    //An unresolved plate is not a refusal here. This runs under Ctrl+V, after
+    //Selection::paste_objects_from_clipboard has already called Model::add_object for
+    //every clipboard object and before the object list learns about them, so throwing
+    //out of it terminated the application AND left the Model holding objects nothing
+    //owned. The plate state that produces it is one the fork supports deliberately: the
+    //picker offers "Keep <name> (not installed)". Unresolved therefore packs nothing and
+    //every copy goes to the row in front of the plate, which is what the tail already
+    //does for anything that will not fit, with the reason named.
+    ResolvedPlateSlicingConfig resolved;
+    std::string                resolve_error;
+    const bool                 plate_resolved = try_resolve_arrange_plate(plate, resolved, resolve_error);
+    const DynamicPrintConfig & plate_config   = resolved.config;
+    const Vec2d                plate_origin   = ppl.get_plate_origin_2d(plate_idx);
 
-    arrangement::ArrangeParams params = init_arrange_params(plater);
-    params.clearance_height_to_rod = plate_config.opt_float("extruder_clearance_height_to_rod");
-    params.clearance_height_to_lid = plate_config.opt_float("extruder_clearance_height_to_lid");
-    params.clearance_radius        = plate_config.opt_float("extruder_clearance_radius");
-    params.printable_height        = (float) plate->get_printable_height();
-    params.nozzle_height           = plate_config.opt_float("nozzle_height");
-    params.is_seq_print            = plate->get_real_print_seq() == PrintSequence::ByObject;
-    params.bed_shrink_x            = params.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
-    params.bed_shrink_y            = params.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
-    //Spacing is the user's arrange spacing. init_arrange_params() zeroes it when the
-    //current plate prints in a different sequence from the project, which is a rule
-    //about the plate being arranged, not about this one.
-    params.min_obj_distance = scaled(plater->canvas3D()->get_arrange_settings().distance);
-    //A copy keeps the orientation it was copied with.
-    params.allow_rotations = false;
-    //Both of these move the whole packed pile once packing is done, and that pile
-    //includes the items already on the plate. Those items' positions do survive (only
-    //the new ones are read back) but the new ones would land shifted off them and
-    //overlap. So alignment is off by default, and best_object_pos is neutralised so
-    //that AutoArranger does not turn it back on as a user-defined alignment. It is
-    //switched back on below in the one case where there is no pile to stay relative to.
-    params.do_final_align = false;
-    params.align_center   = Vec2d(0.5, 0.5);
-    params.progressind    = [](unsigned, std::string) {};
-    params.excluded_regions.clear();
-    params.nonprefered_regions.clear();
+    arrangement::ArrangePolygons selected;
+    std::vector<size_t>          selected_source;
+    std::vector<size_t>          leftovers;
 
-    const bool enable_wrapping = plate_config.opt_bool("enable_wrapping_detection");
-    ppl.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scale_(1), plate_idx);
+    if (!plate_resolved) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << resolve_error
+                                   << "; placing the copies in front of the plate instead of packing them";
+        for (size_t k = 0; k < instances.size(); ++k)
+            leftovers.push_back(k);
+    } else {
+        arrangement::ArrangeParams params = init_arrange_params(plater);
+        params.clearance_height_to_rod = plate_config.opt_float("extruder_clearance_height_to_rod");
+        params.clearance_height_to_lid = plate_config.opt_float("extruder_clearance_height_to_lid");
+        params.clearance_radius        = plate_config.opt_float("extruder_clearance_radius");
+        params.printable_height        = (float) plate->get_printable_height();
+        params.nozzle_height           = plate_config.opt_float("nozzle_height");
+        params.is_seq_print            = plate->get_real_print_seq() == PrintSequence::ByObject;
+        params.bed_shrink_x            = params.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
+        params.bed_shrink_y            = params.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
+        //Spacing is the user's arrange spacing. init_arrange_params() zeroes it when the
+        //current plate prints in a different sequence from the project, which is a rule
+        //about the plate being arranged, not about this one.
+        params.min_obj_distance = scaled(plater->canvas3D()->get_arrange_settings().distance);
+        //A copy keeps the orientation it was copied with.
+        params.allow_rotations = false;
+        //Both of these move the whole packed pile once packing is done, and that pile
+        //includes the items already on the plate. Those items' positions do survive (only
+        //the new ones are read back) but the new ones would land shifted off them and
+        //overlap. So alignment is off by default, and best_object_pos is neutralised so
+        //that AutoArranger does not turn it back on as a user-defined alignment. It is
+        //switched back on below in the one case where there is no pile to stay relative to.
+        params.do_final_align = false;
+        params.align_center   = Vec2d(0.5, 0.5);
+        params.progressind    = [](unsigned, std::string) {};
+        params.excluded_regions.clear();
+        params.nonprefered_regions.clear();
 
-    //Fixed items: everything already standing on this plate, plus its wipe tower.
-    //These are preloaded into the bin and never moved.
-    arrangement::ArrangePolygons fixed;
-    std::set<std::pair<int, int>> being_placed(instances.begin(), instances.end());
-    for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
-        ModelObject *mo = model.objects[oidx];
-        for (size_t iidx = 0; iidx < mo->instances.size(); ++iidx) {
-            if (being_placed.count({(int) oidx, (int) iidx}) > 0)
-                continue;
-            if (!plate->contain_instance((int) oidx, (int) iidx) && !plate->intersect_instance((int) oidx, (int) iidx))
-                continue;
-            arrangement::ArrangePolygon ap = get_instance_arrange_poly(mo->instances[iidx], plate_config);
-            if (ap.poly.contour.size() < 3)
-                continue;
-            ap.name    = mo->name;
-            ap.bed_idx = 0;
-            ap.setter  = nullptr;
-            ap.translation(X) -= scaled<double>(plate_origin.x());
-            ap.translation(Y) -= scaled<double>(plate_origin.y());
+        const bool enable_wrapping = plate_config.opt_bool("enable_wrapping_detection");
+        ppl.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scale_(1), plate_idx);
+
+        //Fixed items: everything already standing on this plate, plus its wipe tower.
+        //These are preloaded into the bin and never moved.
+        arrangement::ArrangePolygons fixed;
+        std::set<std::pair<int, int>> being_placed(instances.begin(), instances.end());
+        for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
+            ModelObject *mo = model.objects[oidx];
+            for (size_t iidx = 0; iidx < mo->instances.size(); ++iidx) {
+                if (being_placed.count({(int) oidx, (int) iidx}) > 0)
+                    continue;
+                if (!plate->contain_instance((int) oidx, (int) iidx) && !plate->intersect_instance((int) oidx, (int) iidx))
+                    continue;
+                arrangement::ArrangePolygon ap = get_instance_arrange_poly(mo->instances[iidx], plate_config);
+                if (ap.poly.contour.size() < 3)
+                    continue;
+                ap.name    = mo->name;
+                ap.bed_idx = 0;
+                ap.setter  = nullptr;
+                ap.translation(X) -= scaled<double>(plate_origin.x());
+                ap.translation(Y) -= scaled<double>(plate_origin.y());
+                fixed.emplace_back(std::move(ap));
+            }
+        }
+        //The wipe tower rectangle is rebuilt here from its plate-local position and its
+        //footprint rather than taken from WipeTower::get_arrange_polygon(), which mixes a
+        //world-space outline with a plate-local translation and so only lands correctly
+        //on plate 0.
+        const GLCanvas3D::WipeTowerInfo wti = plater->canvas3D()->get_wipe_tower_info(plate_idx);
+        if (wti) {
+            const Vec2d wt_pos  = wti.pos();
+            const Vec2d wt_size = wti.bb_size();
+            arrangement::ArrangePolygon ap;
+            ap.poly.contour = Polygon({{scaled(wt_pos.x()), scaled(wt_pos.y())},
+                                       {scaled(wt_pos.x() + wt_size.x()), scaled(wt_pos.y())},
+                                       {scaled(wt_pos.x() + wt_size.x()), scaled(wt_pos.y() + wt_size.y())},
+                                       {scaled(wt_pos.x()), scaled(wt_pos.y() + wt_size.y())}});
+            ap.bed_idx        = 0;
+            ap.is_virt_object = true;
+            ap.is_wipe_tower  = true;
+            ap.height         = 1;
+            ap.name           = "WipeTower";
             fixed.emplace_back(std::move(ap));
         }
-    }
-    //The wipe tower rectangle is rebuilt here from its plate-local position and its
-    //footprint rather than taken from WipeTower::get_arrange_polygon(), which mixes a
-    //world-space outline with a plate-local translation and so only lands correctly
-    //on plate 0.
-    const GLCanvas3D::WipeTowerInfo wti = plater->canvas3D()->get_wipe_tower_info(plate_idx);
-    if (wti) {
-        const Vec2d wt_pos  = wti.pos();
-        const Vec2d wt_size = wti.bb_size();
-        arrangement::ArrangePolygon ap;
-        ap.poly.contour = Polygon({{scaled(wt_pos.x()), scaled(wt_pos.y())},
-                                   {scaled(wt_pos.x() + wt_size.x()), scaled(wt_pos.y())},
-                                   {scaled(wt_pos.x() + wt_size.x()), scaled(wt_pos.y() + wt_size.y())},
-                                   {scaled(wt_pos.x()), scaled(wt_pos.y() + wt_size.y())}});
-        ap.bed_idx        = 0;
-        ap.is_virt_object = true;
-        ap.is_wipe_tower  = true;
-        ap.height         = 1;
-        ap.name           = "WipeTower";
-        fixed.emplace_back(std::move(ap));
-    }
 
-    //An empty plate has no pile for the copies to stay relative to, so they may be
-    //centred exactly the way an arrange of an empty plate centres things. The moment
-    //there is something already standing there, that centring would drag the copies
-    //off the objects they were packed around, and it stays off.
-    if (fixed.empty()) {
-        params.do_final_align = true;
-        if (const ConfigOptionPoint *best_pos = plate_config.option<ConfigOptionPoint>("best_object_pos"))
-            params.align_center = best_pos->value;
-    }
-
-    //Items to place. A degenerate hull is dropped by Arrange's process_arrangeable(),
-    //which would slide every later result onto the wrong item, so it never enters the
-    //list; it is reported as unplaced instead.
-    arrangement::ArrangePolygons        selected;
-    std::vector<size_t>                 selected_source;
-    std::vector<size_t>                 leftovers;
-    for (size_t k = 0; k < instances.size(); ++k) {
-        ModelInstance *mi = instance_of(instances[k]);
-        if (mi == nullptr)
-            continue;
-        arrangement::ArrangePolygon ap = get_instance_arrange_poly(mi, plate_config);
-        if (ap.poly.contour.size() < 3 || ap.poly.area() < 0.001) {
-            leftovers.push_back(k);
-            continue;
+        //An empty plate has no pile for the copies to stay relative to, so they may be
+        //centred exactly the way an arrange of an empty plate centres things. The moment
+        //there is something already standing there, that centring would drag the copies
+        //off the objects they were packed around, and it stays off.
+        if (fixed.empty()) {
+            params.do_final_align = true;
+            if (const ConfigOptionPoint *best_pos = plate_config.option<ConfigOptionPoint>("best_object_pos"))
+                params.align_center = best_pos->value;
         }
-        ap.name    = model.objects[instances[k].first]->name;
-        ap.bed_idx = 0;
-        ap.itemid  = (int) selected.size();
-        //the result is applied here, in world coordinates, not through the setter
-        ap.setter = nullptr;
-        ap.translation(X) -= scaled<double>(plate_origin.x());
-        ap.translation(Y) -= scaled<double>(plate_origin.y());
-        selected.emplace_back(std::move(ap));
-        selected_source.push_back(k);
-    }
 
-    //This plate's own bed outline. An empty one means the plate was never shaped,
-    //which is a defect to repair at its source; it does not license packing against
-    //the project bed, so everything falls through to the row below instead.
-    Points bedpts;
-    for (const Vec2d &p : plate->get_local_shape())
-        bedpts.emplace_back(scaled(p.x()), scaled(p.y()));
-
-    if (bedpts.size() >= 3 && !selected.empty()) {
-        update_arrange_params(params, &plate_config, selected);
-        update_selected_items_inflation(selected, &plate_config, params);
-        update_unselected_items_inflation(fixed, &plate_config, params);
-        bedpts = arrangement::get_shrink_bedpts(std::move(bedpts), params);
-
-        BOOST_LOG_TRIVIAL(info) << boost::format("place: %1% new item(s) onto plate %2% ('%3%'), around %4% fixed item(s)")
-                                       % selected.size() % (plate_idx + 1)
-                                       % (plate->has_printer_assignment() ? plate->get_printer_preset_name() : std::string("project printer"))
-                                       % fixed.size();
-        arrangement::arrange(selected, fixed, bedpts, params);
-        result.arranged = true;
-
-        for (size_t i = 0; i < selected.size(); ++i) {
-            ModelInstance *mi = instance_of(instances[selected_source[i]]);
+        //Items to place. A degenerate hull is dropped by Arrange's process_arrangeable(),
+        //which would slide every later result onto the wrong item, so it never enters the
+        //list; it is reported as unplaced instead.
+        for (size_t k = 0; k < instances.size(); ++k) {
+            ModelInstance *mi = instance_of(instances[k]);
             if (mi == nullptr)
                 continue;
-            //bed 0 is this plate. Anything else means the nester needed another bed,
-            //i.e. it did not fit here.
-            if (selected[i].bed_idx != 0) {
-                leftovers.push_back(selected_source[i]);
+            arrangement::ArrangePolygon ap = get_instance_arrange_poly(mi, plate_config);
+            if (ap.poly.contour.size() < 3 || ap.poly.area() < 0.001) {
+                leftovers.push_back(k);
                 continue;
             }
-            Vec2d offs = selected[i].translation.cast<double>();
-            offs.x() += scaled<double>(plate_origin.x());
-            offs.y() += scaled<double>(plate_origin.y());
-            mi->apply_arrange_result(offs, selected[i].rotation);
-            ++result.placed;
+            ap.name    = model.objects[instances[k].first]->name;
+            ap.bed_idx = 0;
+            ap.itemid  = (int) selected.size();
+            //the result is applied here, in world coordinates, not through the setter
+            ap.setter = nullptr;
+            ap.translation(X) -= scaled<double>(plate_origin.x());
+            ap.translation(Y) -= scaled<double>(plate_origin.y());
+            selected.emplace_back(std::move(ap));
+            selected_source.push_back(k);
         }
-    }
-    else {
-        for (size_t i : selected_source)
-            leftovers.push_back(i);
+
+        //This plate's own bed outline. An empty one means the plate was never shaped,
+        //which is a defect to repair at its source; it does not license packing against
+        //the project bed, so everything falls through to the row below instead.
+        Points bedpts;
+        for (const Vec2d &p : plate->get_local_shape())
+            bedpts.emplace_back(scaled(p.x()), scaled(p.y()));
+
+        if (bedpts.size() >= 3 && !selected.empty()) {
+            update_arrange_params(params, &plate_config, selected);
+            update_selected_items_inflation(selected, &plate_config, params);
+            update_unselected_items_inflation(fixed, &plate_config, params);
+            bedpts = arrangement::get_shrink_bedpts(std::move(bedpts), params);
+
+            BOOST_LOG_TRIVIAL(info) << boost::format("place: %1% new item(s) onto plate %2% ('%3%'), around %4% fixed item(s)")
+                                           % selected.size() % (plate_idx + 1)
+                                           % (plate->has_printer_assignment() ? plate->get_printer_preset_name() : std::string("project printer"))
+                                           % fixed.size();
+            arrangement::arrange(selected, fixed, bedpts, params);
+            result.arranged = true;
+
+            for (size_t i = 0; i < selected.size(); ++i) {
+                ModelInstance *mi = instance_of(instances[selected_source[i]]);
+                if (mi == nullptr)
+                    continue;
+                //bed 0 is this plate. Anything else means the nester needed another bed,
+                //i.e. it did not fit here.
+                if (selected[i].bed_idx != 0) {
+                    leftovers.push_back(selected_source[i]);
+                    continue;
+                }
+                Vec2d offs = selected[i].translation.cast<double>();
+                offs.x() += scaled<double>(plate_origin.x());
+                offs.y() += scaled<double>(plate_origin.y());
+                mi->apply_arrange_result(offs, selected[i].rotation);
+                ++result.placed;
+            }
+        }
+        else {
+            for (size_t i : selected_source)
+                leftovers.push_back(i);
+        }
     }
 
     if (leftovers.empty())
@@ -1334,15 +1367,21 @@ PlacementResult place_instances_on_plate(Plater *plater, int plate_idx,
         ++result.unplaced;
         leftover_names.insert(model.objects[instances[k].first]->name);
 
-        arrangement::ArrangePolygon ap = get_instance_arrange_poly(mi, plate_config);
+        //The footprint, and nothing else. This row is geometry: where a shape can be
+        //laid down so it is visible and not on top of its neighbour. It deliberately
+        //does not go through get_instance_arrange_poly(), which reads temperatures,
+        //support settings and brim widths out of a print config and dereferences those
+        //options unconditionally - so on an unresolved plate, which is exactly when this
+        //branch takes every copy, it would crash rather than answer.
+        arrangement::ArrangePolygon ap;
+        mi->get_arrange_polygon(&ap);
         if (ap.poly.contour.size() < 3)
             continue;   //no footprint to lay out; it keeps the position it was created at
         Polygon hull = ap.poly.contour;
         hull.rotate(ap.rotation);
         const BoundingBox hull_bb = hull.bounding_box();
-        //get_instance_arrange_poly()'s contour carries no X/Y offset, so the instance
-        //offset that puts the footprint at a chosen corner is that corner minus the
-        //footprint's own corner.
+        //the contour carries no X/Y offset, so the instance offset that puts the
+        //footprint at a chosen corner is that corner minus the footprint's own corner.
         const Vec2d offs((double) (cursor_x - hull_bb.min.x()), (double) (row_top - hull_bb.max.y()));
         mi->apply_arrange_result(offs, ap.rotation);
         cursor_x += hull_bb.size().x() + gap;
@@ -1352,11 +1391,22 @@ PlacementResult place_instances_on_plate(Plater *plater, int plate_idx,
         std::string names;
         for (const std::string &name : leftover_names)
             names += (names.empty() ? "" : ", ") + name;
+        //Two different reasons reach this row, and saying "no room" for the second one
+        //would send the user looking for space they already have. An unresolved plate
+        //names the plate and what is wrong with it, because that is the thing to fix.
+        //std::string, not wxString: GUI::format returns std::string and
+        //NotificationManager::push_notification takes one.
+        const std::string message =
+            plate_resolved ?
+                GUI::format(_L("There was no room left on plate %1% for: %2%\n"
+                               "They were placed in front of the plate instead, so you can move them where you want them."),
+                            plate_idx + 1, names) :
+                GUI::format(_L("Plate %1% could not be used to place: %2%\n%3%\n"
+                               "They were placed in front of the plate instead, so you can move them where you want them."),
+                            plate_idx + 1, names, resolve_error);
         plater->get_notification_manager()->push_notification(
             NotificationType::BBLPlateInfo, NotificationManager::NotificationLevel::WarningNotificationLevel,
-            GUI::format(_L("There was no room left on plate %1% for: %2%\n"
-                           "They were placed in front of the plate instead, so you can move them where you want them."),
-                        plate_idx + 1, names));
+            message);
     }
 
     return result;

@@ -731,11 +731,14 @@ void SendToPrinterDialog::sending_mode()
     }
 }
 
-void SendToPrinterDialog::prepare(int print_plate_idx)
+bool SendToPrinterDialog::prepare(int print_plate_idx)
 {
-    if (print_plate_idx < 0)
-        throw Slic3r::RuntimeError("Send-to-printer requires one explicit plate");
+    if (print_plate_idx < 0) {
+        show_error(this, _L("Sending to a printer needs one explicit plate. Select a plate first."), false);
+        return false;
+    }
     m_print_plate_idx = print_plate_idx;
+    return true;
 }
 
 void SendToPrinterDialog::update_priner_status_msg(wxString msg, bool is_warning)

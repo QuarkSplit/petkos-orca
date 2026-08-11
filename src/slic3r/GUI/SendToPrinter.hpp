@@ -191,7 +191,8 @@ public:
     void update_user_printer();
     void update_show_status();
     bool is_blocking_printing(MachineObject* obj_);
-    void prepare(int print_plate_idx);
+    //false when there is no plate to send: spoken, not thrown. See SelectMachineDialog::prepare.
+    bool prepare(int print_plate_idx);
     void check_focus(wxWindow* window);
     void check_fcous_state(wxWindow* window);
     void update_priner_status_msg(wxString msg, bool is_warning = false);

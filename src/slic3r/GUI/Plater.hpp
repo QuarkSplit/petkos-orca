@@ -47,8 +47,14 @@ class ModelObject;
 class ModelInstance;
 class Print;
 class SLAPrint;
-//BBS: add partplatelist and SlicingStatusEvent
-class PartPlateList;
+//BBS: add SlicingStatusEvent
+//There is deliberately no `class PartPlateList;` here. PartPlateList lives in Slic3r::GUI and
+//is forward-declared below with its neighbours; the copy that used to sit at Slic3r scope
+//named a class that does not exist in that namespace, so it could never be defined and no
+//translation unit ever used it. It was not harmless: any file that opens both Slic3r and
+//Slic3r::GUI with using-directives - which a test outside the namespace must - found two
+//candidates for the unqualified name and failed with an ambiguity that pointed at the caller
+//instead of at this line.
 class SlicingStatusEvent;
 class BackgroundSlicingProcess;
 enum SLAPrintObjectStep : unsigned int;
@@ -183,7 +189,9 @@ public:
     //Modifier-click on a board row: changes the scope set and never the current plate.
     //The current plate can never be removed from the set.
     void toggle_scoped_plate(int plate_index);
-    //Clicking the board's project-wide line. Leaves the current plate alone.
+    //Clicking the board's project-wide line, or the project printer row above it, which
+    //is the same row and is reachable when the rollup is not (the rollup is zero-height
+    //at one plate and the whole board is hidden below two). Leaves the current plate alone.
     void set_project_scope();
     //Re-assert the invariant above and push the result at the board and the inspector.
     void refresh_plate_scope();
@@ -565,13 +573,14 @@ public:
     // Expose the slicing process so the device GUI can read the current
     // GCodeProcessorResult (e.g. the nozzle grouping for print-dispatch mapping).
     BackgroundSlicingProcess& background_process();
-    /* -1: send current gcode if not specified
-     * -2: send all gcode to target machine */
-    int send_gcode(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
-    //plate_idx is required and concrete: no default that means "whichever plate is
-    //current when this runs". Callers resolve the current plate at the event boundary.
+    //plate_idx is required and concrete on all three. The -1/-2 "current plate"/"all
+    //plates" sentinels and their defaults are gone: a defaulted call compiled, dispatched
+    //one plate's file under a name that claimed otherwise, and after the bodies started
+    //rejecting a negative index it became a silent failure instead. Callers resolve the
+    //current plate at the event boundary and pass its concrete index.
+    int send_gcode(int plate_idx, Export3mfProgressFn proFn = nullptr);
     void send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn = nullptr);
-    int export_config_3mf(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
+    int export_config_3mf(int plate_idx, Export3mfProgressFn proFn = nullptr);
     //BBS jump to nonitor after print job finished
     void send_calibration_job_finished(wxCommandEvent &evt);
     void print_job_finished(wxCommandEvent &evt);
@@ -683,6 +692,9 @@ public:
     int get_prepare_state();
     //BBS: add print job releated functions
     void get_print_job_data(PrintPrepareData* data);
+    //Records which plate the pending job is for. It is a plain assignment: it used to
+    //turn PLATE_CURRENT_IDX into the current plate, which is how a request naming no
+    //plate silently became a dispatch of whichever one happened to be selected.
     void set_print_job_plate_idx(int plate_idx);
 
     int get_send_calibration_finished_event();
@@ -787,13 +799,14 @@ public:
     // resolve_plate_slicing_config is the correct answer wherever a full config is wanted, but it
     // copies the printer, the process and every filament preset and then applies
     // FullPrintConfig::defaults() plus four more whole-config passes; a path the renderer walks
-    // cannot pay that per frame. This resolves the same plate-scoped process identity and reads
-    // the single key out of it.
+    // cannot pay that per frame.
     //
-    // It substitutes nothing. An empty per-plate process name means the plate explicitly inherits
-    // the Project row, which is the identity the full resolver uses for it too; a named process
-    // preset that is not present is unresolved and yields nullptr rather than the Project's value.
-    // Returns nullptr when the plate, the bundle or the process preset cannot answer.
+    // A thin forward to PresetBundle::plate_process_option, which is tier 1 of
+    // resolve_plate_slicing_config and the single home of the plate-inheritance rule. It
+    // substitutes nothing: an empty per-plate name is explicit inheritance from the Project row,
+    // a named preset resolves by exact name and is never remapped, and anything unresolved
+    // yields nullptr rather than the Project's value. See that declaration for which keys may be
+    // read this way - process options only, and only those no later composition layer carries.
     const ConfigOption *get_plate_process_option(const PartPlate *plate, const std::string &opt_key) const;
     void validate_current_plate(bool& model_fits, bool& validate_error);
     // Rebuild the missing-plugin sets from the active presets and (re)show/close their notifications.

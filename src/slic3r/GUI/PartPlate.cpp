@@ -110,89 +110,42 @@ static bool resolve_plate_context(const PartPlate *plate, ResolvedPlateSlicingCo
     return true;
 }
 
-// Tier-1 siblings of resolve_plate_context. resolve_plate_context is tier 2: it composes the
+// The GUI-side adapter for tier 1. resolve_plate_context above is tier 2: it composes the
 // plate's whole effective config, which copies the printer, the process and every filament
 // preset and then applies FullPrintConfig::defaults() plus four more whole-config passes. That
 // is the right answer for slicing and the wrong one for a question asked once per plate per
 // frame, which is what the render path does.
 //
-// These resolve the same identity by the same rules - an empty name in the plate's context is
-// explicit inheritance from the Project row, a named preset is resolved by exact name and never
-// remapped, a recorded vendor must still match - and then stop, so the caller can read the one
-// option it wanted off the preset that owns it.
+// The inheritance rule itself lives in exactly one place, PresetBundle::resolve_plate_presets:
+// an empty name in the plate's context is explicit inheritance from the Project row, a named
+// preset is resolved by exact name and never remapped, a recorded vendor must still match, and
+// the printer must be FDM and carry a nozzle definition. This function adds only the
+// availability check the render path needs, because it runs on paths where there may be no
+// wxApp and no bundle at all. It composes nothing, writes nothing and throws nothing: a query
+// must not set state an action owns.
 //
-// The narrow read is only equal to the composed value when no later layer carries the key.
-// construct_full_config applies defaults, printer, process, project, filament in that order and
-// the plate's own overrides last. Check any new key against s_project_options in PresetBundle.cpp
-// and the option lists in Preset.cpp before reading it this way. Verified for the keys used here:
-// nozzle_diameter is a printer option carried by no later layer, print_sequence and spiral_mode
-// are process options and are in neither s_project_options nor the printer/filament sets.
-//
-// These belong on PresetBundle as tier 1 of resolve_plate_slicing_config, with tier 2 calling
-// them, so the inheritance rule lives in one place; Plater::get_plate_process_option is a third
-// copy of the same rule for the same reason. Fold all three when PresetBundle is next opened.
-//
-// Like resolve_plate_context after its own repair, these write nothing and throw nothing. A
-// query must not set state an action owns.
-struct PlatePrinterIdentity
+// The narrow read the callers then do is only equal to the composed value when no later layer
+// carries the key. construct_full_config applies defaults, printer, process, project, filament
+// in that order and the plate's own overrides last. Check any new key against s_project_options
+// in PresetBundle.cpp and the option lists in Preset.cpp before reading it this way. Verified
+// for the keys used here: nozzle_diameter is a printer option carried by no later layer, and
+// print_sequence is a process option in neither s_project_options nor the printer/filament sets.
+static bool resolve_plate_presets(const PartPlate *plate, ResolvedPlatePresets &presets)
 {
-    const Preset *preset { nullptr };
-    std::string   vendor_id;
-    bool          is_bbl_vendor { false };
-};
-
-static bool resolve_plate_printer_identity(const PartPlate *plate, PlatePrinterIdentity &identity)
-{
-    identity = PlatePrinterIdentity();
+    presets = ResolvedPlatePresets();
     if (plate == nullptr || wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
         return false;
 
-    const PresetBundle       &bundle  = *wxGetApp().preset_bundle;
-    const PlateSlicingContext context = plate->get_slicing_context();
-
-    const Preset *printer = nullptr;
-    if (context.printer_preset_name.empty()) {
-        if (bundle.printers.get_selected_idx() == size_t(-1) || bundle.printers.get_selected_idx() >= bundle.printers.size())
-            return false;
-        printer = &bundle.printers.get_edited_preset();
-    } else {
-        printer = bundle.printers.find_preset(context.printer_preset_name, false);
-    }
-    if (printer == nullptr || printer->printer_technology() != ptFFF)
-        return false;
-
-    const PresetWithVendorProfile printer_profile = bundle.printers.get_preset_with_vendor_profile(*printer);
-    std::string vendor_id = (printer_profile.vendor != nullptr) ? printer_profile.vendor->id : std::string();
-    if (!context.printer_vendor_id.empty() && context.printer_vendor_id != vendor_id)
-        return false;
-
-    identity.preset        = printer;
-    identity.is_bbl_vendor = vendor_id == "BBL";
-    identity.vendor_id     = std::move(vendor_id);
-    return true;
-}
-
-static const Preset *resolve_plate_process_preset(const PartPlate *plate)
-{
-    if (plate == nullptr || wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
-        return nullptr;
-
-    const PresetBundle &bundle = *wxGetApp().preset_bundle;
-    const std::string   name   = plate->get_print_preset_name();
-    if (name.empty()) {
-        if (bundle.prints.get_selected_idx() == size_t(-1) || bundle.prints.get_selected_idx() >= bundle.prints.size())
-            return nullptr;
-        return &bundle.prints.get_edited_preset();
-    }
-    return bundle.prints.find_preset(name, false);
+    std::string error;
+    return wxGetApp().preset_bundle->resolve_plate_presets(plate->get_slicing_context(), presets, error);
 }
 
 static bool plate_uses_dual_bbl(const PartPlate *plate)
 {
-    PlatePrinterIdentity identity;
-    if (!resolve_plate_printer_identity(plate, identity) || !identity.is_bbl_vendor)
+    ResolvedPlatePresets presets;
+    if (!resolve_plate_presets(plate, presets) || !presets.is_bbl_printer)
         return false;
-    const ConfigOptionFloats *nozzles = identity.preset->config.option<ConfigOptionFloats>("nozzle_diameter");
+    const ConfigOptionFloats *nozzles = presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter");
     return nozzles != nullptr && nozzles->values.size() == 2;
 }
 
@@ -413,17 +366,24 @@ PrintSequence PartPlate::get_real_print_seq(bool* plate_same_as_global) const
     // the process preset's value are the same value. This is asked once per frame from the
     // overlay render, and composing the plate's whole config to read one enum copied every
     // preset in that plate's context.
-    const Preset *print = resolve_plate_process_preset(this);
-    if (print == nullptr) {
+    PrintSequence curr_plate_seq = get_print_seq();
+
+    ResolvedPlatePresets presets;
+    if (!resolve_plate_presets(this, presets)) {
+        // Only the PROCESS PRESET is unavailable here. The plate's own sequence is the plate's
+        // own data and needs no preset to be read, exactly as PresetBundle::plate_process_option
+        // returns a plate override for a context that does not resolve. Answering ByDefault for
+        // a plate the user explicitly set to ByObject is not a smaller answer, it is a wrong
+        // one: arrange reads this to decide extruder clearance (ArrangeJob is_seq_print), so it
+        // would pack that plate's parts too close to print sequentially, silently.
         if (plate_same_as_global)
             *plate_same_as_global = false;
-        return PrintSequence::ByDefault;
+        return curr_plate_seq;
     }
 
 	PrintSequence global_print_seq = PrintSequence::ByDefault;
-	if (const auto *opt = print->config.option<ConfigOptionEnum<PrintSequence>>("print_sequence"))
+	if (const auto *opt = presets.print->config.option<ConfigOptionEnum<PrintSequence>>("print_sequence"))
 		global_print_seq = opt->value;
-    PrintSequence curr_plate_seq = get_print_seq();
     if (curr_plate_seq == PrintSequence::ByDefault) {
 		curr_plate_seq = global_print_seq;
     }
@@ -995,14 +955,15 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
     // fact. Composing this plate's whole config to count nozzles ran once per frame for the
     // selected plate. It also made the logo depend on the plate's filaments and process
     // resolving, which has nothing to do with which bed picture to draw.
-    PlatePrinterIdentity identity;
-    if (!resolve_plate_printer_identity(this, identity))
+    ResolvedPlatePresets presets;
+    if (!resolve_plate_presets(this, presets))
         return;
-    const auto *nozzles = identity.preset->config.option<ConfigOptionFloats>("nozzle_diameter");
+    // Tier 1 refuses a printer preset with no nozzle definition, so this pointer is
+    // non-null and non-empty here. The check is kept because the option has to be looked
+    // up anyway and a null read is a crash, not a wrong picture; drawing the bed logo must
+    // never be what decides whether this plate can be sliced.
+    const auto *nozzles = presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter");
     if (nozzles == nullptr || nozzles->values.empty()) {
-        // Drawing the bed logo must not decide whether this plate can be sliced. The
-        // resolver already refuses a printer preset with no nozzle definition, so reaching
-        // here means the texture cannot be chosen, nothing more.
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": plate context has no nozzle definition";
         return;
     }

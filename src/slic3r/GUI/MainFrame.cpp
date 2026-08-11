@@ -709,7 +709,20 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
             m_print_enable = get_enable_print_status();
             m_print_btn->Enable(m_print_enable);
             if (m_print_enable) {
-                if (wxGetApp().preset_bundle->use_bbl_network())
+                //Which network this goes out on is a question about the CURRENT PLATE's
+                //machine, not the Project row's. Reading the Project preset here posted the
+                //Bambu dispatch event for a plate assigned to a print-host machine, and the
+                //inverse, while the button's own label already came from the plate.
+                //An unresolved plate posts PRINT_PLATE deliberately: its handler is the one
+                //place that names the plate and says why it cannot be dispatched, so the
+                //shortcut reuses that message instead of inventing a second one, and is
+                //never silent.
+                ResolvedPlateSlicingConfig resolved;
+                std::string                error;
+                const bool plate_resolved = wxGetApp().plater() != nullptr &&
+                                            wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error) &&
+                                            resolved.printer_preset != nullptr;
+                if (!plate_resolved || wxGetApp().preset_bundle->use_bbl_network(resolved.printer_preset->config))
                     wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_PRINT_PLATE));
                 else
                     wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SEND_GCODE));
@@ -2135,7 +2148,17 @@ wxBoxSizer* MainFrame::create_side_tools()
                 bool support_send = true;
 
                 if (bundle) {
-                    if (bundle->use_bbl_network()) {
+                    //Whether "Send to Printer" exists in this dropdown is a question about the
+                    //CURRENT PLATE's machine; it was answered from the Project printer, so the
+                    //entry disappeared for a Bambu-assigned plate in a third-party project.
+                    //An unresolved plate offers everything: hiding an entry because a fact is
+                    //missing is a silent gate, and each action names the plate itself.
+                    ResolvedPlateSlicingConfig resolved;
+                    std::string                error;
+                    const bool plate_resolved = wxGetApp().plater() != nullptr &&
+                                                wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error) &&
+                                                resolved.printer_preset != nullptr;
+                    if (!plate_resolved || bundle->use_bbl_network(resolved.printer_preset->config)) {
                         // BBL network support everything
                     } else {
                         support_send = false; // All 3rd print hosts do not have the send options

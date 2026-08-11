@@ -15,6 +15,10 @@ add_executable(${_TEST_NAME}_tests
     test_plugin_sort.cpp
     test_plugin_cloud_metadata.cpp
     test_plugin_audit.cpp
+    # PlateBoardModel lives in libslic3r_gui, which libslic3r_tests does not link. This is the
+    # only test target that does, so the plate board's data layer is exercised from here. See the
+    # header comment in the file. Move it to tests/libslic3r if the model ever moves to libslic3r.
+    test_plate_board_model.cpp
     ../fff_print/test_helpers.cpp
     )
 

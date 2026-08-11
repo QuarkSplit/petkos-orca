@@ -193,26 +193,56 @@ not claim that the repository-wide audit, implementation, build, or tests are co
 - Focused `[PlateContext]` and `[RetainedGcode]` tests have not yet been built or run after these
   changes.
 
-#### Audit findings recorded but not changed before the pause
+#### Audit findings recorded at the pause — all seven answered, verdicts added 2026-08-11
+
+**This list is closed. It is kept because the findings are still the clearest statement of what was
+wrong, but none of it is outstanding work.** Each verdict below was established by reading the tree,
+not by trusting the commit that claimed the fix. Six were repaired; one was answered deliberately in
+the opposite direction and must not be reopened.
 
 - `Sidebar::priv::layout_printer` is passed Bambu-network capability where it expects vendor
   identity, and dual-extruder layout is restricted to Bambu. The bed-visibility check also ignores
   its `isBBL` argument and rereads the Project preset.
+  → **Closed.** The machine-dependent half is now `layout_printer_machine(bool isDual, const
+  DynamicPrintConfig *printer_cfg)`, which reads the plate config it is handed and returns early on
+  `nullptr` rather than substituting the Project machine. Dual-extruder layout carries no vendor
+  test. A **third defect of the same shape**, found on 11 Aug and not in the original wording, is
+  also closed: the two network buttons were still decided from the Project printer by a second
+  writer that ran after the first, so a Bambu plate in an Elegoo project showed the wrong pair after
+  any preset refresh. Both `Show()` calls moved beside the bed control.
 - Preview setup still sizes extruder parameters from the Project filament list instead of the
-  current plate's resolved config.
+  current plate's resolved config. → **Closed.** The Project-list initialiser is gone; an
+  unresolved plate now leaves the previous extruder parameters in place instead of applying the
+  Project count.
 - The legacy `SendJob` and the legacy send/export helpers still accept current/all sentinels after
   launch. Their UI callers should resolve the current plate once and pass its concrete index.
+  → **Closed.** `SendJob::process` and `send_gcode_legacy` reject a sentinel and resolve the target
+  plate's own context; the event boundary resolves the current plate once. The **declarations** kept
+  their `= -1` defaults and their now-false doc comment, and `set_print_job_plate_idx` still
+  performed the `PLATE_CURRENT_IDX` substitution before the reject; that residue was removed on
+  11 Aug.
 - `PlateSettingsDialog` is constructed before the event's target plate is retrieved, so its bed and
-  vendor controls can still be based on whichever plate was current.
+  vendor controls can still be based on whichever plate was current. → **Closed.** The dialog takes
+  the index and builds its bed-type list from that plate. Its enable/disable decision was still
+  reading the *current* plate and **threw out of the constructor** when that plate was unresolved,
+  which killed the application on the way into the one editor that can repair an unresolved plate.
+  Fixed 11 Aug: it resolves its own plate and reports rather than throws.
 - The main Print action still chooses Bambu-network versus print-host routing from the Project
   printer, and the main button's default action can remain stale after switching to a plate with a
-  different printer.
+  different printer. → **Closed.** The stale-default half was already fixed; the routing half was
+  half-converted, with a plate-derived label over a Project-derived handler, so the button could
+  name one network and dispatch to the other. `on_action_print_plate` and both `MainFrame` routing
+  sites now read the current plate's resolved printer.
 - GL-canvas nozzle/filament compatibility still passes the Project filament-preset list even though
-  the print config is plate-local. The exact config already carries `filament_settings_id` and
-  should be the source.
+  the print config is plate-local. → **Closed.** It reads the plate config's own
+  `filament_settings_id`; the unresolved branch clears the warnings rather than substituting.
 - The normal Bambu dialog still contains permissive branches for missing printer-model data and
-  timelapse-storage checks that time out or fail. These currently proceed instead of remaining an
-  explicit error and therefore need removal under the no-fallback rule.
+  timelapse-storage checks that time out or fail. → **Split, and one half deliberately refused.**
+  `is_same_printer_model` no longer answers "yes" when it cannot tell, and the caller turns the
+  unknown into a confirm-before-send warning. The **timelapse check keeps proceeding**, and says so
+  in a notification naming the consequence. An unanswered storage query is a maybe, a maybe must not
+  block a print, and the cost of being wrong is an overwritten old video rather than a damaged
+  machine. The defect was the silence. Do not re-raise this as a no-fallback violation.
 
 ## Work log — 2026-08-10, session 2 (the printer panel; in progress)
 
@@ -272,6 +302,12 @@ project printer. What is not built is the drawing of it inside the board control
 grouping modes, drag), the bulk `Assign to every unassigned plate` footer, and the deletion of the
 in-canvas plate strip. The strip is left in place: deleting it at this stage would remove the
 thumbnails with only a hover preview to replace them, and that is open thread 3 in the plan.
+
+> **Superseded.** Stages 4 and 5 landed in `907d7604a2` and `f58b26ea3f`; the hover preview and drag
+> landed on 2026-08-11. The bulk footer named here **was already built** in this very session, as a
+> modifier on the next pick — the paragraph two bullets above says so, and this list contradicts it.
+> The strip is still in place, but for a better reason than the one given here: see the 2026-08-11
+> entry.
 
 ### Bugfixes from the queued list above
 
@@ -404,6 +440,11 @@ point. Anything added there is a fourth.
 
 ### Verification state
 
+**Superseded on 2026-08-11. The two statements below that are now false are the last two bullets:
+the board HAS been seen working on a multi-plate project, and the focused tests HAVE been built and
+run. `BUILD_TESTS` is `ON`. The bullets are left standing because this log records the sequence of
+evidence rather than its conclusion; read the 2026-08-11 entry for the current state.**
+
 - Release build of `libslic3r` and `libslic3r_gui`: **clean, 0 errors.**
 - **The application starts.** Launched with no project: main window up, responding, no crash log.
   The only errors it logs are two pre-existing `PartPlate::calc_exclude_triangles: Unable to create
@@ -421,3 +462,409 @@ point. Anything added there is a fourth.
 - Focused `[PlateContext]` / `[RetainedGcode]` tests: **still not run.** The build directory has
   `BUILD_TESTS:BOOL=OFF`, which is why the previous round could not run them either. Catch2 is
   vendored at `tests/catch2`, so turning it on needs no new dependency.
+
+## Work log — 2026-08-10, session 3 (stage 4, and an audit that killed its own suggestions)
+
+Commit `907d7604a2`. Nine agents audited the tree and continued the UI. Thirteen findings,
+**seven real and six refuted.**
+
+### Stage 4 of the printer panel
+
+- The pinned inspector, with its `PLATE nn` / `N PLATES` / `PROJECT` scopes stated in a badge rather
+  than inferred from what was last clicked.
+- `Sidebar::m_scoped_plates`, with its invariant — the current plate is always a member and the set
+  is never empty — enforced in **one** function. Two enforcement sites is how a scope set comes to
+  disagree with `PartPlateList` about what is selected.
+- Ctrl/shift-click to extend the scope, and upward resolution from an object selection.
+- Per-plate bed type, using the dialog's verbatim inheritance strings. Inventing a second vocabulary
+  for the same fact is how two controls come to describe one state differently.
+- Read-only nozzle, filament-usage and mapping rows: none of those three is per-plate storage, and
+  an editable-looking control over storage that does not exist is a lie the moment it is clicked.
+- `More plate settings` routes through `EVT_OPEN_PLATESETTINGSDIALOG` rather than constructing the
+  dialog, so the dialog keeps the sixty lines of syncing `Plater` already does for it.
+
+### Six findings refuted, recorded as refuted
+
+Four of the six were raised against the `PartPlate` filament checks (`check_tpu_printable_status`,
+`check_filament_printable`, `check_mixture_of_pla_and_petg`,
+`check_compatible_of_nozzle_and_filament`) and all four assumed those checks could be reached with a
+partially populated config. They cannot: every caller passes a config produced by
+`construct_full_config`, whose first statement applies `FullPrintConfig::defaults()`, so the keys
+the findings assumed absent are always present. The premise held only of the old background-`Print`
+path, which F5 removed in the same commit. **Re-checked at HEAD on 11 Aug and still refuted.**
+
+Those four were the items proposed *before* the audit ran. The adversarial pass earned its keep by
+killing the coordinator's own suggestions, which is the outcome to expect from one rather than the
+surprising one.
+
+### The seven that were real
+
+- **F7 — a `const` query wrote state.** `resolve_plate_context` set `m_apply_invalid`, one writer
+  and no clearer, and the query runs over non-current plates from the render loop. So a plate that
+  was briefly unresolvable kept a sticky failure and a `SLICE_FAILED` thumbnail long after the cause
+  was gone. `render_logo` had the same write. Both now only report, and the flag is owned by the
+  action path that can clear it. A per-frame error log went with them.
+- **F8 — retained-slice validity compared the wrong two things:** composed config against
+  engine-transformed config. The engine rewrites 135 real user settings, so excusing those keys as
+  noise would have meant a process-preset edit stopped invalidating a retained slice. Now composed
+  against composed. It also fixes the CLI, which tested the snapshot before the headless early-out
+  and was therefore told every plate it had just sliced was invalid.
+- **F5 — `validate_current_plate` read the background `Print`'s config**, which belongs to whichever
+  plate the background process happens to hold and can be a different plate entirely.
+- **The retained slice never survived a reopen.** `_load_model_from_file` parses plate metadata into
+  `m_plater_data` and copies about 25 fields out to the caller; `sliced_config` was not one of them,
+  so every reopened plate got an empty snapshot and read as stale. Two further exactness defects on
+  the same path: values were escaped with `xml_escape`, so newline, tab and CR normalised to spaces
+  on read, and reading through `set_deserialize` ran preset migration over a machine-written
+  snapshot.
+- **A retained-slice key this build cannot parse** now drops that plate's snapshot, records the
+  reason and keeps the project, instead of failing the whole 3MF load.
+- **Opening a project poisoned the app config.** `export_selections` persisted the transient
+  project-embedded preset names, closing the project deleted those presets, and the next launch threw
+  from `full_fff_config` during `MainFrame::init_tabpanel`. A project-embedded printer is no longer
+  written to AppConfig.
+- The AppConfig keeper, which became its own commit and is recorded below.
+
+**The focused tests ran here for the first time**: `[PlateContext]` and `[RetainedGcode]`, 60
+assertions in 3 cases, green. `BUILD_TESTS` had been `OFF` in the build directory, which is why the
+two previous rounds could not run them and why their work logs could not say whether they passed.
+
+### `3f2223996e` — a stale name must not deselect a valid preset
+
+`select_preset_by_name_strict` does not leave a failed selection alone: on a miss it sets
+`m_idx_selected` to `(size_t)-1`, deselecting the collection. A stale name in AppConfig therefore
+did not merely fail to be honoured, it **destroyed the valid selection `load_presets` had already
+made**, and the resulting empty preset name reached `full_fff_config` and killed the application
+about 48 seconds into launch. A persisted name is now selected only when it names an installed
+preset; otherwise the collection keeps what it has and says which selection it kept.
+
+Not a fallback: there is no valid name being substituted for, and what stays is the collection's own
+installed selection rather than a guess at what the user meant.
+
+**Two limits found on 11 Aug, recorded beside the fix so they are not mistaken for new defects in
+it.** Both are open.
+
+- The guard tests **presence, not installedness.** `find_preset` matches on canonical name and
+  ignores `is_visible`; `select_preset_by_name_strict` requires `is_visible`. Every system preset
+  from a loaded vendor profile stays in the collection merely marked invisible, so a printer the user
+  unticked in the Configuration Wizard passes the guard, fails the strict select, and deselects the
+  collection exactly as before. Fix: resolve the preset once, require `p->is_visible`, and pass
+  `p->name` so the `renamed_from` resolution actually takes effect.
+- What it keeps for a poisoned config is `Default Printer` / `Default Setting`, the internal
+  placeholders. The app reaches its main window, which is what the commit claims and all it claims.
+  But every plate that inherits then inherits a placeholder, and the poisoning loop is still live at
+  the other end: see the AppConfig finding in the 11 Aug entry.
+
+## Work log — 2026-08-10, session 4 (stage 5, the render path, and paste that arranges)
+
+Commit `f58b26ea3f`. Five agents on disjoint files: two explorations that edited nothing, three
+deliverables.
+
+### Stage 5
+
+All four grouping modes with sticky collapsible headers, proportional queue bars in the by-capacity
+headers, compact 22 px rows inside groups over eight plates, and the n>8 default switch held as
+**"not explicit"** so a project that grows past eight regroups itself. Grouping state is per project
+and resets on a project change, rather than leaving a large project's grouping on a small one.
+
+### F6 — the render path was composing a full print config per plate per frame
+
+The 3D editor reached `plate_uses_dual_bbl` through `render_icons`, which the original finding
+missed and which is the largest site: **36 config compositions per frame** at the plate bound, each
+roughly a thousand heap allocations. That is now a printer-preset lookup and one option read,
+short-circuited on vendor first, so the editor composes none. `render_logo` and `get_real_print_seq`
+likewise. In the plate toolbar, three validity calls per sliced plate per frame became one, hoisted
+out of the loop, and `is_slice_result_valid`'s two-way `diff()` became `equals()` — identical
+semantics, because `ConfigBase::diff` and `equals` both iterate only the intersection of the key
+sets, and no key vector is allocated.
+
+The short circuit was re-derived from scratch on 11 Aug and is value-identical to the composed
+answer: `nozzle_diameter` and `print_sequence` appear in none of the option lists
+`construct_full_config` writes, so the composed value always equals the preset's.
+
+### Paste arranges instead of stacking
+
+A copy lands on the **current** plate, packed into the free space around the objects already there,
+which are handed to the nester as fixed obstacles and never moved: the user placed those
+deliberately. The bed and exclusion areas come from that plate, not the project, because in this
+fork every plate has its own. Final alignment is disabled when the plate is occupied, or libnest2d
+translates the preloaded items too and the copies land shifted off the very things they were packed
+around. Anything that does not fit is laid out in the row in front of the plate and named in one
+notification: nothing is refused and nothing is dropped.
+
+Those three claims were verified independently on 11 Aug at the libnest2d level: fixed items are
+`markAsFixedInBin` and routed to `fixed_bins` rather than `store_`, so no existing `ModelInstance` is
+written at all; `do_final_align` is genuinely off and the `USER_DEFINED` override cannot re-arm it;
+and every leftover increments `unplaced` and inserts its object name *before* the contour test, so a
+part with no usable footprint is still named.
+
+### The debt this commit declared, and what it actually was
+
+The commit body says the plate-inheritance rule now exists in three places. A read on 11 Aug found
+**four**: `PlateBoardModel::build` writes it inline as well, and had diverged from the other three
+rather than merely duplicating them — it reads the *saved* selected preset instead of the edited
+one, applies neither the ptFFF gate nor the recorded-vendor check, and therefore renders a blank
+machine name in every inherited row where the other three raise an explicit error.
+
+**Declared debt is not measured debt.** Three of the four sites are folded below; the fourth is
+deferred with a reason.
+
+## Work log — 2026-08-11 (the fold, the board finished, and the first build all three agents met in)
+
+Six agents: two read-only audits, three implementers on disjoint files, one build. Everything below
+was verified against the tree rather than taken from the commit that claimed it, which is how the
+four-not-three finding above was made.
+
+### The plate-inheritance rule has one home
+
+New tier-1 entry point on `PresetBundle`, declared above the composing resolver:
+
+```cpp
+struct ResolvedPlatePresets { const Preset *printer, *print; std::string printer_vendor_id; bool is_bbl_printer; };
+bool resolve_plate_presets(const PlateSlicingContext&, ResolvedPlatePresets&, std::string &error) const;
+const ConfigOption *plate_process_option(const PlateSlicingContext&, const DynamicPrintConfig *plate_overrides,
+                                         const std::string &opt_key) const;
+```
+
+Tier 1 owns the whole rule and nothing else: an empty field is explicit inheritance from the Project
+row, a named preset resolves by exact name and is never remapped, the printer must be ptFFF with a
+non-empty `nozzle_diameter`, and a recorded vendor id must still match. It composes nothing,
+allocates no preset copy, writes no state and throws nothing. `resolve_plate_slicing_config` now
+calls it and keeps only compatibility, the filament list and `construct_full_config`; the two
+`PartPlate.cpp` statics are gone, replaced by one thin GUI adapter that adds only the no-wxApp
+availability check; and `Plater::get_plate_process_option` forwards to `plate_process_option`.
+
+**Why this had to happen rather than being logged as tidiness:** the copies had already diverged in
+behaviour. Two checked neither the nozzle definition nor the recorded vendor, and the two process
+copies checked no printer at all, so a plate the slicer calls unresolved still handed a process value
+back to the sidebar. Four answers to one question is four chances to disagree, and they were already
+taking them.
+
+**The fold widened a latent defect, and writing the test for it is what found it.**
+`PartPlate::get_real_print_seq` returned `ByDefault` on an unresolved context, discarding the plate's
+**own** `print_sequence` override, which needs no preset to read. That was latent before, because the
+old copy resolved only the process preset; the fold requires the printer to resolve too, so every
+plate whose printer preset is not installed hit it — and the picker deliberately supports exactly
+that state. `ArrangeJob` turns this value into `params.is_seq_print`, so a plate the user had set to
+ByObject would have been packed without extruder clearance, silently. It now reads the plate's own
+value first and falls through to the process preset only when the plate said nothing, matching how
+`plate_process_option` treats a plate override.
+
+### The board's two unfinished affordances
+
+- **Hover thumbnail on a row, and the refresh owner that made it possible.**
+  `GLCanvas3D::_update_imgui_select_plate_toolbar` was the **only** consumer of
+  `Plater::is_plate_toolbar_image_dirty()` — that is, the in-canvas strip was the only thing that
+  ever refreshed `PartPlate::thumbnail_data`. Nine producers mark the flag and without the strip
+  nobody clears it. New `GLCanvas3D::refresh_plate_thumbnail(int)` carries the guarantee the board
+  cannot make for itself: `render_thumbnail` issues GL directly and is correct only while a context
+  is current, and the board asks from a wx timer where nothing has just rendered. `_set_current` and
+  `_is_shown_on_screen` are private, so this belongs in the canvas rather than at the call site. It
+  renders one image, not the strip's two per plate, and does **not** consume the dirty flag, which
+  also drives the strip's own item rebuild.
+- **Drag to a group header, finished.** Autoscroll was motion-driven, so holding the pointer against
+  the edge produced nothing and a group scrolled out of view was **unreachable while the button was
+  held** — a drag that cannot be completed. It is now clock-driven and recomputes the drop target
+  each tick, because no motion event is coming. The drag pill was clipped to the scroll region, so it
+  vanished exactly when the pointer was furthest from a target; it is now drawn after
+  `DestroyClippingRegion` and clamped into the control. A press in Plate-order or By-material is
+  recorded and, past the slop, **answers with where the gesture works**, once per grouping mode:
+  previously it did nothing and said nothing, which is this fork's definition of a silent gate.
+
+Two smaller repairs of the same character. The board's notifications moved from `BBLPlateInfo` to
+`CustomNotification`, because `NotificationManager::set_in_preview` hides every `BBLPlateInfo` while
+the Preview tab is up and the board lives in the sidebar, which is up on both tabs — a message that
+vanishes on one tab is the silence it was written to replace. And the hover preview now hides on
+`wxEVT_SHOW`, because the sidebar hides the board below two plates and a hidden parent does not hide
+a top-level popup.
+
+**The rollup counted kinds of assignment, not machines.** `machines` was
+`assigned_machines.size() + (any_inherited ? 1 : 0)`, and the picker lists the project printer as an
+ordinary entry, so explicitly assigning one plate to the preset the Project row already names — one
+click — counted a single physical machine twice. It is now a distinct-name set, and `summary_text`
+uses `_L_PLURAL` so one machine no longer reads "1 machines".
+
+### The last of the queued audit list, and two throws that killed the application
+
+Two uncaught `Slic3r::RuntimeError`s were thrown out of wx event handlers.
+`generic_exception_handle` rethrows `std::exception`, so `OnExceptionInMainLoop` returns false and
+the process terminates. Both fired **exactly when a plate's context was unresolved**, which is to say
+in the two places a user goes to diagnose or repair one:
+
+- `SelectMachineDialog::prepare`, reached by pressing Print. It now returns `bool`, shows the error
+  and returns false; `SendToPrinterDialog` and `SyncAmsInfoDialog` took the same treatment, and the
+  callers guard the `ShowModal` exactly as `SendMultiMachinePage` already did.
+- `PlateSettingsDialog`, whose bed-type gate resolved the *current* plate rather than the dialog's
+  own and threw from the constructor. Opening plate 3's settings while plate 1 was current therefore
+  greyed the control according to plate 1's vendor, and an unresolved current plate killed the app on
+  the way into the only editor that can fix an unresolved plate.
+
+This is the flush-volume lesson recurring in a new place: **a query and an action must not share a
+throw.** It is also a harder gate than the disabled button the rules already call a bug.
+
+Also closed here: the half-converted Print routing (a plate-derived label over a Project-derived
+handler, so the button could name one network and dispatch to the other), the Preview extruder-count
+fallback to the Project filament list, `layout_printer`'s network argument, and the sentinel residue
+in `Plater.hpp` and `set_print_job_plate_idx`. **`can_paste_from_clipboard` still held both gates
+`Selection::paste_from_clipboard` had been changed to drop**, so the previous commit's paste fix was
+unreachable and the Paste menu item was greyed with no message; both conditions are gone. And
+`place_instances_on_plate` called a resolver that **throws**, straight from the Ctrl+V handler, with
+no catch in any frame above it — so pasting onto a plate whose printer preset is not installed killed
+the process, after the clipboard objects had already been added to the `Model`. It now routes those
+copies to the leftovers row and names the plate.
+
+The PROJECT-scope destination was completed rather than reparented: `combo_printer` itself now binds
+`wxEVT_LEFT_DOWN` to `Sidebar::set_project_scope` and skips to the combo's own handler, because a
+child's mouse event does not travel up to the panel and the combo covers most of the row's width.
+
+### Build
+
+`cmake --build build --config Release --target OrcaSlicer_app_gui libslic3r_tests slic3rutils_tests`
+— **zero errors**, three targets linked, no new warning. One source fix was needed and it was a
+missing declaration: `refresh_plate_thumbnail` had a definition and a call site but no entry in
+`GLCanvas3D.hpp`, because the agent that wrote the definition did not own the header.
+
+`slic3rutils_tests` was added to the target list deliberately. `PlateBoardModel` lives in
+`libslic3r_gui`, which `libslic3r_tests` does not link, so the board's only headless coverage is
+compiled by that target alone, and the build line the recon phase produced would have passed while
+silently skipping every case in it.
+
+The staging pair under `build/OrcaSlicer/` was 72 minutes and 12 days stale respectively and has been
+refreshed. Nothing in the normal loop reads it, which is exactly why it rots unnoticed. **Do not
+treat anything under `build/OrcaSlicer/` as evidence of what the current code does.**
+
+### Tests
+
+| Suite | Filter | Result |
+|---|---|---|
+| `libslic3r_tests` | `[PlateContext],[RetainedGcode]` | **214 assertions in 7 cases, pass** (was 60 in 3) |
+| `slic3rutils_tests` | `[PlateBoard],[PlateContext]` | **367 assertions in 7 cases, pass** (new suite) |
+| `libslic3r_tests` | full | 184 cases, **1 failed** |
+| `slic3rutils_tests` | full | 106 cases, **1 failed**, 33 skipped |
+
+Both wider failures were **stale tests rather than new breakage**, and both test sources are fixed.
+
+- `Printer extruder count tolerates missing nozzle diameter` asserted a fallback this fork repealed.
+  Commit `34e0c7b3dd` changed `get_printer_extruder_count` from warn-and-return-1 to
+  error-and-return-0 for a missing or empty `nozzle_diameter` — a deliberate no-fallback edit that
+  **the commit body never named**, which is why nothing noticed the upstream test still asserting the
+  old behaviour. The test now asserts 0 and is renamed to say so.
+- `test_plugin_audit` hardcoded `orcaslicer.conf` where every sibling assertion uses
+  `SLIC3R_APP_KEY`, and `29291cec5d` renamed the key to `PetkosOrca` on 29 July. The security check
+  itself is intact: `is_denied_filename` uses `istarts_with`, and the uppercase-token assertion in
+  the same section passed. The test now case-flips the key at runtime so the trap cannot recur on the
+  next rename.
+
+**Neither test fix has been compiled or run.** They were written after the build; they are
+expected-value and string-construction changes only, and both identifiers were checked to exist — but
+that is an argument, not a measurement. The next build settles it, and it should read 184/184 and
+73 passed / 0 failed / 33 skipped.
+
+`fff_print`, `sla_print`, `libnest2d`, `filament_group` and `compare_analyzer` are **not built** and
+their state is unknown. The 33 skips are all "the interpreter is already running", a one-process
+harness limit, pre-existing.
+
+### Live verification, and the crash it found
+
+Verified on `DC-17M Watergun.3mf`, 7 plates over 5 installed machines, against the 3MF's own
+metadata: every row names the printer the file names, part counts match, the bed glyphs are
+measurably proportional (Prusa CORE One drew 30×26 px for a 250×220 bed, ratio 1.154 against 1.136),
+the swatches carry the real library colours **without the board having parsed the plate names**, the
+inspector resolves per plate, and the log confirms the engine agrees:
+`apply_plate_config: plate 1 slicing with printer 'Elegoo Centauri Carbon 0.4 nozzle'`. All four
+grouping modes and collapse/expand work.
+
+**Not verified, for want of a fixture:** hours and weight from a plate's own retained slice, the
+rollup totals, and the capacity queue bar. No 3MF on either drive carries retained G-code, so every
+hours cell is an em-dash and the rollup honestly reads "7 not estimated". Producing this needs a live
+slice, save and reopen.
+
+**A reproducible crash, 2 of 2, on the 21-plate fixture.** `Superdestroyer-BD.3mf` dies after its
+four load dialogs, with no WER event, no dump and no "unhandled exception" line. It rides on a live
+no-fallback violation that is visible in the log:
+
+```
+[error] PresetBundle::update_compatible: Project printer selection is unresolved
+[info]  PresetCollection::select_preset: machine try to select preset 1
+[info]  machine set Anycubic 4Max Pro 0.4 nozzle, idx 1 to visible
+```
+
+`Anycubic 4Max Pro` is not one of the seven installed models. `reset_project_embedded_presets`
+correctly sets `m_idx_selected = -1`; `delete_current_preset` then passes that through both of its
+range guards, neither of which is true for `(size_t)-1`, into `select_preset((size_t)-1)`, which
+falls to `first_visible_idx()`, which can only ever match a preset whose `get_printer_id()` is
+`ORCA_FILAMENT_LIBRARY` — no printer can — and so returns `m_num_default_presets`, index 1, the
+alphabetically first system printer on disk whether installed or not. `select_preset` then **marks
+that invisible preset visible**, which is the substitution becoming permanent and unannounced. The
+`delete_current_preset` step is inferred; everything from `first_visible_idx()` onward is proved by
+the log above. Open, and it outranks the remaining panel work.
+
+**The Project row also poisons its own AppConfig, and the loop is still live.** The combo reads
+`(DC-17M Watergun.3mf)` — a project-embedded preset with an empty base name — and
+`export_selections` writes that string into `PetkosOrca.conf`. On the next launch `3f2223996e`'s
+keeper fires and the app survives, keeping `Default Printer` / `Default Setting`, the internal
+placeholders. So every inheriting plate inherits a placeholder, and opening the next project restocks
+the poison.
+
+**Four modal dialogs gate every downloaded project load**, and until the last is dismissed the
+sidebar still shows the pre-load state. One of them declares a process preset incompatible with the
+printer it shipped in the same 3MF with. For a farm whose entire input stream is MakerWorld projects,
+that is the workflow rather than an edge case.
+
+Two method notes for the next live pass, both of which produced a wrong reading before they were
+understood. **Make the process per-monitor DPI aware first**, or `GetWindowRect` comes back scaled by
+1/1.25 and `PrintWindow` renders into an undersized DC, silently invalidating every coordinate. And
+**posted clicks queue behind the app's own work**: on a large project the auto-backup saturates the
+UI thread for minutes, so a click and the capture after it can be a whole tool call out of step.
+Three apparent grouping bugs dissolved under single-click retests with a stability check.
+
+`PartPlate::calc_exclude_triangles: Unable to create exclude triangles` logs **once per plate**, not
+twice per launch. The earlier note that "two are expected" holds only for a single-plate startup.
+
+### Deferred, stated as deferrals
+
+- **The in-canvas plate strip is still there, and plan §8.2 is wrong about it.** The strip is
+  **Preview-only** — `GUI_Preview.cpp` disables it in View3D and enables it in Preview — so it has
+  never competed with the board in the 3D editor. It is also not just thumbnails: its All-Plates tile
+  is the only canvas door to Slice All, the only switch for the G-code viewer's all-plates statistics
+  page, and the source of the flag `MainFrame` reads to gate the Print button, while its per-plate
+  button **starts a slice** rather than selecting one. Deleting it today takes three working features
+  with it. Rewrite §8.2 before anyone tries again.
+- **The fourth copy of the inheritance rule, in `PlateBoardModel::build`, is not folded.** It needs a
+  decision the fold does not make: the row must display an uninstalled preset's *name*, which tier 1
+  correctly refuses to resolve. Its own change.
+- **`sliced_config_dropped_reason` has no reader.** A plate whose retained snapshot was dropped
+  renders as never sliced, collapsing two states the design deliberately separates, with nothing on
+  screen saying a snapshot was discarded. Blocked until `PartPlate` carries the reason off
+  `PlateData`.
+- **`Plater::resolve_plate_slicing_config` writes `plate->update_apply_result_invalid(true)` from a
+  `const` query.** This is F7 one layer up, and it now has more query callers than it did. Since
+  `m_apply_invalid` makes `can_slice()` false with only a log line, it is a latent silent gate on the
+  Slice button. It needs its own pass with a build behind it; moving the slice gate blind is worse
+  than leaving it.
+- **`get_printer_extruder_count` returns 0 as a silent sentinel** at roughly twenty call sites,
+  several of which size loops by it, so the no-fallback repair turns into an empty loop rather than
+  an error. Only reachable via a preset with no `nozzle_diameter`, so it is defensive rather than
+  live, but sentinel-versus-error is a real choice nobody has made.
+- **No per-plate thumbnail cache across hovers.** There is no per-plate generation counter to key one
+  on, only a project-wide bool that the strip clears and only while Preview is up. So in the 3D
+  editor each dwell re-renders one plate: one 512×512 offscreen render per 380 ms of deliberate
+  pointing, with the scale-down done once per show rather than per paint. A real fix is an epoch
+  counter on `Plater`.
+- **No >8-plate mixed-printer fixture exists.** Every project on either drive with more than eight
+  plates names an uninstalled Bambu project printer and carries zero per-plate assignments. One has
+  to be produced by hand from `Superdestroyer-BD.3mf`, which currently crashes on load.
+
+### Closed as won't-do, so it is not re-attempted
+
+**Reparenting `combo_printer` into a board-drawn Project row** (plan §2.3). Every guarantee §2.3 asks
+for already holds on the existing panel, which sits directly above the board and is stated as the
+Project row in three places in the source. Reparenting a live wx combo into a custom-painted row
+means hit-testing around a child window inside `PlateBoard::on_paint`/`on_mouse` and buys no
+guarantee that is not already held. What was actually missing was the PROJECT-scope *destination*,
+which is ten lines and is now built.
+
+**A board-level `Assign to every unassigned plate` footer.** Both footers already exist, on the
+picker where they belong, they are mutually exclusive, and the batch takes one snapshot. A
+board-level version would additionally have no machine to assign, which is why it is a modifier on
+the next pick rather than an action of its own.

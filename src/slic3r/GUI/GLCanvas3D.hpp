@@ -955,6 +955,14 @@ public:
                                  Camera::ViewAngleType     camera_view_angle_type = Camera::ViewAngleType::Iso,
                                  bool                      for_picking  = false,
                                  bool                      ban_light    = false);
+    //PETKO'S ORCA: render ONE plate's thumbnail into its PartPlate, making this canvas's GL
+    //context current first. render_thumbnail issues GL directly and is correct only while a
+    //context is current, which every existing caller satisfies by running inside or just
+    //after a render pass. The sidebar's plate board asks for a single plate from a wx timer,
+    //where nothing has just rendered, so the guarantee has to be stated rather than inherited.
+    //Returns false when the canvas cannot render or the plate has no image afterwards; it
+    //does not touch Plater's plate-toolbar dirty flag, which the plate strip still owns.
+    bool refresh_plate_thumbnail(int plate_index);
     static void render_thumbnail_internal(ThumbnailData& thumbnail_data, const ThumbnailsParams& thumbnail_params, PartPlateList& partplate_list, ModelObjectPtrs& model_objects,
         const GLVolumeCollection& volumes, std::vector<ColorRGBA>& extruder_colors,
                                           GLShaderProgram *                  shader,

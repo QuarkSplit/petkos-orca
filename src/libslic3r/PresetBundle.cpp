@@ -286,23 +286,25 @@ DynamicPrintConfig PresetBundle::construct_full_config(
     return out;
 }
 
-bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext             &context,
-                                                std::optional<std::vector<int>>         filament_maps,
-                                                std::optional<std::vector<int>>         filament_volume_maps,
-                                                ResolvedPlateSlicingConfig             &resolved,
-                                                std::string                            &error) const
+bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
+                                         ResolvedPlatePresets      &presets,
+                                         std::string               &error) const
 {
-    resolved = {};
+    presets = {};
     error.clear();
 
     const Preset *printer = nullptr;
     if (context.printer_preset_name.empty()) {
+        // Explicit inheritance from the Project row. An unresolved Project selection is an
+        // error here as much as anywhere else: it is not permission to reach for whichever
+        // preset happens to be left in the edited slot.
         if (printers.get_selected_idx() == size_t(-1) || printers.get_selected_idx() >= printers.size()) {
             error = "The Project printer preset selection is unresolved";
             return false;
         }
         printer = &printers.get_edited_preset();
     } else {
+        // exact name, never a nearest match
         printer = printers.find_preset(context.printer_preset_name, false);
     }
     if (printer == nullptr) {
@@ -316,6 +318,17 @@ bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext       
     const ConfigOptionFloats *nozzles = printer->config.option<ConfigOptionFloats>("nozzle_diameter");
     if (nozzles == nullptr || nozzles->values.empty()) {
         error = "Printer preset '" + printer->name + "' has no nozzle definition";
+        return false;
+    }
+
+    const PresetWithVendorProfile printer_profile = printers.get_preset_with_vendor_profile(*printer);
+    const std::string vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
+    // The plate records the vendor its printer name was written against. A name that now
+    // resolves to another vendor's preset is a different machine wearing the same string,
+    // so it is unresolved rather than accepted.
+    if (!context.printer_vendor_id.empty() && context.printer_vendor_id != vendor_id) {
+        error = "Printer preset '" + printer->name + "' belongs to vendor '" + vendor_id
+              + "', not the plate's recorded vendor '" + context.printer_vendor_id + "'";
         return false;
     }
 
@@ -333,6 +346,47 @@ bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext       
         error = "Process preset '" + context.print_preset_name + "' is not available";
         return false;
     }
+
+    presets.printer           = printer;
+    presets.print             = print;
+    presets.printer_vendor_id = vendor_id;
+    presets.is_bbl_printer    = vendor_id == "BBL";
+    return true;
+}
+
+const ConfigOption *PresetBundle::plate_process_option(const PlateSlicingContext &context,
+                                                       const DynamicPrintConfig  *plate_overrides,
+                                                       const std::string         &opt_key) const
+{
+    // A per-plate override wins, exactly as it does in the composed config: tier 2 applies
+    // PartPlate::config() last, over everything else.
+    if (plate_overrides != nullptr)
+        if (const ConfigOption *plate_opt = plate_overrides->option(opt_key); plate_opt != nullptr)
+            return plate_opt;
+
+    ResolvedPlatePresets presets;
+    std::string          error;
+    if (!resolve_plate_presets(context, presets, error))
+        return nullptr;
+    return presets.print->config.option(opt_key);
+}
+
+bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext             &context,
+                                                std::optional<std::vector<int>>         filament_maps,
+                                                std::optional<std::vector<int>>         filament_volume_maps,
+                                                ResolvedPlateSlicingConfig             &resolved,
+                                                std::string                            &error) const
+{
+    resolved = {};
+    error.clear();
+
+    // Tier 1 owns the inheritance rule, the FDM gate, the nozzle definition and the recorded
+    // vendor. Everything below it is composition, which is what makes this tier 2.
+    ResolvedPlatePresets presets;
+    if (!resolve_plate_presets(context, presets, error))
+        return false;
+    const Preset *printer = presets.printer;
+    const Preset *print   = presets.print;
 
     const std::vector<std::string> &filament_names = context.filament_preset_names.empty()
         ? filament_presets
@@ -382,18 +436,11 @@ bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext       
         return false;
     }
 
-    resolved.printer_preset = printer;
-    resolved.print_preset   = print;
-    if (printer_profile.vendor != nullptr)
-        resolved.printer_vendor_id = printer_profile.vendor->id;
-    if (!context.printer_vendor_id.empty() && context.printer_vendor_id != resolved.printer_vendor_id) {
-        error = "Printer preset '" + printer->name + "' belongs to vendor '" + resolved.printer_vendor_id
-              + "', not the plate's recorded vendor '" + context.printer_vendor_id + "'";
-        resolved = {};
-        return false;
-    }
+    resolved.printer_preset    = printer;
+    resolved.print_preset      = print;
+    resolved.printer_vendor_id = presets.printer_vendor_id;
     resolved.config.option<ConfigOptionString>("printer_vendor_id", true)->value = resolved.printer_vendor_id;
-    resolved.is_bbl_printer = resolved.printer_vendor_id == "BBL";
+    resolved.is_bbl_printer = presets.is_bbl_printer;
     return true;
 }
 

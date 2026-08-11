@@ -43,6 +43,16 @@ struct ResolvedPlateSlicingConfig
     bool                       is_bbl_printer { false };
 };
 
+// The result of tier 1: which presets a plate's context names, and nothing composed.
+// See PresetBundle::resolve_plate_presets.
+struct ResolvedPlatePresets
+{
+    const Preset *printer { nullptr };
+    const Preset *print { nullptr };
+    std::string   printer_vendor_id;
+    bool          is_bbl_printer { false };
+};
+
 struct AMSMapInfo
 {
     /*for new ams mapping*/ // from struct FilamentInfo
@@ -183,8 +193,47 @@ public:
                                                     std::optional<std::vector<int>> filament_maps_new,
                                                     std::optional<std::vector<int>> filament_volume_maps_new = std::nullopt);
 
-    // Resolve a plate's complete slicing identity. Empty context fields inherit
-    // the Project row; non-empty names are exact and never remapped.
+    // TIER 1. The plate-inheritance rule, and nothing else: an empty context field is
+    // EXPLICIT inheritance from the Project row, a non-empty one is resolved by exact name
+    // and is never remapped to a nearest match, and a recorded vendor id must still match
+    // the resolved printer's. FDM only.
+    //
+    // This is the single home of that rule. It used to exist in three more places, because
+    // the render path asks identity questions once per plate per frame and tier 2 answers
+    // them by copying every preset in the plate's context and running five whole-config
+    // passes. Those copies drifted: two of them checked neither the nozzle definition nor
+    // the recorded vendor, and one checked no printer at all, so a plate that tier 2 called
+    // unresolved still handed a process value to the sidebar.
+    //
+    // Composes nothing, allocates no preset copy, writes no state and throws nothing: a
+    // query must not set state an action owns, and it must not share a throw with one.
+    //
+    // What it deliberately does NOT do is compatibility. Compatibility is a property of a
+    // combination rather than of the inheritance rule, it needs the filament list this tier
+    // does not resolve, and its conditions are placeholder-parser expressions - which is
+    // exactly the per-frame cost tier 1 exists to avoid. It stays in tier 2.
+    bool resolve_plate_presets(const PlateSlicingContext &context,
+                               ResolvedPlatePresets      &presets,
+                               std::string               &error) const;
+
+    // The one narrow read that is equal to the composed answer. plate_overrides is
+    // PartPlate::config(), applied first exactly as resolve_plate_slicing_config applies it
+    // last over everything else; pass nullptr for none. Returns null when the plate's
+    // context does not resolve, which is the honest answer and never the Project row's value.
+    //
+    // Only for PROCESS options. construct_full_config applies defaults, printer, process,
+    // project and filament in that order, so reading the process preset alone is the
+    // composed value only for a key no later layer carries. Check any new key against
+    // s_project_options in PresetBundle.cpp and Preset::filament_options() before using this
+    // for it; print_sequence, spiral_mode and enable_wrapping_detection are verified.
+    const ConfigOption *plate_process_option(const PlateSlicingContext &context,
+                                             const DynamicPrintConfig  *plate_overrides,
+                                             const std::string         &opt_key) const;
+
+    // TIER 2. Resolve a plate's complete slicing identity and compose its effective config.
+    // Calls tier 1 for the identity, then adds compatibility, the filament list and the
+    // composition. Empty context fields inherit the Project row; non-empty names are exact
+    // and never remapped.
     bool resolve_plate_slicing_config(const PlateSlicingContext            &context,
                                       std::optional<std::vector<int>>        filament_maps,
                                       std::optional<std::vector<int>>        filament_volume_maps,

@@ -163,7 +163,10 @@ public:
     void     prepare_mode(bool refresh_button = true);
     void     finish_mode();
     void     sync_ams_mapping_result(std::vector<FilamentInfo> &result);
-    void     prepare(int print_plate_idx);
+    //false when there is no plate to sync against: spoken, not thrown. See
+    //SelectMachineDialog::prepare. Converted with its two siblings rather than left as the
+    //one unconverted throw of the three, which is how the next caller rediscovers it.
+    bool     prepare(int print_plate_idx);
     void     show_status(PrintDialogStatus status, std::vector<wxString> params = std::vector<wxString>());
     void     reset_timeout();
     void     update_user_printer();

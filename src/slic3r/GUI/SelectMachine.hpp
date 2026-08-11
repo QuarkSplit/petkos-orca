@@ -467,7 +467,11 @@ public:
     void sending_mode();
     void finish_mode();
 	void sync_ams_mapping_result(std::vector<FilamentInfo>& result);
-    void prepare(int print_plate_idx);
+    //Returns false when this plate cannot be dispatched. A refusal that must reach the user
+    //is spoken by the caller, not thrown out of a wx event handler: an uncaught
+    //Slic3r::RuntimeError here reaches generic_exception_handle, which rethrows, and the
+    //application terminates - in the one dialog a user opens to fix a broken plate.
+    bool prepare(int print_plate_idx);
     void show_status(PrintDialogStatus status, std::vector<wxString> params = std::vector<wxString>(), wxString wiki_url = wxEmptyString);
     void sys_color_changed();
     void reset_timeout();

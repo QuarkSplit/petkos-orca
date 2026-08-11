@@ -1913,22 +1913,29 @@ bool SelectMachineDialog::is_selected_ams_drying(MachineObject* obj)
     return false;
 }
 
-void SelectMachineDialog::prepare(int print_plate_idx)
+bool SelectMachineDialog::prepare(int print_plate_idx)
 {
     m_print_plate_idx = print_plate_idx;
     if (m_print_type != PrintFromType::FROM_NORMAL) {
         m_mapping_popup.clear_source_plate_config();
-        return;
+        return true;
     }
-    if (print_plate_idx < 0)
-        throw Slic3r::RuntimeError("Normal dispatch requires one explicit plate");
+    if (print_plate_idx < 0) {
+        show_error(this, _L("Sending to a printer needs one explicit plate. Select a plate first."), false);
+        return false;
+    }
     PartPlate *plate = m_plater->get_partplate_list().get_plate(print_plate_idx);
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (!resolve_plate_slicing_context(plate, resolved, error))
-        throw Slic3r::RuntimeError("Unable to prepare plate dispatch: " + error);
+    if (!resolve_plate_slicing_context(plate, resolved, error)) {
+        show_error(this, GUI::format_wxstr(_L("Plate %1% cannot be dispatched: %2%"), print_plate_idx + 1,
+                                           from_u8(error)),
+                   false);
+        return false;
+    }
     m_mapping_popup.set_source_plate_config(
         resolved.printer_preset->get_printer_type(wxGetApp().preset_bundle), resolved.config);
+    return true;
 }
 
 void SelectMachineDialog::update_print_status_msg()

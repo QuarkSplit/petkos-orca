@@ -32,6 +32,9 @@ class Plater;
 //The filament-usage swatch strip. Defined entirely in the .cpp: it is a paint handler
 //and nothing else, and nothing outside the inspector has a reason to name its type.
 class PlateSwatchStrip;
+//The row's hover thumbnail. Same reason: a paint handler and a placement rule, and only
+//the board ever names one.
+class PlateThumbnailPreview;
 
 //The Project row. It is not a plate, so it cannot use a plate index, and it is not
 //absent either, so it cannot use "no row". -1 is the index the sidebar and the board
@@ -118,6 +121,17 @@ struct PlateBoardGroup
     std::string caption;       //what the header says
     std::string detail;        //bed size for a machine group; empty otherwise
     std::string swatch_colour; //material groups draw their colour; empty means none
+
+    //The preset name a drop on this header assigns, carried as data. It is NOT recoverable
+    //from anything else the group holds: key is the mode prefix plus the name, and caption
+    //is a translated string for the inherited group, so a drag that parsed either would be
+    //a second, weaker answer to a question the group already knows. Empty is the inherited
+    //group, and dropping there clears the assignment - exactly what the picker's first item
+    //passes.
+    std::string machine;
+    //Whether a plate may be dropped here. Material groups are false: they key on a colour,
+    //which is not something a plate can be assigned to.
+    bool        drop_target = false;
 
     int   depth         = 0;    //0 top level, 1 a machine sub-group inside a material group
     int   plate_count   = 0;    //including descendants, so a material group can state its total
@@ -330,8 +344,31 @@ private:
 
     void on_paint(wxPaintEvent &evt);
     void on_mouse(wxMouseEvent &evt);
+    void on_left_down(wxMouseEvent &evt);
+    void on_capture_lost(wxMouseCaptureLostEvent &evt);
     void on_scroll(wxMouseEvent &evt);
     void on_anim_tick(wxTimerEvent &evt);
+    void on_hover_tick(wxTimerEvent &evt);
+
+    //The hover thumbnail, which is what the in-canvas plate strip used to be the only place
+    //to see. Shown after a dwell so that merely crossing the board does not fire it.
+    void show_row_preview(int row_index);
+    void hide_row_preview();
+
+    //Drag a row onto a group header to reassign its machine. Never onto another row, and
+    //never a reorder: plate index is load-bearing in every filename the prep pipeline
+    //writes, so a drop changes the machine and nothing else.
+    bool             grouping_allows_drag() const;
+    int              drop_group_at(const wxPoint &pos) const;
+    std::vector<int> drag_targets() const;
+    void             end_drag(bool commit);
+    void             draw_drag_pill(wxDC &dc, bool dark);
+    //-1 up, +1 down, 0 not near an edge. Read from the pointer, applied by the clock.
+    int              autoscroll_direction(const wxPoint &pos) const;
+    void             update_autoscroll(const wxPoint &pos);
+    void             on_autoscroll_tick(wxTimerEvent &evt);
+    //Answers a drag attempted in a grouping that has nothing to drop onto.
+    void             say_where_drag_works();
 
     void rebuild_items();
     void clamp_scroll();
@@ -388,6 +425,31 @@ private:
     wxTimer  m_anim_timer;
     int      m_anim_elapsed_ms = 0;
     bool     m_anim_running    = false;
+
+    //The hover preview and the dwell that gates it. One window for the board's lifetime,
+    //hidden rather than destroyed: a popup rebuilt per hover leaves one dead window behind
+    //per row crossed.
+    PlateThumbnailPreview *m_preview = nullptr;
+    wxTimer                m_hover_timer;
+
+    //Drag state. m_drag_armed is a press that has not yet moved far enough to be a drag, so
+    //a plain click still selects; m_dragging is the captured drag itself.
+    bool    m_drag_armed = false;
+    bool    m_dragging   = false;
+    wxPoint m_press_pos;
+    wxPoint m_drag_pos;
+    int     m_drag_plate = PLATE_BOARD_PROJECT_ROW;
+    int     m_drop_group = -1; //index into m_model.groups(), -1 when the cursor is over none
+
+    //The edge auto-scroll clock. Separate from the hover clock, which the drag suppresses.
+    wxTimer m_autoscroll_timer;
+    int     m_autoscroll_dir = 0;
+
+    //A press on a row in a grouping that has no machine groups to drop onto. Tracked so that
+    //trying to drag there answers with where the action lives instead of with nothing; said
+    //once per grouping mode, because a sentence repeated on every attempt is noise.
+    bool m_drag_attempt     = false;
+    bool m_drag_hint_shown  = false;
 
     ScalableBitmap m_icon_sliced;  //a retained slice this plate's context still matches
     ScalableBitmap m_icon_stale;   //a retained slice the context has moved out from under

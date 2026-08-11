@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <set>
 
 #include <wx/dcbuffer.h>
+#include <wx/display.h>
+#include <wx/image.h>
+#include <wx/popupwin.h>
 #include <wx/settings.h>
 #include <wx/sizer.h>
 
@@ -13,9 +17,11 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
+#include "GLCanvas3D.hpp"
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
+#include "NotificationManager.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
 #include "Widgets/Button.hpp"
@@ -233,8 +239,15 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
         m_rows.push_back(std::move(row));
     }
 
-    m_rollup.plates   = (int) m_rows.size();
-    m_rollup.machines = (int) assigned_machines.size() + (any_inherited && !project_printer.empty() ? 1 : 0);
+    m_rollup.plates = (int) m_rows.size();
+    //Distinct MACHINES, not distinct kinds of assignment. Adding one for "some plate is
+    //inherited" counted the project printer twice whenever a plate was also explicitly
+    //assigned to it - a one-click state, because the picker lists the project printer as an
+    //ordinary entry. The set answers the question the cell asks: how many machines is this
+    //project spread over.
+    if (any_inherited && !project_printer.empty())
+        assigned_machines.insert(project_printer);
+    m_rollup.machines = (int) assigned_machines.size();
     for (const std::pair<const std::string, float> &queue : queue_seconds)
         m_rollup.longest_queue_seconds = std::max(m_rollup.longest_queue_seconds, queue.second);
 
@@ -287,6 +300,11 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
                 group.caption       = machine_caption(machine);
                 group.detail        = machine_detail(machine);
                 group.names_machine = true;
+                //These two are what a drag reads. The name is stored rather than sliced back
+                //out of key or read off the translated caption, because both would answer the
+                //question a second time and one of the two answers would eventually be wrong.
+                group.machine       = machine;
+                group.drop_target   = true;
             }
             group.rows.push_back(i);
             ++group.plate_count;
@@ -359,6 +377,11 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
             group.detail        = machine_detail(machine);
             group.depth         = 1;
             group.names_machine = true;
+            group.machine       = machine;
+            //A machine sub-group names a machine, but nothing in the material grouping is a
+            //drop target: rows are draggable only in the two machine groupings, so a target
+            //here would be a destination that exists in a mode with nothing to drag onto it.
+            group.drop_target   = false;
         }
         group.rows.push_back(i);
         ++group.plate_count;
@@ -386,6 +409,10 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
             material.rows          = only.rows;
             material.names_machine = true;
             material.detail        = only.caption + (only.detail.empty() ? std::string() : "   " + only.detail);
+            material.machine       = only.machine;
+            //Explicitly not a drop target, for the same reason as the sub-group it absorbed:
+            //this header only exists in the material grouping, where no row is draggable.
+            material.drop_target   = false;
             m_groups.push_back(material);
             continue;
         }
@@ -400,7 +427,11 @@ std::string PlateBoardModel::summary_text() const
 {
     if (m_rows.size() <= 1 || m_all_inherited)
         return m_project_row.printer_name;
-    return std::to_string(m_rollup.machines) + " " + into_u8(_L("machines"));
+    //_L_PLURAL, the tree's own plural macro, rather than a fixed plural: with the count
+    //fixed to count machines instead of kinds of assignment, one machine reached two ways is
+    //now genuinely 1, and "1 machines" would be the visible half of the bug just removed.
+    return into_u8(wxString::Format(_L_PLURAL("%d machine", "%d machines", m_rollup.machines),
+                                    m_rollup.machines));
 }
 
 // ----------------------------------------------------------------------------
@@ -494,7 +525,142 @@ bool load_board_icon(wxWindow *win, const char *name, int px, ScalableBitmap &ou
     }
 }
 
+//ThumbnailData is RGBA at PartPlate::plate_thumbnail_width/height and is stored BOTTOM-UP,
+//because it comes straight out of glReadPixels; the in-canvas plate strip is why nothing
+//noticed, since it draws the buffer with flipped texture coordinates rather than flipping
+//the bytes. Two other places in this tree already invert it into a wxImage by hand
+//(SelectMachineDialog and SyncAmsInfoDialog); this is a third, kept local because both of
+//those live in files this change does not own. Written through the raw RGB and alpha
+//buffers rather than SetRGB/SetAlpha per pixel: at 512x512 the per-pixel form is 262144
+//calls each, on a path that runs while the user is waiting for a hover to appear.
+wxImage thumbnail_to_image(const ThumbnailData &data)
+{
+    if (!data.is_valid())
+        return wxImage();
+
+    wxImage image((int) data.width, (int) data.height);
+    if (!image.IsOk())
+        return wxImage();
+    image.InitAlpha();
+
+    unsigned char *rgb   = image.GetData();
+    unsigned char *alpha = image.GetAlpha();
+    if (rgb == nullptr || alpha == nullptr)
+        return wxImage();
+
+    for (unsigned int r = 0; r < data.height; ++r) {
+        const unsigned char *src   = data.pixels.data() + 4 * (size_t)(data.height - 1 - r) * data.width;
+        unsigned char *      d_rgb = rgb + 3 * (size_t) r * data.width;
+        unsigned char *      d_a   = alpha + (size_t) r * data.width;
+        for (unsigned int c = 0; c < data.width; ++c, src += 4) {
+            *d_rgb++ = src[0];
+            *d_rgb++ = src[1];
+            *d_rgb++ = src[2];
+            *d_a++   = src[3];
+        }
+    }
+    return image;
+}
+
 } // namespace
+
+// ----------------------------------------------------------------------------
+// PlateThumbnailPreview
+// ----------------------------------------------------------------------------
+
+//The row's hover preview, and the reason the in-canvas plate strip's thumbnails are no
+//longer the only place a plate can be told apart by its contents.
+//
+//A plain wxPopupWindow and deliberately NOT the transient PopupWindow the picker uses: a
+//transient popup grabs the mouse and dismisses on the next click, so hovering a row would
+//swallow the click that followed it. This one takes no focus, takes no capture, and is
+//moved and hidden by the board alone.
+class PlateThumbnailPreview : public wxPopupWindow
+{
+public:
+    PlateThumbnailPreview(wxWindow *parent) : wxPopupWindow(parent, wxBORDER_NONE)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        Bind(wxEVT_PAINT, &PlateThumbnailPreview::on_paint, this);
+    }
+
+    //The bitmap may be invalid. The preview then carries `note` instead of quietly not
+    //appearing: a hover that produces nothing and says nothing is indistinguishable from
+    //one that is broken, which is the silent case this fork treats as a bug.
+    void show_beside(const wxRect &row_screen_rect, const wxBitmap &bitmap, const wxString &caption, const wxString &note)
+    {
+        m_bitmap  = bitmap;
+        m_caption = caption;
+        m_note    = note;
+
+        const int pad     = FromDIP(6);
+        const int line    = FromDIP(16);
+        const int image_w = m_bitmap.IsOk() ? m_bitmap.GetWidth() : FromDIP(150);
+        const int image_h = m_bitmap.IsOk() ? m_bitmap.GetHeight() : 0;
+
+        const int width  = image_w + 2 * pad;
+        const int height = image_h + 2 * pad + line + (m_note.IsEmpty() ? 0 : line);
+        SetSize(wxSize(width, height));
+
+        //To the LEFT of the row, because the board lives in a sidebar pinned to the right
+        //edge: over the row it would hide the thing being previewed, and to the right it
+        //would be off the screen. It flips back to the right only when there is genuinely
+        //no room, which is a second-monitor arrangement rather than the normal case.
+        //
+        //The display is asked of the BOARD rather than of this window: the popup has not
+        //been positioned yet, so its own answer would name whichever display holds the
+        //origin instead of the one the sidebar is on. GetFromWindow rather than the
+        //wxDisplay(window) constructor, which is the form the rest of this tree uses
+        //(GUI_App::window_pos_sanitize) and the one that says what it does when the window
+        //is on no display yet.
+        const int    display_idx = wxDisplay::GetFromWindow(GetParent() != nullptr ? GetParent() : this);
+        const wxRect screen      = wxDisplay(display_idx == wxNOT_FOUND ? 0u : (unsigned) display_idx).GetClientArea();
+        int          x      = row_screen_rect.GetLeft() - width - FromDIP(8);
+        if (x < screen.GetLeft())
+            x = std::min(row_screen_rect.GetRight() + FromDIP(8), screen.GetRight() - width);
+        int y = row_screen_rect.GetTop() + row_screen_rect.GetHeight() / 2 - height / 2;
+        y     = std::max(screen.GetTop(), std::min(y, screen.GetBottom() - height));
+
+        SetPosition(wxPoint(x, y));
+        Refresh();
+        if (!IsShown())
+            Show();
+    }
+
+private:
+    void on_paint(wxPaintEvent &)
+    {
+        wxAutoBufferedPaintDC dc(this);
+        const bool            dark = wxGetApp().dark_mode();
+        const wxSize          size = GetClientSize();
+        const int             pad  = FromDIP(6);
+
+        dc.SetBrush(wxBrush(board_bg(dark)));
+        dc.SetPen(wxPen(board_dim(dark)));
+        dc.DrawRectangle(0, 0, size.GetWidth(), size.GetHeight());
+
+        int y = pad;
+        if (m_bitmap.IsOk()) {
+            dc.DrawBitmap(m_bitmap, pad, y, true);
+            y += m_bitmap.GetHeight() + FromDIP(2);
+        }
+
+        dc.SetFont(Label::Body_10);
+        dc.SetTextForeground(board_fg(dark));
+        dc.DrawText(wxControl::Ellipsize(m_caption, dc, wxELLIPSIZE_END, size.GetWidth() - 2 * pad), pad, y);
+
+        if (!m_note.IsEmpty()) {
+            dc.SetFont(Label::Body_9);
+            dc.SetTextForeground(board_warn(dark));
+            dc.DrawText(wxControl::Ellipsize(m_note, dc, wxELLIPSIZE_END, size.GetWidth() - 2 * pad),
+                        pad, y + FromDIP(16));
+        }
+    }
+
+    wxBitmap m_bitmap;
+    wxString m_caption;
+    wxString m_note;
+};
 
 // ----------------------------------------------------------------------------
 // PlatePrinterPopup
@@ -861,10 +1027,29 @@ wxString grouping_label(PlateBoardGrouping grouping)
 //A fixed id rather than wxWindow::NewControlId(): this is a namespace-scope constant, and
 //an allocator called during static initialisation runs before wx is up.
 const int PLATE_BOARD_ANIM_TIMER_ID = wxID_HIGHEST + 4211;
+//Its own id, because a second wxTimer sharing one owner and one id would deliver both
+//clocks to whichever handler was bound last.
+const int PLATE_BOARD_HOVER_TIMER_ID = wxID_HIGHEST + 4212;
+//And a third, for the edge auto-scroll during a drag. It cannot share the hover clock: that
+//one is a one-shot the drag deliberately suppresses.
+const int PLATE_BOARD_AUTOSCROLL_TIMER_ID = wxID_HIGHEST + 4213;
 //220 ms, which is the whole point of the animation: long enough to be seen as a resize
 //rather than a repaint, short enough not to be waited on.
 const int PLATE_BOARD_ANIM_MS   = 220;
 const int PLATE_BOARD_ANIM_STEP = 16;
+//The dwell before a row shows its thumbnail. It exists so that crossing the board on the
+//way to something else does not render a thumbnail per row passed over.
+const int PLATE_BOARD_HOVER_MS = 380;
+//How far the pointer must travel with the button down before a press becomes a drag rather
+//than a click. Below this a click on a row still selects, which is the common action.
+const int PLATE_BOARD_DRAG_SLOP_DIP = 5;
+//The edge auto-scroll during a drag: one tick, and how much of a row each tick moves. Driven
+//by a clock rather than by motion events, because holding the pointer still against the edge
+//is exactly the gesture that means "keep going" and it produces no motion events at all. A
+//motion-driven scroll makes a group whose rows are all out of view unreachable while the
+//button is down, which is a drag that cannot be completed rather than one that is refused.
+const int PLATE_BOARD_AUTOSCROLL_MS  = 60;
+const int PLATE_BOARD_AUTOSCROLL_DIV = 3; //row height per tick
 //How many standard rows the board grows to before it scrolls instead. One fewer than the
 //compact threshold, because the rollup tiles and the grouping control sit above the rows
 //and the controls below the board must keep their place on a laptop screen.
@@ -901,13 +1086,27 @@ PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_
     m_icons_ok            = sliced_ok || stale_ok || problem_ok;
 
     m_anim_timer.SetOwner(this, PLATE_BOARD_ANIM_TIMER_ID);
+    m_hover_timer.SetOwner(this, PLATE_BOARD_HOVER_TIMER_ID);
+    m_autoscroll_timer.SetOwner(this, PLATE_BOARD_AUTOSCROLL_TIMER_ID);
 
     Bind(wxEVT_PAINT, &PlateBoard::on_paint, this);
     Bind(wxEVT_MOTION, &PlateBoard::on_mouse, this);
+    Bind(wxEVT_LEFT_DOWN, &PlateBoard::on_left_down, this);
     Bind(wxEVT_LEFT_UP, &PlateBoard::on_mouse, this);
     Bind(wxEVT_LEAVE_WINDOW, &PlateBoard::on_mouse, this);
     Bind(wxEVT_MOUSEWHEEL, &PlateBoard::on_scroll, this);
+    Bind(wxEVT_MOUSE_CAPTURE_LOST, &PlateBoard::on_capture_lost, this);
     Bind(wxEVT_TIMER, &PlateBoard::on_anim_tick, this, PLATE_BOARD_ANIM_TIMER_ID);
+    Bind(wxEVT_TIMER, &PlateBoard::on_hover_tick, this, PLATE_BOARD_HOVER_TIMER_ID);
+    Bind(wxEVT_TIMER, &PlateBoard::on_autoscroll_tick, this, PLATE_BOARD_AUTOSCROLL_TIMER_ID);
+    //The sidebar hides the board below two plates, and a hidden parent does not hide a popup
+    //that is a top-level window in its own right. Without this the preview outlives the
+    //control it belongs to and floats over the 3D scene with nothing to dismiss it.
+    Bind(wxEVT_SHOW, [this](wxShowEvent &evt) {
+        if (!evt.IsShown())
+            hide_row_preview();
+        evt.Skip();
+    });
 }
 
 void PlateBoard::reload()
@@ -916,6 +1115,10 @@ void PlateBoard::reload()
     //can be asked to reload before there is a plate list to read
     if (m_plater == nullptr || !m_plater->is_initialized() || wxGetApp().preset_bundle == nullptr)
         return;
+
+    //The rows are about to move under it, and a preview left pointing at a row that has
+    //changed index is a picture of the wrong plate.
+    hide_row_preview();
 
     const PartPlateList &plates = m_plater->get_partplate_list();
     const int            count  = plates.get_plate_count();
@@ -964,6 +1167,11 @@ void PlateBoard::set_grouping(PlateBoardGrouping grouping)
     m_grouping          = grouping;
     m_grouping_explicit = true;
     m_scroll_px         = 0;
+    //the rows are about to be re-filed, so a preview anchored to one of them is stale
+    hide_row_preview();
+    //Whether a drag has anything to land on is a property of the mode, so the sentence that
+    //says where the gesture works is owed again once the mode changes.
+    m_drag_hint_shown = false;
 
     if (m_plater != nullptr && m_plater->is_initialized() && wxGetApp().preset_bundle != nullptr)
         m_model.rebuild(m_plater->get_partplate_list(), *wxGetApp().preset_bundle, m_grouping);
@@ -1192,6 +1400,8 @@ void PlateBoard::on_plate_selection_changed(int current_plate)
         return;
 
     m_current_plate = current_plate;
+    //scrolling and opening a collapsed group both move the rows a preview is anchored to
+    hide_row_preview();
     scroll_row_into_view(current_plate);
     Refresh();
 }
@@ -1273,6 +1483,10 @@ PlateBoard::Hit PlateBoard::hit_test(const wxPoint &pos) const
 
 void PlateBoard::on_scroll(wxMouseEvent &evt)
 {
+    //the preview is anchored to a row's screen rectangle, so it is wrong the moment the
+    //rows move under it
+    hide_row_preview();
+
     const int max_scroll = std::max(0, m_content_height - view_height());
     if (max_scroll == 0) {
         evt.Skip();
@@ -1289,6 +1503,382 @@ void PlateBoard::open_picker(int plate_index, const wxPoint &screen_anchor)
     show_printer_picker(this, m_plater, plate_index, m_scoped_plates, screen_anchor, m_popup);
 }
 
+// ----------------------------------------------------------------------------
+// the row's hover thumbnail
+// ----------------------------------------------------------------------------
+
+void PlateBoard::hide_row_preview()
+{
+    if (m_hover_timer.IsRunning())
+        m_hover_timer.Stop();
+    if (m_preview != nullptr && m_preview->IsShown())
+        m_preview->Hide();
+}
+
+void PlateBoard::on_hover_tick(wxTimerEvent &)
+{
+    //The dwell has expired. What the pointer is over NOW is the only thing worth showing,
+    //so the row is read back from the hover state rather than remembered when the clock
+    //started: between the two the pointer may have moved on.
+    if (m_dragging || m_hover.kind != HitKind::Row)
+        return;
+    show_row_preview(m_hover.index);
+}
+
+void PlateBoard::show_row_preview(int row_index)
+{
+    if (m_plater == nullptr || !m_plater->is_initialized())
+        return;
+
+    const std::vector<PlateBoardRow> &rows = m_model.rows();
+    if (row_index < 0 || row_index >= (int) rows.size())
+        return;
+
+    const PlateBoardRow &row         = rows[(size_t) row_index];
+    const int            plate_index = row.plate_index;
+    PartPlate *          plate       = m_plater->get_partplate_list().get_plate(plate_index);
+    if (plate == nullptr)
+        return;
+
+    const int item_index = find_row_item(plate_index);
+    if (item_index < 0)
+        return;
+
+    wxString note;
+
+    //Whether what is stored still describes the scene. The flag is READ here and never
+    //cleared: the in-canvas plate strip owns the clear, and clearing it from the board
+    //would leave the strip rebuilding no items for buffers that had changed under it.
+    //
+    //The consequence, stated so it is not mistaken for free: the strip only clears the flag
+    //while the Preview tab is up, so in the 3D editor it stays set and every dwell re-renders
+    //one plate. That is one 512x512 offscreen render per 380 ms of deliberate pointing, on a
+    //gesture the user made; it is not a per-frame cost and it is not per plate.
+    const bool stale = m_plater->is_plate_toolbar_image_dirty();
+
+    if (m_plater->is_gcode_3mf()) {
+        //A project opened from an exported G-code 3MF carries its plate images in the file
+        //and has no model to re-render. What is there is the truth; what is not there
+        //cannot be produced, and saying so is the honest answer.
+        if (!plate->thumbnail_data.is_valid())
+            note = _L("This project was opened from G-code and carries no image for this plate.");
+    } else if (!plate->thumbnail_data.is_valid() || stale) {
+        //The 3D editor's canvas owns both the geometry this renders and the GL context the
+        //render needs current, so it is asked rather than driven: refresh_plate_thumbnail
+        //makes its own context current and declines when it is not the canvas on screen.
+        //When the Preview tab is showing, the plate strip over there has just refreshed
+        //these same buffers, so the stored image is already current.
+        //
+        //One plate, not all of them: the strip's refresh path renders two 512x512 images for
+        //every plate in the project, which is the right shape for a strip that draws them all
+        //and the wrong shape for a hover that shows one.
+        GLCanvas3D *canvas = m_plater->get_view3D_canvas3D();
+        if (canvas != nullptr)
+            canvas->refresh_plate_thumbnail(plate_index);
+        if (!plate->thumbnail_data.is_valid())
+            note = _L("No image for this plate yet.");
+    }
+
+    wxBitmap bitmap;
+    if (plate->thumbnail_data.is_valid()) {
+        wxImage image = thumbnail_to_image(plate->thumbnail_data);
+        if (image.IsOk()) {
+            const int side = FromDIP(168);
+            bitmap         = wxBitmap(image.Rescale(side, side, wxIMAGE_QUALITY_HIGH));
+        }
+    }
+
+    //The caption is the plate number and nothing else. Everything else the preview could
+    //say - machine, hours, parts - is already on the row it is anchored to, and the number
+    //is the one thing that ties a picture floating beside the sidebar back to that row.
+    const wxString caption = wxString::Format(_L("Plate %d"), plate_index + 1);
+
+    if (m_preview == nullptr)
+        m_preview = new PlateThumbnailPreview(this);
+
+    const Item &  item = m_items[(size_t) item_index];
+    const wxPoint top_left = ClientToScreen(wxPoint(0, view_top() + item.y - m_scroll_px));
+    const wxRect  row_rect(top_left.x, top_left.y, GetClientSize().GetWidth(), item.height);
+
+    m_preview->show_beside(row_rect, bitmap, caption, note);
+}
+
+// ----------------------------------------------------------------------------
+// drag a row onto a group header
+// ----------------------------------------------------------------------------
+
+bool PlateBoard::grouping_allows_drag() const
+{
+    //By machine and by capacity only. Plate order draws no headers at all, and by material
+    //the headers key on a colour, which is not a thing a plate can be assigned to. A drag
+    //attempted in either is answered by say_where_drag_works rather than by nothing.
+    return m_grouping == PlateBoardGrouping::ByMachine || m_grouping == PlateBoardGrouping::ByCapacity;
+}
+
+int PlateBoard::drop_group_at(const wxPoint &pos) const
+{
+    const Hit hit = hit_test(pos);
+
+    int group_index = -1;
+    if (hit.kind == HitKind::GroupHeader) {
+        group_index = hit.index;
+    } else if (hit.kind == HitKind::Row) {
+        //A row resolves UP to the group it sits in. This is NOT a drop onto a row: the
+        //highlight is painted on the group's header and the group is what gets assigned, so
+        //no position inside a group can be expressed and nothing can be reordered - which is
+        //the point, because plate index is load-bearing in the prep pipeline's filenames.
+        //It is here because a 26 px header in a 34 px row list is a target the user has to
+        //aim at, while the run of rows underneath it means the same machine and is twenty
+        //times the area.
+        for (const Item &item : m_items)
+            if (!item.header && item.row == hit.index) {
+                group_index = item.group;
+                break;
+            }
+    }
+
+    const std::vector<PlateBoardGroup> &groups = m_model.groups();
+    if (group_index < 0 || group_index >= (int) groups.size() || !groups[(size_t) group_index].drop_target)
+        return -1;
+    return group_index;
+}
+
+std::vector<int> PlateBoard::drag_targets() const
+{
+    std::vector<int> targets;
+    if (m_drag_plate < 0)
+        return targets;
+
+    //A drag carries the selection when the row it grabbed is part of one, and exactly that
+    //row otherwise. Scoped rows are painted differently, so the blast radius is on screen
+    //before the drop - the one condition this design puts on a bulk write.
+    if (m_scoped_plates.size() > 1 &&
+        std::find(m_scoped_plates.begin(), m_scoped_plates.end(), m_drag_plate) != m_scoped_plates.end())
+        return m_scoped_plates;
+
+    targets.push_back(m_drag_plate);
+    return targets;
+}
+
+void PlateBoard::on_left_down(wxMouseEvent &evt)
+{
+    //Binding LEFT_DOWN at all is new; skipping keeps whatever wxPanel did with it before,
+    //rather than making "arm a drag" quietly also mean "swallow the button press". Skipped
+    //on every path, including the ones that arm nothing.
+    evt.Skip();
+
+    hide_row_preview();
+
+    m_drag_armed   = false;
+    m_dragging     = false;
+    m_drag_attempt = false;
+    m_drag_plate   = PLATE_BOARD_PROJECT_ROW;
+    m_drop_group   = -1;
+
+    if (m_plater == nullptr || !m_plater->is_initialized())
+        return;
+    //a modifier-click is a scope change, handled on the button up. Arming a drag as well
+    //would mean the same gesture could both extend the selection and move a plate.
+    if (evt.ControlDown() || evt.ShiftDown())
+        return;
+
+    const Hit hit = hit_test(evt.GetPosition());
+    if (hit.kind != HitKind::Row || hit.index < 0 || hit.index >= (int) m_model.rows().size())
+        return;
+
+    m_press_pos = evt.GetPosition();
+
+    //In plate order and by material there is no machine group to land on, so the row is not
+    //draggable. That is recorded rather than ignored: a user who has used the gesture in the
+    //other two modes and gets nothing here has been refused by silence, which is the one
+    //answer this board is not allowed to give.
+    if (!grouping_allows_drag()) {
+        m_drag_attempt = true;
+        return;
+    }
+
+    m_drag_armed = true;
+    m_drag_plate = m_model.rows()[(size_t) hit.index].plate_index;
+}
+
+void PlateBoard::say_where_drag_works()
+{
+    m_drag_hint_shown = true;
+    if (m_plater == nullptr)
+        return;
+    if (NotificationManager *notifications = m_plater->get_notification_manager())
+        notifications->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+            into_u8(_L("A plate is reassigned by dragging it onto a machine group. Group the board by "
+                       "machine or by capacity first, or click the row's printer name to pick one.")));
+}
+
+void PlateBoard::on_capture_lost(wxMouseCaptureLostEvent &)
+{
+    //The capture can be taken away by anything from a modal dialog to the window manager.
+    //A drag that ends this way commits nothing: the user did not let go over a target.
+    m_dragging   = false;
+    m_drag_armed = false;
+    m_drop_group = -1;
+    if (m_autoscroll_timer.IsRunning())
+        m_autoscroll_timer.Stop();
+    m_autoscroll_dir = 0;
+    Refresh();
+}
+
+int PlateBoard::autoscroll_direction(const wxPoint &pos) const
+{
+    //Nothing to scroll: the whole board is in view, so an edge means nothing.
+    if (m_content_height <= view_height())
+        return 0;
+
+    //One header's worth of band at each end of the scroll region. The top band starts at
+    //view_top() and anything above it is NOT a scroll: the rollup and the grouping segments
+    //sit there, and resting on them while thinking must not read as "scroll up for ever".
+    //Below the control there is no such furniture, so a captured drag dragged past the last
+    //row keeps going, which is what every list that scrolls on drag does.
+    const int top    = view_top();
+    const int bottom = GetClientSize().GetHeight();
+    if (pos.y < top)
+        return 0;
+    if (pos.y < top + m_header_height)
+        return -1;
+    if (pos.y > bottom - m_header_height)
+        return 1;
+    return 0;
+}
+
+void PlateBoard::update_autoscroll(const wxPoint &pos)
+{
+    const int direction = m_dragging ? autoscroll_direction(pos) : 0;
+    if (direction == m_autoscroll_dir)
+        return;
+
+    m_autoscroll_dir = direction;
+    if (direction == 0) {
+        if (m_autoscroll_timer.IsRunning())
+            m_autoscroll_timer.Stop();
+        return;
+    }
+    if (!m_autoscroll_timer.IsRunning())
+        m_autoscroll_timer.Start(PLATE_BOARD_AUTOSCROLL_MS);
+}
+
+void PlateBoard::on_autoscroll_tick(wxTimerEvent &)
+{
+    if (!m_dragging || m_autoscroll_dir == 0) {
+        m_autoscroll_timer.Stop();
+        m_autoscroll_dir = 0;
+        return;
+    }
+
+    const int previous = m_scroll_px;
+    m_scroll_px += m_autoscroll_dir * std::max(1, m_row_height / PLATE_BOARD_AUTOSCROLL_DIV);
+    clamp_scroll();
+    if (m_scroll_px == previous) {
+        //Already at the end. Stop rather than tick against the clamp for as long as the
+        //button is held.
+        m_autoscroll_timer.Stop();
+        m_autoscroll_dir = 0;
+        return;
+    }
+
+    //The rows moved under a stationary pointer, so what is beneath it is a different group
+    //than it was a tick ago. Recomputed here because no motion event is coming.
+    m_drop_group = drop_group_at(m_drag_pos);
+    Refresh();
+}
+
+void PlateBoard::end_drag(bool commit)
+{
+    const int  group_index  = m_drop_group;
+    const int  plate        = m_drag_plate;
+    const bool was_dragging = m_dragging;
+
+    if (HasCapture())
+        ReleaseMouse();
+    m_dragging   = false;
+    m_drag_armed = false;
+    m_drop_group = -1;
+    if (m_autoscroll_timer.IsRunning())
+        m_autoscroll_timer.Stop();
+    m_autoscroll_dir = 0;
+    Refresh();
+
+    //group_index < 0 is a release over nothing, which is a cancel and not a refusal: the pill
+    //under the cursor has been drawn dimmed for the whole time there was no target, so the
+    //gesture has already said what letting go here would do.
+    if (!commit || !was_dragging || plate < 0 || group_index < 0)
+        return;
+    if (m_plater == nullptr || !m_plater->is_initialized())
+        return;
+
+    const std::vector<PlateBoardGroup> &groups = m_model.groups();
+    if (group_index >= (int) groups.size())
+        return;
+    const PlateBoardGroup &group = groups[(size_t) group_index];
+    if (!group.drop_target)
+        return;
+
+    const std::vector<int> targets = drag_targets();
+    if (targets.empty())
+        return;
+
+    //Nothing here renumbers anything. The drop changes which machine the plate is assigned
+    //to and nothing else, because plate index is what every filename the prep pipeline
+    //writes is keyed on.
+    const PartPlateList &plates  = m_plater->get_partplate_list();
+    int                  changed = 0;
+    for (int idx : targets) {
+        const PartPlate *target = plates.get_plate(idx);
+        if (target != nullptr && target->get_printer_preset_name() != group.machine)
+            ++changed;
+    }
+
+    if (changed == 0) {
+        //The write path returns early on an unchanged name, so without this a drop onto the
+        //group a plate is already in would move nothing and say nothing, which is the
+        //silent no-op this fork treats as a bug. It names the plate and the machine.
+        //
+        //CustomNotification rather than BBLPlateInfo, which is what the plate-side code
+        //elsewhere uses: NotificationManager::set_in_preview HIDES every BBLPlateInfo while
+        //the Preview tab is up, and this board is in the sidebar, which is up on both tabs.
+        //A message that disappears on one tab is the silence it was written to replace.
+        //CustomNotification is also in m_multiple_types, compared by text, so repeating the
+        //same drop does not stack the same sentence.
+        wxString message;
+        if (targets.size() == 1)
+            message = group.machine.empty()
+                          ? wxString::Format(_L("Plate %d already follows the project printer."), plate + 1)
+                          : wxString::Format(_L("Plate %d is already assigned to %s."), plate + 1,
+                                             from_u8(group.machine));
+        else
+            message = group.machine.empty()
+                          ? wxString::Format(_L("Those %d plates already follow the project printer."),
+                                             (int) targets.size())
+                          : wxString::Format(_L("Those %d plates are already assigned to %s."),
+                                             (int) targets.size(), from_u8(group.machine));
+
+        if (NotificationManager *notifications = m_plater->get_notification_manager())
+            notifications->push_notification(NotificationType::CustomNotification,
+                                             NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                             into_u8(message));
+        return;
+    }
+
+    //Deferred, because the assignment rebuilds this control from inside the mouse handler
+    //that is still running. One call either way, so the undo snapshot, the bounds re-check
+    //and the slice bookkeeping happen once, and the batch is a single undo press.
+    Plater *          plater  = m_plater;
+    const std::string machine = group.machine;
+    if (targets.size() == 1) {
+        const int one = targets.front();
+        CallAfter([plater, one, machine]() { plater->set_plate_printer(one, machine); });
+    } else {
+        CallAfter([plater, targets, machine]() { plater->set_plate_printers(targets, machine); });
+    }
+}
+
 void PlateBoard::set_scope(const std::vector<int> &scoped_plates, bool project_scope)
 {
     if (m_scoped_plates == scoped_plates && m_scope_project == project_scope)
@@ -1301,16 +1891,57 @@ void PlateBoard::set_scope(const std::vector<int> &scoped_plates, bool project_s
 void PlateBoard::on_mouse(wxMouseEvent &evt)
 {
     if (evt.GetEventType() == wxEVT_LEAVE_WINDOW) {
-        m_hover = Hit();
-        Refresh();
+        //a captured drag keeps receiving motion outside the window, so leaving is not the
+        //end of one
+        if (!m_dragging) {
+            m_hover = Hit();
+            hide_row_preview();
+            Refresh();
+        }
         return;
     }
 
     const Hit hit = hit_test(evt.GetPosition());
 
     if (evt.GetEventType() == wxEVT_MOTION) {
+        if (m_dragging) {
+            m_drag_pos   = evt.GetPosition();
+            m_drop_group = drop_group_at(m_drag_pos);
+            update_autoscroll(m_drag_pos);
+            Refresh();
+            return;
+        }
+
+        //A press that has travelled past the slop is a drag. on_left_down set exactly one of
+        //these two: armed when this grouping has machine groups to drop onto, attempted when
+        //it has none, so the same gesture either starts or gets an answer.
+        if ((m_drag_armed || m_drag_attempt) && evt.LeftIsDown()) {
+            const wxPoint delta = evt.GetPosition() - m_press_pos;
+            if (std::abs(delta.x) + std::abs(delta.y) >= FromDIP(PLATE_BOARD_DRAG_SLOP_DIP)) {
+                if (m_drag_attempt) {
+                    m_drag_attempt = false;
+                    if (!m_drag_hint_shown)
+                        say_where_drag_works();
+                } else {
+                    m_dragging = true;
+                    m_drag_pos = evt.GetPosition();
+                    hide_row_preview();
+                    if (!HasCapture())
+                        CaptureMouse();
+                    m_drop_group = drop_group_at(m_drag_pos);
+                    Refresh();
+                    return;
+                }
+            }
+        }
+
         if (hit != m_hover) {
             m_hover = hit;
+            //Restart the dwell on every row change, and drop the preview immediately, so
+            //what is on screen is never a picture of the row the pointer has just left.
+            hide_row_preview();
+            if (hit.kind == HitKind::Row)
+                m_hover_timer.Start(PLATE_BOARD_HOVER_MS, wxTIMER_ONE_SHOT);
             Refresh();
         }
         return;
@@ -1318,6 +1949,17 @@ void PlateBoard::on_mouse(wxMouseEvent &evt)
 
     if (evt.GetEventType() != wxEVT_LEFT_UP)
         return;
+
+    //A completed drag is the whole gesture. It must return before the chip test and before
+    //select_plate below, or letting go over a header would also select a plate or open a
+    //picker the user never asked for.
+    if (m_dragging) {
+        end_drag(true);
+        return;
+    }
+    m_drag_armed   = false;
+    m_drag_attempt = false;
+    hide_row_preview();
 
     if (m_plater == nullptr || !m_plater->is_initialized())
         return;
@@ -1790,6 +2432,10 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
     //keeps a thirty-six plate project's repaint the same cost as a three plate one.
     dc.SetClippingRegion(0, top, width, visible);
 
+    //The plates the drag is carrying, resolved once rather than per row: it is the scope
+    //set when the grabbed row is part of one, and that set is already on screen.
+    const std::vector<int> dragged = m_dragging ? drag_targets() : std::vector<int>();
+
     for (const Item &item : m_items) {
         const int y = top + item.y - m_scroll_px;
         if (y + item.height <= top)
@@ -1798,25 +2444,84 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
             break;
 
         if (item.header) {
-            if (item.group >= 0 && item.group < (int) groups.size())
+            if (item.group >= 0 && item.group < (int) groups.size()) {
                 draw_group_header(dc, dark, width, y, item.height, groups[(size_t) item.group],
                                   m_collapsed.count(groups[(size_t) item.group].key) > 0);
+                //the header the drop would land on says so, so the machine being assigned is
+                //named on screen before the button is released
+                if (m_dragging && item.group == m_drop_group) {
+                    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+                    dc.SetPen(wxPen(board_accent(dark), FromDIP(2)));
+                    dc.DrawRectangle(1, y + 1, width - 2, item.height - 2);
+                }
+            }
         } else if (item.row >= 0 && item.row < (int) rows.size()) {
             const PlateBoardGroup *group = item.group >= 0 && item.group < (int) groups.size()
                                                ? &groups[(size_t) item.group]
                                                : nullptr;
             draw_row(dc, dark, width, y, item.height, item.row, group);
+
+            if (!dragged.empty() &&
+                std::find(dragged.begin(), dragged.end(), rows[(size_t) item.row].plate_index) != dragged.end()) {
+                dc.SetBrush(*wxTRANSPARENT_BRUSH);
+                dc.SetPen(wxPen(board_accent(dark), 1, wxPENSTYLE_SHORT_DASH));
+                dc.DrawRectangle(0, y, width, item.height);
+            }
         }
     }
 
     //Sticky: the group a scrolled row belongs to stays named at the top of the region, or
     //a scrolled list is a list of rows with nothing saying what they are under.
     const int sticky = m_scroll_px > 0 ? sticky_group() : -1;
-    if (sticky >= 0 && sticky < (int) groups.size())
+    if (sticky >= 0 && sticky < (int) groups.size()) {
         draw_group_header(dc, dark, width, top, m_header_height, groups[(size_t) sticky],
                           m_collapsed.count(groups[(size_t) sticky].key) > 0);
+        if (m_dragging && sticky == m_drop_group) {
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.SetPen(wxPen(board_accent(dark), FromDIP(2)));
+            dc.DrawRectangle(1, top + 1, width - 2, m_header_height - 2);
+        }
+    }
 
     dc.DestroyClippingRegion();
+
+    //After the clip is dropped, not inside it: a captured drag can put the pointer over the
+    //rollup or below the last row, and a pill clipped to the scroll region would vanish at
+    //exactly the moment the user is farthest from a target and most needs telling.
+    if (m_dragging)
+        draw_drag_pill(dc, dark);
+}
+
+void PlateBoard::draw_drag_pill(wxDC &dc, bool dark)
+{
+    //What the cursor is carrying, said in words. Without it a drag over a long list is a
+    //highlight moving with no statement of what would land there.
+    const std::vector<int> targets = drag_targets();
+    if (targets.empty())
+        return;
+
+    const wxString text = targets.size() == 1
+                              ? wxString::Format(_L("Plate %d"), m_drag_plate + 1)
+                              : wxString::Format(_L("%d plates"), (int) targets.size());
+
+    dc.SetFont(Label::Body_9);
+    const wxSize extent = dc.GetTextExtent(text);
+    const int    pad    = FromDIP(6);
+    const int    w      = extent.GetWidth() + 2 * pad;
+    const int    h      = extent.GetHeight() + FromDIP(4);
+    const int    x      = std::max(0, std::min(m_drag_pos.x + FromDIP(10), GetClientSize().GetWidth() - w));
+    //Clamped into the control, because a captured drag reports positions outside it and an
+    //unclipped pill drawn at a negative y is simply not there.
+    const int    y      = std::max(0, std::min(m_drag_pos.y - h / 2, GetClientSize().GetHeight() - h));
+
+    //Dimmed while the pointer is not over a target, so "there is nowhere to drop this here"
+    //is visible without a refusal and without a modal.
+    const wxColour fill = m_drop_group >= 0 ? board_accent(dark) : board_dim(dark);
+    dc.SetBrush(wxBrush(fill));
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.DrawRoundedRectangle(x, y, w, h, FromDIP(3));
+    dc.SetTextForeground(board_bg(dark));
+    dc.DrawText(text, x + pad, y + FromDIP(2));
 }
 
 // ----------------------------------------------------------------------------

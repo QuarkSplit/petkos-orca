@@ -9,6 +9,8 @@
 
 #include <boost/filesystem.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 
 using namespace Slic3r;
@@ -25,6 +27,18 @@ void seed_denied_names()
     PluginAuditManager& mgr = PluginAuditManager::instance();
     for (const auto& name : PluginAuditManager::default_denied_filenames())
         mgr.add_denied_filename(name);
+}
+
+// The case-insensitivity section must case-flip the registered name at runtime instead of
+// hardcoding one spelling of it. A literal spelling of the app key silently stops testing
+// anything when the key is renamed, which is what happened when this fork became PetkosOrca.
+std::string flip_case(const std::string& s, bool upper)
+{
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [upper](unsigned char c) {
+        return static_cast<char>(upper ? std::toupper(c) : std::tolower(c));
+    });
+    return out;
 }
 
 } // namespace
@@ -61,9 +75,12 @@ TEST_CASE("Plugin audit denies app config and token filenames anywhere", "[audit
 
     SECTION("matching is case-insensitive on every platform")
     {
-        CHECK(mgr.is_denied_filename(fs::path("orcaslicer.conf")));
-        CHECK(mgr.is_denied_filename(fs::path("ORCASLICER.CONF")));
-        CHECK(mgr.is_denied_filename(fs::path("ORCA_REFRESH_TOKEN.SEC")));
+        const std::string app_conf = SLIC3R_APP_KEY ".conf";
+        CHECK(mgr.is_denied_filename(fs::path(flip_case(app_conf, false))));
+        CHECK(mgr.is_denied_filename(fs::path(flip_case(app_conf, true))));
+
+        const std::string secret = secret_constants::USER_SECRET_FILENAME;
+        CHECK(mgr.is_denied_filename(fs::path(flip_case(secret, true))));
     }
 
     SECTION("an unrelated name that merely shares a stem is not denied")

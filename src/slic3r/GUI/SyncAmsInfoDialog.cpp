@@ -1593,12 +1593,15 @@ int SyncAmsInfoDialog::convert_filament_map_nozzle_id_to_task_nozzle_id(int nozz
     }
 }
 
-void SyncAmsInfoDialog::prepare(int print_plate_idx)
+bool SyncAmsInfoDialog::prepare(int print_plate_idx)
 {
-    if (print_plate_idx < 0)
-        throw Slic3r::RuntimeError("AMS synchronization requires one explicit plate");
+    if (print_plate_idx < 0) {
+        show_error(this, _L("Synchronizing AMS information needs one explicit plate. Select a plate first."), false);
+        return false;
+    }
     m_print_plate_idx = print_plate_idx;
     m_specify_plate_idx = print_plate_idx;
+    return true;
 }
 
 void SyncAmsInfoDialog::update_ams_status_msg(wxString msg, bool is_warning)

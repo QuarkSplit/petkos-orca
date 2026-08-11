@@ -157,16 +157,21 @@ TEST_CASE("Current vendor type tolerates missing printer model", "[Preset][Bundl
     CHECK(bundle.get_current_vendor_type() == VendorType::Unknown);
 }
 
-TEST_CASE("Printer extruder count tolerates missing nozzle diameter", "[Preset][Bundle]")
+// Carried against upstream, which asserted the opposite. Upstream returned 1 extruder when
+// nozzle_diameter was missing or empty; this fork returns 0 and logs an error, because inventing
+// an extruder count for a printer that never stated one is a fallback, and the count feeds
+// filament-row sizing and per-plate nozzle mapping. Restoring the 1 would put a machine fact
+// nobody supplied into the slicing context. See PresetBundle::get_printer_extruder_count.
+TEST_CASE("Printer extruder count refuses to invent a missing nozzle diameter", "[Preset][Bundle]")
 {
     PresetBundle bundle;
     DynamicPrintConfig& config = bundle.printers.get_edited_preset().config;
 
     config.erase("nozzle_diameter");
-    CHECK(bundle.get_printer_extruder_count() == 1);
+    CHECK(bundle.get_printer_extruder_count() == 0);
 
     config.set_key_value("nozzle_diameter", new ConfigOptionFloats());
-    CHECK(bundle.get_printer_extruder_count() == 1);
+    CHECK(bundle.get_printer_extruder_count() == 0);
 
     config.set_key_value("nozzle_diameter", new ConfigOptionFloats({ 0.4, 0.6 }));
     CHECK(bundle.get_printer_extruder_count() == 2);
@@ -555,6 +560,412 @@ TEST_CASE("Plate slicing context resolves exact FDM presets without Project-prin
         ambiguous.filament_id = "FIL-001";
         CHECK_FALSE(bundle.resolve_ams_filament_preset(tray, resolved, std::nullopt, matched, error));
         CHECK(error.find("multiple compatible presets") != std::string::npos);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Tier 1: PresetBundle::resolve_plate_presets and PresetBundle::plate_process_option
+// ----------------------------------------------------------------------------
+//
+// The plate-inheritance rule has one home. It used to have four, because the render path asks
+// identity questions once per plate per frame and the full resolver answers them by copying every
+// preset in the plate's context. The copies drifted, and the drift was not theoretical: two of
+// them checked neither the nozzle definition nor the recorded vendor, and the two process copies
+// checked no printer at all, so a plate the slicer calls unresolved still handed a process value
+// back to the sidebar.
+//
+// These cases pin tier 1's own behaviour, then pin the three specific disagreements by asking all
+// three surfaces about one context and requiring the same verdict. That agreement is the property
+// the fold exists to create, and it is a property the copies did not have.
+
+namespace {
+
+// A minimal FDM bundle with one named printer, process and filament, and a Project row whose
+// values differ in every field the plate also names. Anything reading the Project row where it
+// should read the plate then shows up as a wrong value rather than as a pass.
+struct PlateContextFixture
+{
+    PresetBundle bundle;
+    // Valid only while no further preset is added to the SAME collection: PresetCollection holds
+    // its presets in a std::deque and inserts in sorted order, so an insertion invalidates
+    // references into it. Nothing below adds a printer or a process after construction except
+    // deselect_via_project_embedded, and no case uses these pointers together with that.
+    Preset *     printer = nullptr;
+    Preset *     process = nullptr;
+
+    PlateContextFixture()
+    {
+        auto [vendor_it, inserted] = bundle.vendors.emplace("TEST", VendorProfile("TEST"));
+        REQUIRE(inserted);
+
+        printer = &add_inmemory_preset(bundle.printers, "Plate Printer");
+        printer->vendor                   = &vendor_it->second;
+        printer->printer_technology_ref() = ptFFF;
+        printer->config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+        printer->config.set_key_value("printer_model", new ConfigOptionString("Plate Model"));
+
+        process = &add_inmemory_preset(bundle.prints, "Plate Process");
+        process->config.set_key_value("layer_height", new ConfigOptionFloat(0.27));
+        process->config.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(PrintSequence::ByObject));
+
+        Preset &filament = add_inmemory_preset(bundle.filaments, "Plate Filament");
+        filament.filament_id = "FIL-001";
+        bundle.filament_presets = {"Plate Filament"};
+
+        // The Project row, deliberately different everywhere it can be.
+        bundle.printers.get_edited_preset().printer_technology_ref() = ptFFF;
+        bundle.printers.get_edited_preset().config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.25}));
+        bundle.printers.get_edited_preset().config.set_key_value("printer_model", new ConfigOptionString("Project Model"));
+        bundle.prints.get_edited_preset().config.set_key_value("layer_height", new ConfigOptionFloat(0.11));
+        bundle.prints.get_edited_preset().config.set_key_value("print_sequence",
+                                                               new ConfigOptionEnum<PrintSequence>(PrintSequence::ByLayer));
+    }
+
+    PlateSlicingContext named_context() const
+    {
+        PlateSlicingContext context;
+        context.printer_preset_name   = "Plate Printer";
+        context.printer_vendor_id     = "TEST";
+        context.print_preset_name     = "Plate Process";
+        context.filament_preset_names = {"Plate Filament"};
+        return context;
+    }
+};
+
+// Leave a collection with no resolved selection, by the route the application actually takes:
+// a project-embedded preset is selected, then the project is closed and its embedded presets are
+// removed. That leaves m_idx_selected == size_t(-1) AND a stale edited preset still in memory,
+// which is the pair that matters - reaching for the edited preset there is the fallback the fork
+// forbids. (select_preset_by_name_strict, the other route into this state, is protected.)
+void deselect_via_project_embedded(PresetCollection &collection, const std::string &name)
+{
+    add_inmemory_preset(collection, name).is_project_embedded = true;
+    collection.select_preset_by_name(name, true);
+    REQUIRE(collection.get_selected_preset_name() == name);
+    REQUIRE(collection.reset_project_embedded_presets());
+    REQUIRE(collection.get_selected_idx() == size_t(-1));
+    REQUIRE(collection.get_edited_preset().name == name); // the stale preset is still there
+}
+
+// The three surfaces that each used to carry their own copy of the rule: tier 1, tier 2, and the
+// narrow process read the sidebar and the render path use.
+struct PlateContextVerdicts
+{
+    bool tier1 = false;
+    bool tier2 = false;
+    bool process_read = false;
+
+    bool all_agree() const { return tier1 == tier2 && tier2 == process_read; }
+};
+
+PlateContextVerdicts ask_every_surface(const PresetBundle &bundle, const PlateSlicingContext &context)
+{
+    PlateContextVerdicts verdicts;
+
+    ResolvedPlatePresets presets;
+    std::string          tier1_error;
+    verdicts.tier1 = bundle.resolve_plate_presets(context, presets, tier1_error);
+
+    ResolvedPlateSlicingConfig resolved;
+    std::string                tier2_error;
+    verdicts.tier2 = bundle.resolve_plate_slicing_config(context, std::vector<int>{1}, std::vector<int>{0},
+                                                         resolved, tier2_error);
+
+    verdicts.process_read = bundle.plate_process_option(context, nullptr, "print_sequence") != nullptr;
+    return verdicts;
+}
+
+} // namespace
+
+TEST_CASE("Tier-1 plate preset resolution follows the inheritance rule exactly", "[Preset][PlateContext]")
+{
+    PlateContextFixture        fixture;
+    PresetBundle &             bundle = fixture.bundle;
+    const PlateSlicingContext  named  = fixture.named_context();
+
+    ResolvedPlatePresets presets;
+    // Seeded non-empty so a resolver that forgets to clear it on success is caught.
+    std::string error = "not cleared";
+
+    SECTION("a named context resolves by exact name and never from the Project row")
+    {
+        REQUIRE(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(error.empty());
+        REQUIRE(presets.printer != nullptr);
+        REQUIRE(presets.print != nullptr);
+        CHECK(presets.printer->name == "Plate Printer");
+        CHECK(presets.print->name == "Plate Process");
+        CHECK(presets.printer_vendor_id == "TEST");
+        CHECK_FALSE(presets.is_bbl_printer);
+        // the plate's 0.6 nozzle, not the Project row's 0.25
+        REQUIRE(presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter") != nullptr);
+        CHECK_THAT(presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
+                   Catch::Matchers::WithinAbs(0.6, 1e-9));
+    }
+
+    SECTION("empty fields are explicit inheritance from the Project row")
+    {
+        const PlateSlicingContext inherited; // every field empty
+        REQUIRE(bundle.resolve_plate_presets(inherited, presets, error));
+        CHECK(error.empty());
+        CHECK(presets.printer == &bundle.printers.get_edited_preset());
+        CHECK(presets.print == &bundle.prints.get_edited_preset());
+        CHECK_THAT(presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
+                   Catch::Matchers::WithinAbs(0.25, 1e-9));
+    }
+
+    SECTION("one empty field inherits while the others still resolve exactly")
+    {
+        PlateSlicingContext printer_only = named;
+        printer_only.print_preset_name.clear();
+        REQUIRE(bundle.resolve_plate_presets(printer_only, presets, error));
+        CHECK(presets.printer->name == "Plate Printer");
+        CHECK(presets.print == &bundle.prints.get_edited_preset());
+    }
+
+    SECTION("a named preset that is not installed is unresolved, never a nearest match")
+    {
+        PlateSlicingContext missing = named;
+        missing.printer_preset_name = "Plate Printer Mk2";
+        CHECK_FALSE(bundle.resolve_plate_presets(missing, presets, error));
+        CHECK(error.find("Plate Printer Mk2") != std::string::npos);
+        // and specifically NOT the similarly named preset that does exist
+        CHECK(presets.printer == nullptr);
+        CHECK(presets.print == nullptr);
+
+        missing = named;
+        missing.print_preset_name = "Plate Process Mk2";
+        CHECK_FALSE(bundle.resolve_plate_presets(missing, presets, error));
+        CHECK(error.find("Plate Process Mk2") != std::string::npos);
+        CHECK(presets.print == nullptr);
+    }
+
+    SECTION("an unresolved Project printer selection is an error, not permission to use the edited preset")
+    {
+        deselect_via_project_embedded(bundle.printers, "Embedded Project Printer");
+
+        const PlateSlicingContext inherited;
+        CHECK_FALSE(bundle.resolve_plate_presets(inherited, presets, error));
+        CHECK(error == "The Project printer preset selection is unresolved");
+        // The stale edited preset is right there - deselect_via_project_embedded asserts it is -
+        // and is deliberately not reached for. That is the whole point of this case.
+        CHECK(presets.printer == nullptr);
+
+        // a plate that names its own machine is untouched by the Project row being broken
+        CHECK(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(presets.printer->name == "Plate Printer");
+    }
+
+    SECTION("an unresolved Project process selection is an error")
+    {
+        deselect_via_project_embedded(bundle.prints, "Embedded Project Process");
+
+        PlateSlicingContext printer_only = named;
+        printer_only.print_preset_name.clear();
+        CHECK_FALSE(bundle.resolve_plate_presets(printer_only, presets, error));
+        CHECK(error == "The Project process preset selection is unresolved");
+        CHECK(presets.print == nullptr);
+
+        // the plate's own named process is unaffected
+        CHECK(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(presets.print->name == "Plate Process");
+    }
+
+    SECTION("tier 1 throws nothing, whatever it is handed")
+    {
+        // A query and an action must not share a throw. Tier 1 is reached from const queries and
+        // from the render loop, where an exception unwinds a wx event handler and terminates the
+        // application; every one of these must come back as a false with a reason instead.
+        PlateSlicingContext hostile;
+        hostile.printer_preset_name   = std::string(4096, 'x');
+        hostile.printer_vendor_id     = "NOT-A-VENDOR";
+        hostile.print_preset_name     = "\n\t\"'<&>";
+        hostile.filament_preset_names = {"", "Ghost Filament"};
+        CHECK_NOTHROW(bundle.resolve_plate_presets(hostile, presets, error));
+        CHECK_FALSE(bundle.resolve_plate_presets(hostile, presets, error));
+
+        deselect_via_project_embedded(bundle.printers, "Embedded Project Printer");
+        CHECK_NOTHROW(bundle.resolve_plate_presets(PlateSlicingContext(), presets, error));
+
+        // and the narrow read on top of it, including a key no ConfigDef in this build carries
+        CHECK_NOTHROW(bundle.plate_process_option(hostile, nullptr, "print_sequence"));
+        CHECK_NOTHROW(bundle.plate_process_option(named, nullptr, "petkos_not_a_process_option"));
+        CHECK_NOTHROW(bundle.plate_process_option(PlateSlicingContext(), nullptr, "print_sequence"));
+    }
+
+    SECTION("tier 1 writes nothing, on the failing path or the succeeding one")
+    {
+        const size_t      printer_idx    = bundle.printers.get_selected_idx();
+        const size_t      print_idx      = bundle.prints.get_selected_idx();
+        const std::string edited_printer = bundle.printers.get_edited_preset().name;
+        const double      edited_nozzle =
+            bundle.printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0);
+
+        PlateSlicingContext missing = named;
+        missing.printer_preset_name = "Ghost Printer";
+        CHECK_FALSE(bundle.resolve_plate_presets(missing, presets, error));
+        CHECK(bundle.printers.get_selected_idx() == printer_idx);
+        CHECK(bundle.prints.get_selected_idx() == print_idx);
+        CHECK(bundle.printers.get_edited_preset().name == edited_printer);
+
+        REQUIRE(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(bundle.printers.get_selected_idx() == printer_idx);
+        CHECK(bundle.prints.get_selected_idx() == print_idx);
+        CHECK(bundle.printers.get_edited_preset().name == edited_printer);
+        CHECK_THAT(bundle.printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
+                   Catch::Matchers::WithinAbs(edited_nozzle, 1e-9));
+    }
+}
+
+TEST_CASE("The three plate-context surfaces cannot disagree", "[Preset][PlateContext]")
+{
+    PlateContextFixture       fixture;
+    PresetBundle &            bundle = fixture.bundle;
+    const PlateSlicingContext named  = fixture.named_context();
+
+    SECTION("a context that resolves: all three say yes")
+    {
+        const PlateContextVerdicts verdicts = ask_every_surface(bundle, named);
+        CHECK(verdicts.tier1);
+        CHECK(verdicts.tier2);
+        CHECK(verdicts.process_read);
+        CHECK(verdicts.all_agree());
+    }
+
+    SECTION("divergence 1: a printer preset with no nozzle definition")
+    {
+        // The GUI identity copy checked only the technology and the vendor, so it accepted a
+        // machine the full resolver refuses. Nothing downstream can size a toolhead from it.
+        fixture.printer->config.set_key_value("nozzle_diameter", new ConfigOptionFloats(std::vector<double>{}));
+
+        const PlateContextVerdicts verdicts = ask_every_surface(bundle, named);
+        CHECK_FALSE(verdicts.tier1);
+        CHECK_FALSE(verdicts.tier2);
+        CHECK_FALSE(verdicts.process_read);
+        CHECK(verdicts.all_agree());
+
+        ResolvedPlatePresets presets;
+        std::string          error;
+        CHECK_FALSE(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(error.find("no nozzle definition") != std::string::npos);
+    }
+
+    SECTION("divergence 2: a printer preset that is not an FDM machine")
+    {
+        // Neither process copy looked at the printer at all, so both answered from the process
+        // preset of a plate whose machine this FDM-only fork cannot slice for.
+        fixture.printer->printer_technology_ref() = ptSLA;
+
+        const PlateContextVerdicts verdicts = ask_every_surface(bundle, named);
+        CHECK_FALSE(verdicts.tier1);
+        CHECK_FALSE(verdicts.tier2);
+        CHECK_FALSE(verdicts.process_read);
+        CHECK(verdicts.all_agree());
+
+        ResolvedPlatePresets presets;
+        std::string          error;
+        CHECK_FALSE(bundle.resolve_plate_presets(named, presets, error));
+        CHECK(error.find("not an FDM printer") != std::string::npos);
+    }
+
+    SECTION("divergence 3: a recorded vendor the resolved preset no longer belongs to")
+    {
+        // Same shape as divergence 2: the process copies had no vendor check, so a preset name
+        // that now resolves to another vendor's machine still produced a process value.
+        PlateSlicingContext moved = named;
+        moved.printer_vendor_id   = "OTHER";
+
+        const PlateContextVerdicts verdicts = ask_every_surface(bundle, moved);
+        CHECK_FALSE(verdicts.tier1);
+        CHECK_FALSE(verdicts.tier2);
+        CHECK_FALSE(verdicts.process_read);
+        CHECK(verdicts.all_agree());
+
+        ResolvedPlatePresets presets;
+        std::string          error;
+        CHECK_FALSE(bundle.resolve_plate_presets(moved, presets, error));
+        CHECK(error.find("recorded vendor 'OTHER'") != std::string::npos);
+    }
+
+    SECTION("divergence 4: an unresolved Project row, reached through inheritance")
+    {
+        deselect_via_project_embedded(bundle.printers, "Embedded Project Printer");
+
+        const PlateContextVerdicts verdicts = ask_every_surface(bundle, PlateSlicingContext());
+        CHECK_FALSE(verdicts.tier1);
+        CHECK_FALSE(verdicts.tier2);
+        CHECK_FALSE(verdicts.process_read);
+        CHECK(verdicts.all_agree());
+
+        // and a plate that names its own machine is still resolvable, so this is an unresolved
+        // Project row rather than an unresolvable project
+        const PlateContextVerdicts named_verdicts = ask_every_surface(bundle, named);
+        CHECK(named_verdicts.tier1);
+        CHECK(named_verdicts.tier2);
+        CHECK(named_verdicts.process_read);
+    }
+}
+
+TEST_CASE("The narrow plate process read equals the composed value", "[Preset][PlateContext]")
+{
+    PlateContextFixture       fixture;
+    PresetBundle &            bundle = fixture.bundle;
+    const PlateSlicingContext named  = fixture.named_context();
+
+    // The plate's own override, which the composition applies last and the narrow read applies
+    // first - the same answer reached from opposite ends.
+    DynamicPrintConfig plate_overrides;
+    plate_overrides.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(PrintSequence::ByLayer));
+
+    SECTION("with no plate override, the value is the plate's process preset, not the Project's")
+    {
+        const ConfigOption *narrow = bundle.plate_process_option(named, nullptr, "print_sequence");
+        REQUIRE(narrow != nullptr);
+        CHECK(narrow->getInt() == int(PrintSequence::ByObject));
+        // the Project process says ByLayer; reading it here would be the substitution the fork forbids
+        CHECK(narrow->getInt() != int(PrintSequence::ByLayer));
+        // and it is the option OF that preset, not a copy of it or a value from anywhere else
+        CHECK(narrow == fixture.process->config.option("print_sequence"));
+
+        ResolvedPlateSlicingConfig resolved;
+        std::string                error;
+        REQUIRE(bundle.resolve_plate_slicing_config(named, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        const ConfigOption *composed = resolved.config.option("print_sequence");
+        REQUIRE(composed != nullptr);
+        CHECK(narrow->serialize() == composed->serialize());
+    }
+
+    SECTION("a plate override wins, and still equals the composed value")
+    {
+        const ConfigOption *narrow = bundle.plate_process_option(named, &plate_overrides, "print_sequence");
+        REQUIRE(narrow != nullptr);
+        CHECK(narrow->getInt() == int(PrintSequence::ByLayer));
+
+        ResolvedPlateSlicingConfig resolved;
+        std::string                error;
+        REQUIRE(bundle.resolve_plate_slicing_config(named, std::vector<int>{1}, std::vector<int>{0}, resolved, error));
+        resolved.config.apply(plate_overrides, true); // exactly what resolve_plate_context does last
+        const ConfigOption *composed = resolved.config.option("print_sequence");
+        REQUIRE(composed != nullptr);
+        CHECK(narrow->serialize() == composed->serialize());
+    }
+
+    SECTION("an unresolved context yields nothing, never the Project row's value")
+    {
+        PlateSlicingContext missing = named;
+        missing.print_preset_name   = "Ghost Process";
+        CHECK(bundle.plate_process_option(missing, nullptr, "print_sequence") == nullptr);
+
+        // ...but a plate override is the plate's own data and survives an unresolved preset,
+        // because it needs no preset to be read.
+        const ConfigOption *narrow = bundle.plate_process_option(missing, &plate_overrides, "print_sequence");
+        REQUIRE(narrow != nullptr);
+        CHECK(narrow->getInt() == int(PrintSequence::ByLayer));
+    }
+
+    SECTION("an option the process preset does not carry is absent, not zero")
+    {
+        CHECK(bundle.plate_process_option(named, nullptr, "petkos_not_a_process_option") == nullptr);
     }
 }
 
