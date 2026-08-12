@@ -36,6 +36,23 @@ fixes that followed are all restatements of it (commits `7cb1ff7bd7`, `bca2d008e
 Left deliberately dormant: `build_variant_items`/`is_back` in the picker (the ask-step that was
 built and then repealed the same hour — remove on next touch).
 
+### Found live, not yet fixed: File-Save re-decorates a downloaded project
+
+A save mid-testing (15:27:33, `export_3mf ... backup=0` in the 15:25 debug log) wrote the
+load-time `"(Superdestroyer-BD.3mf)"` preset decorations back into the fixture, and the next
+load decorated them AGAIN: `@BBL P2S(Superdestroyer-BD.3mf)(Superdestroyer-BD.3mf)`. Every save
+of a downloaded project degrades its names one generation deeper. The load side copes (the
+rename-completion resolves them), but the fix belongs on the SAVE side: strip the current
+project's own decoration from every name the exporter writes — one helper, every name field.
+The pristine fixture is gone (no other copy existed); the current file loads and slices, so it
+stays. First item for the next session; also in the plans INDEX open threads.
+
+The same live pass earned the day's quiet-down batch (`a76be888ad`): the relative-E validator
+error deleted in favour of the slicer emitting `G92 E0` itself at layer change, the
+invalid-values toast demoted to one calm line, and assignment now selecting the plate so the
+new bed is visible the moment it is picked — the reported "first change does nothing" was
+correct behaviour succeeding invisibly.
+
 ## Work log — 2026-08-12, session 2 (the mechanism, and the crash that was never about presets)
 
 ### The re-resolution mechanism exists
