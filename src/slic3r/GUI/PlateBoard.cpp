@@ -701,16 +701,24 @@ PlatePrinterPopup::PlatePrinterPopup(wxWindow *             parent,
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     m_row_height = FromDIP(26);
 
-    build_items(current_name);
+    m_current_name = current_name;
+    //the nozzle the plate is on now, which is the value a machine pick carries over
+    {
+        const std::string effective = !current_name.empty() ? current_name
+                                                            : wxGetApp().preset_bundle->printers.get_selected_preset_name();
+        if (const Preset *cur = wxGetApp().preset_bundle->printers.find_preset(effective, false); cur != nullptr)
+            m_current_variant = cur->config.opt_string("printer_variant");
+    }
 
-    const int rows   = (int) m_items.size();
-    const int height = std::min(FromDIP(420), rows * m_row_height + FromDIP(4));
-    SetSize(wxSize(std::max(parent->GetSize().GetWidth(), FromDIP(280)), height));
+    build_items(current_name);
+    SetSize(wxSize(std::max(parent->GetSize().GetWidth(), FromDIP(280)), FromDIP(100)));
+    fit_height();
 
     Bind(wxEVT_PAINT, &PlatePrinterPopup::on_paint, this);
     Bind(wxEVT_MOTION, &PlatePrinterPopup::on_mouse, this);
     Bind(wxEVT_LEFT_UP, &PlatePrinterPopup::on_mouse, this);
     Bind(wxEVT_LEAVE_WINDOW, &PlatePrinterPopup::on_mouse, this);
+    Bind(wxEVT_MOUSEWHEEL, &PlatePrinterPopup::on_wheel, this);
 
     //A transient popup only hears clicks inside its own application. Alt-tabbing or
     //clicking another app leaves it floating over that app, so it listens for the app
@@ -796,23 +804,46 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
         header.label     = from_u8(group.first);
         m_items.push_back(header);
 
+        //ONE ROW PER MACHINE, not one per nozzle. Ten spellings of the same printer
+        //differing by variant is the stock-Orca idiom this fork exists to retire: the
+        //machine is the identity, the nozzle is a dependent resolved after the pick.
+        std::map<std::string, Item>     models;      //keyed by model name (or preset name when no model)
+        std::vector<std::string>        model_order; //map iteration loses discovery order
         for (const Preset *preset : group.second) {
-            Item item;
-            item.name  = preset->name;
-            item.label = from_u8(preset->name);
-
-            if (PlateBoardModel::printer_bed_size(bundle, preset->name, item.bed_w, item.bed_d)) {
-                item.detail = wxString::Format("%.0f x %.0f mm", item.bed_w, item.bed_d);
-                m_glyph_reference_mm = std::max(m_glyph_reference_mm, std::max(item.bed_w, item.bed_d));
-                item.smaller_bed = current_w > 0. && current_d > 0. &&
-                                   (item.bed_w < current_w - 0.5 || item.bed_d < current_d - 0.5);
+            std::string key = preset->config.opt_string("printer_model");
+            if (key.empty())
+                key = preset->name;
+            auto it = models.find(key);
+            if (it == models.end()) {
+                Item item;
+                item.label = from_u8(key);
+                if (PlateBoardModel::printer_bed_size(bundle, preset->name, item.bed_w, item.bed_d)) {
+                    item.detail = wxString::Format("%.0f x %.0f mm", item.bed_w, item.bed_d);
+                    m_glyph_reference_mm = std::max(m_glyph_reference_mm, std::max(item.bed_w, item.bed_d));
+                    item.smaller_bed = current_w > 0. && current_d > 0. &&
+                                       (item.bed_w < current_w - 0.5 || item.bed_d < current_d - 0.5);
+                }
+                it = models.emplace(key, std::move(item)).first;
+                model_order.push_back(key);
             }
+            it->second.variant_presets.push_back(preset->name);
+            std::string variant = preset->config.opt_string("printer_variant");
+            it->second.variant_labels.push_back(variant.empty() ? from_u8(preset->name)
+                                                                : wxString::Format(_L("%s nozzle"), from_u8(variant)));
+        }
 
-            const std::map<std::string, int>::const_iterator used = plate_counts.find(preset->name);
-            if (used != plate_counts.end())
-                item.detail += wxString::Format("   %d %s", used->second,
-                                                used->second == 1 ? _L("plate") : _L("plates"));
-            m_items.push_back(item);
+        for (const std::string &key : model_order) {
+            Item &item = models[key];
+            int   plates_here = 0;
+            for (const std::string &preset_name : item.variant_presets) {
+                const auto used = plate_counts.find(preset_name);
+                if (used != plate_counts.end())
+                    plates_here += used->second;
+            }
+            if (plates_here > 0)
+                item.detail += wxString::Format("   %d %s", plates_here,
+                                                plates_here == 1 ? _L("plate") : _L("plates"));
+            m_items.push_back(std::move(item));
         }
     }
 
@@ -846,9 +877,85 @@ void PlatePrinterPopup::Popup(wxWindow *focus)
     PopupWindow::Popup(focus);
 }
 
+//The second step, shown only when the nozzle question is real: the machine is chosen,
+//its variants are the options, and the way back is the first row.
+void PlatePrinterPopup::build_variant_items(const Item &model_item)
+{
+    const Item model = model_item; //copied: m_items is about to be replaced under it
+    m_items.clear();
+    m_scroll = 0;
+
+    Item back;
+    back.is_back = true;
+    back.label   = wxString::FromUTF8("\xE2\x86\x90 ") + model.label;
+    m_items.push_back(back);
+
+    Item header;
+    header.is_header = true;
+    header.label     = _L("Which nozzle?");
+    m_items.push_back(header);
+
+    for (size_t i = 0; i < model.variant_presets.size(); ++i) {
+        Item item;
+        item.name        = model.variant_presets[i];
+        item.label       = model.variant_labels[i];
+        item.bed_w       = model.bed_w;
+        item.bed_d       = model.bed_d;
+        item.smaller_bed = model.smaller_bed;
+        m_items.push_back(item);
+    }
+
+    fit_height();
+    Refresh();
+}
+
+void PlatePrinterPopup::commit(const std::string &preset_name)
+{
+    Plater *  plater = m_plater;
+    const int plate  = m_plate_index;
+
+    std::vector<int> targets;
+    if (m_bulk_to_scope)
+        targets = m_scoped_plates;
+    else if (m_bulk_to_unassigned)
+        targets = m_unassigned_plates;
+    if (!targets.empty() && std::find(targets.begin(), targets.end(), plate) == targets.end())
+        targets.push_back(plate);
+
+    Dismiss();
+    //the assignment rebuilds the board this popup is parented to, so it runs after
+    //the dismissal rather than underneath it. One write path either way; the batch
+    //takes ONE snapshot, or undoing a five-plate action would take five presses.
+    CallAfter([plater, plate, preset_name, targets]() {
+        if (targets.empty())
+            plater->set_plate_printer(plate, preset_name);
+        else
+            plater->set_plate_printers(targets, preset_name);
+    });
+}
+
+void PlatePrinterPopup::fit_height()
+{
+    const int rows   = (int) m_items.size();
+    const int height = std::min(FromDIP(420), rows * m_row_height + FromDIP(4));
+    SetSize(wxSize(GetSize().GetWidth(), height));
+}
+
+void PlatePrinterPopup::on_wheel(wxMouseEvent &evt)
+{
+    const int content = (int) m_items.size() * m_row_height + FromDIP(4);
+    const int max_scroll = std::max(0, content - GetClientSize().GetHeight());
+    if (max_scroll == 0)
+        return;
+    const int step = m_row_height * 3;
+    m_scroll = std::max(0, std::min(max_scroll, m_scroll + (evt.GetWheelRotation() > 0 ? -step : step)));
+    m_hover  = hit_test(evt.GetPosition());
+    Refresh();
+}
+
 int PlatePrinterPopup::hit_test(const wxPoint &pos) const
 {
-    const int index = (pos.y - FromDIP(2)) / m_row_height;
+    const int index = (pos.y + m_scroll - FromDIP(2)) / m_row_height;
     if (index < 0 || index >= (int) m_items.size() || m_items[index].is_header)
         return -1;
     return index;
@@ -891,30 +998,38 @@ void PlatePrinterPopup::on_mouse(wxMouseEvent &evt)
             return;
         }
 
-        const std::string chosen = m_items[index].name;
-        Plater *          plater = m_plater;
-        const int         plate  = m_plate_index;
+        if (m_items[index].is_back) {
+            build_items(m_current_name);
+            m_scroll = 0;
+            fit_height();
+            Refresh();
+            return;
+        }
 
-        std::vector<int> targets;
-        if (m_bulk_to_scope)
-            targets = m_scoped_plates;
-        else if (m_bulk_to_unassigned)
-            targets = m_unassigned_plates;
-        if (!targets.empty() && std::find(targets.begin(), targets.end(), plate) == targets.end())
-            targets.push_back(plate);
+        //a MACHINE row: the nozzle NEVER asks. It resolves silently — the plate's
+        //current variant when the model carries it, 0.4 otherwise because that is what
+        //is physically in nearly every machine nearly all the time, else whatever the
+        //model has. Someone who actually changed a nozzle goes looking for that setting,
+        //and finds it on the plate inspector's Nozzle row.
+        if (!m_items[index].variant_presets.empty()) {
+            const Item &model = m_items[index];
+            auto variant_of = [](const std::string &preset_name) {
+                const Preset *p = wxGetApp().preset_bundle->printers.find_preset(preset_name, false);
+                return p != nullptr ? p->config.opt_string("printer_variant") : std::string();
+            };
+            std::string pick;
+            for (const std::string &preset_name : model.variant_presets)
+                if (!m_current_variant.empty() && variant_of(preset_name) == m_current_variant) { pick = preset_name; break; }
+            if (pick.empty())
+                for (const std::string &preset_name : model.variant_presets)
+                    if (variant_of(preset_name) == "0.4") { pick = preset_name; break; }
+            if (pick.empty())
+                pick = model.variant_presets.front();
+            commit(pick);
+            return;
+        }
 
-        Dismiss();
-        //the assignment rebuilds the board this popup is parented to, so it runs after
-        //the dismissal rather than underneath it. One write path either way, so the
-        //undo snapshot, the bounds re-check and the slice bookkeeping happen once; the
-        //batch takes ONE snapshot, or undoing a five-plate action would take five
-        //presses.
-        CallAfter([plater, plate, chosen, targets]() {
-            if (targets.empty())
-                plater->set_plate_printer(plate, chosen);
-            else
-                plater->set_plate_printers(targets, chosen);
-        });
+        commit(m_items[index].name);
     }
 }
 
@@ -931,7 +1046,7 @@ void PlatePrinterPopup::on_paint(wxPaintEvent &evt)
     const int glyph_x   = FromDIP(8);
     const int glyph_col = FromDIP(18);
     const int text_x    = glyph_x + glyph_col + FromDIP(8);
-    int       y         = FromDIP(2);
+    int       y         = FromDIP(2) - m_scroll;
 
     for (size_t i = 0; i < m_items.size(); ++i, y += m_row_height) {
         const Item &item = m_items[i];
@@ -2941,6 +3056,10 @@ void PlateInspector::build_rows()
 
     m_nozzle_label = make_label(_L("Nozzle"));
     m_nozzle_value = make_value(wxString());
+    //clicking the value switches the nozzle by picking the machine's sibling preset —
+    //the setting a changed nozzle is LOOKED for, never one the app asks about
+    m_nozzle_value->SetCursor(wxCursor(wxCURSOR_HAND));
+    m_nozzle_value->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &) { on_nozzle_click(); });
     grid->Add(m_nozzle_label, 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(m_nozzle_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
 
@@ -3049,6 +3168,54 @@ void PlateInspector::open_picker()
 
     const wxPoint anchor = m_printer_value->ClientToScreen(wxPoint(0, m_printer_value->GetSize().GetHeight()));
     show_printer_picker(this, m_plater, m_plate_index, scope, anchor, m_popup);
+}
+
+void PlateInspector::on_nozzle_click()
+{
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_PROJECT_ROW)
+        return;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
+    if (plate == nullptr)
+        return;
+
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    const std::string effective = plate->has_printer_assignment() ? plate->get_printer_preset_name()
+                                                                  : bundle->printers.get_selected_preset_name();
+    const Preset *current = bundle->printers.find_preset(effective, false);
+    if (current == nullptr)
+        return;
+    const std::string model = current->config.opt_string("printer_model");
+    if (model.empty())
+        return;
+
+    //the machine's variants, in the collection's order
+    std::vector<const Preset *> siblings;
+    for (const Preset &preset : bundle->printers) {
+        if (preset.is_visible && !preset.is_default && preset.printer_technology() == ptFFF &&
+            preset.config.opt_string("printer_model") == model)
+            siblings.push_back(&preset);
+    }
+    if (siblings.size() < 2)
+        return; //one nozzle is not a choice
+
+    wxMenu menu;
+    const int base_id = wxID_HIGHEST + 4300;
+    for (size_t i = 0; i < siblings.size(); ++i) {
+        const std::string variant = siblings[i]->config.opt_string("printer_variant");
+        wxMenuItem *item = menu.AppendCheckItem((int) (base_id + i),
+                                                variant.empty() ? from_u8(siblings[i]->name)
+                                                                : wxString::Format(_L("%s nozzle"), from_u8(variant)));
+        if (siblings[i]->name == current->name)
+            item->Check(true);
+    }
+    Plater *plater = m_plater;
+    const int plate_index = m_plate_index;
+    menu.Bind(wxEVT_MENU, [plater, plate_index, siblings, base_id](wxCommandEvent &evt) {
+        const size_t i = (size_t) (evt.GetId() - base_id);
+        if (i < siblings.size())
+            plater->set_plate_printer(plate_index, siblings[i]->name);
+    });
+    PopupMenu(&menu);
 }
 
 void PlateInspector::on_more_plate_settings()

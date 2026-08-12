@@ -254,13 +254,28 @@ private:
         bool        keep_missing = false;
         bool        is_bulk_toggle = false;  //"every unassigned plate"
         bool        is_scope_toggle = false; //"the N selected plates"
+        bool        is_back = false;         //the variant step's way home
+        //A MACHINE entry: one row per printer model, never one per nozzle. Picking it
+        //resolves the nozzle the way the mechanism resolves every dependent: the plate's
+        //current variant when the model carries it, the model's only variant when there
+        //is one, and a second step naming the variants only when the question is real.
+        std::vector<std::string> variant_presets; //exact preset names, aligned with labels
+        std::vector<wxString>    variant_labels;
     };
 
     void build_items(const std::string &current_name);
+    void build_variant_items(const Item &model_item);
+    void commit(const std::string &preset_name);
     void on_paint(wxPaintEvent &evt);
     void on_mouse(wxMouseEvent &evt);
+    void on_wheel(wxMouseEvent &evt);
     void on_app_activate(wxActivateEvent &evt);
     int  hit_test(const wxPoint &pos) const;
+    void fit_height();
+
+    int         m_scroll = 0;          //pixels; the list scrolls when taller than the popup
+    std::string m_current_name;        //the plate's stored assignment, for rebuilds
+    std::string m_current_variant;     //its nozzle variant: the value that carries over
 
     Plater *          m_plater = nullptr;
     int               m_plate_index = PLATE_BOARD_PROJECT_ROW;
@@ -515,6 +530,10 @@ private:
     void on_bed_type_selected();
     void on_more_plate_settings();
     void open_picker();
+    //the nozzle switch: a native menu of the plate's machine's variants, committing the
+    //sibling preset through the one write path. This is where a changed nozzle is looked
+    //for; nothing ever asks unprompted.
+    void on_nozzle_click();
     void set_expanded(bool expanded);
     void on_header_paint(wxPaintEvent &evt);
 
