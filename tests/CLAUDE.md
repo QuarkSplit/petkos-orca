@@ -76,8 +76,16 @@ REQUIRE(a > 0);
 REQUIRE(b < 10);  // Each shows individual values on failure
 ```
 
-### 4. **FLOATING POINT - NEVER USE APPROX**
-❌ **WRONG**: Approx is deprecated and asymmetric
+### 4. **FLOATING POINT — prefer the matchers for new assertions**
+
+For **new** float assertions use `WithinAbs` / `WithinRel` / `WithinULP`. `Approx` is asymmetric,
+double-only, and `Approx(0) == X` holds only when `X == 0`.
+
+**Leave existing `Approx` alone** unless you are already changing that assertion's semantics. This
+fork pays a permanent rebase cost against upstream for every line it touches, so a cosmetic sweep
+through untouched upstream tests is a real ongoing cost for no behavioural gain.
+
+❌ Approx is asymmetric and double-only
 ```cpp
 REQUIRE(calculated_value == Catch::Approx(expected));  // Deprecated!
 ```
@@ -179,273 +187,15 @@ Use descriptive tags for test categorization:
 - `[Algorithm]` - Core algorithms and processing
 - `[Performance]` - Performance benchmarks (if applicable)
 
-## Catch2 Features Guide
+## Catch2 reference
 
-### Basic Assertions
-```cpp
-// Primary assertions - stop test on failure
-REQUIRE(expression);
-REQUIRE_FALSE(expression);
+Catch2 **v3.11.0**, vendored at `tests/catch2`, built with
+`CATCH_CONFIG_EXPERIMENTAL_THREAD_SAFE_ASSERTIONS` **off** — which is why the assertion
+thread-safety rule above is a hard rule here and not merely good practice.
 
-// Continuing assertions - continue test after failure  
-CHECK(expression);
-CHECK_FALSE(expression);
-
-// Non-failing checks - record result but don't fail test
-CHECK_NOFAIL(expression);  // Useful for assumptions that might be violated
-```
-
-### Exception Testing
-```cpp
-// Verify no exception is thrown
-REQUIRE_NOTHROW(function_call());
-
-// Verify any exception is thrown
-REQUIRE_THROWS(risky_function());
-
-// Verify specific exception type
-REQUIRE_THROWS_AS(function_call(), SpecificException);
-
-// Verify exception message
-REQUIRE_THROWS_WITH(function_call(), "Expected error message");
-
-// Verify exception with matchers (for partial matching)
-REQUIRE_THROWS_MATCHES(function_call(), SpecificException, 
-                       Catch::Matchers::Message("contains this"));
-```
-
-### Complex Assertions with Matchers
-```cpp
-#include <catch2/matchers/catch_matchers.hpp>
-
-// String matchers
-using Catch::Matchers::StartsWith;
-using Catch::Matchers::EndsWith;
-using Catch::Matchers::ContainsSubstring;
-using Catch::Matchers::Equals;
-using Catch::Matchers::Matches;  // Regex matching
-
-REQUIRE_THAT(result_string, StartsWith("Expected prefix"));
-REQUIRE_THAT(result_string, ContainsSubstring("middle part"));
-REQUIRE_THAT(result_string, Matches(".*pattern.*"));
-
-// Floating point matchers - ALWAYS use these instead of Approx!
-using Catch::Matchers::WithinAbs;
-using Catch::Matchers::WithinRel;
-using Catch::Matchers::WithinULP;
-
-REQUIRE_THAT(float_value, WithinAbs(expected, 0.001));     // Absolute tolerance
-REQUIRE_THAT(float_value, WithinRel(expected, 0.01));      // Relative tolerance (1%)
-REQUIRE_THAT(float_value, WithinULP(expected, 4));         // ULP difference (requires IEEE-754)
-
-// Combining matchers
-REQUIRE_THAT(value, WithinRel(expected, 0.001) || WithinAbs(0.0, 0.000001));
-```
-
-### Sections for Test Organization
-```cpp
-TEST_CASE("Complex feature testing", "[Feature]") {
-    // Common setup code
-    SomeObject obj;
-    
-    SECTION("First scenario") {
-        // Specific test case
-        REQUIRE(obj.method1() == expected_value);
-    }
-    
-    SECTION("Second scenario") {
-        // Another test case with same setup
-        REQUIRE(obj.method2() == other_expected);
-    }
-}
-```
-
-### BDD-Style Tests
-Use for complex scenarios and user story testing:
-
-> **Note**: BDD macros are aliases for TEST_CASE and SECTION with prefixed names
-```cpp
-SCENARIO("User performs complex operation", "[UserStory]") {
-    GIVEN("A specific setup condition") {
-        GCodeWriter writer;
-        // Setup code
-        
-        WHEN("User performs action") {
-            auto result = writer.some_operation();
-            
-            THEN("Expected outcome occurs") {
-                REQUIRE(result.size() > 0);
-                
-                AND_WHEN("Follow-up action occurs") {
-                    auto next_result = writer.next_operation();
-                    
-                    THEN("Final outcome is correct") {
-                        REQUIRE(next_result == expected);
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-### Data Generators for Parameterized Tests
-```cpp
-TEST_CASE("Function works with various inputs", "[Algorithm]") {
-    auto test_value = GENERATE(1, 3, 5, 7, 11, 13);
-    
-    REQUIRE(is_odd(test_value));
-    REQUIRE(test_value > 0);
-}
-
-// Range-based generators
-TEST_CASE("Range testing", "[Algorithm]") {
-    auto i = GENERATE(range(1, 10));  // 1 to 9
-    REQUIRE(process_value(i) > i);
-}
-
-// Using variables in generators (requires GENERATE_COPY or GENERATE_REF)
-TEST_CASE("Generator with variables", "[Algorithm]") {
-    std::vector<int> values = {1, 2, 3, 4, 5};
-    auto test_value = GENERATE_REF(from_range(values));  // Use GENERATE_REF for references
-    
-    REQUIRE(test_value > 0);
-}
-
-// Custom generators
-TEST_CASE("Random values", "[Algorithm]") {
-    auto random_int = GENERATE(take(100, random(-1000, 1000)));  // 100 random values
-    REQUIRE(process_random_value(random_int));
-}
-```
-
-### Test Fixtures
-```cpp
-class GeometryFixture {
-public:
-    Point origin{0, 0};
-    Point unit_x{1, 0};
-    Point unit_y{0, 1};
-    
-    mutable double tolerance = EPSILON;  // Use mutable for data that might change
-};
-
-// Standard fixture - new instance per test run
-TEST_CASE_METHOD(GeometryFixture, "Point operations", "[Geometry]") {
-    REQUIRE(origin.distance_to(unit_x) == 1.0);
-}
-
-// Persistent fixture - single instance for entire test case (v3.2.0+)
-TEST_CASE_PERSISTENT_FIXTURE(GeometryFixture, "Persistent operations", "[Geometry]") {
-    static int call_count = 0;
-    ++call_count;
-    INFO("This fixture persists across sections, call: " << call_count);
-    
-    SECTION("First section") {
-        REQUIRE(origin.distance_to(unit_x) == 1.0);
-    }
-    
-    SECTION("Second section") {
-        REQUIRE(origin.distance_to(unit_y) == 1.0);
-        // call_count will be 2 here with persistent fixture
-    }
-}
-
-// Template fixtures for type-parameterized tests
-template<typename T>
-class NumericFixture {
-public:
-    T zero = T{0};
-    T one = T{1};
-};
-
-TEMPLATE_TEST_CASE_METHOD(NumericFixture, "Numeric operations", "[Template]", int, float, double) {
-    REQUIRE(TestType{} == this->zero);
-    REQUIRE(TestType{1} == this->one);
-}
-```
-
-### Advanced Testing Features
-
-#### Logging and Information Macros
-```cpp
-TEST_CASE("Advanced logging", "[Logging]") {
-    INFO("This info persists until end of scope");
-    
-    SECTION("Section A") {
-        INFO("Section A specific info");
-        CAPTURE(some_variable, another_var);  // Captures variable names and values
-        CHECK(some_condition);
-    }
-    
-    SECTION("Section B") {
-        UNSCOPED_INFO("This survives beyond its scope");  // v2.7.0+
-        CHECK(other_condition);
-    }
-}
-
-// Warning and explicit control
-TEST_CASE("Explicit test control", "[Control]") {
-    WARN("This warns but doesn't fail the test");
-    
-    if (precondition_not_met) {
-        SKIP("Reason");  // Marks the test as skipped (v3.3.0+, available)
-        return;
-    }
-    
-    if (critical_failure) {
-        FAIL("Critical condition failed");  // Fails and stops test
-    }
-    
-    SUCCEED("Reached successful completion");  // Explicit success marker
-}
-```
-
-#### Static Assertions (Compile-time Testing)
-```cpp
-TEST_CASE("Compile-time checks", "[Static]") {
-    STATIC_REQUIRE(sizeof(int) >= 4);  // Checked at compile time
-    STATIC_REQUIRE_FALSE(std::is_void_v<int>);
-    
-    // For traits and template metaprogramming
-    STATIC_CHECK(std::is_trivially_copyable_v<Point>);  // v3.0.1+
-}
-```
-
-#### Conditional Testing
-```cpp
-TEST_CASE("Conditional blocks", "[Conditional]") {
-    int value = get_test_value();
-    
-    // These record the expression but don't count as test failures (v3.0.1+)
-    CHECKED_IF(value > 0) {
-        // This block runs if value > 0
-        REQUIRE(value <= 100);
-    } CHECKED_ELSE(value > 0) {
-        // This block runs if value <= 0  
-        REQUIRE(value >= -100);
-    }
-}
-```
-
-#### Benchmarking (v2.9.0+)
-```cpp
-TEST_CASE("Performance testing", "[Benchmark]") {
-    // Simple benchmarking
-    BENCHMARK("Algorithm performance") {
-        return expensive_algorithm();
-    };
-    
-    // Advanced benchmarking with setup
-    BENCHMARK_ADVANCED("Advanced benchmark")(Catch::Benchmark::Chronometer meter) {
-        std::vector<int> data = setup_test_data();  // Setup not measured
-        
-        meter.measure([&] { 
-            return process_data(data);  // Only this is measured
-        });
-    };
-}
-```
+For assertion macros, matchers, generators, fixtures, BDD syntax and reporters, read the Catch2
+docs rather than a paraphrase: <https://github.com/catchorg/Catch2/tree/devel/docs>. This file
+holds only what is true of *this* repo and would not be guessable from the framework.
 
 ## OrcaSlicer-Specific Testing Patterns
 
@@ -565,35 +315,30 @@ namespace Catch {
 ## Running and Debugging Tests
 
 ### Building Tests
-```bash
-# Build all tests
-cd build && make
 
-# Build specific test suite
-cd build && make libslic3r_tests
+**This fork is Windows-only. `make` and `./tests/...` are upstream's Unix commands and do not run
+here.** Use the CMake driver and the Release output paths:
 
-# Build and run tests
-cd build && make && ctest
+```powershell
+# Build. Name BOTH targets: PlateBoardModel lives in libslic3r_gui, which libslic3r_tests does not
+# link, so board coverage compiles only under slic3rutils_tests. Omit it and cases are SILENTLY
+# skipped rather than failing.
+cmake --build build --config Release --target libslic3r_tests slic3rutils_tests
 ```
 
 ### Running Tests
 
 #### Essential Test Execution Patterns
-```bash
-# REQUIRED: Random order with assertion warnings (best practice)
-cd build && ./tests/libslic3r/libslic3r_tests --order rand --warn NoAssertions
+```powershell
+# Random order with assertion warnings
+build\tests\libslic3r\Release\libslic3r_tests.exe --order rand --warn NoAssertions
+build\tests\slic3rutils\Release\slic3rutils_tests.exe --order rand --warn NoAssertions
 
-# Run all tests with verbose output via CTest
-cd build && ctest --output-on-failure
+# Filter by tag
+build\tests\libslic3r\Release\libslic3r_tests.exe "[Geometry]" --order rand
 
-# Run specific test suite with best practices
-cd build && ./tests/libslic3r/libslic3r_tests --order rand --warn NoAssertions
-
-# Filter tests with specific tags
-cd build && ./tests/libslic3r/libslic3r_tests "[Geometry]" --order rand
-
-# Filter by test name patterns
-cd build && ./tests/libslic3r/libslic3r_tests "*geometry*" --order rand
+# Filter by test name pattern
+build\tests\libslic3r\Release\libslic3r_tests.exe "*geometry*" --order rand
 
 # Exclude tests (negation)
 cd build && ./tests/libslic3r/libslic3r_tests "~[Performance]" --order rand
@@ -679,164 +424,6 @@ TriangleMesh mesh = mesh(TestMesh::cube_20x20x20);
 DynamicPrintConfig config = config(TestConfig::PLA_default);
 ```
 
-## Common Pitfalls and Solutions
-
-### Floating-Point Comparisons
-
-> **CRITICAL**: Never use Approx - it's deprecated due to asymmetry and other issues
-
-❌ **Incorrect**:
-```cpp
-REQUIRE(calculated_volume == expected_volume);           // Exact equality
-REQUIRE(calculated_volume == Catch::Approx(expected));   // Deprecated! Asymmetric!
-```
-
-✅ **Correct**: Always use floating point matchers
-```cpp
-// Absolute tolerance - good when values are near zero
-REQUIRE_THAT(calculated_volume, WithinAbs(expected_volume, 0.001));
-
-// Relative tolerance - good for values with different magnitudes
-REQUIRE_THAT(calculated_volume, WithinRel(expected_volume, 0.01));  // 1% tolerance
-
-// ULP (Units in Last Place) - most precise, requires IEEE-754
-REQUIRE_THAT(calculated_volume, WithinULP(expected_volume, 4));
-
-// Combined approach - relative OR absolute
-REQUIRE_THAT(calculated_volume, 
-    WithinRel(expected_volume, 0.001) || WithinAbs(0.0, 0.000001));
-
-// Precision control for output
-Catch::StringMaker<double>::precision = 15;  // Show more decimal places
-```
-
-### Why Approx is Problematic:
-- **Asymmetric**: `Approx(10).epsilon(0.1) != 11.1` but `Approx(11.1).epsilon(0.1) == 10`
-- **Double-only**: All computation done in `double`, causes issues with `float` inputs  
-- **Default behavior**: Only uses relative comparison, so `Approx(0) == X` only works for `X == 0`
-
-### Path Handling
-❌ **Incorrect**:
-```cpp
-std::string path = TEST_DATA_DIR + "/model.obj";  // May have path separator issues
-```
-
-✅ **Correct**:
-```cpp
-std::string path = std::string(TEST_DATA_DIR) + "/model.obj";
-// or use boost::filesystem for complex path operations
-```
-
-### Exception Testing
-❌ **Incorrect**:
-```cpp
-bool threw_exception = false;
-try {
-    risky_function();
-} catch (...) {
-    threw_exception = true;
-}
-REQUIRE(threw_exception);
-```
-
-✅ **Correct**:
-```cpp
-REQUIRE_THROWS(risky_function());
-// or for specific exceptions
-REQUIRE_THROWS_AS(risky_function(), SpecificException);
-```
-
-### Thread Safety
-
-⚠️ **CRITICAL**: Catch2 assertions are **NOT thread-safe** by default!
-
-> **Note**: Catch2 v3.9.0+ has opt-in thread-safe assertions via `CATCH_CONFIG_EXPERIMENTAL_THREAD_SAFE_ASSERTIONS`. OrcaSlicer is on v3.11.0 but does not enable this flag, so assertions remain non-thread-safe by default.
-
-❌ **Incorrect**: Will cause undefined behavior or crashes
-```cpp
-std::thread t([&]() {
-    REQUIRE(threaded_operation() == expected);  // NOT THREAD-SAFE!
-    CHECK(other_operation());                   // NOT THREAD-SAFE!
-});
-```
-
-✅ **Correct**: Collect results, assert on main thread
-```cpp
-std::atomic<bool> success{false};
-std::atomic<int> error_count{0};
-
-std::thread t([&]() {
-    // Do work in thread, collect results
-    bool result1 = (threaded_operation() == expected);
-    bool result2 = other_operation();
-    
-    if (result1 && result2) {
-        success = true;
-    } else {
-        error_count++;
-    }
-});
-
-t.join();
-
-// Assert results on main thread
-REQUIRE(success);
-REQUIRE(error_count == 0);
-```
-
-#### Thread Safety Rules:
-- **REQUIRE family**: Would terminate process in spawned threads (throws exception with no try-catch)
-- **CHECK family**: Not thread-safe, can corrupt internal state
-- **SKIP, FAIL, SUCCEED**: Not thread-safe even with v3 thread-safe assertions
-- **Message macros**: INFO, CAPTURE, WARN - not thread-safe
-- **STATIC_REQUIRE/CHECK**: Not thread-safe (relies on runtime registration)
-
-### Memory Management
-Use RAII and smart pointers in tests:
-```cpp
-TEST_CASE("Resource management", "[Memory]") {
-    auto model = std::make_unique<Model>();
-    // Automatic cleanup on test completion/failure
-    
-    REQUIRE(model->objects.empty());
-}
-```
-
-## Performance Considerations
-
-### Compilation Optimizations
-```cpp
-// In CMakeLists.txt or as preprocessor definition
-#define CATCH_CONFIG_FAST_COMPILE  // 20% faster compilation, disables some features
-
-// For faster test iteration during development
-#define CATCH_CONFIG_DISABLE_STRINGIFICATION  // Workaround for VS2017 raw string bug
-```
-
-### Runtime Performance
-```cpp
-TEST_CASE("Performance-sensitive test", "[Performance]") {
-    // Manual timing example (Catch2's built-in BENCHMARK macro is also available)
-    auto start = std::chrono::high_resolution_clock::now();
-    
-    auto result = expensive_operation();
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    
-    REQUIRE(result.is_valid());
-    REQUIRE(duration.count() < 1000);  // Should complete in < 1 second
-    
-    INFO("Operation took " << duration.count() << "ms");
-}
-```
-
-### Memory Leak Detection
-```cpp
-// For Windows builds - detects memory leaks
-#define CATCH_CONFIG_WINDOWS_CRTDBG  // Must be defined for whole build
-```
-
 ## Integration with CMake
 
 ### Adding New Test Files
@@ -848,60 +435,6 @@ add_executable(${_TEST_NAME}_tests
     test_existing_feature.cpp
     test_new_feature.cpp  # Add here
 )
-```
-
-### Advanced Test Discovery
-```cmake
-# Basic test discovery
-catch_discover_tests(${_TEST_NAME}_tests TEST_PREFIX "${_TEST_NAME}: ")
-
-# Advanced test discovery with customization
-catch_discover_tests(${_TEST_NAME}_tests
-    TEST_PREFIX "${_TEST_NAME}: "
-    TEST_SUFFIX " (auto)"
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    EXTRA_ARGS --order rand --warn NoAssertions
-    PROPERTIES 
-        TIMEOUT 300
-        LABELS "unit;core"
-    DISCOVERY_MODE PRE_TEST  # or POST_BUILD
-    REPORTER junit
-    OUTPUT_DIR ${CMAKE_BINARY_DIR}/test-results
-    OUTPUT_PREFIX "results_"
-    OUTPUT_SUFFIX ".xml"
-)
-
-# Test sharding for parallel execution
-include(CatchShardTests)  # If available
-catch_shard_tests(${_TEST_NAME}_tests
-    SHARD_COUNT 4
-    TEST_PREFIX "${_TEST_NAME}_shard: "
-)
-```
-
-### Conditional Test Compilation
-```cmake
-# Feature-dependent tests
-if (TARGET OpenVDB::openvdb)
-    target_sources(${_TEST_NAME}_tests PRIVATE test_hollowing.cpp)
-endif()
-
-# Platform-specific tests
-if(WIN32)
-    target_sources(${_TEST_NAME}_tests PRIVATE test_windows_specific.cpp)
-elseif(UNIX)
-    target_sources(${_TEST_NAME}_tests PRIVATE test_unix_specific.cpp)
-endif()
-
-# Compiler-specific workarounds
-if(MSVC)
-    target_compile_definitions(${_TEST_NAME}_tests PRIVATE CATCH_CONFIG_DISABLE_STRINGIFICATION)
-endif()
-
-# Fast compile mode for development
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_definitions(${_TEST_NAME}_tests PRIVATE CATCH_CONFIG_FAST_COMPILE)
-endif()
 ```
 
 ## Known Issues and Workarounds

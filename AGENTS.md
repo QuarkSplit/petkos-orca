@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+> **This file is upstream OrcaSlicer's, kept for reference. `PETKOS-ORCA.md` outranks it.**
+> In particular the cross-platform and backward-compatibility constraints below do **not** bind this
+> fork: it is Windows-only and FDM-only, and only the Windows Release build is verifiable here.
+
 OrcaSlicer — open-source C++17 3D slicer. wxWidgets GUI, CMake build system.
 
 ## Build Commands

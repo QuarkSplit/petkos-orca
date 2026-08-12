@@ -18547,8 +18547,30 @@ void Plater::set_bed_shape() const
     auto bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (bundle == nullptr || !resolve_current_plate_slicing_config(resolved, error))
-        throw Slic3r::RuntimeError(error.empty() ? "Unable to resolve the current plate bed" : error);
+    if (bundle == nullptr || !resolve_current_plate_slicing_config(resolved, error)) {
+        // PetkosOrca: this used to throw, and the throw destroyed whole projects.
+        //
+        // set_bed_shape() is a const query reached from Plater::on_config_change(), which
+        // Plater::priv::load_files() runs inside its own try block. That catch shows the message
+        // and then `continue`s to the next input file, abandoning the Model that had already been
+        // read — so a project whose plate context does not resolve lost all of its geometry and
+        // was reported to the user as "The file does not contain any geometry data", which is a
+        // lie about the file. force_print_bed_update() deliberately poisons printer_model on every
+        // project open so that this branch runs, so the throw fired for every such project.
+        // Measured: all 89 BambuStudio-authored projects in the Comic Con collection, none of
+        // whose printers are installed here.
+        //
+        // A bed that cannot be computed is not a reason to discard a model. Keep the bed that is
+        // already drawn, and say what could not be resolved instead of dying.
+        const std::string reason = error.empty() ? std::string("the current plate has no resolved printer") : error;
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": leaving the bed unchanged: " << reason;
+        if (NotificationManager *ntf = const_cast<Plater *>(this)->get_notification_manager(); ntf != nullptr)
+            ntf->push_notification(NotificationType::CustomNotification,
+                                   NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                   into_u8(_L("The bed shown is not this plate's.")) + " " + reason + " " +
+                                       into_u8(_L("Assign the plate a printer you have installed to fix it.")));
+        return;
+    }
     const Preset *printer = resolved.printer_preset;
     if (printer->is_system)
         texture_filename = PresetUtils::system_printer_bed_texture(*printer);
@@ -19058,8 +19080,18 @@ wxString Plater::get_selected_printer_name_in_combox() {
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
             plate->get_real_filament_volume_maps(bundle->project_config),
-            resolved, error))
-        throw Slic3r::RuntimeError(error.empty() ? "No plate is selected" : error);
+            resolved, error)) {
+        // PetkosOrca: this used to throw, out of a wx event handler and with no catch above it,
+        // so an unresolved plate killed the process on the way into a warning dialog — the same
+        // shape as the two throws closed in SelectMachineDialog::prepare and PlateSettingsDialog.
+        // Every caller wants a name to put in front of the user, and the name is the one thing a
+        // plate still knows when tier 1 refuses to resolve it: the printer it was assigned. Report
+        // the failure and hand back the recorded name rather than dying while describing it.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << (error.empty() ? "no plate is selected" : error);
+        if (plate != nullptr && !plate->get_slicing_context().printer_preset_name.empty())
+            return from_u8(plate->get_slicing_context().printer_preset_name);
+        return wxEmptyString;
+    }
     return resolved.printer_preset->get_printer_type(bundle);
 }
 
@@ -19293,19 +19325,24 @@ bool Plater::resolve_plate_slicing_config(PartPlate *plate, ResolvedPlateSlicing
         error = "No plate is selected";
         return false;
     }
+    // PetkosOrca: both branches below used to call plate->update_apply_result_invalid(true).
+    // This is F7 one layer up, and by now it has more query callers than F7 did — the render
+    // path, the sidebar and the board all resolve plates they are only describing. m_apply_invalid
+    // makes can_slice() false with nothing on screen, so a plate that was briefly unresolvable
+    // left the Slice button dead with no message: a silent gate, which this fork calls a bug.
+    // The flag belongs to Plater::priv::apply_plate_config, the one path that both sets it on a
+    // real failure (with a validate-error notification naming the plate) and clears it on success.
+    // A query reports; it does not decide whether the user may slice.
     if (bundle == nullptr) {
         error = "The preset bundle is unavailable";
-        plate->update_apply_result_invalid(true);
         return false;
     }
     if (!bundle->resolve_plate_slicing_config(
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
             plate->get_real_filament_volume_maps(bundle->project_config),
-            resolved, error)) {
-        plate->update_apply_result_invalid(true);
+            resolved, error))
         return false;
-    }
     if (apply_plate_overrides)
         resolved.config.apply(*plate->config(), true);
     return true;

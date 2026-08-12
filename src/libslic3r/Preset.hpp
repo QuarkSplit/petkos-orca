@@ -622,14 +622,12 @@ public:
     // Select a preset. If an invalid index is provided, the first visible preset is selected.
     Preset&         select_preset(size_t idx);
     // Return the selected preset, without the user modifications applied.
-    Preset&         get_selected_preset() {
-        //BBS fix crash when m_idx_selected == -1, give a default value
-        if ((m_idx_selected < 0) || (m_idx_selected >= m_presets.size())) {
-            select_preset(first_visible_idx());
-        }
-        return m_presets[m_idx_selected];
-    }
-    const Preset&   get_selected_preset() const { return m_presets[m_idx_selected]; }
+    // PetkosOrca: both overloads used to index m_presets with m_idx_selected unguarded on the
+    // const side and to repair silently on the non-const side. The repair is now logged and
+    // first_visible_idx() can only name an installed preset, so an unresolved selection can no
+    // longer promote an uninstalled machine into the printer list without saying so.
+    Preset&         get_selected_preset();
+    const Preset&   get_selected_preset() const;
     size_t          get_selected_idx()    const { return m_idx_selected; }
     // Returns the name of the selected preset, or an empty string if no preset is selected.
     std::string     get_selected_preset_name() const {
@@ -650,7 +648,9 @@ public:
     Preset&         get_edited_preset()         { return m_edited_preset; }
     const Preset&   get_edited_preset() const   { return m_edited_preset; }
 
-    const Preset& get_selected_preset_base() const { return *get_preset_base(m_presets[m_idx_selected]); }
+    // PetkosOrca: went through m_presets[m_idx_selected] directly, so an unresolved selection
+    // indexed the deque out of range before get_preset_base() was ever called.
+    const Preset& get_selected_preset_base() const { return *get_preset_base(this->get_selected_preset()); }
 
     // Return the last saved preset.
 //  const Preset&   get_saved_preset() const { return m_saved_preset; }

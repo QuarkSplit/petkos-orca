@@ -1282,18 +1282,31 @@ void Selection::translate(const Vec3d &displacement, TransformationType transfor
                 PresetBundle *bundle = wxGetApp().preset_bundle;
                 ResolvedPlateSlicingConfig resolved;
                 std::string context_error;
-                if (!bundle->resolve_plate_slicing_config(
-                        tower_plate->get_slicing_context(),
-                        tower_plate->get_real_filament_maps(bundle->project_config),
-                        tower_plate->get_real_filament_volume_maps(bundle->project_config),
-                        resolved, context_error)) {
-                    tower_plate->update_apply_result_invalid(true);
-                    throw RuntimeError(context_error);
+                // PetkosOrca: this threw the bare resolver error out of Selection::translate, which
+                // runs from PartPlateList::set_default_wipe_tower_pos_for_plate during project load
+                // and from every drag of a wipe tower. There is no catch in any frame above either,
+                // so opening a project whose plate context does not resolve terminated the process
+                // right after the geometry had finished loading. Measured on Superdestroyer-BD.3mf.
+                //
+                // All that is wanted here is a margin to keep the tower on its bed. The plate's own
+                // brim width is unavailable, so use the same constant the already-sliced branch
+                // uses. Being wrong costs half a line width on a plate that cannot slice yet; the
+                // throw cost the whole session.
+                bool resolved_ok = bundle->resolve_plate_slicing_config(
+                    tower_plate->get_slicing_context(),
+                    tower_plate->get_real_filament_maps(bundle->project_config),
+                    tower_plate->get_real_filament_volume_maps(bundle->project_config),
+                    resolved, context_error);
+                double margin = WIPE_TOWER_MARGIN;
+                if (!resolved_ok) {
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate " << (plate_idx + 1)
+                                             << " is unresolved, keeping the wipe tower inside the bed on the default margin: "
+                                             << context_error;
+                } else {
+                    resolved.config.apply(*tower_plate->config(), true);
+                    float brim_width = resolved.config.opt_float("prime_tower_brim_width");
+                    margin = show_read_wipe_tower ? WIPE_TOWER_MARGIN : brim_width + 0.5; // 0.5 is the line width of wipe tower
                 }
-                resolved.config.apply(*tower_plate->config(), true);
-                float brim_width = resolved.config.opt_float("prime_tower_brim_width");
-
-                const double margin = show_read_wipe_tower ? WIPE_TOWER_MARGIN : brim_width + 0.5; // 0.5 is the line width of wipe tower
 
                 actual_displacement = (m_cache.volumes_data[i].get_instance_rotation_matrix() * m_cache.volumes_data[i].get_instance_scale_matrix() *
                                         m_cache.volumes_data[i].get_instance_mirror_matrix())

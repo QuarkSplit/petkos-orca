@@ -3305,11 +3305,11 @@ Preset* PresetCollection::find_preset2(const std::string& name, bool auto_match/
 size_t PresetCollection::first_visible_idx() const
 {
     //BBS: set first visible filament to fla
-    size_t first_visible = -1;
+    size_t first_visible = size_t(-1);
     size_t idx = m_default_suppressed ? m_num_default_presets : 0;
     for (; idx < m_presets.size(); ++ idx)
         if (m_presets[idx].is_visible && m_presets[idx].get_printer_id() == PresetBundle::ORCA_FILAMENT_LIBRARY) {
-            if (first_visible == -1)
+            if (first_visible == size_t(-1))
                 first_visible = idx;
             if (m_type != Preset::TYPE_FILAMENT)
                 break;
@@ -3320,13 +3320,48 @@ size_t PresetCollection::first_visible_idx() const
                 }
             }
         }
-    if (first_visible == -1) {
-        if (m_presets.size() > 1 && m_default_suppressed)
-            first_visible = m_presets.size() == m_num_default_presets ? 0 : m_num_default_presets;
-        else
-            first_visible = 0;
+    if (first_visible != size_t(-1))
+        return first_visible;
+
+    // PetkosOrca: the branch that used to run here returned m_num_default_presets without ever
+    // testing is_visible. Only a filament preset can carry ORCA_FILAMENT_LIBRARY, so the loop
+    // above never matches for a machine or process collection and every one of them landed here
+    // and named whichever preset sorted first on disk, installed or not. select_preset() then
+    // marked that preset visible, which is how loading a project whose printer is not installed
+    // put "Anycubic 4Max Pro 0.4 nozzle" into the machine list and selected it. Honour the
+    // function's own contract: only a visible preset may be named.
+    for (size_t i = m_default_suppressed ? m_num_default_presets : 0; i < m_presets.size(); ++ i)
+        if (m_presets[i].is_visible)
+            return i;
+
+    // Nothing is installed in this collection. Index 0 is the '- default -' preset, which always
+    // exists and is not a machine, so naming it substitutes no real printer for the missing one.
+    return 0;
+}
+
+// PetkosOrca: out-of-line so the repair path can say what it did. See the header for why.
+Preset& PresetCollection::get_selected_preset()
+{
+    if (m_idx_selected >= m_presets.size()) {
+        const size_t idx = this->first_visible_idx();
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": %1% has no valid selection; keeping the installed preset '%2%'."
+                                                                 " Whatever was asked for is unresolved and has NOT been substituted for.")
+                                        % Preset::get_type_string(m_type) % m_presets[idx].name;
+        this->select_preset(idx);
     }
-    return first_visible;
+    return m_presets[m_idx_selected];
+}
+
+const Preset& PresetCollection::get_selected_preset() const
+{
+    if (m_idx_selected >= m_presets.size()) {
+        // A const query cannot repair the selection and must not throw: callers include the
+        // render loop. Name the inert '- default -' preset and let the action paths report.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": %1% has no valid selection; a const query cannot repair it")
+                                        % Preset::get_type_string(m_type);
+        return m_presets[0];
+    }
+    return m_presets[m_idx_selected];
 }
 
 size_t PresetCollection::first_visible_idx_by_type(const std::string& filament_type) const

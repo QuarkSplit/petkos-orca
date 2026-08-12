@@ -4212,18 +4212,29 @@ void PartPlate::on_filament_added()
         std::vector<int>& filament_volume_map = m_config.option<ConfigOptionInts>("filament_volume_map")->values;
         // A new filament defaults onto the first extruder, so seed its volume value from
         // that extruder's flow type.
+        // PetkosOrca: both of these threw, out of a void notification handler with no catch above
+        // it, so adding a filament while any plate was unresolved killed the process. Standard is
+        // the value this same code already substitutes for a Hybrid extruder, and the row is
+        // recomputed the moment the plate resolves — so seeding it costs a default that is already
+        // in use here, while the throw cost the session. Same class as the wipe-tower throw in
+        // Selection::translate.
+        int volume_type = static_cast<int>(NozzleVolumeType::nvtStandard);
         ResolvedPlateSlicingConfig resolved;
         std::string error;
-        if (!wxGetApp().plater()->resolve_plate_slicing_config(this, resolved, error))
-            throw Slic3r::RuntimeError("Unable to add a filament to the plate: " + error);
-        const auto *nozzle_volumes = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-        if (nozzle_volumes == nullptr || nozzle_volumes->values.empty())
-            throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
-        int volume_type = nozzle_volumes->values[0];
-        // Orca: never store the Hybrid marker as a per-filament value; on a Hybrid extruder
-        // each filament still prints with a concrete flow, defaulting to Standard.
-        if (volume_type == static_cast<int>(NozzleVolumeType::nvtHybrid))
-            volume_type = static_cast<int>(NozzleVolumeType::nvtStandard);
+        if (!wxGetApp().plater()->resolve_plate_slicing_config(this, resolved, error)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate " << (m_plate_index + 1)
+                                     << " is unresolved; the new filament starts on the standard flow: " << error;
+        } else if (const auto *nozzle_volumes = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+                   nozzle_volumes == nullptr || nozzle_volumes->values.empty()) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate " << (m_plate_index + 1)
+                                     << " resolved to a config with no nozzle volume types; the new filament starts on the standard flow";
+        } else {
+            volume_type = nozzle_volumes->values[0];
+            // Orca: never store the Hybrid marker as a per-filament value; on a Hybrid extruder
+            // each filament still prints with a concrete flow, defaulting to Standard.
+            if (volume_type == static_cast<int>(NozzleVolumeType::nvtHybrid))
+                volume_type = static_cast<int>(NozzleVolumeType::nvtStandard);
+        }
 
         filament_volume_map.push_back(volume_type);
     }

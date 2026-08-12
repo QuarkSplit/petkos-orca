@@ -399,7 +399,17 @@ bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext       
     const PresetWithVendorProfile printer_profile = printers.get_preset_with_vendor_profile(*printer);
     const PresetWithVendorProfile print_profile   = prints.get_preset_with_vendor_profile(*print);
     if (!is_compatible_with_printer(print_profile, printer_profile, &project_config)) {
+        // PetkosOrca: name the reason, not only the verdict. Both presets here routinely come out
+        // of the same 3MF, so a bare "X is incompatible with Y" reads as an impossible pairing and
+        // sends the reader looking for a corrupt file. It is a conditional verdict and the
+        // condition is knowable, so say which one failed.
         error = "Process preset '" + print->name + "' is incompatible with printer '" + printer->name + "'";
+        const auto *listed = dynamic_cast<const ConfigOptionStrings *>(print->config.option("compatible_printers"));
+        if (listed != nullptr && !listed->values.empty())
+            error += ": it names " + std::to_string(listed->values.size()) +
+                     " compatible printers and this is not one of them";
+        else if (const std::string &cond = print->compatible_printers_condition(); !cond.empty())
+            error += ": its compatible_printers_condition (" + cond + ") is false for this printer";
         return false;
     }
 
@@ -2708,13 +2718,26 @@ static inline std::string remove_ini_suffix(const std::string &name)
 //a guess at what the user meant.
 bool PresetBundle::select_persisted_or_keep(PresetCollection &collection, const std::string &name, const char *caller)
 {
-    if (!name.empty() && collection.find_preset(name, false) != nullptr)
-        return collection.select_preset_by_name_strict(name);
+    if (name.empty())
+        return false;
 
-    if (!name.empty())
-        BOOST_LOG_TRIVIAL(error) << caller << ": persisted " << Preset::get_type_string(collection.type())
-                                 << " preset '" << name << "' is not installed; keeping the installed selection '"
-                                 << collection.get_selected_preset_name() << "'";
+    // PetkosOrca: this guard used to test find_preset() != nullptr, which is PRESENCE, not
+    // installedness. find_preset matches on canonical name and ignores is_visible, while
+    // select_preset_by_name_strict requires it — and every system preset from a loaded vendor
+    // profile stays in the collection merely marked invisible. So a printer the user unticked in
+    // the Configuration Wizard passed the guard, failed the strict select, and deselected the
+    // collection exactly as an absent name did, which is the failure this function exists to
+    // prevent. Resolve once, require the preset to be installed, and hand the strict select the
+    // resolved preset's own name so renamed_from resolution actually takes effect.
+    const Preset *p = collection.find_preset(name, false);
+    if (p != nullptr && p->is_visible)
+        return collection.select_preset_by_name_strict(p->name);
+
+    BOOST_LOG_TRIVIAL(error) << caller << ": persisted " << Preset::get_type_string(collection.type())
+                             << " preset '" << name << "' is "
+                             << (p == nullptr ? "not present" : "present but not installed")
+                             << "; keeping the installed selection '"
+                             << collection.get_selected_preset_name() << "'";
     return false;
 }
 
@@ -3230,35 +3253,78 @@ void PresetBundle::export_selections(AppConfig &config)
     // per-printer block below by a project filename, which is how "(BD-1 qadqwLower.3mf)" ended up
     // as the recorded machine. The persisted selection therefore stays as it was before the project
     // was opened. This substitutes nothing; it declines to record a name already known to dangle.
+    // PetkosOrca: the test used to be is_project_embedded alone, and it missed. A preset
+    // synthesised from a project's flat config gets is_external at Preset.cpp:2747 and only picks
+    // up is_project_embedded a few lines later behind a filename test, so the two flags do not
+    // always travel together — and the miss put "Bambu Lab P2S 0.4 nozzle(Superdestroyer-BD.3mf)"
+    // into PetkosOrca.conf, where the next launch could not find it. Either flag means the same
+    // thing for this decision: the preset came from a file, not from the user's installed set.
     const Preset *selected_printer = this->printers.find_preset(printer_name, false);
-    if (selected_printer != nullptr && selected_printer->is_project_embedded) {
+    const bool from_a_project = selected_printer != nullptr &&
+                                (selected_printer->is_external || selected_printer->is_project_embedded);
+
+    // The placeholder is not a selection either. The old code wrote it into presets.machine BEFORE
+    // deciding not to persist its settings, so opening one project on a printer this build does not
+    // have was enough to destroy the record of the printer the user actually works on — measured:
+    // a good "Flashforge AD5X 0.4 nozzle" became "Default Printer" with a null filament list, and
+    // every later launch started from nothing. Declining to overwrite a good record with a
+    // placeholder substitutes nothing; it keeps what the user last really chose.
+    if (printer_name.empty() || from_a_project || printer_name == "Default Printer") {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": the selected printer preset '" << printer_name
-                                << "' is embedded in the open project and cannot outlive it; the persisted selections are left unchanged";
+                                << "' is " << (from_a_project ? "embedded in the open project" : "the built-in placeholder")
+                                << " and is not a global startup selection; the persisted selections are left unchanged";
+        config.clear_printer_settings("Default Printer");
         return;
     }
 
     config.clear_section("presets");
     config.set("presets", PRESET_PRINTER_NAME, printer_name);
 
-    // Don't persist settings for the built-in "Default Printer" placeholder —
-    // it's only the initial state before a real printer is loaded/selected.
-    // Also clean up any stale entry that other code paths (e.g. bed type change)
-    // may have created for "Default Printer".
-    if (printer_name == "Default Printer") {
-        config.clear_printer_settings("Default Printer");
-        return;
+    // PetkosOrca: the guard above catches a project-embedded PRINTER, but a project can also be
+    // opened on an installed printer while its process and filaments are embedded — and those were
+    // still persisted, so "0.20mm Standard @BBL P2S(Superdestroyer-BD.3mf)" reached PetkosOrca.conf
+    // and dangled the moment the project closed. Read what is already recorded before the block is
+    // cleared, and keep it wherever the live name is one that cannot outlive the open project. A
+    // name that dangles is not a record of the user's choice, so declining to overwrite a good one
+    // with it substitutes nothing.
+    const auto keep_if_embedded = [&](const PresetCollection &collection, const std::string &live,
+                                      const std::string &key) -> std::string {
+        // Same two flags as the printer test above, for the same reason.
+        const Preset *p = collection.find_preset(live, false);
+        if (p == nullptr || !(p->is_external || p->is_project_embedded))
+            return live;
+        const std::string persisted = config.get_printer_setting(printer_name, key);
+        BOOST_LOG_TRIVIAL(info) << "export_selections: " << Preset::get_type_string(collection.type())
+                                << " preset '" << live << "' is embedded in the open project and cannot outlive it; "
+                                << (persisted.empty() ? std::string("recording nothing for '") + key + "'"
+                                                      : std::string("keeping the persisted '") + persisted + "'");
+        return persisted;
+    };
+    const std::string print_to_persist = keep_if_embedded(prints, prints.get_selected_preset_name(), PRESET_PRINT_NAME);
+    std::vector<std::string> filaments_to_persist;
+    filaments_to_persist.reserve(filament_presets.size());
+    for (unsigned i = 0; i < filament_presets.size(); ++i) {
+        char key[64];
+        if (i == 0)
+            snprintf(key, sizeof(key), "%s", PRESET_FILAMENT_NAME);
+        else
+            snprintf(key, sizeof(key), "filament_%02u", i);
+        filaments_to_persist.push_back(keep_if_embedded(filaments, filament_presets[i], key));
     }
 
     config.clear_printer_settings(printer_name);
     config.set_printer_setting(printer_name, PRESET_PRINTER_NAME, printer_name);
-    config.set_printer_setting(printer_name, PRESET_PRINT_NAME, prints.get_selected_preset_name());
-    config.set_printer_setting(printer_name, PRESET_FILAMENT_NAME,     filament_presets.front());
+    if (!print_to_persist.empty())
+        config.set_printer_setting(printer_name, PRESET_PRINT_NAME, print_to_persist);
+    if (!filaments_to_persist.empty() && !filaments_to_persist.front().empty())
+        config.set_printer_setting(printer_name, PRESET_FILAMENT_NAME, filaments_to_persist.front());
     config.set_printer_setting(printer_name, "curr_bed_type", config.get("curr_bed_type"));
-    for (unsigned i = 1; i < filament_presets.size(); ++i) {
+    for (unsigned i = 1; i < filaments_to_persist.size(); ++i) {
         char name[64];
-        assert(!filament_presets[i].empty());
-        sprintf(name, "filament_%02u", i);
-        config.set_printer_setting(printer_name, name, filament_presets[i]);
+        if (filaments_to_persist[i].empty())
+            continue;
+        snprintf(name, sizeof(name), "filament_%02u", i);
+        config.set_printer_setting(printer_name, name, filaments_to_persist[i]);
     }
     // Load project config data into app config
     CNumericLocalesSetter locales_setter;
@@ -4457,7 +4523,49 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
             printer_different_keys_set.insert(ignore_settings_list.begin(), ignore_settings_list.end());
         //BBS: add config related logs
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": load printer preset from printer_settings_id");
+        // PetkosOrca: the identity the project's own process refers to, captured before
+        // load_external_preset renames the printer. See the rewrite immediately below.
+        const std::string printer_name_in_project = config.opt_string("printer_settings_id", true);
         load_preset(this->printers, num_filaments + 1, "printer_settings_id", printer_different_keys_set, std::string());
+
+        // PetkosOrca: finish the rename that load_external_preset leaves half-done.
+        //
+        // Every preset created from a project is renamed to "<original>(<project file>)", and each
+        // collection does that independently. The process preset's compatible_printers, restored
+        // from the 3MF a few lines above, still names the printer by its ORIGINAL name — so the
+        // pair declares itself incompatible even though both came out of the same file, and every
+        // plate in the project reads as unresolved. Measured on Superdestroyer-BD.3mf: 21 plates,
+        // and the message it produced ("names 1 compatible printers and this is not one of them")
+        // is true of the decorated name and false of the project.
+        //
+        // This is not a compatibility fallback. It substitutes nothing and widens nothing: it maps
+        // exactly one dangling reference, the project's own printer, onto the preset this same load
+        // created from it. Anything else the list names is left alone and still has to match.
+        if (is_external && !printer_name_in_project.empty()) {
+            const std::string printer_name_loaded = this->printers.get_selected_preset_name();
+            Preset &print_stored = this->prints.get_selected_preset();
+            if (!printer_name_loaded.empty() && printer_name_loaded != printer_name_in_project && print_stored.is_external) {
+                const auto rewrite = [&](DynamicPrintConfig &cfg) {
+                    auto *listed = cfg.option<ConfigOptionStrings>("compatible_printers", false);
+                    if (listed == nullptr)
+                        return false;
+                    bool changed = false;
+                    for (std::string &v : listed->values)
+                        if (v == printer_name_in_project) {
+                            v = printer_name_loaded;
+                            changed = true;
+                        }
+                    return changed;
+                };
+                const bool changed_stored = rewrite(print_stored.config);
+                rewrite(this->prints.get_edited_preset().config);
+                if (changed_stored)
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": process preset '" << print_stored.name
+                                            << "' referred to its printer as '" << printer_name_in_project
+                                            << "'; the same load renamed that printer to '" << printer_name_loaded
+                                            << "', so the reference was updated to match";
+            }
+        }
 
         // 3) Now load the filaments. If there are multiple filament presets, split them and load them.
         auto old_filament_profile_names = config.option<ConfigOptionStrings>("filament_settings_id", true);

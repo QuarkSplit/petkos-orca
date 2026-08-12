@@ -1007,9 +1007,18 @@ float GLVolumeCollection::get_selection_support_normal_z() const
             plate->get_real_filament_maps(bundle->project_config),
             plate->get_real_filament_volume_maps(bundle->project_config),
             resolved, error)) {
-        if (plate != nullptr)
-            plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for support visualization" : error);
+        // PetkosOrca: this threw the bare resolver error, and it is reached from the render path
+        // via Plater::select_plate, with no catch in any frame above it. So opening a project whose
+        // plate context does not resolve terminated the process a few milliseconds after the
+        // geometry had finished loading. Measured on Superdestroyer-BD.3mf, 2 of 2.
+        //
+        // This function only decides where the 3D view tints an overhang. There is no correct
+        // threshold for a plate with no resolved process, and inventing one would tint the model
+        // with a number that came from nowhere — so return the value that highlights nothing and
+        // say why. Nothing downstream reads this as a slicing decision.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": no overhang highlight; "
+                                 << (error.empty() ? std::string("no plate is selected") : error);
+        return 0.0f;
     }
     resolved.config.apply(*plate->config(), true);
     const DynamicPrintConfig& full_cfg = resolved.config;
@@ -1028,8 +1037,13 @@ float GLVolumeCollection::get_selection_support_normal_z() const
         const auto*  nozzle_diameter_opt = full_cfg.option<ConfigOptionFloats>("nozzle_diameter");
         const int    wall_filament_id       = full_cfg.opt_int("outer_wall_filament_id");
         const size_t nozzle_count        = nozzle_diameter_opt->values.size();
-        if (nozzle_count == 0 || wall_filament_id < 0 || wall_filament_id > static_cast<int>(nozzle_count))
-            throw RuntimeError("The plate's outer-wall filament does not map to one of its printer nozzles");
+        if (nozzle_count == 0 || wall_filament_id < 0 || wall_filament_id > static_cast<int>(nozzle_count)) {
+            // Same reasoning as the unresolved branch above: this is the overhang tint, on the
+            // render path, with no catch above it. Highlight nothing rather than end the session.
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": no overhang highlight; the plate's outer-wall filament ("
+                                     << wall_filament_id << ") does not map to one of its " << nozzle_count << " nozzles";
+            return 0.0f;
+        }
         const size_t wall_extruder_idx = wall_filament_id == 0 ? 0 : static_cast<size_t>(wall_filament_id - 1);
         
         // Use wall extruder's nozzle diameter for better estimation of external perimeter width,
