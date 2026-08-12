@@ -1330,7 +1330,33 @@ bool GLVolumeCollection::check_outside_state(const BuildVolume &build_volume, Mo
     int extruder_count = plate_build_volume.get_extruder_area_count();
     std::vector<std::set<int>> unprintable_filament_ids(extruder_count, std::set<int>());
     std::set<ModelObject*> partly_objects_set;
+    // PETKO'S ORCA: why a volume collides, not just that it does. The colliding test answers
+    // "does this fit" with one bit; re-asking it with the height ceiling lifted separates the
+    // footprint fault from the height fault, which are the two things the user can act on.
+    std::set<ModelObject*> over_boundary_set;
+    std::set<ModelObject*> over_height_set;
+    const double           plate_printable_height = plate_build_volume.printable_height();
     const ModelObjectPtrs &model_objects = model.objects;
+    auto classify_collision = [&](GLVolume& volume) {
+        const BoundingBoxf3 bb = volume_bbox(volume);
+        const bool over_height = plate_printable_height > 0.0 &&
+                                 bb.max.z() > plate_printable_height + BuildVolume::SceneEpsilon;
+        BuildVolume::ObjectState xy_state = BuildVolume::ObjectState::Inside;
+        if (plate_build_volume.type() == BuildVolume_Type::Rectangle)
+            xy_state = plate_build_volume.volume_state_bbox(bb, true, true);
+        else if (plate_build_volume.type() != BuildVolume_Type::Invalid)
+            xy_state = plate_build_volume.object_state(volume_convex_mesh(volume).its, volume.world_matrix().cast<float>(),
+                                                       volume_sinking(volume), true, true);
+        // Anything the height-blind test still rejects is a footprint fault. When neither test
+        // accuses anything the collision is still real, so it is reported as a footprint fault
+        // rather than dropped: an unexplained fault must never become a silent one.
+        const bool over_boundary = xy_state != BuildVolume::ObjectState::Inside || !over_height;
+        ModelObject* model_object = model_objects[volume.object_idx()];
+        if (over_boundary)
+            over_boundary_set.emplace(model_object);
+        if (over_height)
+            over_height_set.emplace(model_object);
+    };
     for (GLVolume* volume : this->volumes)
     {
         std::vector<bool> inside_extruders;
@@ -1397,6 +1423,7 @@ bool GLVolumeCollection::check_outside_state(const BuildVolume &build_volume, Mo
                 {
                     overall_state = ModelInstancePVS_Partly_Outside;
                     partly_objects_set.emplace(model_objects[volume->object_idx()]);
+                    classify_collision(*volume);
                 }
                 else if ((state == BuildVolume::ObjectState::Limited) && (overall_state != ModelInstancePVS_Partly_Outside))
                     overall_state = ModelInstancePVS_Limited;
@@ -1446,6 +1473,8 @@ bool GLVolumeCollection::check_outside_state(const BuildVolume &build_volume, Mo
 
     if (object_results && !partly_objects_set.empty()) {
         object_results->partly_outside_objects = std::vector<ModelObject*>(partly_objects_set.begin(), partly_objects_set.end());
+        object_results->objects_over_boundary  = std::vector<ModelObject*>(over_boundary_set.begin(), over_boundary_set.end());
+        object_results->objects_over_height    = std::vector<ModelObject*>(over_height_set.begin(), over_height_set.end());
     }
 
     //check per-object error for extruder areas

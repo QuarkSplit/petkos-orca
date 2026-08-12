@@ -185,6 +185,11 @@ enum class NotificationType
     // Active preset references a capability the installed+loaded plugin does not provide (outdated
     // plugin). Informational; cannot be auto-resolved; persistent, blocks slicing.
     OrcaPluginCapabilityUnavailableError,
+    // PETKO'S ORCA: the two halves of upstream's single "laid over the boundary of plate or
+    // exceeds the height limit" message. They are separate faults with separate fixes, so they
+    // are separate notifications and either can be true without the other.
+    PlaterObjectOverBoundary,
+    PlaterObjectOverHeight,
     NotificationTypeCount
 
 };
@@ -420,6 +425,28 @@ public:
     void bbl_show_sole_text_notification(NotificationType sType,const std::string &text, bool bOverride, int level, bool autohide);
     void bbl_chose_sole_text_notification(NotificationType sType);
 
+	// PETKO'S ORCA: everything an object-scoped problem needs in order to be one calm, useful
+	// line instead of a paragraph. See ObjectProblemNotification for why it exists.
+	struct ObjectProblemData
+	{
+		NotificationType  type  { NotificationType::CustomNotification };
+		NotificationLevel level { NotificationLevel::ErrorNotificationLevel };
+		// One plain sentence, already pluralised: only the caller knows what the noun is.
+		std::string       summary;
+		// What to do about it. Shown only when the user asks for detail.
+		std::string       remedy;
+		// The objects the message is about: the id to select by, the name to show.
+		std::vector<std::pair<ObjectID, std::string>> objects;
+		// A fix the app can carry out itself. Empty label means there is no honest one-click
+		// fix, and inventing one would be a silent yes.
+		std::string           action_label;
+		std::function<void()> action;
+	};
+	// Shows the problem, or refreshes the one already on screen for this type. Refreshing keeps
+	// the disclosure state when nothing the user is reading has changed.
+	void update_object_problem_notification(const ObjectProblemData& problem);
+	void close_object_problem_notification(NotificationType type);
+
 private:
 	// duration 0 means not disapearing
 	struct NotificationData {
@@ -475,6 +502,13 @@ private:
 		virtual ~PopNotification() { if (m_id) m_id_provider.release_id(m_id); }
 		virtual void           render(GLCanvas3D& canvas, float initial_y, bool move_from_overlay, float overlay_width, float right_margin);
         virtual void bbl_render_block_notification(GLCanvas3D &canvas, float initial_y, bool move_from_overlay, float overlay_width, float right_margin);
+		// PETKO'S ORCA: which of the two renderers this notification wants. Upstream chooses by
+		// level alone, so anything at error level gets the full-bleed red panel no matter how
+		// little it has to say. A notification designed to be one calm line has to be able to
+		// decline that treatment without lying about its severity.
+		virtual bool           uses_block_render() const
+		{ return m_data.level == NotificationLevel::ErrorNotificationLevel
+		      || m_data.level == NotificationLevel::SeriousWarningNotificationLevel; }
 		// close will dissapear notification on next render
         virtual void close();
 		// data from newer notification of same type
@@ -676,6 +710,55 @@ private:
 		void         show()            { m_state = EState::Unknown; }
 	};
 
+
+	// PETKO'S ORCA: a problem the app can point at, and often fix for you.
+	//
+	// Upstream states an object problem as a paragraph on a full-bleed red panel: a heading, the
+	// raw mesh filenames, and a sentence of instructions. None of it is clickable, so after
+	// reading it the user still has to find the object themselves, and the filenames are the
+	// author's names for parts the user has never seen. Nor does the design survive its own
+	// commonest cause: point a plate at a smaller machine and every object on it fails at once,
+	// so the paragraph becomes a screenful of red about work the app could have done itself.
+	//
+	// This renders one sentence with a count. Clicking it selects the objects it is about, so
+	// the app answers "which one" instead of asking the user to. A fix the app can perform
+	// itself sits beside it as a link. The names and the remedy live behind a disclosure
+	// toggle: the detail is still there, it just isn't shouted.
+	class ObjectProblemNotification : public PopNotification
+	{
+	public:
+		ObjectProblemNotification(const NotificationData& n, NotificationIDProvider& id_provider,
+		                          wxEvtHandler* evt_handler, const ObjectProblemData& problem);
+		// Takes new content. Keeps the disclosure state if the user is reading the same thing.
+		void update_problem(const ObjectProblemData& problem);
+		bool uses_block_render() const override { return false; }
+	protected:
+		void init() override;
+		void count_spaces() override;
+		void count_lines() override;
+		void set_next_window_size(ImGuiWrapper& imgui) override;
+		void render_text(ImGuiWrapper& imgui,
+		                 const float win_size_x, const float win_size_y,
+		                 const float win_pos_x, const float win_pos_y) override;
+		void render_minimize_button(ImGuiWrapper& imgui, const float win_pos_x, const float win_pos_y) override {}
+		// The card already carries a coloured edge and icon; a red wash on top of one line of
+		// text is volume without information.
+		bool push_background_color() override { return false; }
+	private:
+		static std::string signature_of(const ObjectProblemData& problem);
+		void   select_objects(const std::vector<ObjectID>& ids) const;
+		// Draws a label that acts like a link: normal text colour, underlined while hovered.
+		bool   clickable_label(ImGuiWrapper& imgui, float text_x, float text_y,
+		                       const std::string& text, const char* id, bool emphasise);
+		// Longest prefix of text that fits max_width, with an ellipsis when it had to cut.
+		std::string elide(const std::string& text, float max_width) const;
+
+		ObjectProblemData m_problem;
+		std::string       m_signature;
+		bool              m_expanded { false };
+		// Names beyond this fold into an "and N more" row rather than growing without limit.
+		static constexpr size_t MAX_LISTED_NAMES = 6;
+	};
 
 	class ProgressBarNotification : public PopNotification
 	{

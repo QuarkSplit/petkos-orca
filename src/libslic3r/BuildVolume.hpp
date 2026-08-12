@@ -107,10 +107,14 @@ public:
     // Called by Plater to update Inside / Colliding / Outside state of ModelObjects before slicing.
     // Called from Model::update_print_volume_state() -> ModelObject::update_instances_print_volume_state()
     // Using SceneEpsilon
-    ObjectState  object_state(const indexed_triangle_set &its, const Transform3f &trafo, bool may_be_below_bed, bool ignore_bottom = true) const;
+    // PETKO'S ORCA: ignore_height re-runs the very same geometry test with the Z ceiling lifted.
+    // "Hangs over the plate edge" and "taller than the machine prints" are two faults with two
+    // different fixes, and upstream reports them as one sentence because one test answers both.
+    // Asking twice, once without the ceiling, tells them apart exactly rather than by guesswork.
+    ObjectState  object_state(const indexed_triangle_set &its, const Transform3f &trafo, bool may_be_below_bed, bool ignore_bottom = true, bool ignore_height = false) const;
     // Called by GLVolumeCollection::check_outside_state() after an object is manipulated with gizmos for example.
     // Called for a rectangular bed:
-    ObjectState  volume_state_bbox(const BoundingBoxf3& volume_bbox, bool ignore_bottom = true) const;
+    ObjectState  volume_state_bbox(const BoundingBoxf3& volume_bbox, bool ignore_bottom = true, bool ignore_height = false) const;
 
     // 2) Test called on G-code paths.
     // Using BedEpsilon for all tests.

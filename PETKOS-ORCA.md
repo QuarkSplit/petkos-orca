@@ -137,6 +137,25 @@ should make one more consumer plural.
 request as not planned. Keep diffs small, and comment each site with why it is carried, in
 terms of what breaks otherwise.
 
+**A message in the corner is the app asking for help. It costs the user attention, so it has
+to be worth it.** The bar, in order:
+
+- **One sentence, in the user's terms**, and a count rather than a list. A message that grows
+  with the number of affected objects is a message that fails hardest exactly when it matters
+  most, and re-pointing a plate at a smaller machine does that to every fit warning at once.
+- **Say which problem this is.** Two faults reported as one sentence because one test answered
+  both is the test's convenience, not the user's. If they are cheap to tell apart, tell them
+  apart and raise two.
+- **Name nothing the user cannot reach.** An object's name in a message is only useful if
+  clicking it selects that object. `NotificationManager::ObjectProblemNotification` is the
+  mechanism: one line, click to select, a More/Less toggle over the names and the remedy.
+- **Do the work rather than describe it.** If the app can fix the thing, the message offers the
+  fix as a link. If it cannot fix it honestly — anything that changes what gets made — it says
+  so and leaves the choice alone, because a silent yes costs more than a silent no.
+- **Severity is not a visual treatment.** `PopNotification::uses_block_render()` lets a
+  notification choose its own renderer; upstream inferred a full-bleed red panel from the level
+  alone, so one calm line of text arrived shouting. Red belongs on the edge, not the field.
+
 **Nothing may gate the user out of slicing on a maybe.** The clearance tests compare inflated
 2D hulls and approximate the toolhead rather than model it; their own wording says "may". A
 maybe must not block a definite when the user is looking at the plate. The bar for a hard

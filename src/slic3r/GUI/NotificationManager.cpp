@@ -3135,7 +3135,8 @@ void NotificationManager::render_notifications(GLCanvas3D &canvas, float overlay
 
 	int i = 0;
 	for (const auto& notification : m_pop_notifications) {
-        if (notification->get_data().level == NotificationLevel::ErrorNotificationLevel || notification->get_data().level == NotificationLevel::SeriousWarningNotificationLevel) {
+        // PETKO'S ORCA: ask the notification, do not infer from its level. See uses_block_render().
+        if (notification->uses_block_render()) {
             notification->bbl_render_block_notification(canvas, bottom_up_last_y, m_move_from_overlay && !m_in_preview, overlay_width * m_scale, right_margin);  // ORCA dont scale margins
             if (notification->get_state() != PopNotification::EState::Finished) 
 				bottom_up_last_y = notification->get_top() + GAP_WIDTH;
@@ -3686,6 +3687,254 @@ void NotificationManager::set_scale(float scale)
 	}
 }
 
+
+
+//------ObjectProblemNotification (PETKO'S ORCA)--------
+// One line about objects, that can select them and offer the app's own fix. The rationale for
+// replacing upstream's red paragraph is on the class in NotificationManager.hpp.
+
+NotificationManager::ObjectProblemNotification::ObjectProblemNotification(
+	const NotificationData& n, NotificationIDProvider& id_provider, wxEvtHandler* evt_handler,
+	const ObjectProblemData& problem)
+	: PopNotification(n, id_provider, evt_handler)
+	, m_problem(problem)
+	, m_signature(signature_of(problem))
+{
+	// The remedy is the only text that needs wrapping, so it is what the base machinery holds.
+	m_text1 = problem.remedy;
+}
+
+std::string NotificationManager::ObjectProblemNotification::signature_of(const ObjectProblemData& problem)
+{
+	std::string signature = problem.summary + "\x1f" + problem.remedy;
+	for (const auto& object : problem.objects)
+		signature += "\x1f" + object.second;
+	return signature;
+}
+
+void NotificationManager::ObjectProblemNotification::update_problem(const ObjectProblemData& problem)
+{
+	// The fix closure captures the objects it acts on, so it is replaced even when the words
+	// have not changed: a stale closure would arrange a plate the user has moved on from.
+	const std::string signature = signature_of(problem);
+	m_problem = problem;
+	if (signature == m_signature)
+		return;
+	m_signature = signature;
+	m_text1     = problem.remedy;
+	// Different problem, so the user is not part-way through reading the old one.
+	m_expanded  = false;
+	init();
+}
+
+void NotificationManager::ObjectProblemNotification::init()
+{
+	PopNotification::init();
+	// m_multiline drives the base "More" affordance, which this notification replaces with its
+	// own disclosure toggle. Leaving it set would draw both.
+	m_multiline = false;
+}
+
+void NotificationManager::ObjectProblemNotification::count_spaces()
+{
+	m_line_height = ImGui::CalcTextSize("A").y;
+	// Room for the coloured edge and then text. Upstream reserves 32px here for the icon its
+	// block panel draws, which this notification does not use.
+	m_left_indentation    = m_line_height * 1.25f;
+	m_window_width_offset = m_left_indentation + m_line_height * 3.5f;
+	// Wider than a stock notification, because the whole point is to fit the sentence, the fix
+	// and the disclosure toggle on one line rather than wrapping any of them.
+	m_window_width        = m_line_height * 29.f;
+}
+
+void NotificationManager::ObjectProblemNotification::count_lines()
+{
+	// The base pass wraps m_text1, which is the remedy, and leaves the breaks in m_endlines.
+	// It returns early on empty text without clearing them, so a problem with no remedy would
+	// otherwise render the previous problem's lines.
+	if (m_text1.empty())
+		m_endlines.clear();
+	PopNotification::count_lines();
+	const size_t remedy_lines = m_expanded ? m_lines_count : 0;
+	size_t       name_lines   = 0;
+	if (m_expanded) {
+		name_lines = std::min(m_problem.objects.size(), MAX_LISTED_NAMES);
+		if (m_problem.objects.size() > MAX_LISTED_NAMES)
+			++ name_lines;
+	}
+	m_lines_count = 1 + name_lines + remedy_lines;
+}
+
+void NotificationManager::ObjectProblemNotification::set_next_window_size(ImGuiWrapper& imgui)
+{
+	m_window_height = m_lines_count * m_line_height + m_line_height;
+	m_window_height = std::max(m_window_height, 3.f * m_line_height);
+}
+
+std::string NotificationManager::ObjectProblemNotification::elide(const std::string& text, float max_width) const
+{
+	if (max_width <= 0.f || ImGui::CalcTextSize(text.c_str()).x <= max_width)
+		return text;
+	// Cut on character boundaries, so a multi-byte name never ends in half a character.
+	wxString wide = from_u8(text);
+	while (!wide.empty() && ImGui::CalcTextSize((into_u8(wide) + "...").c_str()).x > max_width)
+		wide.RemoveLast();
+	return into_u8(wide) + "...";
+}
+
+bool NotificationManager::ObjectProblemNotification::clickable_label(ImGuiWrapper& imgui,
+	float text_x, float text_y, const std::string& text, const char* id, bool emphasise)
+{
+	const ImVec2 part_size = ImGui::CalcTextSize(text.c_str());
+	ImGui::SetCursorPosX(text_x - 4);
+	ImGui::SetCursorPosY(text_y - 5);
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.0f, .0f, .0f, .0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.0f, .0f, .0f, .0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.0f, .0f, .0f, .0f));
+	const bool clicked = imgui.button(id, part_size.x + 8, part_size.y + 10);
+	ImGui::PopStyleColor(3);
+	const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_RectOnly);
+
+	ImVec4 color = m_TextColor;
+	if (!emphasise)
+		color.w *= 0.8f;
+	if (hovered)
+		color = m_HyperTextColorHover;
+
+	push_style_color(ImGuiCol_Text, color, m_state == EState::FadingOut, m_current_fade_opacity);
+	ImGui::SetCursorPosX(text_x);
+	ImGui::SetCursorPosY(text_y);
+	imgui.text(text.c_str());
+	ImGui::PopStyleColor();
+
+	// The message does not advertise itself as a link until the pointer is on it: it is a
+	// sentence first. Underlining it permanently would make the notification look like a menu.
+	if (hovered) {
+		ImVec2 line_end   = ImGui::GetItemRectMax();
+		line_end.y       -= 2;
+		ImVec2 line_start = line_end;
+		line_start.x      = ImGui::GetItemRectMin().x;
+		ImGui::GetWindowDrawList()->AddLine(line_start, line_end,
+			IM_COL32((int)(color.x * 255), (int)(color.y * 255), (int)(color.z * 255),
+				(int)(color.w * 255.f * (m_state == EState::FadingOut ? m_current_fade_opacity : 1.f))));
+	}
+	return clicked;
+}
+
+void NotificationManager::ObjectProblemNotification::select_objects(const std::vector<ObjectID>& ids) const
+{
+	auto& objects = wxGetApp().model().objects;
+	std::vector<ObjectVolumeID> selection;
+	for (const ObjectID id : ids) {
+		auto iter = std::find_if(objects.begin(), objects.end(), [id](auto o) { return o->id() == id; });
+		if (iter != objects.end())
+			selection.push_back({ *iter, nullptr });
+	}
+	if (selection.empty())
+		return;
+	// The problem is about geometry on the plate, so the answer to "which one" is only useful
+	// in the editor.
+	wxGetApp().mainframe->select_tab(MainFrame::tp3DEditor);
+	wxGetApp().obj_list()->select_items(selection);
+}
+
+void NotificationManager::ObjectProblemNotification::render_text(ImGuiWrapper& imgui,
+	const float win_size_x, const float win_size_y, const float win_pos_x, const float win_pos_y)
+{
+	ensure_ui_inited();
+
+	// The toggle is drawn before the rows it governs, so a click on it must not change the
+	// layout half way down the frame. This frame draws what its size was computed for.
+	const bool  expanded  = m_expanded;
+	const float shift_y   = m_line_height;
+	const float start_y   = m_lines_count > 1 ? m_line_height / 2.f : win_size_y / 2.f - m_line_height / 2.f;
+	const float gap       = m_line_height * 0.7f;
+	// The close button owns the right hand end of the card.
+	const float right_end = win_size_x - m_line_height * 3.f;
+
+	std::vector<ObjectID> all_ids;
+	all_ids.reserve(m_problem.objects.size());
+	for (const auto& object : m_problem.objects)
+		all_ids.push_back(object.first);
+
+	// Lay the links out from the right edge inwards, so the sentence gets whatever is left.
+	const std::string toggle_label = expanded ? _u8L("Less") : _u8L("More");
+	const bool        has_action   = !m_problem.action_label.empty() && (bool)m_problem.action;
+	float             links_x      = right_end - ImGui::CalcTextSize(toggle_label.c_str()).x;
+	const float       toggle_x     = links_x;
+	float             action_x     = 0.f;
+	if (has_action) {
+		links_x -= gap + ImGui::CalcTextSize(m_problem.action_label.c_str()).x;
+		action_x = links_x;
+	}
+
+	// An elided sentence loses nothing: the names and the remedy are one click away.
+	const std::string summary = elide(m_problem.summary, links_x - gap - m_left_indentation);
+	if (clickable_label(imgui, m_left_indentation, start_y, summary, "##objprob_summary", true))
+		select_objects(all_ids);
+
+	if (has_action)
+		render_hyperlink_action(imgui, action_x, start_y, m_problem.action_label, "##objprob_action",
+			[this] { m_problem.action(); });
+
+	render_hyperlink_action(imgui, toggle_x, start_y, toggle_label, "##objprob_toggle",
+		[this, &imgui] { m_expanded = !m_expanded; count_lines(); set_next_window_size(imgui); });
+
+	if (!expanded)
+		return;
+
+	float        y           = start_y + shift_y;
+	const float  detail_x    = m_left_indentation + m_line_height * 0.75f;
+	const float  detail_wide = right_end - detail_x;
+	const size_t listed      = std::min(m_problem.objects.size(), MAX_LISTED_NAMES);
+	for (size_t i = 0; i < listed; ++ i) {
+		// One name, one object: naming a thing the user cannot reach is what made the upstream
+		// message useless.
+		const std::string id = "##objprob_name" + std::to_string(i);
+		if (clickable_label(imgui, detail_x, y, elide(m_problem.objects[i].second, detail_wide), id.c_str(), false))
+			select_objects({ m_problem.objects[i].first });
+		y += shift_y;
+	}
+	if (m_problem.objects.size() > listed) {
+		const std::string rest = GUI::format(_u8L("and %1% more"), m_problem.objects.size() - listed);
+		if (clickable_label(imgui, detail_x, y, elide(rest, detail_wide), "##objprob_rest", false))
+			select_objects(all_ids);
+		y += shift_y;
+	}
+
+	// The remedy, wrapped by the base machinery into m_endlines.
+	size_t last_end = 0;
+	for (size_t i = 0; i < m_endlines.size() && m_text1.size() >= m_endlines[i]; ++ i) {
+		ImGui::SetCursorPosX(m_left_indentation);
+		ImGui::SetCursorPosY(y);
+		imgui.text(m_text1.substr(last_end, m_endlines[i] - last_end).c_str());
+		last_end = m_endlines[i];
+		if (m_text1.size() > m_endlines[i])
+			last_end += (m_text1[m_endlines[i]] == '\n' || m_text1[m_endlines[i]] == ' ') ? 1 : 0;
+		y += shift_y;
+	}
+}
+
+void NotificationManager::update_object_problem_notification(const ObjectProblemData& problem)
+{
+	for (std::unique_ptr<PopNotification>& notification : m_pop_notifications) {
+		if (notification->get_type() == problem.type && !notification->is_finished()) {
+			if (auto* existing = dynamic_cast<ObjectProblemNotification*>(notification.get())) {
+				existing->update_problem(problem);
+				return;
+			}
+		}
+	}
+	NotificationData data { problem.type, problem.level, 0, problem.summary };
+	push_notification_data(std::make_unique<ObjectProblemNotification>(data, m_id_provider, m_evt_handler, problem), 0);
+}
+
+void NotificationManager::close_object_problem_notification(NotificationType type)
+{
+	for (std::unique_ptr<PopNotification>& notification : m_pop_notifications)
+		if (notification->get_type() == type)
+			notification->close();
+}
 
 void NotificationManager::PlaterWarningNotification::close()
 {

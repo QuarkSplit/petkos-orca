@@ -31,6 +31,7 @@
 #include "Mouse3DController.hpp"
 #include "I18N.hpp"
 #include "NotificationManager.hpp"
+#include "Jobs/Job.hpp"
 #include "format.hpp"
 #include "DailyTips.hpp"
 #include "FilamentMapDialog.hpp"
@@ -127,12 +128,6 @@ std::string& get_object_limited_text() {
     static std::string object_limited_text = _u8L("An object is placed in the left/right nozzle-only area or exceeds the printable height of the left nozzle.\n"
             "Please ensure the filaments used by this object are not arranged to other nozzles.");
     return object_limited_text;
-}
-
-std::string& get_object_clashed_text() {
-    static std::string object_clashed_text = _u8L("An object is laid over the boundary of plate or exceeds the height limit.\n"
-            "Please solve the problem by moving it totally on or off the plate, and confirming that the height is within the build volume.");
-    return object_clashed_text;
 }
 
 std::string& get_left_extruder_unprintable_text() {
@@ -1417,20 +1412,86 @@ BoundingBoxf3 GLCanvas3D::_get_current_partplate_print_volume()
     return test_volume;
 }
 
-static bool construct_error_string(ObjectFilamentResults& object_result, std::string& error_string)
+// PETKO'S ORCA: one fit check in, two actionable notifications out.
+//
+// What this replaces was a single message reading "Following objects are laid over the boundary
+// of plate or exceeds the height limit", the names of the offending meshes, and a sentence
+// telling the user to solve it. Three faults in one: it did not say which of the two problems
+// this was, although both are cheap to tell apart; the names were the original author's, so
+// they identified nothing the user could see; and it asked for work the app can do itself.
+// It also scaled the wrong way -- point a plate at a smaller machine and every object on it
+// fails at once, so the message grows without bound at exactly the moment it is least readable.
+void update_plate_fit_notifications(const ObjectFilamentResults& object_results)
 {
-    error_string.clear();
-    if (!object_result.partly_outside_objects.empty()) {
-        error_string += _u8L("Following objects are laid over the boundary of plate or exceeds the height limit:\n");
-        for(auto& object: object_result.partly_outside_objects)
-        {
-            error_string += object->name;
-            error_string += "\n";
+    if (!wxGetApp().plater())
+        return;
+    auto& notification_manager = *wxGetApp().plater()->get_notification_manager();
+    using ObjectProblemData = NotificationManager::ObjectProblemData;
+
+    auto named = [](const std::vector<ModelObject*>& objects) {
+        std::vector<std::pair<ObjectID, std::string>> out;
+        out.reserve(objects.size());
+        for (const ModelObject* object : objects)
+            if (object)
+                out.emplace_back(object->id(), object->name);
+        return out;
+    };
+
+    const auto over_boundary = named(object_results.objects_over_boundary);
+    const auto over_height   = named(object_results.objects_over_height);
+
+    if (over_boundary.empty())
+        notification_manager.close_object_problem_notification(NotificationType::PlaterObjectOverBoundary);
+    else {
+        ObjectProblemData problem;
+        problem.type    = NotificationType::PlaterObjectOverBoundary;
+        problem.level   = NotificationManager::NotificationLevel::ErrorNotificationLevel;
+        problem.summary = over_boundary.size() == 1 ?
+            _u8L("1 object hangs over the edge of the plate") :
+            GUI::format(_u8L("%1% objects hang over the edge of the plate"), over_boundary.size());
+        problem.remedy  = over_boundary.size() == 1 ?
+            _u8L("Nothing outside the plate is printed. Move it fully on, or let Arrange place it.") :
+            _u8L("Nothing outside the plate is printed. Move them fully on, or let Arrange place them.");
+        problem.objects = over_boundary;
+        // The app can fix this one itself, so it offers to rather than asking for it. This is
+        // the whole answer to a plate re-pointed at a smaller machine: one click, not one drag
+        // per object.
+        if (wxGetApp().plater()->can_arrange()) {
+            problem.action_label = _u8L("Arrange");
+            problem.action       = [] {
+                // This plate, not the project. The notification is about one plate's fit, and
+                // rearranging plates the user was not asking about would be a bigger yes than
+                // the one they gave.
+                wxGetApp().plater()->set_prepare_state(Job::PREPARE_STATE_MENU);
+                wxGetApp().plater()->arrange();
+            };
         }
-        error_string += _u8L("Please solve the problem by moving it totally on or off the plate, and confirming that the height is within the build volume.\n");
-        return true;
+        notification_manager.update_object_problem_notification(problem);
     }
-    return false;
+
+    if (over_height.empty())
+        notification_manager.close_object_problem_notification(NotificationType::PlaterObjectOverHeight);
+    else {
+        PartPlate* plate  = wxGetApp().plater()->get_partplate_list().get_selected_plate();
+        const double height = plate ? plate->get_printable_height() : 0.;
+        ObjectProblemData problem;
+        problem.type    = NotificationType::PlaterObjectOverHeight;
+        problem.level   = NotificationManager::NotificationLevel::ErrorNotificationLevel;
+        problem.summary = over_height.size() == 1 ?
+            _u8L("1 object is taller than this printer can print") :
+            GUI::format(_u8L("%1% objects are taller than this printer can print"), over_height.size());
+        // There is no honest one-click fix here: scaling or cutting a model changes what gets
+        // made, and choosing that silently would be a yes the user never gave. So the height is
+        // stated and the choice stays theirs.
+        problem.remedy  = height > 0. ?
+            GUI::format(over_height.size() == 1 ?
+                            _u8L("This plate prints up to %1% mm tall. Scale it down, or cut it into parts.") :
+                            _u8L("This plate prints up to %1% mm tall. Scale them down, or cut them into parts."),
+                        format_number((float) height)) :
+            _u8L("Scale it down, or cut it into parts.");
+        problem.objects = over_height;
+        notification_manager.update_object_problem_notification(problem);
+    }
 }
 
 static std::pair<bool, bool> construct_extruder_unprintable_error(ObjectFilamentResults& object_result,
@@ -1537,7 +1598,6 @@ ModelInstanceEPrintVolumeState GLCanvas3D::check_volumes_outside_state(ObjectFil
     ModelInstanceEPrintVolumeState state;
     m_volumes.check_outside_state(m_bed.build_volume(), &state, object_results);
 
-    construct_error_string(*object_results, get_object_clashed_text());
     construct_extruder_unprintable_error(*object_results, wxGetApp().plater()->get_partplate_list().get_curr_plate(),
                                          get_left_extruder_unprintable_text(), get_right_extruder_unprintable_text());
     return state;
@@ -3041,14 +3101,13 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
             bool show_wipe_tower_outside_error = show_read_wipe_tower ? !wipe_tower_outside : false;
             _set_warning_notification(EWarning::PrimeTowerOutside, show_wipe_tower_outside_error);
 
-            auto clash_flag = construct_error_string(object_results, get_object_clashed_text());
+            update_plate_fit_notifications(object_results);
             auto unprintable_flag= construct_extruder_unprintable_error(object_results, cur_plate,
                                                                          get_left_extruder_unprintable_text(),
                                                                          get_right_extruder_unprintable_text());
 
             bool is_flushing_volume_valid = is_flushing_matrix_error();
             _set_warning_notification(EWarning::FlushingVolumeZero, is_flushing_volume_valid);
-            _set_warning_notification(EWarning::ObjectClashed, clash_flag);
             _set_warning_notification(EWarning::LeftExtruderPrintableError, unprintable_flag.first);
             _set_warning_notification(EWarning::RightExtruderPrintableError, unprintable_flag.second);
             //_set_warning_notification(EWarning::ObjectLimited, objectLimited);
@@ -3115,7 +3174,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
         else {
             _set_warning_notification(EWarning::ObjectOutside, false);
             _set_warning_notification(EWarning::FlushingVolumeZero, false);
-            _set_warning_notification(EWarning::ObjectClashed, false);
+            update_plate_fit_notifications(ObjectFilamentResults());
             _set_warning_notification(EWarning::LeftExtruderPrintableError, false);
             _set_warning_notification(EWarning::RightExtruderPrintableError, false);
             //_set_warning_notification(EWarning::ObjectLimited, false);
@@ -10623,9 +10682,6 @@ void GLCanvas3D::_set_warning_notification(EWarning warning, bool state)
     // BBS: remove _u8L() for SLA
     case EWarning::SlaSupportsOutside: text = ("SLA supports outside the print area were detected."); error = ErrorType::PLATER_ERROR; break;
     case EWarning::SomethingNotShown:  text = _u8L("Only the object being edited is visible."); break;
-    case EWarning::ObjectClashed:
-        error = ErrorType::PLATER_ERROR;
-        break;
     case EWarning::ObjectLimited:
         text = get_object_limited_text();
         break;
@@ -10717,16 +10773,6 @@ void GLCanvas3D::_set_warning_notification(EWarning warning, bool state)
             }
             else {
                 notification_manager.bbl_close_filament_map_invalid_notification_before_slice(NotificationType::RightExtruderUnprintableError);
-            }
-        }
-        else if (warning == EWarning::ObjectClashed) {
-            auto str = get_object_clashed_text();
-            if(state){
-                if (!str.empty())
-                    notification_manager.push_plater_error_notification(str);
-            }
-            else{
-                notification_manager.close_plater_error_notification(str);
             }
         }
         else {

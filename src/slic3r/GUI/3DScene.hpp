@@ -71,6 +71,12 @@ struct ObjectFilamentResults {
     std::vector<int>        filaments; //filaments has conflicts
     std::map<int, int>      filament_maps; //filament maps
     std::vector<ModelObject*> partly_outside_objects; //partly outside objects
+    // PETKO'S ORCA: two faults, kept apart from the moment they are detected. Hanging over the
+    // plate edge is fixed by moving or arranging; being taller than the machine prints is fixed
+    // by scaling or splitting. Reported as one sentence they cancel each other out, and the
+    // user is left to work out which of the two they are looking at.
+    std::vector<ModelObject*> objects_over_boundary; //footprint leaves the printable area
+    std::vector<ModelObject*> objects_over_height;   //top is above the printable height
 
     std::vector<ObjectFilamentInfo> object_filaments;
 };

@@ -7,6 +7,71 @@ Dated build history and closed audit findings for the fork, split out of `PETKOS
 authority on how the fork behaves now; anything here is a record of how it got there and may
 describe states that no longer exist.
 
+## Work log — 2026-08-12, session 4 (the notification stops shouting and starts pointing)
+
+The trigger was one screenshot: a solid red panel reading "Following objects are laid over the
+boundary of plate or exceeds the height limit:", the mesh filename `R2.stl`, and a sentence
+instructing the user to solve it. Four faults live in that one message, and each is a fault of
+design rather than of wording:
+
+- **It names two different problems and does not say which one this is.** Hanging over the plate
+  edge and being taller than the machine prints have different fixes. Both are cheap to tell
+  apart and upstream never bothered.
+- **It names the object by the original author's filename**, which identifies nothing the user
+  can see, and gives them no way to reach it. Naming a thing the user cannot select is worse
+  than saying nothing, because it looks like help.
+- **It asks for work the app can do itself.** "Move it totally on or off the plate" is what
+  Arrange is for.
+- **It does not survive its own commonest cause.** Point a plate at a smaller machine — the
+  ordinary operation in this fork — and every object on it fails at once, so the paragraph grows
+  without bound at exactly the moment it is least readable.
+
+The severity treatment made all four worse: `render_notifications` chose the renderer from the
+notification's LEVEL, so anything at error level got a full-bleed red panel however little it had
+to say. Small text, red field, no action: attention without information.
+
+### What was built
+
+**`BuildVolume::object_state` / `volume_state_bbox` take `ignore_height`.** The same geometry
+test, asked a second time with the Z ceiling lifted. Whatever it still rejects is a footprint
+fault; whatever it now accepts was only ever a height fault. Exact rather than inferred, and
+covered by `tests/libslic3r/test_build_volume.cpp` for both the bbox path and the mesh path.
+
+**`check_outside_state` classifies as it detects.** `ObjectFilamentResults` gained
+`objects_over_boundary` and `objects_over_height`; a collision that explains itself as neither is
+still reported as a boundary fault, because an unexplained fault must never become a silent one.
+
+**`NotificationManager::ObjectProblemNotification`** — the mechanism, not the instance. One
+sentence with a count; clicking it selects the objects it is about; a fix the app can perform
+itself sits beside it as a link; names and remedy live behind a More/Less toggle, each name
+selecting its own object. Six names then "and N more".
+
+**`PopNotification::uses_block_render()`** is the general repair underneath it: a notification
+now chooses its own renderer instead of having one inferred from its level. That is what lets an
+error be calm — a card with a red edge — without lying about its severity, and it is available to
+every other notification that currently gets the red panel by default.
+
+**One producer, two consumers.** `update_plate_fit_notifications()` turns a fit check into the
+two notifications, and both the scene reload and `Plater::validate_current_plate` call it, so the
+live scene and validation can no longer describe the same plate differently. The old path — a
+file-static `get_object_clashed_text()` string built by `construct_error_string()`, pushed by
+text and closed by matching that text — is gone, along with `EWarning::ObjectClashed`.
+
+What the user now sees, for a plate re-pointed at a smaller machine: `7 objects hang over the
+edge of the plate     Arrange   More`. One click fixes it; the click arranges THIS plate
+(`PREPARE_STATE_MENU`), not the project.
+
+### What was deliberately not done
+
+The height problem is offered no one-click fix. Scaling or cutting a model changes what gets
+made, and choosing it silently would be a yes the user never gave; the plate's actual limit is
+stated instead and the choice stays theirs.
+
+The slice button is still disabled while a plate does not fit. That gate is upstream's and it is
+a separate fault — a disabled control with its explanation in a dismissable notification is a
+silent gate waiting to happen. Not touched here; the notification is no longer dismissable in a
+way that outlives a scene change, so the pairing is no worse than it was.
+
 ## Work log — 2026-08-12, session 3 (the board learns what it is for)
 
 Petko's design review, in one sentence: the UI must make "one project, many machines, switch

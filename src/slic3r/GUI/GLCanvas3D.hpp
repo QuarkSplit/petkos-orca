@@ -198,6 +198,13 @@ wxDECLARE_EVENT(EVT_GLCANVAS_ADAPTIVE_LAYER_HEIGHT_PROFILE, Event<float>);
 wxDECLARE_EVENT(EVT_GLCANVAS_SMOOTH_LAYER_HEIGHT_PROFILE, HeightProfileSmoothEvent);
 wxDECLARE_EVENT(EVT_GLCANVAS_PRINTABLE, SimpleEvent);
 
+// PETKO'S ORCA: report a plate's fit problems as the two things the user can act on -- objects
+// hanging over the plate edge, and objects taller than the machine prints. Upstream fused both
+// into one paragraph of red text naming raw mesh filenames, which told the user neither which
+// fault they had nor which object had it. Pushes, updates or clears both notifications from a
+// single fit check, so the two call sites that run that check cannot drift apart.
+void update_plate_fit_notifications(const ObjectFilamentResults& object_results);
+
 class GLCanvas3D
 {
     static const double DefaultCameraZoomToBoxMarginFactor;
@@ -376,7 +383,6 @@ class GLCanvas3D
         ToolpathOutside,
         SlaSupportsOutside,
         SomethingNotShown,
-        ObjectClashed,
         ObjectLimited,
         GCodeConflict,
         ToolHeightOutside,

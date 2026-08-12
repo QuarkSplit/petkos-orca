@@ -374,13 +374,16 @@ BuildVolume::ObjectState object_state_templ(const indexed_triangle_set &its, con
     return inside ? (outside ? BuildVolume::ObjectState::Colliding : BuildVolume::ObjectState::Inside) : BuildVolume::ObjectState::Outside;
 }
 
-BuildVolume::ObjectState BuildVolume::object_state(const indexed_triangle_set& its, const Transform3f& trafo, bool may_be_below_bed, bool ignore_bottom) const
+BuildVolume::ObjectState BuildVolume::object_state(const indexed_triangle_set& its, const Transform3f& trafo, bool may_be_below_bed, bool ignore_bottom, bool ignore_height) const
 {
+    // A height of 0 already means "no ceiling" everywhere below, so lifting the ceiling is
+    // simply asking the same question with that height.
+    const double max_print_height = ignore_height ? 0.0 : m_max_print_height;
     switch (m_type) {
     case BuildVolume_Type::Rectangle:
     {
         BoundingBox3Base<Vec3d> build_volume = this->bounding_volume().inflated(SceneEpsilon);
-        if (m_max_print_height == 0.0)
+        if (max_print_height == 0.0)
             build_volume.max.z() = std::numeric_limits<double>::max();
         if (ignore_bottom)
             build_volume.min.z() = -std::numeric_limits<double>::max();
@@ -393,27 +396,27 @@ BuildVolume::ObjectState BuildVolume::object_state(const indexed_triangle_set& i
     case BuildVolume_Type::Circle:
     {
         Geometry::Circlef circle { unscaled<float>(m_circle.center), unscaled<float>(m_circle.radius + SceneEpsilon) };
-        return m_max_print_height == 0.0 ?
+        return max_print_height == 0.0 ?
             object_state_templ(its, trafo, may_be_below_bed, true, [circle](const Vec3f& pt) { return circle.contains(to_2d(pt)); }) :
-            object_state_templ(its, trafo, may_be_below_bed, true, [circle, z = m_max_print_height + SceneEpsilon](const Vec3f &pt) { return pt.z() < z && circle.contains(to_2d(pt)); });
+            object_state_templ(its, trafo, may_be_below_bed, true, [circle, z = max_print_height + SceneEpsilon](const Vec3f &pt) { return pt.z() < z && circle.contains(to_2d(pt)); });
     }
     case BuildVolume_Type::Convex:
     //FIXME doing test on convex hull until we learn to do test on non-convex polygons efficiently.
     case BuildVolume_Type::Custom:
-        return m_max_print_height == 0.0 ?
+        return max_print_height == 0.0 ?
             object_state_templ(its, trafo, may_be_below_bed, m_type == BuildVolume_Type::Convex, [this](const Vec3f &pt) { return Geometry::inside_convex_polygon(m_top_bottom_convex_hull_decomposition_scene, to_2d(pt).cast<double>()); }) :
-            object_state_templ(its, trafo, may_be_below_bed, m_type == BuildVolume_Type::Convex, [this, z = m_max_print_height + SceneEpsilon](const Vec3f &pt) { return pt.z() < z && Geometry::inside_convex_polygon(m_top_bottom_convex_hull_decomposition_scene, to_2d(pt).cast<double>()); });
+            object_state_templ(its, trafo, may_be_below_bed, m_type == BuildVolume_Type::Convex, [this, z = max_print_height + SceneEpsilon](const Vec3f &pt) { return pt.z() < z && Geometry::inside_convex_polygon(m_top_bottom_convex_hull_decomposition_scene, to_2d(pt).cast<double>()); });
     case BuildVolume_Type::Invalid:
     default:
         return ObjectState::Inside;
     }
 }
 
-BuildVolume::ObjectState BuildVolume::volume_state_bbox(const BoundingBoxf3& volume_bbox, bool ignore_bottom) const
+BuildVolume::ObjectState BuildVolume::volume_state_bbox(const BoundingBoxf3& volume_bbox, bool ignore_bottom, bool ignore_height) const
 {
     assert(m_type == BuildVolume_Type::Rectangle);
     BoundingBox3Base<Vec3d> build_volume = this->bounding_volume().inflated(SceneEpsilon);
-    if (m_max_print_height == 0.0)
+    if (m_max_print_height == 0.0 || ignore_height)
         build_volume.max.z() = std::numeric_limits<double>::max();
     if (ignore_bottom)
         build_volume.min.z() = -std::numeric_limits<double>::max();
