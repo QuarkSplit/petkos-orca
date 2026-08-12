@@ -1116,7 +1116,16 @@ void PlaterPresetComboBox::show_edit_menu()
 
 wxString PlaterPresetComboBox::get_preset_name(const Preset& preset)
 {
-    return from_u8(preset.label(false));
+    //A preset synthesised from a project's flat config can have an EMPTY base name, so
+    //its whole label is the "(file.3mf)" decoration — a filename wearing a printer's
+    //slot. Say what the config actually declares instead: its printer model.
+    std::string label = preset.label(false);
+    if (!label.empty() && label.front() == '(' && preset.type == Preset::TYPE_PRINTER) {
+        const std::string model = preset.config.opt_string("printer_model");
+        if (!model.empty())
+            label = model + " " + label;
+    }
+    return from_u8(label);
 }
 
 // Only the compatible presets are shown.
@@ -1435,7 +1444,10 @@ void PlaterPresetComboBox::update()
     };
 
     //BBS: add project embedded preset logic
-    add_presets(project_embedded_presets, selected_user_preset, L("Project-inside presets"), _L("Project") + " ");
+    //"This project's presets" over "Project-inside presets": the group holds the presets
+    //the open 3MF brought with it, and the stock wording read as a category of its own
+    //next to an entry literally labelled "Project"
+    add_presets(project_embedded_presets, selected_user_preset, L("This project's presets"), _L("Project") + " ");
     // ORCA add sorting support for vendor / type for user presets
     auto group_filament_presets    = wxGetApp().app_config->get("group_filament_presets");
     auto group_filament_presets_by = group_filament_presets  == "0" ? (_L("Custom") + " ") // Append all to "Custom" sub menu
@@ -1794,7 +1806,7 @@ void TabPresetComboBox::update()
     //BBS: add project embedded preset logic
     if (!project_embedded_presets.empty())
     {
-        set_label_marker(Append(_L("Project-inside presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
+        set_label_marker(Append(_L("This project's presets"), wxNullBitmap, DD_ITEM_STYLE_SPLIT_ITEM));
         for (std::map<wxString, std::pair<wxBitmap*, bool>>::iterator it = project_embedded_presets.begin(); it != project_embedded_presets.end(); ++it) {
             int item_id = Append(it->first, *it->second.first);
             SetItemTooltip(item_id, preset_descriptions[it->first]);

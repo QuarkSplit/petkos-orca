@@ -593,6 +593,9 @@ public:
     //dirty marking — are handled in exactly one place. An empty preset_name clears
     //the assignment back to "follow the project printer".
     void set_plate_printer(int plate_index, std::string preset_name);
+    //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
+    //had. The board's inline editor and any MCP surface should both land here.
+    void rename_plate(int plate_index, const std::string &name);
     // Physical dispatch target is independent from the slicing preset and does
     // not invalidate an unchanged slice.
     void set_plate_physical_printer(int plate_index, std::string device_id);

@@ -8,10 +8,13 @@
 
 #include <wx/dcbuffer.h>
 #include <wx/display.h>
+#include <wx/filefn.h>
 #include <wx/image.h>
 #include <wx/popupwin.h>
 #include <wx/settings.h>
 #include <wx/sizer.h>
+
+#include "libslic3r/Utils.hpp"
 
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -147,6 +150,7 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
 
         PlateBoardRow row;
         row.plate_index = i;
+        row.plate_name  = plate->get_plate_name();
         row.assigned    = plate->has_printer_assignment();
 
         if (row.assigned) {
@@ -167,6 +171,10 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
         //machine or the project one it is following. A plate stores no nozzle, so this is
         //read-only wherever it is displayed and is labelled with the preset it came from.
         printer_nozzle_diameter(bundle, row.printer_name, row.nozzle_diameter);
+
+        //model identity for the row's printer picture and its short caption
+        if (const Preset *preset = bundle.printers.find_preset(row.printer_name, false); preset != nullptr)
+            row.printer_model = preset->config.opt_string("printer_model");
 
         //The plate's OWN bed type and map mode, not the project's resolved values.
         //btDefault here is the plate saying it follows the global plate type, which is a
@@ -582,6 +590,22 @@ public:
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
         Bind(wxEVT_PAINT, &PlateThumbnailPreview::on_paint, this);
+        //hidden when the app itself loses the foreground; a hover preview floating over
+        //another application is the board leaking out of its window
+        wxTheApp->Bind(wxEVT_ACTIVATE_APP, &PlateThumbnailPreview::on_app_activate, this);
+    }
+
+    ~PlateThumbnailPreview() override
+    {
+        if (wxTheApp != nullptr)
+            wxTheApp->Unbind(wxEVT_ACTIVATE_APP, &PlateThumbnailPreview::on_app_activate, this);
+    }
+
+    void on_app_activate(wxActivateEvent &evt)
+    {
+        evt.Skip();
+        if (!evt.GetActive() && IsShown())
+            Hide();
     }
 
     //The bitmap may be invalid. The preview then carries `note` instead of quietly not
@@ -687,6 +711,25 @@ PlatePrinterPopup::PlatePrinterPopup(wxWindow *             parent,
     Bind(wxEVT_MOTION, &PlatePrinterPopup::on_mouse, this);
     Bind(wxEVT_LEFT_UP, &PlatePrinterPopup::on_mouse, this);
     Bind(wxEVT_LEAVE_WINDOW, &PlatePrinterPopup::on_mouse, this);
+
+    //A transient popup only hears clicks inside its own application. Alt-tabbing or
+    //clicking another app leaves it floating over that app, so it listens for the app
+    //losing activation and dismisses itself. Unbound in the destructor: the popup can be
+    //destroyed by its owner while the app object lives on.
+    wxTheApp->Bind(wxEVT_ACTIVATE_APP, &PlatePrinterPopup::on_app_activate, this);
+}
+
+PlatePrinterPopup::~PlatePrinterPopup()
+{
+    if (wxTheApp != nullptr)
+        wxTheApp->Unbind(wxEVT_ACTIVATE_APP, &PlatePrinterPopup::on_app_activate, this);
+}
+
+void PlatePrinterPopup::on_app_activate(wxActivateEvent &evt)
+{
+    evt.Skip();
+    if (!evt.GetActive() && IsShown())
+        Dismiss();
 }
 
 void PlatePrinterPopup::build_items(const std::string &current_name)
@@ -1009,15 +1052,18 @@ void show_printer_picker(wxWindow *              owner,
     slot->Popup();
 }
 
-//The grouping control's four segments, in the order they are drawn.
-const PlateBoardGrouping GROUPING_ORDER[4] = {PlateBoardGrouping::PlateOrder, PlateBoardGrouping::ByMachine,
-                                              PlateBoardGrouping::ByCapacity, PlateBoardGrouping::ByMaterial};
+//The grouping control's segments, in the order they are drawn. ByCapacity is not one of
+//them: with no estimates it rendered as an exact twin of ByMachine — two tabs, one view —
+//so its queue bars live inside the Machine grouping instead, appearing when estimates
+//exist. The enum value survives for persisted state, which coerces to ByMachine on read.
+const PlateBoardGrouping GROUPING_ORDER[3] = {PlateBoardGrouping::PlateOrder, PlateBoardGrouping::ByMachine,
+                                              PlateBoardGrouping::ByMaterial};
 
 wxString grouping_label(PlateBoardGrouping grouping)
 {
     switch (grouping) {
     case PlateBoardGrouping::ByMachine: return _L("Machine");
-    case PlateBoardGrouping::ByCapacity: return _L("Capacity");
+    case PlateBoardGrouping::ByCapacity: return _L("Machine");
     case PlateBoardGrouping::ByMaterial: return _L("Material");
     case PlateBoardGrouping::PlateOrder:
     default: return _L("Plate order");
@@ -1053,7 +1099,10 @@ const int PLATE_BOARD_AUTOSCROLL_DIV = 3; //row height per tick
 //How many standard rows the board grows to before it scrolls instead. One fewer than the
 //compact threshold, because the rollup tiles and the grouping control sit above the rows
 //and the controls below the board must keep their place on a laptop screen.
-const int PLATE_BOARD_VISIBLE_ROWS = 7;
+//The board is the TOP of the sidebar, not the sidebar: filament and process settings —
+//the actual slicer — live below it and must never be pushed off screen. Four rich rows
+//is the budget; past that the board scrolls inside itself.
+const int PLATE_BOARD_VISIBLE_ROWS = 4;
 
 double smoothstep(double t)
 {
@@ -1070,8 +1119,11 @@ double smoothstep(double t)
 PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_ANY), m_plater(plater)
 {
     SetBackgroundStyle(wxBG_STYLE_PAINT);
-    m_row_height     = FromDIP(34);
-    m_row_compact    = FromDIP(22);
+    //one row format, tall enough for a plate render and a printer picture with their
+    //captions: the row IS the fork's core object and it earns the space. m_row_compact
+    //is zero so the legacy compact branch can never fire.
+    m_row_height     = FromDIP(64);
+    m_row_compact    = 0;
     m_header_height  = FromDIP(26);
     m_rollup_height  = FromDIP(38);
     m_segment_height = FromDIP(28); //22 of control plus the gap under it
@@ -1111,6 +1163,9 @@ PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_
 
 void PlateBoard::reload()
 {
+    //rows are about to be re-filed; an in-flight caption edit commits rather than
+    //floating over a row that may no longer be under it
+    commit_rename(true);
     //is_initialized(): the board is created during Plater::priv's constructor, so it
     //can be asked to reload before there is a plate list to read
     if (m_plater == nullptr || !m_plater->is_initialized() || wxGetApp().preset_bundle == nullptr)
@@ -1161,6 +1216,11 @@ void PlateBoard::reload()
 
 void PlateBoard::set_grouping(PlateBoardGrouping grouping)
 {
+    //ByCapacity is no longer a tab of its own; state persisted before the merge folds
+    //into the Machine grouping that now carries its queue bars
+    if (grouping == PlateBoardGrouping::ByCapacity)
+        grouping = PlateBoardGrouping::ByMachine;
+
     if (m_grouping == grouping && m_grouping_explicit)
         return;
 
@@ -1283,7 +1343,7 @@ void PlateBoard::rebuild_items()
         //Plate order. Compact above eight rows for the same reason a group is: at that
         //length the list stops being read and starts being scanned. The printer name stays,
         //because in this mode nothing above the row is naming it.
-        const int height = (int) rows.size() > PLATE_BOARD_COMPACT_ABOVE ? m_row_compact : m_row_height;
+        const int height = m_row_height;
         for (int i = 0; i < (int) rows.size(); ++i)
             push(false, -1, i, height);
         return;
@@ -1306,7 +1366,7 @@ void PlateBoard::rebuild_items()
             continue;
         }
 
-        const int height = group.plate_count > PLATE_BOARD_COMPACT_ABOVE ? m_row_compact : m_row_height;
+        const int height = m_row_height;
         for (int row_index : group.rows)
             push(false, g, row_index, height);
     }
@@ -1421,8 +1481,8 @@ int PlateBoard::segment_at(int x) const
     const int width = GetClientSize().GetWidth();
     if (width <= 0)
         return -1;
-    const int index = x * 4 / std::max(1, width);
-    return index < 0 ? -1 : std::min(3, index);
+    const int index = x * 3 / std::max(1, width);
+    return index < 0 ? -1 : std::min(2, index);
 }
 
 int PlateBoard::sticky_group() const
@@ -2007,23 +2067,36 @@ void PlateBoard::on_mouse(wxMouseEvent &evt)
             return;
         }
 
-        //the printer chip opens the picker; anywhere else on the row selects the plate.
-        //A compact row starts its content further left, so the chip has to follow the row
-        //rather than sit at a constant that is right for one of the two heights.
+        //A row divides three ways: the caption under the plate render begins an inline
+        //rename, the machine half (arrow + printer picture + caption) opens the picker,
+        //and everything else selects the plate.
         const int item_index = find_row_item(row.plate_index);
         if (item_index >= 0) {
-            const Item &item    = m_items[(size_t) item_index];
-            const bool  compact = item.height <= m_row_compact;
-            const int   chip_x  = compact ? FromDIP(28) : FromDIP(60);
-            const int   chip_w  = GetClientSize().GetWidth() - chip_x - FromDIP(80);
-            //a compact row under a header that already names the machine shows no name, so
-            //there is no chip on it to click; the picker is reached from the inspector
+            const Item &item   = m_items[(size_t) item_index];
+            const int   item_y = view_top() + item.y - m_scroll_px;
+
+            //the plate caption band: single click renames. Agents name plates through the
+            //same call over MCP; this is the human's end of that contract.
+            const int cap_x = FromDIP(24), cap_w = FromDIP(72);
+            const int cap_y = item_y + FromDIP(44), cap_h = FromDIP(18);
+            if (evt.GetPosition().x >= cap_x && evt.GetPosition().x < cap_x + cap_w &&
+                evt.GetPosition().y >= cap_y && evt.GetPosition().y < cap_y + cap_h) {
+                begin_rename(row.plate_index, wxRect(cap_x - FromDIP(4), cap_y - FromDIP(2), cap_w + FromDIP(8), cap_h + FromDIP(2)));
+                return;
+            }
+
+            //the picker chip is the machine half of the row
+            const int   chip_x  = FromDIP(100);
+            const int   chip_w  = FromDIP(110);
+            //a row under a header that already names the machine shows no machine name, so
+            //there is no chip on it to click; the picker is reached from the inspector or
+            //by dragging the row onto another machine group
             const std::vector<PlateBoardGroup> &groups = m_model.groups();
             const bool names_machine_above = item.group >= 0 && item.group < (int) groups.size() &&
                                              groups[(size_t) item.group].names_machine;
-            const bool has_chip = !(compact && names_machine_above);
+            const bool has_chip = !names_machine_above;
             if (has_chip && chip_w > 0 && evt.GetPosition().x >= chip_x && evt.GetPosition().x < chip_x + chip_w) {
-                const int y = view_top() + item.y - m_scroll_px + item.height;
+                const int y = item_y + item.height;
                 open_picker(row.plate_index, ClientToScreen(wxPoint(0, y)));
                 return;
             }
@@ -2054,24 +2127,28 @@ void PlateBoard::draw_rollup(wxDC &dc, bool dark, int width)
         dc.DrawRoundedRectangle(0, 0, width, height, FromDIP(4));
     }
 
-    //Figures render as figures. Four tiles, each a value over its label, rather than one
-    //run-on sentence of numbers: a line that is mostly digits is the wrong shape for the
-    //thing it is describing.
+    //Figures render as figures, each a value over its label. The time tiles exist only
+    //once at least one plate has an estimate: a fresh project showing two em-dash tiles
+    //and an orange "N not estimated" reads as a broken dashboard, when nothing has
+    //happened yet and nothing is wrong.
     struct Tile
     {
         wxString value;
         wxString label;
     };
-    const Tile tiles[4] = {
-        {wxString::Format("%d", rollup.plates), _L("plates")},
-        {wxString::Format("%d", rollup.machines), _L("machines")},
-        {format_hours(rollup.total_seconds), _L("total")},
-        {format_hours(rollup.longest_queue_seconds), _L("longest queue")},
+    const bool has_estimates = rollup.total_seconds > 0.f || rollup.longest_queue_seconds > 0.f;
+    std::vector<Tile> tiles = {
+        {wxString::Format("%d", rollup.plates), _L_PLURAL("plate", "plates", rollup.plates)},
+        {wxString::Format("%d", rollup.machines), _L_PLURAL("machine", "machines", rollup.machines)},
     };
+    if (has_estimates) {
+        tiles.push_back({format_hours(rollup.total_seconds), _L("total")});
+        tiles.push_back({format_hours(rollup.longest_queue_seconds), _L("longest queue")});
+    }
 
-    const int cell = std::max(FromDIP(10), width / 4);
-    for (int i = 0; i < 4; ++i) {
-        const int x     = i * cell + FromDIP(4);
+    const int cell = std::max(FromDIP(10), width / (int) tiles.size());
+    for (size_t i = 0; i < tiles.size(); ++i) {
+        const int x     = (int) i * cell + FromDIP(4);
         const int max_w = cell - FromDIP(8);
 
         dc.SetFont(Label::Head_13);
@@ -2083,9 +2160,9 @@ void PlateBoard::draw_rollup(wxDC &dc, bool dark, int width)
         dc.DrawText(wxControl::Ellipsize(tiles[i].label, dc, wxELLIPSIZE_END, max_w), x, FromDIP(22));
     }
 
-    //Without this the totals are a lie by omission: a plate with no valid slice reads as
-    //zero hours in every cell above.
-    if (rollup.not_estimated > 0) {
+    //Once time IS shown, an uncounted plate makes the totals a lie by omission, so the
+    //note appears exactly when the tiles it corrects do.
+    if (has_estimates && rollup.not_estimated > 0) {
         dc.SetFont(Label::Body_9);
         dc.SetTextForeground(board_warn(dark));
         const wxString note   = wxString::Format(_L("%d not estimated"), rollup.not_estimated);
@@ -2105,12 +2182,12 @@ void PlateBoard::draw_grouping(wxDC &dc, bool dark, int width, int top)
     dc.SetPen(*wxTRANSPARENT_PEN);
     dc.DrawRoundedRectangle(0, top, width, height, FromDIP(4));
 
-    const int cell = std::max(FromDIP(10), width / 4);
-    for (int i = 0; i < 4; ++i) {
+    const int cell = std::max(FromDIP(10), width / 3);
+    for (int i = 0; i < 3; ++i) {
         const bool active = m_grouping == GROUPING_ORDER[i];
         const bool hover  = m_hover.kind == HitKind::Segment && m_hover.index == i;
         const int  x      = i * cell;
-        const int  w      = i == 3 ? width - x : cell;
+        const int  w      = i == 2 ? width - x : cell;
 
         if (active) {
             dc.SetBrush(wxBrush(board_sel(dark)));
@@ -2194,10 +2271,11 @@ void PlateBoard::draw_group_header(wxDC &                 dc,
                     y + (height - dc.GetCharHeight()) / 2);
     }
 
-    //By capacity: a bar measured against the project's longest queue, so an idle machine
-    //reads short at a glance. It states the number the rollup already headlines and
-    //proposes nothing; rebalancing machines is the farm's job, not a sidebar's.
-    if (m_grouping == PlateBoardGrouping::ByCapacity) {
+    //Queue bar under a machine header, measured against the project's longest queue, so
+    //an idle machine reads short at a glance. Drawn only when estimates exist — this is
+    //what the separate Capacity tab used to show, and estimates are the only thing that
+    //ever distinguished it from Machine.
+    if (m_grouping == PlateBoardGrouping::ByMachine || m_grouping == PlateBoardGrouping::ByCapacity) {
         const float longest = m_model.rollup().longest_queue_seconds;
         if (longest > 0.f) {
             const int bar_h = FromDIP(3);
@@ -2225,9 +2303,11 @@ void PlateBoard::draw_swatches(wxDC &dc, bool dark, const PlateBoardRow &row, in
                         colour.Set(from_u8(row.filament_colours[i]));
         //an unparsable or absent colour draws hollow. Substituting a plausible one would
         //put a filament on screen that the library does not contain.
+        //Circles: a row of tiny squares reads as broken image chips; dots read as
+        //materials.
         dc.SetBrush(ok ? wxBrush(colour) : *wxTRANSPARENT_BRUSH);
         dc.SetPen(wxPen(board_line(dark)));
-        dc.DrawRectangle(x + drawn * (box + gap), y, box, box);
+        dc.DrawEllipse(x + drawn * (box + gap), y, box, box);
         ++drawn;
     }
 
@@ -2258,6 +2338,132 @@ void PlateBoard::draw_state_icon(wxDC &dc, const PlateBoardRow &row, int x, int 
 
     if (icon != nullptr && icon->bmp().IsOk())
         dc.DrawBitmap(icon->bmp(), x, y, true);
+}
+
+void PlateBoard::begin_rename(int plate_index, const wxRect &rect)
+{
+    if (m_plater == nullptr || !m_plater->is_initialized())
+        return;
+    commit_rename(true);
+
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(plate_index);
+    if (plate == nullptr)
+        return;
+
+    if (m_rename_edit == nullptr) {
+        m_rename_edit = new wxTextCtrl(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
+                                       wxTE_PROCESS_ENTER | wxTE_CENTER | wxBORDER_SIMPLE);
+        m_rename_edit->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent &) { commit_rename(true); });
+        m_rename_edit->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent &evt) {
+            evt.Skip();
+            commit_rename(true);
+        });
+        m_rename_edit->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent &evt) {
+            if (evt.GetKeyCode() == WXK_ESCAPE)
+                commit_rename(false);
+            else
+                evt.Skip();
+        });
+    }
+
+    m_rename_plate = plate_index;
+    m_rename_edit->SetSize(rect);
+    m_rename_edit->ChangeValue(from_u8(plate->get_plate_name()));
+    m_rename_edit->Show();
+    m_rename_edit->SetFocus();
+    m_rename_edit->SelectAll();
+}
+
+void PlateBoard::commit_rename(bool apply)
+{
+    if (m_rename_edit == nullptr || m_rename_plate < 0)
+        return;
+    const int plate_index = m_rename_plate;
+    //cleared FIRST: hiding the editor fires its kill-focus, which lands back here and
+    //must find nothing left to commit
+    m_rename_plate = -1;
+    const std::string name = into_u8(m_rename_edit->GetValue());
+    m_rename_edit->Hide();
+
+    if (apply && m_plater != nullptr && m_plater->is_initialized())
+        m_plater->rename_plate(plate_index, name);
+}
+
+const wxBitmap *PlateBoard::plate_thumb_bitmap(int plate_index, int px)
+{
+    if (m_plater == nullptr || !m_plater->is_initialized())
+        return nullptr;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(plate_index);
+    if (plate == nullptr)
+        return nullptr;
+
+    //Self-healing: anything that moves an instance resets the plate's thumbnail
+    //(notify_instance_update), and in the 3D editor nothing re-renders it — the strip
+    //that used to is Preview-only. So an invalid render is re-requested through the same
+    //canvas call the hover preview uses, at most one plate per paint so a 21-plate
+    //project rebuilds over a second of frames instead of stalling one.
+    if (!plate->thumbnail_data.is_valid() && !m_thumb_refreshed_this_paint) {
+        if (GLCanvas3D *canvas = m_plater->get_view3D_canvas3D(); canvas != nullptr) {
+            m_thumb_refreshed_this_paint = true;
+            canvas->refresh_plate_thumbnail(plate_index);
+            //another paint is owed only when this one actually produced pixels; a canvas
+            //that cannot render right now must not become a repaint spin
+            m_thumb_heal_more = plate->thumbnail_data.is_valid();
+        }
+    }
+    if (!plate->thumbnail_data.is_valid())
+        return nullptr;
+
+    const ThumbnailData &data = plate->thumbnail_data;
+    ThumbCacheEntry &    slot = m_thumb_cache[plate_index];
+    if (slot.pixels == (const void *) data.pixels.data() && slot.size == data.pixels.size() && slot.bmp.IsOk())
+        return &slot.bmp;
+
+    wxImage image = thumbnail_to_image(data);
+    if (!image.IsOk())
+        return nullptr;
+    //aspect-fit into a square cell; the render already sits on transparent padding
+    const int side = std::max(image.GetWidth(), image.GetHeight());
+    image.Resize(wxSize(side, side), wxPoint((side - image.GetWidth()) / 2, (side - image.GetHeight()) / 2));
+    image.Rescale(px, px, wxIMAGE_QUALITY_HIGH);
+    slot.pixels = (const void *) data.pixels.data();
+    slot.size   = data.pixels.size();
+    slot.bmp    = wxBitmap(image);
+    return slot.bmp.IsOk() ? &slot.bmp : nullptr;
+}
+
+const wxBitmap *PlateBoard::printer_cover_bitmap(const std::string &model, int px)
+{
+    if (model.empty())
+        return nullptr;
+    auto it = m_cover_cache.find(model);
+    if (it != m_cover_cache.end())
+        return it->second.IsOk() ? &it->second : nullptr;
+
+    //the wizard's cover art: resources/profiles/<vendor>/<model>_cover.png. A miss is
+    //cached too, so an uncovered model costs one directory probe per session, not one
+    //per paint.
+    wxBitmap &slot = m_cover_cache[model];
+    if (wxGetApp().preset_bundle != nullptr) {
+        for (const auto &vendor : wxGetApp().preset_bundle->vendors) {
+            for (const auto &vendor_model : vendor.second.models) {
+                if (vendor_model.name != model)
+                    continue;
+                const std::string path = Slic3r::resources_dir() + "/profiles/" + vendor.second.id + "/" + model + "_cover.png";
+                if (wxFileExists(from_u8(path))) {
+                    wxImage image(from_u8(path), wxBITMAP_TYPE_PNG);
+                    if (image.IsOk()) {
+                        const int side = std::max(image.GetWidth(), image.GetHeight());
+                        image.Resize(wxSize(side, side), wxPoint((side - image.GetWidth()) / 2, (side - image.GetHeight()) / 2));
+                        image.Rescale(px, px, wxIMAGE_QUALITY_HIGH);
+                        slot = wxBitmap(image);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    return slot.IsOk() ? &slot : nullptr;
 }
 
 void PlateBoard::draw_row(wxDC &                 dc,
@@ -2303,106 +2509,136 @@ void PlateBoard::draw_row(wxDC &                 dc,
         dc.DrawRectangle(0, y, FromDIP(2), height);
     }
 
-    const bool compact = height <= m_row_compact;
-    const int  icon_x  = width - FromDIP(18);
-    const int  right   = icon_x - FromDIP(6);
+    //THE ROW IS THE FORK'S CORE SENTENCE, drawn as pictures: [this plate] → [that
+    //machine], each image over its caption. Under a header that already names the
+    //machine the sentence loses its second half rather than repeating it.
+    const bool names_machine_above = group != nullptr && group->names_machine;
 
-    // ---- index -------------------------------------------------------------
-    //1-based, because that is the numbering the rest of the app uses and the one every
-    //filename the prep pipeline writes is keyed on. Right-aligned so 1 and 36 line up.
-    dc.SetFont(compact ? Label::Body_9 : Label::Body_10);
+    const int icon_x = width - FromDIP(18);
+    const int right  = icon_x - FromDIP(6);
+    const int img    = FromDIP(40);
+    const int col_w  = FromDIP(72);
+    const int img_y  = y + FromDIP(3);
+    const int cap_y  = y + FromDIP(46);
+
+    // ---- index gutter ------------------------------------------------------
+    dc.SetFont(Label::Body_10);
     dc.SetTextForeground(selected ? board_fg(dark) : board_dim(dark));
     const wxString index_text   = wxString::Format("%d", row.plate_index + 1);
     const wxSize   index_extent = dc.GetTextExtent(index_text);
-    dc.DrawText(index_text, FromDIP(22) - index_extent.GetWidth(), y + (height - index_extent.GetHeight()) / 2);
+    dc.DrawText(index_text, FromDIP(20) - index_extent.GetWidth(), y + (height - index_extent.GetHeight()) / 2);
 
-    // ---- hours -------------------------------------------------------------
-    dc.SetFont(compact ? Label::Body_10 : Label::Head_11);
-    dc.SetTextForeground(row.has_time ? board_soft(dark) : board_dim(dark));
-    const wxString hours        = format_hours(row.has_time ? row.print_time_seconds : 0.f);
-    const wxSize   hours_extent = dc.GetTextExtent(hours);
-    const int      hours_x      = right - hours_extent.GetWidth();
-    dc.DrawText(hours, hours_x, y + (compact ? (height - hours_extent.GetHeight()) / 2 : FromDIP(4)));
-
-    draw_state_icon(dc, row, icon_x, y + (height - FromDIP(14)) / 2);
-
-    // ---- the name, and whether this row has to carry it --------------------
-    //A compact row spends the width it saves on its swatches, and it only saves that width
-    //when the header above it already names the machine. Dropping the name under a header
-    //that does not state one would leave the row unable to say what it is on.
-    const bool names_machine_above = group != nullptr && group->names_machine;
-    const int  content_x           = compact ? FromDIP(28) : FromDIP(60);
-
-    if (!compact) {
-        //bed glyph: proportional to the largest bed in this project, animated so a
-        //reassignment that resizes it is seen rather than merely applied. This is the
-        //board's only geometric signal; it does not draw plates. The 3D scene is the
-        //scene, and a second one inside a narrow column is a worse copy of it.
-        double glyph_w = row.bed_w, glyph_h = row.bed_d;
-        if ((size_t) row_index < m_glyphs.size()) {
-            const GlyphAnim &anim = m_glyphs[(size_t) row_index];
-            const double     t = m_anim_running ? smoothstep((double) m_anim_elapsed_ms / PLATE_BOARD_ANIM_MS) : 1.;
-            glyph_w = anim.from_w + (anim.to_w - anim.from_w) * t;
-            glyph_h = anim.from_h + (anim.to_h - anim.from_h) * t;
-        }
-
-        const wxSize glyph = bed_glyph_size(this, glyph_w, glyph_h, m_model.glyph_reference_mm(), 26);
-        const int    cell  = FromDIP(26);
-        dc.SetBrush(wxBrush(row.assigned ? board_soft(dark) : board_line(dark)));
-        dc.SetPen(wxPen(board_dim(dark)));
-        dc.DrawRectangle(FromDIP(28) + (cell - glyph.GetWidth()) / 2,
-                         y + (height - glyph.GetHeight()) / 2, glyph.GetWidth(), glyph.GetHeight());
+    // ---- plate column: render over name ------------------------------------
+    const int plate_col_x = FromDIP(24);
+    const int plate_img_x = plate_col_x + (col_w - img) / 2;
+    if (const wxBitmap *thumb = plate_thumb_bitmap(row.plate_index, img)) {
+        dc.DrawBitmap(*thumb, plate_img_x, img_y, true);
+    } else {
+        //no render yet: a quiet framed cell with the plate number, which is a state, not
+        //a broken image
+        dc.SetBrush(wxBrush(board_soft(dark)));
+        dc.SetPen(wxPen(board_line(dark)));
+        dc.DrawRoundedRectangle(plate_img_x, img_y, img, img, FromDIP(4));
+        dc.SetFont(Label::Head_13);
+        dc.SetTextForeground(board_dim(dark));
+        const wxSize ne = dc.GetTextExtent(index_text);
+        dc.DrawText(index_text, plate_img_x + (img - ne.GetWidth()) / 2, img_y + (img - ne.GetHeight()) / 2);
     }
 
-    const bool show_name = !compact || !names_machine_above;
-    if (show_name) {
-        //an inherited row is greyed and shows the project printer it is following; an
-        //assigned row is in normal weight. The distinction comes from
-        //has_printer_assignment() and from nowhere else, so a project loaded from a 3MF
-        //that already carries assignments shows them.
-        dc.SetTextForeground(row.preset_missing ? board_err(dark)
-                                                : (row.assigned ? board_fg(dark) : board_dim(dark)));
-        dc.SetFont(compact ? Label::Body_10 : Label::Body_12);
+    wxString plate_label = from_u8(row.plate_name);
+    if (plate_label.IsEmpty())
+        plate_label = wxString::Format(_L("Plate %d"), row.plate_index + 1);
+    dc.SetFont(Label::Body_10);
+    dc.SetTextForeground(board_fg(dark));
+    {
+        const wxString shown = wxControl::Ellipsize(plate_label, dc, wxELLIPSIZE_END, col_w);
+        const wxSize   ext   = dc.GetTextExtent(shown);
+        dc.DrawText(shown, plate_col_x + (col_w - ext.GetWidth()) / 2, cap_y);
+    }
 
-        wxString name = from_u8(row.printer_name);
+    int content_right = plate_col_x + col_w;
+
+    // ---- arrow and machine column ------------------------------------------
+    if (!names_machine_above) {
+        const int arrow_x0 = plate_col_x + col_w + FromDIP(4);
+        const int arrow_x1 = arrow_x0 + FromDIP(18);
+        const int arrow_y  = img_y + img / 2;
+        //assigned reads in accent, inherited in dim: the dimming is what says
+        //"changeable default, not a choice"
+        const wxColour arrow_colour = row.preset_missing ? board_err(dark)
+                                      : row.assigned     ? board_accent(dark)
+                                                         : board_dim(dark);
+        dc.SetPen(wxPen(arrow_colour, FromDIP(2)));
+        dc.DrawLine(arrow_x0, arrow_y, arrow_x1, arrow_y);
+        dc.DrawLine(arrow_x1 - FromDIP(5), arrow_y - FromDIP(4), arrow_x1, arrow_y);
+        dc.DrawLine(arrow_x1 - FromDIP(5), arrow_y + FromDIP(4), arrow_x1, arrow_y);
+
+        const int machine_col_x = arrow_x1 + FromDIP(4);
+        const int machine_img_x = machine_col_x + (col_w - img) / 2;
+        if (const wxBitmap *cover = printer_cover_bitmap(row.printer_model, img)) {
+            dc.DrawBitmap(*cover, machine_img_x, img_y, true);
+        } else {
+            dc.SetBrush(wxBrush(board_soft(dark)));
+            dc.SetPen(wxPen(board_line(dark)));
+            dc.DrawRoundedRectangle(machine_img_x, img_y, img, img, FromDIP(4));
+        }
+
+        //the caption is the MODEL when the preset declares one — short and human — and
+        //the exact preset name only when nothing better exists. A project-embedded
+        //preset with an empty base name would otherwise caption a machine "(file.3mf)".
+        wxString machine_caption = from_u8(!row.printer_model.empty() ? row.printer_model : row.printer_name);
         if (row.preset_missing)
-            name += _L(" (not installed)");
-
-        const int      name_max = std::max(FromDIP(30), hours_x - content_x - FromDIP(8));
-        const wxString shown    = wxControl::Ellipsize(name, dc, wxELLIPSIZE_END, name_max);
-        const wxSize   extent   = dc.GetTextExtent(shown);
-        const int      name_y   = compact ? y + (height - extent.GetHeight()) / 2 : y + FromDIP(4);
-        dc.DrawText(shown, content_x, name_y);
-
-        //struck through, so an assignment this installation cannot resolve reads as an
-        //assignment that is being kept rather than one that is in force. Drawn rather than
-        //asked of the font, which is the same reason the chevrons are geometry.
+            machine_caption += _L(" (not installed)");
+        dc.SetFont(Label::Body_10);
+        dc.SetTextForeground(row.preset_missing ? board_err(dark)
+                             : row.assigned     ? board_fg(dark)
+                                                : board_dim(dark));
+        const wxString shown = wxControl::Ellipsize(machine_caption, dc, wxELLIPSIZE_END, col_w + FromDIP(16));
+        const wxSize   ext   = dc.GetTextExtent(shown);
+        int            mx    = machine_col_x + (col_w - ext.GetWidth()) / 2;
+        mx                   = std::max(mx, machine_col_x - FromDIP(8));
+        dc.DrawText(shown, mx, cap_y);
         if (row.preset_missing) {
             dc.SetPen(wxPen(board_err(dark)));
-            const int mid = name_y + extent.GetHeight() / 2;
-            dc.DrawLine(content_x, mid, content_x + extent.GetWidth(), mid);
+            dc.DrawLine(mx, cap_y + ext.GetHeight() / 2, mx + ext.GetWidth(), cap_y + ext.GetHeight() / 2);
         }
+
+        content_right = machine_col_x + col_w;
     }
 
-    // ---- second line, or the width the name did not take -------------------
-    const int box = FromDIP(9);
-    if (compact) {
-        if (!show_name)
-            draw_swatches(dc, dark, row, content_x, y + (height - box) / 2, box, hours_x - content_x - FromDIP(8));
-        return;
-    }
+    // ---- right block: state, time, parts, materials ------------------------
+    draw_state_icon(dc, row, icon_x, y + FromDIP(4));
 
-    draw_swatches(dc, dark, row, content_x, y + FromDIP(21), box, FromDIP(90));
+    dc.SetFont(Label::Body_10);
+    dc.SetTextForeground(board_soft(dark));
+    if (row.has_time) {
+        //shown only when there is a number: a column of em-dashes reads as a broken
+        //table, and "no estimate" is the default state of every plate
+        const wxString hours = format_hours(row.print_time_seconds);
+        const wxSize   ext   = dc.GetTextExtent(hours);
+        dc.DrawText(hours, right - ext.GetWidth(), y + FromDIP(22));
+    }
 
     dc.SetFont(Label::Body_9);
     dc.SetTextForeground(board_dim(dark));
     const wxString parts = row.part_count == 1 ? _L("1 part") : wxString::Format(_L("%d parts"), row.part_count);
     const wxSize   parts_extent = dc.GetTextExtent(parts);
-    dc.DrawText(parts, right - parts_extent.GetWidth(), y + FromDIP(21));
+    dc.DrawText(parts, right - parts_extent.GetWidth(), y + FromDIP(38));
+
+    //material dots between the columns and the right block, vertically centred on the
+    //images
+    const int box       = FromDIP(8);
+    const int swatch_x  = content_right + FromDIP(10);
+    const int swatch_max = right - FromDIP(64) - swatch_x;
+    if (swatch_max > box)
+        draw_swatches(dc, dark, row, swatch_x, img_y + (img - box) / 2, box, swatch_max);
 }
 
 void PlateBoard::on_paint(wxPaintEvent &evt)
 {
+    m_thumb_refreshed_this_paint = false;
+    m_thumb_heal_more            = false;
+
     wxAutoBufferedPaintDC dc(this);
     const bool            dark   = wxGetApp().dark_mode();
     const wxSize          client = GetClientSize();
@@ -2490,6 +2726,10 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
     //exactly the moment the user is farthest from a target and most needs telling.
     if (m_dragging)
         draw_drag_pill(dc, dark);
+
+    //one healed thumbnail per paint: schedule the next paint to heal the next row
+    if (m_thumb_heal_more)
+        CallAfter([this]() { Refresh(); });
 }
 
 void PlateBoard::draw_drag_pill(wxDC &dc, bool dark)

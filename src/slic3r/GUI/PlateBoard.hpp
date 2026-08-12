@@ -67,6 +67,13 @@ struct PlateBoardRow
     //what the row shows: the plate's own printer when it has one, otherwise the
     //project printer it is following
     std::string printer_name;
+    //the plate's own name when the user gave it one; under a header that already names
+    //the machine this is the most useful thing a row can say about itself
+    std::string plate_name;
+    //the machine's model identity ("Creality K2 Pro"): the short display name under the
+    //row's printer picture, and the key its cover image is found by. Empty when the
+    //preset is missing or declares no model.
+    std::string printer_model;
     bool assigned       = false; //has_printer_assignment()
     bool preset_missing = false; //assigned, but this installation has no such preset
 
@@ -225,6 +232,7 @@ public:
                       int                plate_index,
                       const std::string &current_name,
                       const std::vector<int> &scoped_plates = std::vector<int>());
+    ~PlatePrinterPopup() override;
 
     void Popup(wxWindow *focus = nullptr) override;
 
@@ -251,6 +259,7 @@ private:
     void build_items(const std::string &current_name);
     void on_paint(wxPaintEvent &evt);
     void on_mouse(wxMouseEvent &evt);
+    void on_app_activate(wxActivateEvent &evt);
     int  hit_test(const wxPoint &pos) const;
 
     Plater *          m_plater = nullptr;
@@ -454,6 +463,25 @@ private:
     ScalableBitmap m_icon_sliced;  //a retained slice this plate's context still matches
     ScalableBitmap m_icon_stale;   //a retained slice the context has moved out from under
     ScalableBitmap m_icon_problem; //parts outside the bed, or an assignment with no preset
+
+    //the row's plate render, scaled once per thumbnail generation: keyed by the pixel
+    //buffer's address+size, which changes exactly when the thumbnail is re-rendered
+    struct ThumbCacheEntry { const void *pixels = nullptr; size_t size = 0; wxBitmap bmp; };
+    std::map<int, ThumbCacheEntry> m_thumb_cache;
+    bool m_thumb_refreshed_this_paint = false; //one re-render request per paint, reset in on_paint
+    bool m_thumb_heal_more            = false; //that request produced pixels, so paint again for the next row
+    //the row's printer picture, scaled once per model: the vendor cover art the wizard
+    //uses, so the board and the wizard agree on what a machine looks like
+    std::map<std::string, wxBitmap> m_cover_cache;
+    const wxBitmap *plate_thumb_bitmap(int plate_index, int px);
+    const wxBitmap *printer_cover_bitmap(const std::string &model, int px);
+
+    //inline rename of a plate, entered by a single click on the row's caption. Commit on
+    //Enter or focus loss, abandon on Escape; both routes end at Plater::rename_plate.
+    wxTextCtrl *m_rename_edit  = nullptr;
+    int         m_rename_plate = -1;
+    void begin_rename(int plate_index, const wxRect &rect);
+    void commit_rename(bool apply);
     bool           m_icons_ok = false;
 
     //render copies of the sidebar's scope set; see set_scope

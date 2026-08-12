@@ -20144,6 +20144,19 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
         schedule_background_process();
 }
 
+void Plater::rename_plate(int plate_index, const std::string &name)
+{
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    if (plate == nullptr || plate->get_plate_name() == name)
+        return;
+
+    take_snapshot(std::string("Rename plate"));
+    plate->set_plate_name(name);
+    set_plater_dirty(true);
+    if (p->sidebar != nullptr)
+        p->sidebar->refresh_plate_board();
+}
+
 void Plater::set_plate_physical_printer(int plate_index, std::string device_id)
 {
     PartPlate *plate = p->partplate_list.get_plate(plate_index);
