@@ -99,7 +99,7 @@ PickingModel &GLGizmoBase::Grabber::get_cube()
         indexed_triangle_set its = its_make_cube(1.0, 1.0, 1.0);
         its_translate(its, -0.5f * Vec3f::Ones());
         s_cube.model.init_from(its);
-        s_cube.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        s_cube.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
     return s_cube;
 }
@@ -129,13 +129,13 @@ void GLGizmoBase::Grabber::render(float size, const ColorRGBA& render_color)
         indexed_triangle_set its = its_make_cube(1.0, 1.0, 1.0);
         its_translate(its, -0.5f * Vec3f::Ones());
         s_cube.model.init_from(its);
-        s_cube.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        s_cube.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
 
     if (!s_cone.model.is_initialized()) {
         indexed_triangle_set its = its_make_cone(1.0, 1.0, double(PI) / 18.0);
         s_cone.model.init_from(its);
-        s_cone.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        s_cone.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
 
     //BBS set to fixed size grabber
@@ -158,7 +158,7 @@ void GLGizmoBase::Grabber::render(float size, const ColorRGBA& render_color)
 
         if (raycasters[idx] == nullptr) {
             GLCanvas3D &canvas = *wxGetApp().plater()->canvas3D();
-            raycasters[idx] = canvas.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, picking_id, *model.mesh_raycaster, model_matrix);
+            raycasters[idx] = canvas.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, picking_id, model.mesh_raycaster, model_matrix);
         } else {
             raycasters[idx]->set_transform(model_matrix);
         }

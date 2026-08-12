@@ -35,7 +35,7 @@ static ModelVolume *get_model_volume(const Selection &selection, Model &model)
 GLGizmoBrimEars::GLGizmoBrimEars(GLCanvas3D &parent, const std::string &icon_filename, unsigned int sprite_id) : GLGizmoBase(parent, icon_filename, sprite_id)
 {
     GLModel::Geometry cylinder_geometry = smooth_cylinder(16, 1.0f, 1.0f);
-    m_cylinder.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(cylinder_geometry.get_as_indexed_triangle_set()));
+    m_cylinder.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(cylinder_geometry.get_as_indexed_triangle_set()));
     m_cylinder.model.init_from(std::move(cylinder_geometry));
 }
 
@@ -1132,7 +1132,7 @@ void GLGizmoBrimEars::update_raycasters()
             auto& g = m_grabbers.emplace_back();
             g.register_raycasters_for_picking(id);
             g.raycasters[0] = m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, id,
-                                                                 *m_cylinder.mesh_raycaster, Transform3d::Identity());
+                                                                 m_cylinder.mesh_raycaster, Transform3d::Identity());
             remaining--;
         }
     }
@@ -1152,7 +1152,7 @@ void GLGizmoBrimEars::register_single_mesh_pick()
                 m_mesh_raycaster_map[v]->set_transform(world_tran.get_matrix());
             } else {
                 auto mesh               = mv->mesh_ptr();
-                m_mesh_raycaster_map[v] = std::make_shared<PickRaycaster>(-1, *v->mesh_raycaster, world_tran.get_matrix());
+                m_mesh_raycaster_map[v] = std::make_shared<PickRaycaster>(-1, v->mesh_raycaster, world_tran.get_matrix());
                 m_mesh_raycaster_map[v]->set_transform(world_tran.get_matrix());
             }
         }

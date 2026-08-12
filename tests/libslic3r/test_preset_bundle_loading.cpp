@@ -969,3 +969,128 @@ TEST_CASE("The narrow plate process read equals the composed value", "[Preset][P
     }
 }
 
+// ----------------------------------------------------------------------------
+// The re-resolution mechanism: PresetBundle::reresolve_plate_context_for_printer
+// ----------------------------------------------------------------------------
+//
+// One missing rule surfaced as three unrelated faults (a half-renamed compatible_printers
+// list, a plate left unresolved after assignment, a hard refusal from the model combo).
+// These cases pin the rule itself: what is kept, what is switched, what is reported, and
+// what is never touched.
+
+TEST_CASE("Reresolving a plate context after a printer change", "[Preset][PlateContext][Reresolve]")
+{
+    PlateContextFixture fixture;
+    PresetBundle &      bundle = fixture.bundle;
+
+    // The plate's process runs only on the plate's original printer. Set before anything
+    // else is added to prints: fixture.process points into a deque.
+    fixture.process->config.set_key_value("compatible_printers", new ConfigOptionStrings({"Plate Printer"}));
+
+    // A second machine with its own declared default process. After these insertions the
+    // fixture's raw pointers are not used again.
+    Preset &other_process = add_inmemory_preset(bundle.prints, "Other Process");
+    (void) other_process;
+    Preset &other_printer = add_inmemory_preset(bundle.printers, "Other Printer");
+    other_printer.vendor                   = &bundle.vendors.find("TEST")->second;
+    other_printer.printer_technology_ref() = ptFFF;
+    other_printer.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.4}));
+    other_printer.config.set_key_value("printer_model", new ConfigOptionString("Other Model"));
+    other_printer.config.set_key_value("default_print_profile", new ConfigOptionString("Other Process"));
+
+    PresetBundle::PlateContextReresolution result;
+    std::string                            error;
+
+    SECTION("a process that cannot run switches to the new printer's own default")
+    {
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Other Printer";
+        context.printer_vendor_id.clear(); // assignment clears it; the mechanism re-records it
+
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(error.empty());
+        CHECK(result.process_switched());
+        CHECK(result.process_from == "Plate Process");
+        CHECK(result.process_to == "Other Process");
+        CHECK_FALSE(result.process_now_inherits);
+        CHECK(context.print_preset_name == "Other Process");
+        // the vendor id is the identity's second half, and it followed the printer
+        CHECK(context.printer_vendor_id == "TEST");
+
+        // and the switched context genuinely resolves: this is the whole point
+        ResolvedPlatePresets presets;
+        std::string          tier1_error;
+        CHECK(bundle.resolve_plate_presets(context, presets, tier1_error));
+    }
+
+    SECTION("a process that still runs on the new printer is kept exactly as it is")
+    {
+        // make the plate process claim the new printer too
+        Preset *plate_process = bundle.prints.find_preset("Plate Process", false);
+        REQUIRE(plate_process != nullptr);
+        plate_process->config.option<ConfigOptionStrings>("compatible_printers")->values = {"Plate Printer", "Other Printer"};
+
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Other Printer";
+
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK_FALSE(result.process_switched());
+        CHECK(result.process_unresolved.empty());
+        CHECK(context.print_preset_name == "Plate Process"); // still the thing the user chose
+    }
+
+    SECTION("a printer this build does not have preserves the context verbatim")
+    {
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Missing Printer";
+        const PlateSlicingContext before = context;
+
+        CHECK_FALSE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(error.find("Missing Printer") != std::string::npos);
+        CHECK(context == before); // nothing rewritten, nothing cleared, nothing remapped
+    }
+
+    SECTION("no usable switch target leaves the slot alone and names the reason")
+    {
+        Preset *target = bundle.printers.find_preset("Other Printer", false);
+        REQUIRE(target != nullptr);
+        target->config.option<ConfigOptionString>("default_print_profile", true)->value = "Ghost Process";
+
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Other Printer";
+
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK_FALSE(result.process_switched());
+        CHECK(result.process_unresolved.find("Ghost Process") != std::string::npos);
+        CHECK(context.print_preset_name == "Plate Process"); // unresolved is unresolved, not rewritten
+    }
+
+    SECTION("clearing the printer back to the Project row re-inherits an incompatible plate process")
+    {
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name.clear(); // follow the project printer again
+        context.printer_vendor_id.clear();
+
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(result.process_switched());
+        CHECK(result.process_now_inherits);
+        CHECK(context.print_preset_name.empty()); // inheritance, not a copied name
+    }
+
+    SECTION("filaments are reported, never rewritten")
+    {
+        Preset *filament = bundle.filaments.find_preset("Plate Filament", false);
+        REQUIRE(filament != nullptr);
+        filament->config.set_key_value("compatible_printers", new ConfigOptionStrings({"Plate Printer"}));
+
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Other Printer";
+
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        REQUIRE(result.incompatible_filaments.size() == 1);
+        CHECK(result.incompatible_filaments.front() == "Plate Filament");
+        // material choice is user intent: the slot still names what the user chose
+        CHECK(context.filament_preset_names == std::vector<std::string>{"Plate Filament"});
+    }
+}
+

@@ -227,7 +227,8 @@ public:
 
     GUI::GLModel            model;
     // raycaster used for picking
-    std::unique_ptr<GUI::MeshRaycaster> mesh_raycaster;
+    //shared with SceneRaycasterItem: freeing a volume cannot dangle a registered raycaster
+    std::shared_ptr<GUI::MeshRaycaster> mesh_raycaster;
     // BBS
     mutable std::vector<GUI::GLModel> mmuseg_models;
     mutable ObjectBase::Timestamp       mmuseg_ts;

@@ -622,6 +622,11 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         }
     } while (0);
 
+    //an unresolved plate has no filament palette; the geometry still renders in its own
+    //color, it just cannot be tinted per material
+    if (extruder_colors.empty())
+        color_volume = false;
+
     if (color_volume && !picking) {
         // when force_transparent, we need to keep the alpha
         if (force_native_color && render_color.is_transparent()) {
@@ -637,6 +642,8 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
             if (shader) {
                 if (idx == 0) {
                     int extruder_id = model_volume->extruder_id();
+                    if (extruder_id < 1 || extruder_id > (int)extruder_colors.size())
+                        extruder_id = 1;
                     //to make black not too hard too see
                     ColorRGBA new_color = adjust_color_for_rendering(extruder_colors[extruder_id - 1]);
                     if (ban_light) {
@@ -783,7 +790,7 @@ int GLVolumeCollection::load_object_volume(
     v.name = model_volume->name;
 
     v.model.init_from(*mesh);
-    if (need_raycaster) { v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(mesh); }
+    if (need_raycaster) { v.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(mesh); }
     v.composite_id = GLVolume::CompositeID(obj_idx, volume_idx, instance_idx);
 
     if (model_volume->is_model_part())
@@ -836,7 +843,7 @@ void GLVolumeCollection::load_object_auxiliary(
         GLVolume& v = *this->volumes.back();
         v.model.init_from(mesh);
         v.model.set_color((milestone == slaposPad) ? GLVolume::SLA_PAD_COLOR : GLVolume::SLA_SUPPORT_COLOR);
-        v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(mesh));
+        v.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(mesh));
         v.composite_id = GLVolume::CompositeID(obj_idx, -int(milestone), (int)instance_idx.first);
         v.geometry_id = std::pair<size_t, size_t>(timestamp, model_instance.id().id);
         // Create a copy of the convex hull mesh for each instance. Use a move operator on the last instance.
@@ -864,12 +871,20 @@ int GLVolumeCollection::load_wipe_tower_preview(
         height = 0.1f;
 
     std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    //An unresolved plate has no filament palette, and a plate that cannot slice has no
+    //wipe tower to preview. The resolver reports the state; here there is only nothing
+    //to draw. Indexing the empty palette took the application down from reload_scene.
+    if (extruder_colors.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": plate %1% has no resolved extruder colors; skipping wipe tower preview") % (plate_idx + 1);
+        return int(this->volumes.size() - 1);
+    }
     std::vector<ColorRGBA> colors;
     GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
     std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_extruders(true);
     TriangleMesh wipe_tower_shell = make_cube(width, depth, height);
     for (int extruder_id : plate_extruders) {
-        if (extruder_id <= extruder_colors.size())
+        if (extruder_id >= 1 && extruder_id <= (int)extruder_colors.size())
             colors.push_back(extruder_colors[extruder_id - 1]);
         else
             colors.push_back(extruder_colors[0]);
@@ -887,7 +902,7 @@ int GLVolumeCollection::load_wipe_tower_preview(
         v.model_per_colors[i].init_from(color_part);
     }
     v.model.init_from(wipe_tower_shell);
-    v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(wipe_tower_shell));
+    v.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(wipe_tower_shell));
     v.set_convex_hull(wipe_tower_shell);
     v.set_volume_offset(Vec3d(pos_x, pos_y, 0.0));
     v.set_volume_rotation(Vec3d(0., 0., (M_PI / 180.) * rotation_angle));
@@ -906,11 +921,15 @@ int GLVolumeCollection::load_real_wipe_tower_preview(
     if (wt_mesh.its.vertices.empty()) return int(this->volumes.size() - 1);
 
     std::vector<Slic3r::ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    //same rule as load_wipe_tower_preview: an unresolved plate has no palette and no
+    //tower to preview
+    if (extruder_colors.empty())
+        return int(this->volumes.size() - 1);
     GUI::PartPlateList               &ppl              = GUI::wxGetApp().plater()->get_partplate_list();
     std::vector<int>                  plate_extruders  = ppl.get_plate(plate_idx)->get_extruders(true);
     std::vector<Slic3r::ColorRGBA>    colors;
     if (!plate_extruders.empty()) {
-        if (plate_extruders.front() <= extruder_colors.size())
+        if (plate_extruders.front() >= 1 && plate_extruders.front() <= (int)extruder_colors.size())
             colors.push_back(extruder_colors[plate_extruders.front() - 1]);
         else
             colors.push_back(extruder_colors[0]);
@@ -928,7 +947,7 @@ int GLVolumeCollection::load_real_wipe_tower_preview(
     }
     TriangleMesh wipe_tower_shell = mesh.convex_hull_3d();
     v.model.init_from(wipe_tower_shell);
-    v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(wipe_tower_shell));
+    v.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(std::make_shared<const TriangleMesh>(wipe_tower_shell));
     v.set_convex_hull(wipe_tower_shell);
     v.set_volume_offset(Vec3d(pos_x, pos_y, 0.0));
     v.set_volume_rotation(Vec3d(0., 0., (M_PI / 180.) * rotation_angle));

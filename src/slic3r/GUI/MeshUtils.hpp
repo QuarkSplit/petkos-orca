@@ -234,7 +234,9 @@ private:
 struct PickingModel
 {
     GLModel model;
-    std::unique_ptr<MeshRaycaster> mesh_raycaster;
+    //shared with SceneRaycasterItem: resetting this model cannot dangle a registered
+    //raycaster, whatever the rebuild order
+    std::shared_ptr<MeshRaycaster> mesh_raycaster;
 
     void reset() {
         model.reset();

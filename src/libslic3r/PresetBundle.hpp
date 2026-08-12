@@ -216,6 +216,48 @@ public:
                                ResolvedPlatePresets      &presets,
                                std::string               &error) const;
 
+    // THE RE-RESOLUTION MECHANISM. When a plate's printer identity changes, every preset
+    // that depends on it is re-resolved against the new printer through this one path.
+    // Its absence is what made one missing rule surface as three unrelated faults: a
+    // half-renamed compatible_printers list, a plate left unresolved after assignment,
+    // and a hard refusal from the model combo.
+    //
+    // The rules, and why each is what it is:
+    //  - A dependent that still runs on the new printer is kept exactly as it is. It is
+    //    still the thing the user chose.
+    //  - A process that cannot run (incompatible, or no longer available) is switched to
+    //    the new printer's own declared default_print_profile. A process is machine
+    //    tuning, its identity means nothing across machines, and the target is the
+    //    printer's own declaration rather than a nearest match. When the plate follows
+    //    the Project printer, the switch clears the slot back to inheritance instead,
+    //    because the Project pairing is what the plate just asked to follow.
+    //  - A filament that cannot run is REPORTED by name and never rewritten. Filament is
+    //    material choice, user intent the machine cannot infer; substituting one is a
+    //    silent yes with a real cost.
+    //  - Anything that still cannot resolve stays as it is and is named in the result:
+    //    unresolved is unresolved, fix it at the source.
+    //
+    // Returns false without touching the context when the new printer itself does not
+    // resolve: a preset this build does not have is preserved verbatim, because the
+    // project may be reopened on a machine that has it, and there is nothing here to
+    // re-resolve against. It also re-records printer_vendor_id from the resolved
+    // printer, which assignment alone leaves empty.
+    //
+    // Scope: plate-local identity changes. A PROJECT printer change flows through
+    // Tab::select_preset / update_compatible, which owns the Project row's own pairing.
+    struct PlateContextReresolution
+    {
+        std::string              process_from;            // effective process before the switch
+        std::string              process_to;              // what it now names; empty = no switch
+        bool                     process_now_inherits { false }; // the switch cleared the slot to inheritance
+        std::string              process_unresolved;      // why no switch target could be found; empty = none needed or found
+        std::vector<std::string> incompatible_filaments;  // slots that cannot run on the new printer, reported not rewritten
+        bool process_switched() const { return !process_to.empty(); }
+    };
+    bool reresolve_plate_context_for_printer(PlateSlicingContext      &context,
+                                             PlateContextReresolution &result,
+                                             std::string              &error) const;
+
     // The one narrow read that is equal to the composed answer. plate_overrides is
     // PartPlate::config(), applied first exactly as resolve_plate_slicing_config applies it
     // last over everything else; pass nullptr for none. Returns null when the plate's

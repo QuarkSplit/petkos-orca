@@ -36,14 +36,14 @@ SceneRaycaster::SceneRaycaster() {
 #endif // ENABLE_RAYCAST_PICKING_DEBUG
 }
 
-std::shared_ptr<SceneRaycasterItem> SceneRaycaster::add_raycaster(EType type, int id, const MeshRaycaster& raycaster,
+std::shared_ptr<SceneRaycasterItem> SceneRaycaster::add_raycaster(EType type, int id, std::shared_ptr<const MeshRaycaster> raycaster,
     const Transform3d& trafo, bool use_back_faces)
 {
     switch (type) {
-    case EType::Bed:    { return m_bed.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), raycaster, trafo, use_back_faces)); }
-    case EType::Volume: { return m_volumes.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), raycaster, trafo, use_back_faces)); }
-    case EType::Gizmo:  { return m_gizmos.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), raycaster, trafo, use_back_faces)); }
-    case EType::FallbackGizmo:  { return m_fallback_gizmos.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), raycaster, trafo, use_back_faces)); }
+    case EType::Bed:    { return m_bed.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), std::move(raycaster), trafo, use_back_faces)); }
+    case EType::Volume: { return m_volumes.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), std::move(raycaster), trafo, use_back_faces)); }
+    case EType::Gizmo:  { return m_gizmos.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), std::move(raycaster), trafo, use_back_faces)); }
+    case EType::FallbackGizmo:  { return m_fallback_gizmos.emplace_back(std::make_shared<SceneRaycasterItem>(encode_id(type, id), std::move(raycaster), trafo, use_back_faces)); }
     default:            { assert(false);  return nullptr; }
     };
 }

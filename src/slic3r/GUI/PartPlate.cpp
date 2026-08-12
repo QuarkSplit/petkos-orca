@@ -615,7 +615,7 @@ static void init_raycaster_from_model(PickingModel& model)
         its.indices.emplace_back(geometry.extract_index(tri_id), geometry.extract_index(tri_id + 1), geometry.extract_index(tri_id + 2));
     }
 
-    model.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+    model.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
 }
 
 void PartPlate::calc_gridlines(const ExPolygon& poly, const BoundingBox& pp_bbox) {
@@ -1586,7 +1586,7 @@ static void register_model_for_picking(GLCanvas3D &canvas, PickingModel &model, 
 	if (model.mesh_raycaster == nullptr)
 		return;
 
-    canvas.add_raycaster_for_picking(SceneRaycaster::EType::Bed, id, *model.mesh_raycaster, Transform3d::Identity());
+    canvas.add_raycaster_for_picking(SceneRaycaster::EType::Bed, id, model.mesh_raycaster, Transform3d::Identity());
 }
 
 void PartPlate::register_raycasters_for_picking(GLCanvas3D &canvas)

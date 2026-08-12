@@ -755,9 +755,9 @@ public:
     bool init();
     void post_event(wxEvent &&event);
 
-    std::shared_ptr<SceneRaycasterItem> add_raycaster_for_picking(SceneRaycaster::EType type, int id, const MeshRaycaster& raycaster,
+    std::shared_ptr<SceneRaycasterItem> add_raycaster_for_picking(SceneRaycaster::EType type, int id, std::shared_ptr<const MeshRaycaster> raycaster,
         const Transform3d& trafo = Transform3d::Identity(), bool use_back_faces = false) {
-        return m_scene_raycaster.add_raycaster(type, id, raycaster, trafo, use_back_faces);
+        return m_scene_raycaster.add_raycaster(type, id, std::move(raycaster), trafo, use_back_faces);
     }
     void remove_raycasters_for_picking(SceneRaycaster::EType type, int id) {
         m_scene_raycaster.remove_raycasters(type, id);

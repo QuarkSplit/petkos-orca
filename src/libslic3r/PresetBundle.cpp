@@ -354,6 +354,129 @@ bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
     return true;
 }
 
+bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      &context,
+                                                       PlateContextReresolution &result,
+                                                       std::string              &error) const
+{
+    result = {};
+    error.clear();
+
+    // The printer half, by the tier-1 rules. resolve_plate_presets is not reused whole
+    // because it also resolves the process slot, and an unresolved process slot is
+    // exactly the state this function exists to repair.
+    const Preset *printer = nullptr;
+    if (context.printer_preset_name.empty()) {
+        if (printers.get_selected_idx() == size_t(-1) || printers.get_selected_idx() >= printers.size()) {
+            error = "The Project printer preset selection is unresolved";
+            return false;
+        }
+        printer = &printers.get_edited_preset();
+    } else {
+        printer = printers.find_preset(context.printer_preset_name, false);
+    }
+    if (printer == nullptr) {
+        error = "Printer preset '" + context.printer_preset_name + "' is not available";
+        return false;
+    }
+    if (printer->printer_technology() != ptFFF) {
+        error = "Printer preset '" + printer->name + "' is not an FDM printer";
+        return false;
+    }
+    const ConfigOptionFloats *nozzles = printer->config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzles == nullptr || nozzles->values.empty()) {
+        error = "Printer preset '" + printer->name + "' has no nozzle definition";
+        return false;
+    }
+
+    const PresetWithVendorProfile printer_profile = printers.get_preset_with_vendor_profile(*printer);
+    // Assignment records the name and set_printer_preset_name clears the vendor id.
+    // Recording it here is what makes a later name collision across vendors read as a
+    // different machine wearing the same string, rather than resolve to it.
+    if (!context.printer_preset_name.empty())
+        context.printer_vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
+
+    // The process slot.
+    const bool    process_inherits = context.print_preset_name.empty();
+    const Preset *process = nullptr;
+    if (process_inherits) {
+        if (prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size())
+            process = &prints.get_edited_preset();
+    } else {
+        process = prints.find_preset(context.print_preset_name, false);
+    }
+
+    bool process_runs = false;
+    if (process != nullptr) {
+        const PresetWithVendorProfile process_profile = prints.get_preset_with_vendor_profile(*process);
+        process_runs = is_compatible_with_printer(process_profile, printer_profile, &project_config);
+    }
+
+    if (!process_runs) {
+        result.process_from = process != nullptr ? process->name
+                            : process_inherits  ? std::string("(unresolved Project process)")
+                                                : context.print_preset_name;
+        if (context.printer_preset_name.empty()) {
+            // The plate follows the Project printer, so a plate-local process that cannot
+            // run there re-resolves to the Project pairing itself — that pairing is what
+            // the plate just asked to follow. Both slots inheriting is not this plate's
+            // state to repair: if the Project row cannot run its own process, that is the
+            // Project row's error and the resolver reports it as such.
+            const bool project_has_process = prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size();
+            if (!process_inherits && project_has_process) {
+                context.print_preset_name.clear();
+                result.process_to           = prints.get_edited_preset().name;
+                result.process_now_inherits = true;
+            } else if (!process_inherits) {
+                result.process_unresolved = "The Project process selection is unresolved, so there is nothing to inherit";
+            }
+        } else {
+            const std::string target_name = printer->config.opt_string("default_print_profile");
+            if (target_name.empty()) {
+                result.process_unresolved = "Printer preset '" + printer->name + "' declares no default process profile";
+            } else if (const Preset *target = prints.find_preset(target_name, false); target == nullptr) {
+                result.process_unresolved = "The printer's own default process '" + target_name + "' is not available";
+            } else if (const PresetWithVendorProfile target_profile = prints.get_preset_with_vendor_profile(*target);
+                       !is_compatible_with_printer(target_profile, printer_profile, &project_config)) {
+                result.process_unresolved = "The printer's own default process '" + target->name + "' is itself incompatible with it";
+            } else {
+                context.print_preset_name = target->name;
+                result.process_to         = target->name;
+            }
+        }
+    }
+
+    // Filament slots: reported, never rewritten. The effective list is the plate's own
+    // when it has one and the Project row's otherwise; either way the user should hear
+    // which materials cannot follow the plate onto this machine.
+    const Preset *post_process = nullptr;
+    if (context.print_preset_name.empty()) {
+        if (prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size())
+            post_process = &prints.get_edited_preset();
+    } else {
+        post_process = prints.find_preset(context.print_preset_name, false);
+    }
+    const std::vector<std::string> &filament_names = context.filament_preset_names.empty()
+        ? filament_presets
+        : context.filament_preset_names;
+    for (const std::string &name : filament_names) {
+        const Preset *filament = filaments.find_preset(name, false);
+        if (filament == nullptr) {
+            result.incompatible_filaments.push_back(name + " (not available)");
+            continue;
+        }
+        const PresetWithVendorProfile filament_profile = filaments.get_preset_with_vendor_profile(*filament);
+        if (!is_compatible_with_printer(filament_profile, printer_profile, &project_config)) {
+            result.incompatible_filaments.push_back(filament->name);
+        } else if (post_process != nullptr) {
+            const PresetWithVendorProfile process_profile = prints.get_preset_with_vendor_profile(*post_process);
+            if (!is_compatible_with_print(filament_profile, process_profile, printer_profile))
+                result.incompatible_filaments.push_back(filament->name);
+        }
+    }
+
+    return true;
+}
+
 const ConfigOption *PresetBundle::plate_process_option(const PlateSlicingContext &context,
                                                        const DynamicPrintConfig  *plate_overrides,
                                                        const std::string         &opt_key) const
@@ -1077,7 +1200,15 @@ void PresetBundle::reset_project_embedded_presets()
     // thing load_selections keeps when a persisted name fails. Nothing is guessed at: the deleted
     // preset is gone with its project and there is no name being substituted for, only a dangling
     // one being replaced by the collection's real state. Every replacement is named in the log.
-    const std::string installed_filament = this->filaments.get_selected_preset_name();
+    // With nothing installed the row floors at the collection's own inert default, exactly as
+    // the machine collection floors at '- default -' when nothing is installed. An earlier
+    // version emptied the row instead, which only moved the throw: full_fff_config refuses an
+    // empty row with "The Project row has no explicit filament preset", and that refusal out of
+    // the close path ended the session. Measured on a datadir whose AppConfig filament section
+    // was null, which is the state a config rebuild leaves behind.
+    std::string installed_filament = this->filaments.get_selected_preset_name();
+    if (installed_filament.empty())
+        installed_filament = this->filaments.default_preset().name;
     for (size_t i = 0; i < filament_presets.size(); ++ i)
     {
         Preset* selected_filament = this->filaments.find_preset(filament_presets[i], false);
@@ -1085,15 +1216,9 @@ void PresetBundle::reset_project_embedded_presets()
             continue;
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected filament preset '" << filament_presets[i]
                                  << "' went with the project that carried it; the Project filament row "
-                                 << (installed_filament.empty() ? std::string("has nothing installed to fall back on")
-                                                                : "now reads '" + installed_filament + "'");
+                                 << "now reads '" << installed_filament << "'";
         filament_presets[i] = installed_filament;
     }
-    // A row of empty names is the same inconsistency in another shape, and full_fff_config throws
-    // on it too. With nothing installed there is no project to describe, so the row is emptied
-    // rather than left holding blanks.
-    if (installed_filament.empty())
-        filament_presets.clear();
 }
 
 //BBS: get bed texture for printer model

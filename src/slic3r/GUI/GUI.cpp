@@ -1,5 +1,7 @@
 #include "GUI.hpp"
 #include "GUI_App.hpp"
+#include "Plater.hpp"
+#include "NotificationManager.hpp"
 #include "ICloudServiceAgent.hpp"
 #include "format.hpp"
 #include "I18N.hpp"
@@ -389,6 +391,19 @@ static wxString substitution_message(const wxString& changes)
 		_L("Some values have been replaced. Please check them:") + "\n" + changes + "\n";
 }
 
+//Substitution reports state facts about replacements already made — information, not a
+//choice — so they inform through a notification and put the full list in the log instead
+//of gating the load behind a modal OK.
+static void notify_substitutions(const wxString& headline, const wxString& changes)
+{
+	BOOST_LOG_TRIVIAL(warning) << "config value substitutions: " << into_u8(headline) << into_u8(changes);
+	NotificationManager* notifications = wxGetApp().plater() != nullptr ? wxGetApp().plater()->get_notification_manager() : nullptr;
+	if (notifications != nullptr)
+		notifications->push_notification(NotificationType::CustomNotification,
+		                                 NotificationManager::NotificationLevel::WarningNotificationLevel,
+		                                 into_u8(headline + " " + _L("Replaced values are listed in the application log.")));
+}
+
 void show_substitutions_info(const PresetsConfigSubstitutions& presets_config_substitutions)
 {
 	wxString changes;
@@ -413,8 +428,7 @@ void show_substitutions_info(const PresetsConfigSubstitutions& presets_config_su
 		add_config_substitutions(substitution.substitutions, changes);
 	}
 
-	InfoDialog msg(nullptr, _L("The configuration package was loaded, but some values were not recognized."), substitution_message(changes), true);
-	msg.ShowModal();
+	notify_substitutions(_L("The configuration package was loaded, but some values were not recognized."), substitution_message(changes));
 }
 
 void show_substitutions_info(const ConfigSubstitutions& config_substitutions, const std::string& filename)
@@ -422,10 +436,9 @@ void show_substitutions_info(const ConfigSubstitutions& config_substitutions, co
 	wxString changes = "\n";
 	add_config_substitutions(config_substitutions, changes);
 
-	InfoDialog msg(nullptr,
+	notify_substitutions(
 		format_wxstr(_L("The configuration file \u201c%1%\u201d was loaded, but some values were not recognized."), from_u8(filename)),
-		substitution_message(changes), true);
-	msg.ShowModal();
+		substitution_message(changes));
 }
 
 void create_combochecklist(wxComboCtrl* comboCtrl, const std::string& text, const std::string& items)

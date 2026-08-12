@@ -68,35 +68,34 @@ the plate picker retargets them. Two things had to be true for that, and both ar
   kept naming the printer's old name — so a project's own two presets declared each other
   incompatible and every plate read as unresolved. `load_config_file_config` completes that rename.
 
-### These are not three bugs. They are one missing mechanism.
+### The re-resolution mechanism (built 2026-08-12)
 
-The preset-rename fault above, the plate-process fault below, and the nozzle-variant refusal are the
-same sentence in three costumes: **a plate's printer identity changed, and the presets that depend on
-it were not re-resolved against the new printer.**
+Three faults — the preset-rename fault above, a plate left unresolved after assignment, and a
+hard nozzle-variant refusal from the model combo — were one sentence in three costumes: **a
+plate's printer identity changed, and the presets that depend on it were not re-resolved against
+the new printer.** The mechanism now exists:
+`PresetBundle::reresolve_plate_context_for_printer`, called from both plate-printer write paths.
+Its rules, which are the top-of-file rules applied to a change of identity:
 
-| | What changed | What failed to follow | How it surfaced |
-|---|---|---|---|
-| 1 | the printer's decorated name | `compatible_printers` on the process | every plate silently unresolved (fixed) |
-| 2 | the plate's assigned printer | the process | plate stays unresolved until set by hand |
-| 3 | the selected printer model | the nozzle variant | hard refusal from the sidebar combo |
+- A dependent preset that still runs on the new printer is kept. It is still what the user chose.
+- A process that cannot run switches to the new printer's own declared `default_print_profile` —
+  the printer's own declaration, never a nearest match. A plate cleared back to "follow the
+  project" re-inherits the Project pairing instead.
+- A filament that cannot run is reported by name and never rewritten: filament is material
+  choice, and substituting one is a silent yes with a real cost.
+- Anything that still cannot resolve stays as it is and is named. Unresolved is unresolved.
+- A printer this build does not have preserves the whole context verbatim — the project may be
+  headed to a machine that has it.
 
-They fail in three different ways precisely because there is no re-resolution mechanism: each
-dependency is handled ad hoc at its own call site, so each one invents its own failure. Patching
-them individually keeps the list three items long.
+The model combo applies the same shape to its own dependent: picking a printer MODEL re-resolves
+the nozzle variant — carried over when the model has it, the model's single variant when not, a
+named choice when several exist. The only refusal left is a model with no preset at all.
 
-**The mechanism to build:** when a plate's printer identity changes, every dependent preset is
-re-resolved against the new printer's capabilities, through one path, with a single defined rule for
-no-match. That rule is already written at the top of this file — no fallbacks, unresolved is
-unresolved, fix it at the source — and it belongs in one place rather than at each call site.
-
-Note that this file already classifies two of the three as defects rather than gaps. Item 2 is "an
-operation that technically succeeds but leaves the user manual work the app could obviously have
-done". Item 3 is a hard refusal to a definite request, which is the silent-gate failure the
-objective exists to prevent. Neither is housekeeping.
-
-Item 2's fix is written and was seen working, and it crashes on assignment; see the 2026-08-12
-work-log entry. The crash is worth understanding rather than reverting around, because it is
-probably the same missing mechanism objecting to being bolted on at one call site.
+The crash that stalled item 2's first fix was never in the preset system: it was a dangling
+`MeshRaycaster` in the scene raycaster, exposed by any per-plate bed change and triggered by the
+mouse being over the canvas. Ownership is now shared (`SceneRaycasterItem` / `PickingModel` /
+`GLVolume` hold `shared_ptr`), so no rebuild order can dangle a registered raycaster. Full
+forensics, including where the app's own crash logs live, in the 2026-08-12 work-log entries.
 
 **This fork has free rein.** Upstream compatibility is not a goal in itself. Rebase cost is real
 but secondary, and worth paying where the current design is genuinely wrong rather than merely

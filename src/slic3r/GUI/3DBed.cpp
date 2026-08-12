@@ -794,8 +794,8 @@ void Bed3D::register_raycasters_for_picking(const GLModel::Geometry& geometry, c
         its.indices.emplace_back(geometry.extract_index(tri_id), geometry.extract_index(tri_id + 1), geometry.extract_index(tri_id + 2));
     }
 
-    m_model.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
-    wxGetApp().plater()->canvas3D()->add_raycaster_for_picking(SceneRaycaster::EType::Bed, 0, *m_model.mesh_raycaster, trafo);
+    m_model.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+    wxGetApp().plater()->canvas3D()->add_raycaster_for_picking(SceneRaycaster::EType::Bed, 0, m_model.mesh_raycaster, trafo);
 }
 */
 } // GUI

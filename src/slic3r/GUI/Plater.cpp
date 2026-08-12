@@ -45,6 +45,7 @@
 #include <wx/string.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
+#include <wx/choicdlg.h>
 #include <wx/debug.h>
 #include <wx/busyinfo.h>
 #include <wx/event.h>
@@ -7448,7 +7449,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__
                                                 << " "
                                                 << boost::format("3MF import message [%1%]: %2% | file: %3%") % into_u8(title) % into_u8(text) % path.string();
-                        show_info(q, text, title);
+                        //informs without gating. These are statements of fact about the file's
+                        //origin, not choices; as modal OK-boxes they held the whole load hostage
+                        //(and, mid-load_files, stacked under the progress dialog), gating every
+                        //scripted load and every human one. For a farm fed on downloaded
+                        //projects this fired on essentially every open.
+                        notification_manager->push_notification(NotificationType::CustomNotification,
+                                                                NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                                                into_u8(title + ": " + text));
                     };
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
                         // do not reset the model config
@@ -8402,6 +8410,59 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     }
     q->schedule_background_process(true);
     q->mark_plate_toolbar_image_dirty();
+
+    //Dev hook: PETKOS_TEST_ASSIGN="<plate>:<printer preset name>" (1-based plate) drives the
+    //one plate-printer write path after a project load finishes. The plate board is
+    //custom-painted, so no UI-automation tool can reach its rows; this makes the
+    //assignment flow scriptable through the same production path the picker commits
+    //through, which is what turns a crash-on-assignment report into a repeatable test.
+    //Fires once per process; inert unless the variable is set at launch.
+    static bool petkos_test_assign_fired = false;
+    if (!petkos_test_assign_fired) {
+        wxString   spec;
+        const bool has_env = wxGetEnv("PETKOS_TEST_ASSIGN", &spec);
+        //the hook says what it saw even when it does nothing: a silent no-op here cost a
+        //debugging round in which binary, env var and parse were all suspects at once
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN hook: env "
+                                   << (has_env ? "present, value '" + into_u8(spec) + "'" : "absent");
+        if (has_env && !spec.IsEmpty()) {
+            petkos_test_assign_fired = true;
+            const std::string s     = into_u8(spec);
+            const size_t      colon = s.find(':');
+            if (colon == std::string::npos) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_TEST_ASSIGN: no ':' in spec, expected <plate>:<preset name>[:delay_ms]";
+            } else {
+                const int   plate_idx = std::atoi(s.substr(0, colon).c_str()) - 1;
+                std::string preset    = s.substr(colon + 1);
+                //optional trailing :delay_ms gives a debugger time to attach after startup,
+                //which matters because the network plugin refuses to LOAD under one
+                long delay_ms = 0;
+                if (const size_t colon2 = preset.rfind(':'); colon2 != std::string::npos) {
+                    char *end = nullptr;
+                    const long parsed = std::strtol(preset.c_str() + colon2 + 1, &end, 10);
+                    if (end != nullptr && *end == '\0' && parsed > 0) {
+                        delay_ms = parsed;
+                        preset.erase(colon2);
+                    }
+                }
+                Plater *plater = q;
+                auto fire = [plater, plate_idx, preset]() {
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN: assigning plate "
+                                               << (plate_idx + 1) << " to '" << preset << "'";
+                    plater->set_plate_printer(plate_idx, preset);
+                };
+                if (delay_ms > 0) {
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN: will assign in " << delay_ms << " ms";
+                    std::thread([plater, fire, delay_ms]() {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                        plater->CallAfter(fire);
+                    }).detach();
+                } else {
+                    q->CallAfter(fire);
+                }
+            }
+        }
+    }
     return obj_idxs;
 }
 
@@ -11008,24 +11069,58 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 physical_printers.unselect_printer();
 
             if (combo->is_selected_printer_model()) {
+                //Picking a MODEL is a definite request; the nozzle variant is the dependent
+                //that re-resolves against it. The old code required the edited preset's
+                //variant to exist on the new model and refused otherwise — from "Default
+                //Printer", whose variant matches nothing, that refused every model in the
+                //list. Same missing mechanism as a plate's process after a printer change:
+                //keep the variant when the model carries it, fall back to the model's own
+                //variants when it does not, and ask only when there is a genuine choice.
                 PresetBundle *bundle = wxGetApp().preset_bundle;
                 const std::string variant = bundle->printers.get_edited_preset().config.opt_string("printer_variant");
-                std::vector<const Preset *> candidates;
-                for (const Preset &candidate : bundle->printers) {
-                    if (candidate.printer_technology() == ptFFF &&
-                        candidate.config.opt_string("printer_model") == preset_name &&
-                        candidate.config.opt_string("printer_variant") == variant)
-                        candidates.push_back(&candidate);
-                }
+                auto model_presets = [bundle, &preset_name](const std::string &want_variant) {
+                    std::vector<const Preset *> found;
+                    for (const Preset &candidate : bundle->printers) {
+                        if (candidate.printer_technology() == ptFFF &&
+                            candidate.config.opt_string("printer_model") == preset_name &&
+                            (want_variant.empty() || candidate.config.opt_string("printer_variant") == want_variant))
+                            found.push_back(&candidate);
+                    }
+                    return found;
+                };
+                std::vector<const Preset *> candidates = variant.empty() ? std::vector<const Preset *>{} : model_presets(variant);
                 if (candidates.size() != 1) {
-                    show_error(this->sidebar,
-                               candidates.empty()
-                                   ? _L("No installed printer preset exactly matches this model and the current nozzle variant.")
-                                   : _L("Multiple printer presets match this model and nozzle variant. Select an exact preset."),
-                               false);
+                    //the current variant does not decide it: re-resolve from the model's own
+                    //presets, preferring installed ones when any are
+                    candidates = model_presets(std::string());
+                    std::vector<const Preset *> visible;
+                    for (const Preset *candidate : candidates)
+                        if (candidate->is_visible)
+                            visible.push_back(candidate);
+                    if (!visible.empty())
+                        candidates = std::move(visible);
+                }
+                if (candidates.empty()) {
+                    //the model genuinely has no preset here — the one honest refusal left
+                    show_error(this->sidebar, _L("This printer model has no printer preset at all in this installation."), false);
                     return;
                 }
-                preset_name = candidates.front()->name;
+                if (candidates.size() == 1) {
+                    preset_name = candidates.front()->name;
+                } else {
+                    //several variants exist and nothing selects between them: name them
+                    //rather than refuse. Cancelling keeps the current printer, which is the
+                    //user declining, not the app refusing.
+                    wxArrayString names;
+                    for (const Preset *candidate : candidates)
+                        names.Add(from_u8(candidate->name));
+                    wxSingleChoiceDialog dlg(this->sidebar,
+                                             _L("This model is installed with more than one nozzle variant. Which one is this plate for?"),
+                                             _L("Select nozzle variant"), names);
+                    if (dlg.ShowModal() != wxID_OK)
+                        return;
+                    preset_name = candidates[dlg.GetSelection()]->name;
+                }
             }
             std::string old_preset_name = wxGetApp().preset_bundle->printers.get_edited_preset().name;
 
@@ -19911,6 +20006,77 @@ bool Plater::plugins_block_slicing() const
     return has_missing_plugins() || has_inactive_plugins() || has_broken_plugins();
 }
 
+//Re-resolve one plate's dependent presets after its printer identity changed, and say
+//what happened. This is the GUI half of PresetBundle::reresolve_plate_context_for_printer:
+//the mechanism decides, this applies the decision to the plate and names it to the user.
+//Shared by both write paths so a single assignment and a batch cannot drift apart.
+static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plate)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return;
+
+    PlateSlicingContext context = plate->get_slicing_context();
+    PresetBundle::PlateContextReresolution reresolved;
+    std::string resolve_error;
+    if (!bundle->reresolve_plate_context_for_printer(context, reresolved, resolve_error)) {
+        //The new printer does not resolve on this build, so the context is preserved
+        //verbatim: the project may be reopened on a machine that has it, and there is
+        //nothing here to re-resolve against.
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_after_printer_change"
+            << boost::format(": plate %1%: context preserved verbatim (%2%)")
+               % (plate->get_index() + 1) % resolve_error;
+        return;
+    }
+    plate->set_slicing_context(context);
+
+    NotificationManager *notifications = plater->get_notification_manager();
+    const std::string    printer_name  = context.printer_preset_name.empty()
+        ? bundle->printers.get_edited_preset().name : context.printer_preset_name;
+
+    if (reresolved.process_switched()) {
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_after_printer_change"
+            << boost::format(": plate %1%: process '%2%' cannot run on '%3%'; switched to '%4%'%5%")
+               % (plate->get_index() + 1) % reresolved.process_from % printer_name % reresolved.process_to
+               % (reresolved.process_now_inherits ? " (the project's own process)" : " (the printer's own default process)");
+        if (notifications != nullptr)
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                into_u8(reresolved.process_now_inherits
+                    ? wxString::Format(_L("Plate %d: process \"%s\" cannot run on the project printer. The plate now follows the project process \"%s\"."),
+                                       plate->get_index() + 1, from_u8(reresolved.process_from), from_u8(reresolved.process_to))
+                    : wxString::Format(_L("Plate %d: process \"%s\" cannot run on \"%s\". Switched to \"%s\", the printer's own default."),
+                                       plate->get_index() + 1, from_u8(reresolved.process_from), from_u8(printer_name), from_u8(reresolved.process_to))));
+    } else if (!reresolved.process_unresolved.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+            << boost::format(": plate %1%: process '%2%' cannot run on '%3%' and no switch target exists: %4%")
+               % (plate->get_index() + 1) % reresolved.process_from % printer_name % reresolved.process_unresolved;
+        if (notifications != nullptr)
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d: process \"%s\" cannot run on \"%s\" and could not be re-resolved: %s Pick a process for this plate."),
+                                         plate->get_index() + 1, from_u8(reresolved.process_from), from_u8(printer_name),
+                                         from_u8(reresolved.process_unresolved))));
+    }
+
+    if (!reresolved.incompatible_filaments.empty()) {
+        std::string names;
+        for (const std::string &name : reresolved.incompatible_filaments) {
+            if (!names.empty())
+                names += ", ";
+            names += name;
+        }
+        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+            << boost::format(": plate %1%: %2% filament(s) cannot run on '%3%': %4%")
+               % (plate->get_index() + 1) % reresolved.incompatible_filaments.size() % printer_name % names;
+        if (notifications != nullptr)
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d: these filaments cannot run on \"%s\": %s. Filament is a material choice, so nothing was substituted — pick materials for this plate."),
+                                         plate->get_index() + 1, from_u8(printer_name), from_u8(names))));
+    }
+}
+
 //The one write path for a plate's printer assignment. Owns every consequence of a
 //reassignment: the undo snapshot, the bed update, the bounds re-check and the slice
 //invalidation. An empty preset_name clears the assignment back to "follow the
@@ -19935,6 +20101,9 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
         << boost::format(": assign plate %1% to printer '%2%'") % (plate_index + 1) % preset_name;
 
     plate->set_printer_preset_name(preset_name);
+    //the printer identity changed, so everything that depends on it re-resolves — one
+    //mechanism, not a patch per dependent (see PresetBundle::reresolve_plate_context_for_printer)
+    reresolve_plate_after_printer_change(this, plate);
     p->partplate_list.apply_printer_to_plate(plate_index);
     //the plate outline, grid and icons are rebuilt by the call above; the reflow can
     //move the current plate even when another plate was reassigned, so the textured
@@ -20020,8 +20189,13 @@ void Plater::set_plate_printers(const std::vector<int>& plate_indices, std::stri
 
     //write every name first, then apply every bed with its own reflow deferred, so
     //the single trailing reflow is the only visible shuffle
-    for (int idx : changed)
-        p->partplate_list.get_plate(idx)->set_printer_preset_name(preset_name);
+    for (int idx : changed) {
+        PartPlate *plate = p->partplate_list.get_plate(idx);
+        plate->set_printer_preset_name(preset_name);
+        //same mechanism as the single-plate path: the printer identity changed, so its
+        //dependents re-resolve, per plate, before any bed is applied
+        reresolve_plate_after_printer_change(this, plate);
+    }
     for (int idx : changed)
         p->partplate_list.apply_printer_to_plate(idx, false);
     p->partplate_list.reflow_layout();

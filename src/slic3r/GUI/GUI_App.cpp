@@ -3483,10 +3483,19 @@ bool GUI_App::on_init_inner()
     BOOST_LOG_TRIVIAL(info) << "finished the gui app init";
     if (m_config_corrupted) {
         m_config_corrupted = false;
-        show_error(nullptr,
-                   _u8L(
-                       "The OrcaSlicer configuration file may be corrupted and cannot be parsed.\nOrcaSlicer has attempted to recreate the "
-                       "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected."));
+        //informs without gating: this is a report about something already handled — the file
+        //was recreated — so a modal OK adds a click and no choice. As a modal it also blocked
+        //every scripted launch after a config-corrupting crash, which is exactly when a
+        //scripted launch is trying to find out what happened.
+        const std::string config_recreated_msg =
+            _u8L("The OrcaSlicer configuration file may be corrupted and cannot be parsed.\nOrcaSlicer has attempted to recreate the "
+                 "configuration file.\nPlease note, application settings will be lost, but printer profiles will not be affected.");
+        if (plater() != nullptr && plater()->get_notification_manager() != nullptr)
+            plater()->get_notification_manager()->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                config_recreated_msg);
+        else
+            BOOST_LOG_TRIVIAL(error) << "config recreated, and no notification surface exists yet: " << config_recreated_msg;
     }
     return true;
 }

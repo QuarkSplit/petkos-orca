@@ -7,6 +7,133 @@ Dated build history and closed audit findings for the fork, split out of `PETKOS
 authority on how the fork behaves now; anything here is a record of how it got there and may
 describe states that no longer exist.
 
+## Work log — 2026-08-12, session 2 (the mechanism, and the crash that was never about presets)
+
+### The re-resolution mechanism exists
+
+`PresetBundle::reresolve_plate_context_for_printer`, the "one missing mechanism" the previous
+entry's table describes, is built, unit-tested and verified live. One path, called from both
+plate-printer write paths (`set_plate_printer` and the batch variant): when a plate's printer
+identity changes, a dependent that still runs on the new printer is kept, a process that cannot
+run switches to the new printer's own declared `default_print_profile` (or back to inheritance
+when the plate was just cleared to follow the Project row), filaments are REPORTED by name and
+never substituted — material is user intent — and anything that still cannot resolve stays put
+and says why. A printer this build does not have preserves the context verbatim, same as before.
+It also re-records `printer_vendor_id`, which assignment alone left cleared.
+
+Six new cases pin those rules in `test_preset_bundle_loading.cpp` (`[Reresolve]`). Live, on the
+21-plate fixture: assigning plate 1 to the Creality K2 Pro logged
+`process '0.20mm Standard @BBL P2S(Superdestroyer-BD.3mf)' cannot run on 'Creality K2 Pro 0.4
+nozzle'; switched to '0.20mm Standard @Creality K2 Pro 0.4 nozzle' (the printer's own default
+process)`, the board grew a second machine group with the K2's real 300×300 bed, and the
+inspector read "Assigned to this plate".
+
+The model-combo hard refusal (fault 3 in the table) is closed by the same reasoning at its own
+site: picking a printer MODEL re-resolves the nozzle variant against that model — kept when it
+carries over, the model's own single variant when not, a named choice when several exist, and a
+refusal only when the model genuinely has no preset here.
+
+### The assignment crash was never in the preset system
+
+The previous entry's deferral said assigning a plate a working process "crashes the process
+shortly afterwards, 2 of 2" and suspected the notification. Reproduced 3 of 3 — but only with
+**the mouse over the 3D canvas**, which is why every human run died and every scripted run
+(cursor parked elsewhere) survived. The network plugin, CallAfter timing and call ordering were
+all red herrings.
+
+**The stack was on disk the whole time.** The app installs its own `SetUnhandledExceptionFilter`
+(`dev-utils/BaseException.h`) with a StackWalker that writes `crash_<date>_0.log` into
+`datadir/log/` — including for yesterday's two "no WER event, no dump" crashes nobody could
+diagnose. Check there FIRST for any future crash; WER LocalDumps never fires because the app's
+own filter eats the exception.
+
+The stack: `GLCanvas3D::render → _mouse_to_3d → SceneRaycaster::hit →
+MeshRaycaster::closest_hit → AABBMesh::query_ray_hits`, access violation reading freed memory.
+`PartPlate::set_shape` (reached from every bed-changing path: assignment, clearing, reflow via
+`reposition`) resets and rebuilds all eight of the plate's `PickingModel`s, destroying the
+`MeshRaycaster` objects that the canvas' registered `SceneRaycasterItem`s still point at. The
+next repaint with the cursor over the canvas raycasts through the dangling pointer. Upstream
+never hits this because upstream never changes a single plate's bed mid-session; the choreography
+(`reload_scene` re-registers) covers only its own paths.
+
+**Fixed at the ownership boundary, not with more choreography.** `SceneRaycasterItem`,
+`PickingModel` and `GLVolume` now share ownership of their `MeshRaycaster`
+(`std::shared_ptr`), so no rebuild order can dangle a registered raycaster — for plates, volumes
+and every gizmo alike. An epoch-counter re-registration scheme was built first and deleted on
+review: its ten-line justifying comment was the tell that it was choreography defending broken
+ownership. The one-frame staleness the shared pointer leaves (old geometry answering hovers until
+the scene refresh that the assignment path already triggers) is harmless and self-healing.
+
+### Two modal gates became notifications
+
+The "3MF was created by BambuStudio" info box and the startup "configuration file recreated"
+notice were modal OK-dialogs carrying no choice. Both gated every scripted load and every human
+one — for a farm fed on downloaded projects, the Bambu box fired on essentially every open. Both
+now inform through the notification manager and get out of the way. The dialogs that remain on
+the load path (`ProjectDropDialog`, network-plugin install) carry real choices, and the former
+remembers its answer.
+
+### The close path, one layer further down
+
+Closing a project on a datadir whose AppConfig filament section was null (the state a config
+rebuild leaves) threw `The Project row has no explicit filament preset` twice from
+`full_fff_config` and terminated the app. Yesterday's close-path repair emptied the filament row
+when nothing was installed, which only moved the throw. The row now floors at the filament
+collection's own inert default preset — the same floor the machine collection already had.
+
+### Scripted testing exists now, and its traps are recorded
+
+- **`PETKOS_TEST_ASSIGN="<plate>:<preset>[:delay_ms]"`** (env var, dev hook at the tail of
+  `Plater::priv::load_files`): drives the real plate-assignment write path after a project load,
+  no synthetic input. The plate board is custom-painted, so no UIA tool can reach its rows; this
+  is the scriptable route. The optional delay exists so a debugger can attach after startup —
+  the Bambu network plugin executes garbage under a launch-time debugger (anti-debug), so attach
+  late or sideline the plugin.
+- The hook logs what it saw even when it does nothing. Its first version was silent unless it
+  fired, which made "not in the binary", "env var missing" and "never reached" indistinguishable
+  and cost a diagnosis round.
+- **Modal dialogs are dismissed by posting `WM_LBUTTONDOWN/UP` to the button's own hwnd** —
+  no cursor, no focus, works with other windows on top. Enumerate the dialog's children for the
+  button text. In PowerShell, a delegate callback writes `$script:` scope; a FUNCTION reading its
+  local copy of the same name reads nothing — dismissals silently no-op. Keep such code inline or
+  read `$script:` on both ends.
+- **`WindowFromPoint` before every synthetic click.** A run of clicks landed in a Chrome window
+  covering the slicer; nothing in the click API fails when the target is buried.
+- **Killing an orca instance risks corrupting `PetkosOrca.conf`** (it happened twice this
+  session; the app writes the conf often). The corrupted-conf notice is now a notification, and
+  the parse failure is logged as `parse app config ... error` at the top of the next run's log.
+- The build's post-build step (`rm -rf python` + recopy beside the exe) half-fails while any
+  instance runs, because `python312.dll` is mapped; the gutted folder then kills the next launch
+  instantly with exit code -1 and no log. Restore from
+  `deps/build/OrcaSlicer_dep/usr/local/libpython`, or close instances before building the exe
+  target. The DLL-rename trick still covers the link itself.
+
+### Verification
+
+Release build clean. `libslic3r_tests` 185/185 (49277 assertions), `slic3rutils_tests` 73
+passed / 0 failed / 33 skipped, including the six new `[Reresolve]` cases.
+
+**Live, under the exact trigger condition (scripted assignment firing with the cursor parked
+over the canvas), both scenarios survived:** a resolving assignment (K2 Pro 0.4 — process
+switched, plate resolved, engine applied `printer 'Creality K2 Pro 0.4 nozzle', process
+'0.20mm Standard @Creality K2 Pro 0.4 nozzle'`) and a deliberately unresolvable one (K2 Pro
+0.2 — reported, no crash). The second scenario had crashed live minutes earlier through a
+SECOND defect the first fix exposed: `load_wipe_tower_preview` (and `simple_render`, and the
+real-tower variant) indexed the plate's extruder-color palette blind, and an unresolved plate's
+palette is honestly empty. All three sites now treat an empty palette as "nothing to tint":
+no tower preview, no per-material tint, geometry still renders. A day of interactive use by
+Petko between the two builds also exercised the raycaster fix without a recurrence.
+
+Two more modal info-gates found in that session became notifications: the two
+`show_substitutions_info` overloads ("some values were not recognized"), which reported
+already-made replacements behind a modal OK. Full replacement lists go to the log.
+
+One true vendor-data finding, reported by the mechanism rather than fixed: `Creality K2 Pro
+0.2 nozzle` declares `default_print_profile` = `0.16mm Optimal @Creality K2 Pro 0.2 nozzle`,
+which does not exist in this datadir's process collection, so a plate assigned to it stays
+unresolved with the reason named. Check whether the 29 July preset cleanup pruned it or the
+vendor profile genuinely lacks it.
+
 ## Work log — 2026-08-12 (a downloaded project could not be opened at all, and why)
 
 The 11 Aug entry recorded a reproducible crash on `Superdestroyer-BD.3mf` and attributed it to

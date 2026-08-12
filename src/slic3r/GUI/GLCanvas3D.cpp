@@ -2852,13 +2852,13 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
 	                            assert(! mesh.empty());
                                 mesh.transform(sla_print->sla_trafo(*m_model->objects[volume.object_idx()]).inverse());
                                 volume.model.init_from(mesh);
-                                volume.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<TriangleMesh>(mesh));
+                                volume.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(std::make_shared<TriangleMesh>(mesh));
                             }
                             else {
 	                        	// Reload the original volume.
                                 const TriangleMesh& new_mesh = m_model->objects[volume.object_idx()]->volumes[volume.volume_idx()]->mesh();
                                 volume.model.init_from(new_mesh);
-                                volume.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(std::make_shared<TriangleMesh>(new_mesh));
+                                volume.mesh_raycaster = std::make_shared<GUI::MeshRaycaster>(std::make_shared<TriangleMesh>(new_mesh));
                             }
 	                    }
                     	//FIXME it is an ugly hack to write the timestamp into the "offsets" field to not have to add another member variable
@@ -3158,7 +3158,7 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
     for (size_t i = 0; i < m_volumes.volumes.size(); ++i) {
         const GLVolume* v = m_volumes.volumes[i];
         assert(v->mesh_raycaster != nullptr);
-        std::shared_ptr<SceneRaycasterItem> raycaster = add_raycaster_for_picking(SceneRaycaster::EType::Volume, i, *v->mesh_raycaster, v->world_matrix());
+        std::shared_ptr<SceneRaycasterItem> raycaster = add_raycaster_for_picking(SceneRaycaster::EType::Volume, i, v->mesh_raycaster, v->world_matrix());
         raycaster->set_active(v->is_active);
     }
 

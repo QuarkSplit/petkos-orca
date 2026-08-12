@@ -185,14 +185,14 @@ GLGizmoMeasure::GLGizmoMeasure(GLCanvas3D& parent, const std::string& icon_filen
 : GLGizmoBase(parent, icon_filename, sprite_id)
 {
     GLModel::Geometry sphere_geometry = smooth_sphere(16, 7.5f);
-    m_sphere.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(sphere_geometry.get_as_indexed_triangle_set()));
+    m_sphere.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(sphere_geometry.get_as_indexed_triangle_set()));
     m_sphere.model.init_from(std::move(sphere_geometry));
-    m_gripper_id_raycast_map[GripperType::POINT] = std::make_shared<PickRaycaster>(POINT_ID, *m_sphere.mesh_raycaster);
+    m_gripper_id_raycast_map[GripperType::POINT] = std::make_shared<PickRaycaster>(POINT_ID, m_sphere.mesh_raycaster);
 
     GLModel::Geometry cylinder_geometry = smooth_cylinder(16, 5.0f, 1.0f);
-    m_cylinder.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(cylinder_geometry.get_as_indexed_triangle_set()));
+    m_cylinder.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(cylinder_geometry.get_as_indexed_triangle_set()));
     m_cylinder.model.init_from(std::move(cylinder_geometry));
-    m_gripper_id_raycast_map[GripperType::EDGE] = std::make_shared<PickRaycaster>(EDGE_ID, *m_cylinder.mesh_raycaster);
+    m_gripper_id_raycast_map[GripperType::EDGE] = std::make_shared<PickRaycaster>(EDGE_ID, m_cylinder.mesh_raycaster);
 }
 
 bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
@@ -314,7 +314,7 @@ bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
                             // 2nd feature selection
                             m_selected_features.second = item;
                             if (requires_sphere_raycaster_for_picking(item)) {
-                                auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_2_ID, *m_sphere.mesh_raycaster);
+                                auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_2_ID, m_sphere.mesh_raycaster);
                                 m_gripper_id_raycast_map[GripperType::SPHERE_2] = pick;
                             }
                         }
@@ -326,7 +326,7 @@ bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
                         // promote 2nd feature to 1st feature
                         reset_feature1();
                         if (requires_sphere_raycaster_for_picking(m_selected_features.first)) {
-                            auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_1_ID, *m_sphere.mesh_raycaster);
+                            auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_1_ID, m_sphere.mesh_raycaster);
                             m_gripper_id_raycast_map[GripperType::SPHERE_1] = pick;
                         }
                     } else {
@@ -346,7 +346,7 @@ bool GLGizmoMeasure::on_mouse(const wxMouseEvent &mouse_event)
                 m_selected_wrong_feature_waring_tip = false;
                 m_selected_features.first = item;
                 if (requires_sphere_raycaster_for_picking(item)) {
-                    auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_1_ID, *m_sphere.mesh_raycaster);
+                    auto pick = std::make_shared<PickRaycaster>(SEL_SPHERE_1_ID, m_sphere.mesh_raycaster);
                     m_gripper_id_raycast_map[GripperType::SPHERE_1] = pick;
                 }
             }
@@ -528,10 +528,10 @@ void GLGizmoMeasure::init_circle_glmodel(GripperType gripper_type, const Measure
         reset_gripper_pick(gripper_type);
         circle_gl_model.circle.reset();
         GLModel::Geometry circle_geometry = init_torus_data(64, 16, center.cast<float>(), float(radius), 5.0f * inv_zoom, normal.cast<float>(), Transform3f::Identity());
-        circle_gl_model.circle.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(circle_geometry.get_as_indexed_triangle_set()));
+        circle_gl_model.circle.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(circle_geometry.get_as_indexed_triangle_set()));
         circle_gl_model.circle.model.init_from(std::move(circle_geometry));
         if (circle_gl_model.circle.model.is_initialized()) {
-            m_gripper_id_raycast_map[gripper_type] = std::make_shared<PickRaycaster>(CIRCLE_ID, *m_curr_circle.circle.mesh_raycaster);
+            m_gripper_id_raycast_map[gripper_type] = std::make_shared<PickRaycaster>(CIRCLE_ID, m_curr_circle.circle.mesh_raycaster);
         }
         circle_gl_model.last_circle_feature = cur_feature;
         circle_gl_model.inv_zoom            = inv_zoom;
@@ -554,10 +554,10 @@ void GLGizmoMeasure::init_plane_glmodel(GripperType gripper_type, const Measure:
         plane_gl_model.plane_idx    = idx;
         reset_gripper_pick(gripper_type);
         GLModel::Geometry init_data = init_plane_data(mesh->its, *feature.plane_indices, MEASURE_PLNE_NORMAL_OFFSET);
-        plane_gl_model.plane.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(init_data.get_as_indexed_triangle_set()));
+        plane_gl_model.plane.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(init_data.get_as_indexed_triangle_set()));
         plane_gl_model.plane.model.init_from(std::move(init_data));
         if (plane_gl_model.plane.model.is_initialized()) {
-            m_gripper_id_raycast_map[gripper_type] = std::make_shared<PickRaycaster>(PLANE_ID, *plane_gl_model.plane.mesh_raycaster, feature.world_tran);
+            m_gripper_id_raycast_map[gripper_type] = std::make_shared<PickRaycaster>(PLANE_ID, plane_gl_model.plane.mesh_raycaster, feature.world_tran);
         }
     }
 }
@@ -710,12 +710,12 @@ void GLGizmoMeasure::on_render()
                 default: { assert(false); break; }
                 case Measure::SurfaceFeatureType::Point:
                 {
-                    m_gripper_id_raycast_map[GripperType::POINT] = std::make_shared<PickRaycaster>(POINT_ID, *m_sphere.mesh_raycaster);
+                    m_gripper_id_raycast_map[GripperType::POINT] = std::make_shared<PickRaycaster>(POINT_ID, m_sphere.mesh_raycaster);
                     break;
                 }
                 case Measure::SurfaceFeatureType::Edge:
                 {
-                    m_gripper_id_raycast_map[GripperType::EDGE] = std::make_shared<PickRaycaster>(EDGE_ID, *m_cylinder.mesh_raycaster);
+                    m_gripper_id_raycast_map[GripperType::EDGE] = std::make_shared<PickRaycaster>(EDGE_ID, m_cylinder.mesh_raycaster);
                     break;
                 }
                 case Measure::SurfaceFeatureType::Circle: {
@@ -2273,7 +2273,7 @@ void GLGizmoMeasure::register_single_mesh_pick()
                 const ModelObject*   obj  = selection.get_model()->objects[v->object_idx()];
                 const ModelVolume*   vol  = obj->volumes[v->volume_idx()];
                 auto                 mesh = vol->mesh_ptr();
-                m_mesh_raycaster_map[v] = std::make_shared<PickRaycaster>(-1, *v->mesh_raycaster, world_tran.get_matrix());
+                m_mesh_raycaster_map[v] = std::make_shared<PickRaycaster>(-1, v->mesh_raycaster, world_tran.get_matrix());
                 m_mesh_raycaster_map[v]->set_transform(world_tran.get_matrix());
                 m_mesh_measure_map[v] = std::make_shared<Measure::Measuring>(mesh->its);
             }

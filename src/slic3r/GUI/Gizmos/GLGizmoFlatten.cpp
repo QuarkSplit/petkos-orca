@@ -127,7 +127,7 @@ void GLGizmoFlatten::on_register_raycasters_for_picking()
             selection.get_first_volume()->get_instance_transformation().get_matrix();
 
         for (int i = 0; i < (int)m_planes.size(); ++i) {
-            m_planes_casters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, i, *m_planes[i].vbo.mesh_raycaster, matrix));
+            m_planes_casters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, i, m_planes[i].vbo.mesh_raycaster, matrix));
         }
     }
 }
@@ -373,7 +373,7 @@ void GLGizmoFlatten::update_planes()
                     std::swap(face[1], face[2]);
             }
         }
-        plane.vbo.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        plane.vbo.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
         // vertices are no more needed, clear memory
         plane.vertices = std::vector<Vec3d>();
     }

@@ -1445,30 +1445,30 @@ void GLGizmoCut3D::on_register_raycasters_for_picking()
         if (CommonGizmosDataObjects::SelectionInfo* si = m_c->selection_info()) {
             const CutConnectors& connectors = si->model_object()->cut_connectors;
             for (int i = 0; i < int(connectors.size()); ++i)
-                m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, i + m_connectors_group_id, *(m_shapes[connectors[i].attribs]).mesh_raycaster, Transform3d::Identity()));
+                m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, i + m_connectors_group_id, (m_shapes[connectors[i].attribs]).mesh_raycaster, Transform3d::Identity()));
         }
     }
     else if (!cut_line_processing()) {
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, X, *m_cone.mesh_raycaster, Transform3d::Identity()));
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, X, *m_cone.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, X, m_cone.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, X, m_cone.mesh_raycaster, Transform3d::Identity()));
 
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Y, *m_cone.mesh_raycaster, Transform3d::Identity()));
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Y, *m_cone.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Y, m_cone.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Y, m_cone.mesh_raycaster, Transform3d::Identity()));
 
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Z, *m_sphere.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, Z, m_sphere.mesh_raycaster, Transform3d::Identity()));
 
-        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::FallbackGizmo, CutPlane, *m_plane.mesh_raycaster, Transform3d::Identity()));
+        m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::FallbackGizmo, CutPlane, m_plane.mesh_raycaster, Transform3d::Identity()));
 
         if (CutMode(m_mode) == CutMode::cutTongueAndGroove) {
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, *m_sphere.mesh_raycaster, Transform3d::Identity()));
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, *m_cone.mesh_raycaster, Transform3d::Identity()));
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, *m_cone.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, m_sphere.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, m_cone.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneZRotation, m_cone.mesh_raycaster, Transform3d::Identity()));
 
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneXMove, *m_cube.mesh_raycaster, Transform3d::Identity()));
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneXMove, *m_cone.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneXMove, m_cube.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneXMove, m_cone.mesh_raycaster, Transform3d::Identity()));
 
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneYMove, *m_cube.mesh_raycaster, Transform3d::Identity()));
-            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneYMove, *m_cone.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneYMove, m_cube.mesh_raycaster, Transform3d::Identity()));
+            m_raycasters.emplace_back(m_parent.add_raycaster_for_picking(SceneRaycaster::EType::Gizmo, CutPlaneYMove, m_cone.mesh_raycaster, Transform3d::Identity()));
         }
     }
 
@@ -1951,17 +1951,17 @@ void GLGizmoCut3D::init_picking_models()
     if (!m_cone.model.is_initialized()) {
         indexed_triangle_set its = its_make_cone(1.0, 1.0, PI / 12.0);
         m_cone.model.init_from(its);
-        m_cone.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        m_cone.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
     if (!m_sphere.model.is_initialized()) {
         indexed_triangle_set its = its_make_sphere(1.0, PI / 12.0);
         m_sphere.model.init_from(its);
-        m_sphere.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        m_sphere.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
     if (!m_cube.model.is_initialized()) {
         indexed_triangle_set its = its_make_cube(1., 1., 1.);
         m_cube.model.init_from(its);
-        m_cube.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        m_cube.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
 
     if (!m_plane.model.is_initialized() && !m_hide_cut_plane && !m_connectors_editing) {
@@ -1970,7 +1970,7 @@ void GLGizmoCut3D::init_picking_models()
                                    its_make_frustum_dowel((double)m_cut_plane_radius_koef * m_radius, cp_width, m_cut_plane_as_circle ? 180 : 4);
 
         m_plane.model.init_from(its);
-        m_plane.mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        m_plane.mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
     }
 
     if (m_shapes.empty())
@@ -3717,7 +3717,7 @@ void GLGizmoCut3D::init_connector_shapes()
                 const CutConnectorAttributes attribs = { type, style, shape };
                 indexed_triangle_set its = get_connector_mesh(attribs);
                 m_shapes[attribs].model.init_from(its);
-                m_shapes[attribs].mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+                m_shapes[attribs].mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
             }
         }
 }
@@ -3730,7 +3730,7 @@ void GLGizmoCut3D::update_connector_shape()
         indexed_triangle_set its = get_connector_mesh(attribs);
         m_shapes[attribs].reset();
         m_shapes[attribs].model.init_from(its);
-        m_shapes[attribs].mesh_raycaster = std::make_unique<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
+        m_shapes[attribs].mesh_raycaster = std::make_shared<MeshRaycaster>(std::make_shared<const TriangleMesh>(std::move(its)));
 
         //const indexed_triangle_set its = get_connector_mesh(attribs);
         //m_connector_mesh.clear();

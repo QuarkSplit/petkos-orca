@@ -17,22 +17,24 @@ class SceneRaycasterItem
     int m_id{ -1 };
     bool m_active{ true };
     bool m_use_back_faces{ false };
-    const MeshRaycaster* m_raycaster;
+    //shared ownership: a registered raycaster cannot dangle, whatever rebuilds the
+    //model that created it and in whatever order
+    std::shared_ptr<const MeshRaycaster> m_raycaster;
     Transform3d m_trafo;
 
 public:
-    SceneRaycasterItem(int id, const MeshRaycaster& raycaster)
-        : m_id(id), m_raycaster(&raycaster), m_trafo(Transform3d::Identity()), m_use_back_faces(false)
+    SceneRaycasterItem(int id, std::shared_ptr<const MeshRaycaster> raycaster)
+        : m_id(id), m_raycaster(std::move(raycaster)), m_trafo(Transform3d::Identity()), m_use_back_faces(false)
     {}
-    SceneRaycasterItem(int id, const MeshRaycaster& raycaster, const Transform3d& trafo, bool use_back_faces = false)
-        : m_id(id), m_raycaster(&raycaster), m_trafo(trafo), m_use_back_faces(use_back_faces)
+    SceneRaycasterItem(int id, std::shared_ptr<const MeshRaycaster> raycaster, const Transform3d& trafo, bool use_back_faces = false)
+        : m_id(id), m_raycaster(std::move(raycaster)), m_trafo(trafo), m_use_back_faces(use_back_faces)
     {}
 
     int get_id() const { return m_id; }
     bool is_active() const { return m_active; }
     void set_active(bool active) { m_active = active; }
     bool use_back_faces() const { return m_use_back_faces; }
-    const MeshRaycaster* get_raycaster() const { return m_raycaster; }
+    const MeshRaycaster* get_raycaster() const { return m_raycaster.get(); }
     const Transform3d& get_transform() const { return m_trafo; }
     void set_transform(const Transform3d& trafo) { m_trafo = trafo; }
 };
@@ -86,7 +88,7 @@ private:
 public:
     SceneRaycaster();
 
-    std::shared_ptr<SceneRaycasterItem> add_raycaster(EType type, int picking_id, const MeshRaycaster& raycaster,
+    std::shared_ptr<SceneRaycasterItem> add_raycaster(EType type, int picking_id, std::shared_ptr<const MeshRaycaster> raycaster,
         const Transform3d& trafo, bool use_back_faces = false);
     void remove_raycasters(EType type, int id);
     void remove_raycasters(EType type);
