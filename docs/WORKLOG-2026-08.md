@@ -7,6 +7,35 @@ Dated build history and closed audit findings for the fork, split out of `PETKOS
 authority on how the fork behaves now; anything here is a record of how it got there and may
 describe states that no longer exist.
 
+## Work log — 2026-08-12, session 3 (the board learns what it is for)
+
+Petko's design review, in one sentence: the UI must make "one project, many machines, switch
+anytime" legible, and instead the board had become a farm dashboard burying that sentence. The
+fixes that followed are all restatements of it (commits `7cb1ff7bd7`, `bca2d008ee`):
+
+- **A row IS the mapping**, drawn as pictures: the plate's render with its name beneath, an
+  arrow (accent = assigned, dim = following the project default), the machine's wizard cover
+  photo with its model name beneath. Renders self-heal at paint time — anything that moves an
+  instance resets them (`notify_instance_update`), and only the Preview strip ever re-rendered.
+- **Single click on the caption renames the plate** inline, through a new
+  `Plater::rename_plate` that carries the undo snapshot the Plate Settings dialog's path never
+  had. Plate naming is an agent surface over MCP; this is the human end of it.
+- **The picker picks machines, not presets.** One row per printer model; the nozzle resolves
+  silently (current variant → 0.4 → whatever exists) and NEVER asks. A changed nozzle is looked
+  for at the inspector's Nozzle row, now a native variant menu. The popup scrolls (it could
+  not, so brands past its height were unreachable) and dismisses when the app loses foreground,
+  as does the hover preview.
+- **What got deleted:** the Capacity tab (twin of Machine until estimates exist — its queue
+  bars moved into Machine grouping), the filled bed glyphs that read as broken thumbnails, the
+  em-dash hours column, the "N not estimated" scold on fresh projects, machine names repeated
+  under machine headers, square swatches, "1 machines".
+- **The board is the top of the sidebar, not the sidebar**: capped at four rows, scrolls
+  internally. It had grown to push the filament and process sections — the actual slicer —
+  off screen, which read as "the settings disappeared".
+
+Left deliberately dormant: `build_variant_items`/`is_back` in the picker (the ask-step that was
+built and then repealed the same hour — remove on next touch).
+
 ## Work log — 2026-08-12, session 2 (the mechanism, and the crash that was never about presets)
 
 ### The re-resolution mechanism exists
