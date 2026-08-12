@@ -1762,29 +1762,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         m_config.layer_change_gcode.value, regex_g92e0);
 
     if (m_config.use_relative_e_distances) {
-        // Relative mode: "G92 E0" is required to reset extruder position.
-        const bool before_has_g92_exact = boost::regex_search(
-            m_config.before_layer_change_gcode.value, regex_g92e0_correct);
-        const bool layer_has_g92_exact  = boost::regex_search(
-            m_config.layer_change_gcode.value, regex_g92e0_correct);
-
-        // Wrong case found?
-        if (before_has_g92_any && !before_has_g92_exact)
-            return {L("\"G92 E0\" was found in before_layer_change_gcode, but the G or E are not uppercase. "
-                      "Please change them to the exact uppercase \"G92 E0\"."),
-                    nullptr, "before_layer_change_gcode"};
-        if (layer_has_g92_any && !layer_has_g92_exact)
-            return {L("\"G92 E0\" was found in layer_change_gcode, but the G or E are not uppercase. "
-                      "Please change them to the exact uppercase \"G92 E0\"."),
-                    nullptr, "layer_change_gcode"};
-
-        // Only Marlin flavours need the reset; BBL printers do not.
-        if ((m_config.gcode_flavor == gcfMarlinLegacy || m_config.gcode_flavor == gcfMarlinFirmware) &&
-            !is_BBL_printer() &&
-            !before_has_g92_exact && !layer_has_g92_exact)
-            return {L("Relative extruder addressing requires resetting the extruder position at each layer to "
-                      "prevent loss of floating point accuracy. Add \"G92 E0\" to layer_gcode."),
-                    nullptr, "before_layer_change_gcode"};
+        //PetkosOrca: the three relative-mode nags that used to live here are gone. The
+        //slicer now emits "G92 E0" at each layer change itself when the custom gcode
+        //lacks one (GCode.cpp, change_layer): a validator error that names its own
+        //mechanical fix and assigns it to the user is the app being obtuse. A miscased
+        //user "g92 e0" now simply coexists with the emitted reset, which is harmless.
+        (void) regex_g92e0_correct;
     } else {
         // Absolute mode: any occurrence of "G92 E0" is incompatible.
         if (before_has_g92_any)

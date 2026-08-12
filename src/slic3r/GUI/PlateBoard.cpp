@@ -927,9 +927,14 @@ void PlatePrinterPopup::commit(const std::string &preset_name)
     //the dismissal rather than underneath it. One write path either way; the batch
     //takes ONE snapshot, or undoing a five-plate action would take five presses.
     CallAfter([plater, plate, preset_name, targets]() {
-        if (targets.empty())
+        if (targets.empty()) {
             plater->set_plate_printer(plate, preset_name);
-        else
+            //assigning a plate selects it: the canvas then shows the new machine's bed
+            //under the parts immediately. Without this, retargeting a non-current plate
+            //succeeded invisibly — the current plate is the only one that renders its
+            //machine's bed texture — and a success nobody can see reads as a failure.
+            plater->select_plate(plate);
+        } else
             plater->set_plate_printers(targets, preset_name);
     });
 }

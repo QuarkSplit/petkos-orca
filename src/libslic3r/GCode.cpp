@@ -5484,6 +5484,21 @@ LayerResult GCode::process_layer(
     m_max_layer_z  = std::max(m_max_layer_z, m_last_layer_z);
     m_last_height = height;
 
+    //If precision needs "G92 E0" at each layer, the slicer emits it. Marlin relative-E
+    //accumulates floating point error per move and the per-layer reset is the known,
+    //mechanical fix — the old behaviour was a validator ERROR demanding the user paste
+    //this exact line into their machine gcode, which is homework the app can do itself.
+    //Skipped when the custom layer gcode already carries it, and for BBL machines, whose
+    //firmware manages E its own way.
+    if (m_config.use_relative_e_distances &&
+        (m_config.gcode_flavor == gcfMarlinLegacy || m_config.gcode_flavor == gcfMarlinFirmware) &&
+        !this->is_BBL_Printer() &&
+        !boost::algorithm::contains(m_config.before_layer_change_gcode.value, "G92 E0") &&
+        !boost::algorithm::contains(m_config.layer_change_gcode.value, "G92 E0")) {
+        gcode += m_writer.reset_e(true); //resets the writer's accumulator; silent in relative mode
+        gcode += "G92 E0\n";
+    }
+
     // Set new layer - this will change Z and force a retraction if retract_when_changing_layer is enabled.
     if (! m_config.before_layer_change_gcode.value.empty()) {
         DynamicConfig config;
