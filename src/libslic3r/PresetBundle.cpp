@@ -1060,14 +1060,40 @@ void PresetBundle::reset_project_embedded_presets()
     //this->update_multi_material_filament_presets();
 
     //update filament_presets
+    //
+    // PetkosOrca: this loop NOTICED that the Project filament row still named presets this
+    // function had just deleted, logged it, and left them in place. The rule for the load path is
+    // already written a few hundred lines below select_persisted_or_keep and says exactly why that
+    // cannot stand: "A name the filament collection never selected must not enter filament_presets.
+    // The two are one identity, and the only thing that inconsistency produces is a throw out of
+    // every later full_fff_config()." The close path had never been given the same rule, so closing
+    // a project whose filaments were embedded ended the session with
+    //   Unhandled exception: Filament preset 'Bambu PETG HF @BBL P1S 0.4 nozzle(Ciri Sword.3mf)'
+    //   is not installed; terminating the application
+    // — measured on shutdown after opening a MakerWorld project, which is every shutdown that
+    // matters here. Losing the app on the way out is how unsaved work disappears.
+    //
+    // The row is repaired to the filament collection's own installed selection, which is the same
+    // thing load_selections keeps when a persisted name fails. Nothing is guessed at: the deleted
+    // preset is gone with its project and there is no name being substituted for, only a dangling
+    // one being replaced by the collection's real state. Every replacement is named in the log.
+    const std::string installed_filament = this->filaments.get_selected_preset_name();
     for (size_t i = 0; i < filament_presets.size(); ++ i)
     {
         Preset* selected_filament = this->filaments.find_preset(filament_presets[i], false);
-        if (!selected_filament) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected filament preset '"
-                                     << filament_presets[i] << "' is not installed";
-        }
+        if (selected_filament != nullptr)
+            continue;
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected filament preset '" << filament_presets[i]
+                                 << "' went with the project that carried it; the Project filament row "
+                                 << (installed_filament.empty() ? std::string("has nothing installed to fall back on")
+                                                                : "now reads '" + installed_filament + "'");
+        filament_presets[i] = installed_filament;
     }
+    // A row of empty names is the same inconsistency in another shape, and full_fff_config throws
+    // on it too. With nothing installed there is no project to describe, so the row is emptied
+    // rather than left holding blanks.
+    if (installed_filament.empty())
+        filament_presets.clear();
 }
 
 //BBS: get bed texture for printer model
