@@ -173,6 +173,37 @@ enumeration returned the dialog at `480,351 570x170` where it really was at `600
 clicks computed from the first land in the dialog body and do nothing. This is the same trap the
 11 Aug entry recorded for `PrintWindow`, and it applies identically to `SetCursorPos`.
 
+### Closing the project killed the app too, and that is what corrupted the config
+
+Found by closing the app at the end of the session rather than killing it, which is the only way
+this path ever runs. `full_fff_config` threw `Filament preset 'Bambu PETG HF @BBL P1S 0.4
+nozzle(Ciri Sword TW4 V1.3mf)' is not installed` and the process terminated.
+`reset_project_embedded_presets` deletes the filament presets a project brought and left the
+Project filament row still naming them; the loop that walks that row noticed, logged, and did
+nothing. The rule for the load end of exactly this is already written above
+`select_persisted_or_keep`; the close end had never been given it. It now repairs the row to the
+collection's own installed selection and names every replacement.
+
+**This is what corrupted `PetkosOrca.conf`.** The crash happened while the app was writing it, so
+the next launch reported "The configuration file may be corrupted and cannot be parsed", rebuilt it
+and lost the recorded printer selection. Two notes for whoever meets that state:
+
+- The installed-model list survives a rebuild; only the selection is lost. Re-adding
+  `presets.machine` by hand is enough, and the app rewrites its own checksum on the next clean exit.
+- **A wrong MD5 trailer is not fatal.** `AppConfig::load` only logs it ("This may indicate a file
+  corruption or a harmless user edit") and carries on; the hash covers everything up to and
+  including the final `}`, and the line is `# MD5 checksum <32 UPPERCASE HEX>` on the following
+  line. The corrupted-config dialog comes from a JSON parse failure, not from the checksum.
+
+**A real defect found on the way, not fixed, and it blocks a first-run user.** Picking a printer
+*model* from the sidebar combo matches candidates on `printer_model` **and** the currently edited
+preset's `printer_variant` (`Plater.cpp` ~11010). From `Default Printer`, whose variant matches no
+system preset, the search finds nothing and refuses with "No installed printer preset exactly
+matches this model and the current nozzle variant" — so from a rebuilt config you cannot select any
+printer from the combo at all. That is a hard refusal to a definite request, which this fork's own
+rules forbid. It should fall back to the model's own variants and, where there is more than one,
+name them rather than refuse.
+
 ### Deferred, stated as a deferral
 
 **Giving a plate a process its new machine can run is written, works, and crashes — so it is not in
