@@ -881,7 +881,16 @@ int GLVolumeCollection::load_wipe_tower_preview(
     }
     std::vector<ColorRGBA> colors;
     GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int> plate_extruders = ppl.get_plate(plate_idx)->get_extruders(true);
+    //get_plate answers NULL for an index it does not have, and the wipe tower reaches this
+    //function through the obj_idx-1000 encoding, which is exactly where an index survives
+    //the plate it named. Nothing to draw is a state, not a reason to take the app down.
+    const GUI::PartPlate* tower_plate = ppl.get_plate(plate_idx);
+    if (tower_plate == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": no plate %1%; skipping wipe tower preview") % (plate_idx + 1);
+        return int(this->volumes.size() - 1);
+    }
+    std::vector<int> plate_extruders = const_cast<GUI::PartPlate*>(tower_plate)->get_extruders(true);
     TriangleMesh wipe_tower_shell = make_cube(width, depth, height);
     for (int extruder_id : plate_extruders) {
         if (extruder_id >= 1 && extruder_id <= (int)extruder_colors.size())

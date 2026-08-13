@@ -4,6 +4,8 @@
 
 #include <boost/log/trivial.hpp>
 
+#include <algorithm>
+
 #include <wx/webviewarchivehandler.h>
 #include <wx/webviewfshandler.h>
 #if wxUSE_WEBVIEW_EDGE
@@ -231,6 +233,18 @@ wxDEFINE_EVENT(EVT_WEBVIEW_RECREATED, wxCommandEvent);
 static std::vector<wxWebView*> g_webviews;
 static std::vector<wxWebView*> g_delay_webviews;
 
+//A wxWebView that has been destroyed leaves its owner holding a dangling pointer, and a
+//queued wxEVT_WEBVIEW_NAVIGATED delivered afterwards calls straight through it. That is
+//not hypothetical: it took the app down on startup, jumping to an address that was a
+//fragment of a string. g_webviews is already the exact set of live views - WebViewRef
+//erases from it in its destructor - so liveness is a question with an answer here rather
+//than a pointer everyone has to trust.
+static bool webview_is_live(const wxWebView *webView)
+{
+    return webView != nullptr && std::find(g_webviews.begin(), g_webviews.end(), webView) != g_webviews.end();
+}
+
+
 class WebViewRef : public wxObjectRefData
 {
 public:
@@ -366,6 +380,11 @@ void WebView::LoadUrl(wxWebView * webView, wxString const &url)
 
 bool WebView::RunScript(wxWebView *webView, wxString const &javascript)
 {
+    if (!webview_is_live(webView)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": webview is gone; script not run";
+        return false;
+    }
+
     if (Slic3r::GUI::wxGetApp().app_config->get("internal_developer_mode") == "true"
             && javascript.find("studio_userlogin") == wxString::npos)
         wxLogMessage("Running JavaScript:\n%s\n", javascript);
