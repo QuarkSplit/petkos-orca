@@ -35,6 +35,7 @@
 #include "2DBed.hpp"
 #include "3DBed.hpp"
 #include "PartPlate.hpp"
+#include "PetkosPerf.hpp"
 #include "Camera.hpp"
 #include "GUI_Colors.hpp"
 #include "GUI_ObjectList.hpp"
@@ -86,6 +87,9 @@ static bool resolve_plate_context(const PartPlate *plate, ResolvedPlateSlicingCo
     if (plate == nullptr || wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
         return false;
 
+    //Perf: the tier-2 funnel. One call composes a whole DynamicPrintConfig, so this probe's
+    //per-call cost multiplied by its call count is the unit of the whole hunt.
+    PETKOS_PERF_SCOPE(Perf::Probe::ResolvePlateContext);
     PresetBundle *bundle = wxGetApp().preset_bundle;
     const std::vector<int> filament_maps = plate->get_real_filament_maps(bundle->project_config);
     const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle->project_config);
@@ -136,6 +140,9 @@ static bool resolve_plate_presets(const PartPlate *plate, ResolvedPlatePresets &
     if (plate == nullptr || wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
         return false;
 
+    //Perf: the tier-1 funnel - presets found, no config composed. Cheaper than tier 2 and
+    //still called per plate per frame from render_icons.
+    PETKOS_PERF_SCOPE(Perf::Probe::ResolvePlatePresets);
     std::string error;
     return wxGetApp().preset_bundle->resolve_plate_presets(plate->get_slicing_context(), presets, error);
 }
@@ -3558,6 +3565,7 @@ bool PartPlate::intersects(const BoundingBoxf3& bb) const
 
 void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_body, bool force_background_color, HeightLimitMode mode, int hover_id, bool render_cali, bool show_grid)
 {
+	PETKOS_PERF_SCOPE_AUX(Perf::Probe::PlateRender, (int32_t) m_plate_index);
     glsafe(::glEnable(GL_DEPTH_TEST));
 
     GLShaderProgram *shader = wxGetApp().get_shader("flat");
@@ -3720,6 +3728,7 @@ void PartPlate::update_slice_result_valid_state(bool valid, bool capture_config)
 
 bool PartPlate::is_slice_result_valid() const
 {
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::PlateSliceValid, (int32_t) m_plate_index);
     if (!m_slice_result_valid)
         return false;
 
@@ -4480,6 +4489,7 @@ void PartPlateList::reflow_layout()
 //Pull a bed out of an arbitrary printer preset, not just the selected one.
 bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed &bed) const
 {
+	PETKOS_PERF_SCOPE(Perf::Probe::ResolvePrinterBed);
 	if (preset_name.empty())
 		return false;
 
@@ -4545,6 +4555,7 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 // inherits the Project row. A named assignment must resolve exactly.
 bool PartPlateList::apply_printer_to_plate(int index, bool reflow)
 {
+	PETKOS_PERF_SCOPE_AUX(Perf::Probe::ApplyPrinterToPlate, (int32_t) index);
 	if (index < 0 || index >= (int)m_plate_list.size() || m_plate_list[index] == nullptr)
 		return false;
 
@@ -5431,8 +5442,13 @@ int PartPlateList::select_plate(int index)
 
 		// BBS: erase unnecessary snapshot
 		if (get_curr_plate_index() != index && m_intialized) {
-			if (m_plater)
+			if (m_plater) {
+				//Perf: snapshot #2 of the two one plate click takes, and this one runs with
+				//m_plates_mutex held - a whole-model cereal serialise inside the lock the
+				//renderer needs every frame.
+				PETKOS_PERF_SCOPE_AUX(Perf::Probe::SelectPlateSnapshot, 2);
 				m_plater->take_snapshot("select partplate!");
+			}
 		}
 
 		std::vector<PartPlate *>::iterator it = m_plate_list.begin();
@@ -6362,7 +6378,16 @@ void PartPlateList::postprocess_arrange_polygon(arrangement::ArrangePolygon& arr
 //render
 void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool only_current, bool only_body, int hover_id, bool render_cali, bool show_grid)
 {
-	const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
+	//Perf: the lock is timed separately from the drawing. A frame that is slow because it
+	//waited for a worker to finish with the plate list is a different bug from a frame that
+	//is slow because it drew too much, and one number cannot tell them apart.
+	PETKOS_PERF_SCOPE_NAMED(pp_list_span, Perf::Probe::PlateListRender, 0);
+	int pp_drawn = 0;
+	{
+		PETKOS_PERF_SCOPE(Perf::Probe::PlateListRenderLock);
+		m_plates_mutex.lock();
+	}
+	const std::lock_guard<std::mutex> local_lock(m_plates_mutex, std::adopt_lock);
 	std::vector<PartPlate*>::iterator it = m_plate_list.begin();
 
 	int plate_hover_index = -1;
@@ -6382,6 +6407,7 @@ void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& pr
 		int current_index = (*it)->get_index();
 		if (only_current && (current_index != m_current_plate))
 			continue;
+		++pp_drawn;
 		if (current_index == m_current_plate) {
 			PartPlate::HeightLimitMode height_mode = (only_current)?PartPlate::HEIGHT_LIMIT_NONE:m_height_limit_mode;
 			if (plate_hover_index == current_index)
@@ -6396,6 +6422,9 @@ void PartPlateList::render(const Transform3d& view_matrix, const Transform3d& pr
                 (*it)->render(view_matrix, projection_matrix, bottom, only_body, false, PartPlate::HEIGHT_LIMIT_NONE, -1, render_cali, show_grid);
 		}
 	}
+	//aux carries how many plates this frame actually drew, which is the number that has to
+	//stop tracking the plate count once culling exists.
+	pp_list_span.set_aux(pp_drawn);
 }
 
 /*int PartPlateList::select_plate_by_hover_id(int hover_id)
@@ -6478,7 +6507,11 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
                                float                       height_to_lid,
                                float                       height_to_rod)
 {
+	PETKOS_PERF_SCOPE_NAMED(pp_set_shapes, Perf::Probe::SetShapes, 0);
 	const std::lock_guard<std::mutex> local_lock(m_plates_mutex);
+	//aux is read under the lock: the list is written from other paths, and a metric is not
+	//a reason to introduce a race
+	pp_set_shapes.set_aux((int32_t) m_plate_list.size());
 	m_shape = shape;
 	m_exclude_areas = exclude_areas;
     m_wrapping_exclude_areas = wrapping_exclude_areas;

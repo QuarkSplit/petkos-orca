@@ -3,6 +3,8 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
+#include "PetkosPerf.hpp"
+#include "PetkosPerfDriver.hpp"
 #include "ConfigImport.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
@@ -1066,6 +1068,11 @@ void GUI_App::post_init()
         }
     }
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
+
+    //Inert unless PETKOS_PERF_SCRIPT is set. Started here because this is the first point
+    //at which the plater, the canvas and the preset bundle all exist.
+    petkos_perf_driver_start();
+
 //BBS: remove the single instance currently
 #ifdef _WIN32
     // Sets window property to mainframe so other instances can indentify it.
@@ -2700,6 +2707,9 @@ void GUI_App::init_single_instance_checker(const std::string &name, const std::s
 
 bool GUI_App::OnInit()
 {
+    //Perf: startup is part of "feels fast" - the app is not quick if the wait is spent
+    //before the window appears. Closed by the first painted frame.
+    Perf::begin_interaction(Perf::Interaction::AppStartup, 0);
     try {
         return on_init_inner();
     } catch (const std::exception& e) {
@@ -2711,6 +2721,10 @@ bool GUI_App::OnInit()
 
 int GUI_App::OnExit()
 {
+    //Perf: written here rather than from a destructor, because a static destructor runs
+    //after wx has torn down enough that a failure to write is invisible.
+    Perf::flush();
+
     stop_http_server();
     stop_sync_user_preset();
 

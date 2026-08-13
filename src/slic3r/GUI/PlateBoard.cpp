@@ -1,4 +1,5 @@
 #include "PlateBoard.hpp"
+#include "PetkosPerf.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -121,6 +122,10 @@ std::string slot_material_type(const PresetBundle &bundle, int slot)
 
 void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
 {
+    //Perf: aux is the plate count, but the finding is the CALL COUNT per click - one user
+    //action currently rebuilds this model more than once, and each rebuild costs O(plates)
+    //full config compositions.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowLayout, (int32_t) plates.get_plate_count());
     m_rows.clear();
     m_groups.clear();
     m_rollup = PlateBoardRollup();
@@ -2525,6 +2530,8 @@ const wxBitmap *PlateBoard::plate_thumb_bitmap(int plate_index, int px)
     if (!plate->thumbnail_data.is_valid() && !m_thumb_refreshed_this_paint) {
         if (GLCanvas3D *canvas = m_plater->get_view3D_canvas3D(); canvas != nullptr) {
             m_thumb_refreshed_this_paint = true;
+            //Perf: an offscreen GL render plus a readback, issued from inside a paint handler.
+            PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardThumbHeal, (int32_t) plate_index);
             canvas->refresh_plate_thumbnail(plate_index);
             //another paint is owed only when this one actually produced pixels; a canvas
             //that cannot render right now must not become a repaint spin
@@ -2756,6 +2763,7 @@ void PlateBoard::draw_row(wxDC &                 dc,
 
 void PlateBoard::on_paint(wxPaintEvent &evt)
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::BoardPaint);
     m_thumb_refreshed_this_paint = false;
     m_thumb_heal_more            = false;
 
@@ -2850,6 +2858,10 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
     //one healed thumbnail per paint: schedule the next paint to heal the next row
     if (m_thumb_heal_more)
         CallAfter([this]() { Refresh(); });
+
+    //Perf: a board paint is a surface the user sees, so it closes an interaction just as a
+    //canvas frame does. Surface 100 distinguishes it from a canvas type.
+    Perf::note_painted(100);
 }
 
 void PlateBoard::draw_drag_pill(wxDC &dc, bool dark)

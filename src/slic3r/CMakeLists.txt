@@ -401,6 +401,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/ParamsPanel.hpp
     GUI/PartPlate.cpp
     GUI/PartPlate.hpp
+    GUI/PetkosPerf.cpp
+    GUI/PetkosPerf.hpp
+    GUI/PetkosPerfDriver.cpp
+    GUI/PetkosPerfDriver.hpp
     GUI/FilamentGroupPopup.hpp
     GUI/FilamentGroupPopup.cpp
     GUI/PhysicalPrinterDialog.cpp

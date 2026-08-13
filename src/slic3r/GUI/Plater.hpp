@@ -178,6 +178,10 @@ public:
     void on_plate_selection_changed(int current_plate);
     //Rebuild the board's rows from the plate list.
     void refresh_plate_board();
+    //The board as a plain window, for code that needs to reach it without depending on
+    //PlateBoard's own header. Carried for the scripted latency run, which posts real mouse
+    //events at it because a custom-painted panel has no other way in.
+    wxWindow *get_plate_board_window() const;
 
     //The scope set. It always contains the current plate and is never empty once the
     //plater is up, so every consumer can read it with no special case. A single member

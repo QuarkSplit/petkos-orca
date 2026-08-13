@@ -1,5 +1,6 @@
 #include "libslic3r/libslic3r.h"
 #include "GLCanvas3D.hpp"
+#include "PetkosPerf.hpp"
 
 #include <igl/unproject.h>
 
@@ -2012,6 +2013,10 @@ void GLCanvas3D::render(bool only_init)
     Slic3r::ScopeGuard in_render_guard([this]() { m_in_render = false; });
     (void)in_render_guard;
 
+    //Perf: the whole-frame span. aux is the canvas type, so a View3D frame and a Preview
+    //frame do not average into one meaningless number.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::CanvasRender, (int32_t) m_canvas_type);
+
     if (m_canvas == nullptr)
         return;
 
@@ -2175,13 +2180,20 @@ void GLCanvas3D::render(bool only_init)
     // we need to set the mouse's scene position here because the depth buffer
     // could be invalidated by the following gizmo render methods
     // this position is used later into on_mouse() to drag the objects
-    if (m_picking_enabled)
+    if (m_picking_enabled) {
+        //Perf: the frame's SECOND raycaster walk. Unlike _picking_pass this one has no
+        //m_mouse.dragging early-out, so a plain orbit pays it too.
+        PETKOS_PERF_SCOPE(Perf::Probe::MouseTo3d);
         m_mouse.scene_position = _mouse_to_3d(m_mouse.position.cast<coord_t>());
+    }
 
     // sidebar hints need to be rendered before the gizmos because the depth buffer
     // could be invalidated by the following gizmo render methods
-    _render_selection_sidebar_hints();
-    _render_current_gizmo();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::RenderGizmos);
+        _render_selection_sidebar_hints();
+        _render_current_gizmo();
+    }
 
 #if ENABLE_RAYCAST_PICKING_DEBUG
     if (m_picking_enabled && !m_mouse.dragging && !m_gizmos.is_dragging() && !m_rectangle_selection.is_dragging())
@@ -2195,14 +2207,20 @@ void GLCanvas3D::render(bool only_init)
     if (m_picking_enabled && m_rectangle_selection.is_dragging())
         m_rectangle_selection.render(*this);
 
-    if (_is_ssao_enabled())
-        _render_ssao_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::RenderSsaoFxaa);
+        if (_is_ssao_enabled())
+            _render_ssao_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
 
-    if (_is_fxaa_enabled())
-        _render_fxaa_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
+        if (_is_fxaa_enabled())
+            _render_fxaa_pass(static_cast<unsigned int>(cnv_size.get_width()), static_cast<unsigned int>(cnv_size.get_height()));
+    }
 
     // draw overlays
-    _render_overlays();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::RenderOverlays);
+        _render_overlays();
+    }
 
     const int current_fps = m_render_stats.get_fps_and_reset_if_needed();
     if (_is_fps_overlay_enabled())
@@ -2292,13 +2310,24 @@ void GLCanvas3D::render(bool only_init)
         wxGetApp().plater()->get_dailytips()->render();
     }
 
-    wxGetApp().imgui()->render();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::RenderImGui);
+        wxGetApp().imgui()->render();
+    }
 
     // On Wayland, eglSwapBuffers blocks when the canvas is hidden or
     // occluded. Skip the swap to avoid stalling the render loop.
     if (m_canvas->IsShownOnScreen()) {
-        m_canvas->SwapBuffers();
+        {
+            //Perf: the swap alone, which is where a GPU-bound frame shows up as a stall the
+            //CPU-side spans cannot see.
+            PETKOS_PERF_SCOPE_AUX(Perf::Probe::CanvasSwap, (int32_t) m_canvas_type);
+            m_canvas->SwapBuffers();
+        }
         m_render_stats.increment_fps_counter();
+        //Perf: a frame the user can actually see closes the first-paint half of any
+        //interaction that is still open.
+        Perf::note_painted((int32_t) m_canvas_type);
     }
 }
 
@@ -2423,6 +2452,9 @@ bool GLCanvas3D::refresh_plate_thumbnail(int plate_index)
         return false;
 
     const ThumbnailsParams params = {{}, false, true, true, true, plate_index};
+    //Perf: an offscreen render plus a glReadPixels, which is a pipeline flush - the single
+    //most expensive thing that can be triggered from a paint handler.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::RenderThumbnail, (int32_t) plate_index);
     render_thumbnail(plate->thumbnail_data, PartPlate::plate_thumbnail_width, PartPlate::plate_thumbnail_height,
                      params, Camera::EType::Ortho);
     return plate->thumbnail_data.is_valid();
@@ -3390,8 +3422,12 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
 #endif // ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
     m_dirty |= GLTexture::Compressor::has_compressed_texture_to_refresh();
 
-    if (!m_dirty)
+    if (!m_dirty) {
+        //Perf: nothing left to draw is the moment the app is usable again, which is the
+        //number a "feels laggy" report is actually about.
+        Perf::note_idle();
         return;
+    }
 
 #if ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
     // this needs to be done here.
@@ -3426,8 +3462,10 @@ void GLCanvas3D::on_idle(wxIdleEvent& evt)
         m_extra_frame_requested = false;
         evt.RequestMore();
     }
-    else
+    else {
         m_dirty = false;
+        Perf::note_idle();
+    }
 }
 
 void GLCanvas3D::on_char(wxKeyEvent& evt)
@@ -7367,6 +7405,10 @@ void GLCanvas3D::_refresh_if_shown_on_screen()
 
 void GLCanvas3D::_picking_pass()
 {
+    //Perf: the frame's FIRST full raycaster walk. Told apart from the second (MouseTo3d)
+    //because only one of the two has a dragging guard, and a fix aimed at the wrong one
+    //would leave the cost exactly where it was.
+    PETKOS_PERF_SCOPE(Perf::Probe::PickingPass);
     if (!m_picking_enabled || m_mouse.dragging || m_mouse.position == Vec2d(DBL_MAX, DBL_MAX) || m_gizmos.is_dragging()) {
 #if ENABLE_RAYCAST_PICKING_DEBUG
         ImGuiWrapper& imgui = *wxGetApp().imgui();
@@ -8042,6 +8084,7 @@ void GLCanvas3D::_render_background()
 
 void GLCanvas3D::_render_bed(const Transform3d& view_matrix, const Transform3d& projection_matrix, bool bottom, bool show_axes)
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::RenderBed);
     float scale_factor = 1.0;
 #if ENABLE_RETINA_GL
     scale_factor = m_retina_helper->get_scale_factor();
@@ -8069,6 +8112,7 @@ void GLCanvas3D::_render_platelist(const Transform3d& view_matrix, const Transfo
 
 void GLCanvas3D::_render_shadows(const Transform3d& view_matrix, const Transform3d& projection_matrix)
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::RenderShadows);
     if (wxGetApp().app_config == nullptr)
         return;
     if (!wxGetApp().app_config->get_bool(SETTING_OPENGL_REALISTIC_MODE))
@@ -8363,6 +8407,7 @@ void GLCanvas3D::_render_plane() const
 //BBS: add outline drawing logic
 void GLCanvas3D::_render_objects(GLVolumeCollection::ERenderType type, bool with_outline)
 {
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::RenderObjects, (int32_t) type);
     if (m_volumes.empty())
         return;
 

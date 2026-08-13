@@ -1,5 +1,6 @@
 #include "libslic3r/libslic3r.h"
 #include "SceneRaycaster.hpp"
+#include "PetkosPerf.hpp"
 
 #include "Camera.hpp"
 #include "GUI_App.hpp"
@@ -153,6 +154,10 @@ SceneRaycaster::HitResult SceneRaycaster::hit(const Vec2d& mouse_pos, const Came
 #endif // ENABLE_RAYCAST_PICKING_DEBUG
 
     HitResult ret;
+
+    //Perf: aux is how many bed raycasters are registered, which is ~8 per plate - the
+    //number a spatial reject would have to stop tracking.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::SceneRaycasterHit, (int32_t) m_bed.size());
 
     auto test_raycasters = [this, is_closest, clipping_plane, &volume_keeper](EType type, const Vec2d& mouse_pos, const Camera& camera, HitResult& ret) {
         const ClippingPlane* clip_plane = (clipping_plane != nullptr && type == EType::Volume) ? clipping_plane : nullptr;

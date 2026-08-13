@@ -53,6 +53,10 @@ __pycache__/
 # petkos-orca dev build: isolated --datadir (see run-petkos-orca.bat), never shared config
 datadir/
 
+# petkos-orca latency runs: the CSVs are large and machine-specific. The numbers that
+# matter get written up; the raw rows are a local artefact of tools/petkos-perf-run.ps1.
+perf-runs/
+
 # graphify knowledge-graph output
 graphify-out/
 

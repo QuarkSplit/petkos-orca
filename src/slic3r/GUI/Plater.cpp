@@ -1,4 +1,5 @@
 #include "Plater.hpp"
+#include "PetkosPerf.hpp"
 #include "../Utils/NetworkAgent.hpp"
 #include "../Utils/NetworkAgentFactory.hpp"
 #include "libslic3r/Config.hpp"
@@ -5199,6 +5200,11 @@ void Sidebar::update_ui_from_settings()
 //Recompute the board from the plate list. Deliberately not cached: the plate list is
 //mutated by arrange, 3MF load, undo and the plate list itself, so a cache would go
 //stale exactly when it matters, and MAX_PLATE_COUNT bounds the work at 36 rows.
+wxWindow *Sidebar::get_plate_board_window() const
+{
+    return p == nullptr ? nullptr : static_cast<wxWindow *>(p->plate_board);
+}
+
 void Sidebar::refresh_plate_board()
 {
     if (p == nullptr || p->plate_board == nullptr || p->plater == nullptr || !p->plater->is_initialized())
@@ -19507,9 +19513,16 @@ void Plater::apply_background_progress()
 //BBS: select Plate
 int Plater::select_plate(int plate_index, bool need_slice)
 {
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::SelectPlate, (int32_t) plate_index);
+    Perf::begin_interaction(Perf::Interaction::PlateSwitch, (int32_t) plate_index);
     int ret;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: plate %2%, need_slice %3% ")%__LINE__ %plate_index  %need_slice;
-    take_snapshot("select partplate!");
+    {
+        //Perf: snapshot #1 of the two a single plate click takes; the second is inside
+        //PartPlateList::select_plate.
+        PETKOS_PERF_SCOPE_AUX(Perf::Probe::SelectPlateSnapshot, 1);
+        take_snapshot("select partplate!");
+    }
     ret = p->partplate_list.select_plate(plate_index);
     if (!ret) {
         if (is_view3D_shown())
@@ -20090,8 +20103,18 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
     if (plate->get_printer_preset_name() == preset_name)
         return;
 
+    //Perf: this is the click that feels worst, so it is timed as a whole and phase by
+    //phase. Which phase dominates decides whether the fix is a cache, a narrower
+    //invalidation, or moving work off the UI thread - and guessing that wrong is how a
+    //day goes into the phase that was never the cost.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::SetPlatePrinter, (int32_t) plate_index);
+    Perf::begin_interaction(Perf::Interaction::PrinterAssign, (int32_t) plate_index);
+
     //one snapshot, named for the action, so the whole reassignment is one undo press
-    take_snapshot(std::string("Assign plate printer"));
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppSnapshot);
+        take_snapshot(std::string("Assign plate printer"));
+    }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
         << boost::format(": assign plate %1% to printer '%2%'") % (plate_index + 1) % preset_name;
@@ -20099,17 +20122,30 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
     plate->set_printer_preset_name(preset_name);
     //the printer identity changed, so everything that depends on it re-resolves — one
     //mechanism, not a patch per dependent (see PresetBundle::reresolve_plate_context_for_printer)
-    reresolve_plate_after_printer_change(this, plate);
-    p->partplate_list.apply_printer_to_plate(plate_index);
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppReresolve);
+        reresolve_plate_after_printer_change(this, plate);
+    }
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppApply);
+        p->partplate_list.apply_printer_to_plate(plate_index);
+    }
     //the plate outline, grid and icons are rebuilt by the call above; the reflow can
     //move the current plate even when another plate was reassigned, so the textured
     //Bed3D underneath must follow unconditionally
-    update_bed_for_selected_plate();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppBedUpdate);
+        update_bed_for_selected_plate();
+    }
 
     //the bed changed under parts that kept their world coordinates, so re-check what
     //still fits. This feeds instance_outside_set; the plate board's row state and
     //inspector consume it later — for now the log line names the objects.
-    const std::vector<std::pair<int, int>> outside = plate->update_instances_outside_state();
+    std::vector<std::pair<int, int>> outside;
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppOutsideState);
+        outside = plate->update_instances_outside_state();
+    }
     if (!outside.empty()) {
         std::string names;
         for (const std::pair<int, int>& pair : outside) {
@@ -20132,12 +20168,16 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
     set_plater_dirty(true);
 
     //the row's machine, bed glyph and state all changed
-    if (p->sidebar != nullptr)
+    if (p->sidebar != nullptr) {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppBoardRefresh);
         p->sidebar->refresh_plate_board();
+    }
 
     //the current plate's slice/export button state follows on the next timer pass
-    if (plate_index == p->partplate_list.get_curr_plate_index())
+    if (plate_index == p->partplate_list.get_curr_plate_index()) {
+        PETKOS_PERF_SCOPE(Perf::Probe::SppBackgroundProcess);
         schedule_background_process();
+    }
 }
 
 void Plater::rename_plate(int plate_index, const std::string &name)
@@ -20683,6 +20723,7 @@ void Plater::set_bed_position(Vec2d& pos)
 //nothing changed, so calling this liberally is cheap.
 void Plater::update_bed_for_selected_plate(const Vec2d* forced_position)
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::UpdateBedForPlate);
     PartPlateList& ppl = p->partplate_list;
     PartPlate* plate = ppl.get_curr_plate();
     Vec2d pos = forced_position ? *forced_position : ppl.get_current_shape_position();
