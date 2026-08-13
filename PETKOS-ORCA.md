@@ -164,6 +164,20 @@ impossible. Everything else informs and gets out of the way, naming the object i
 Silent gates, where a button is disabled or does nothing with no message, are the worst case
 and are always a bug.
 
+**Do not optimise the GUI from reading. It has been measured, and reading got it wrong.** The
+per-plate render loop is the obvious suspect and is 2.1 ms of an 88 ms frame at 36 plates. The
+frame belongs to `_render_overlays` (a flat ~21 ms EVERY frame, whatever the plate count) and
+`_render_objects` (~1.9 ms per volume). The clicks belong to the plate board's O(plates) config
+compositions. It is CPU-bound: the buffer swap stays at 0.6 ms while the frame triples.
+
+**The instrument is in the tree.** `PETKOS_PERF=1` turns on scoped spans; `PETKOS_PERF_SCRIPT`
+drives a scripted run through the production paths; `pwsh -Command "& tools/petkos-perf-run.ps1"`
+takes 1, 6 and 36 plates and `tools/petkos-perf-table.py` puts them side by side. Free when off.
+Four traps it already knows about: the app opens on Home where the canvas does not draw, so a run
+that forgets to select the editor measures an idle app and calls it fast; `pwsh -File` flattens
+`-Plates 1,6,36` into 1636; `create_plate` refuses past `MAX_PLATE_COUNT`; and a killed process
+writes no CSV, because the flush is in `GUI_App::OnExit`. Never measure while a build runs.
+
 **Launch only via `run-petkos-orca.bat`.** It passes an isolated `--datadir`; an un-isolated
 launch has previously run the setup wizard and clobbered the installed Orca's shared config.
 

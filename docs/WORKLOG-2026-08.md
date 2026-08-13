@@ -7,6 +7,135 @@ Dated build history and closed audit findings for the fork, split out of `PETKOS
 authority on how the fork behaves now; anything here is a record of how it got there and may
 describe states that no longer exist.
 
+## Work log — 2026-08-13 (the lag is measured, and it is not where anyone was looking)
+
+The report was "since plates got their own printers, the interface feels laggy" — canvas
+interaction, plate switching, printer assignment. The suspect list that came with it was
+written from reading the code, and it led with the obvious one: every plate is drawn every
+frame, with the plate list locked, ~13 GL buffers per plate, no frustum cull.
+
+That suspect is real and it is 2% of the problem.
+
+### The instrument had to exist first
+
+The headless slicing rig cannot see a GUI stall, and the in-repo Shiny profiler forces TBB to
+one thread, which changes the app it is measuring. `PetkosPerf` is the smallest honest
+alternative: an env-gated scoped span (`PETKOS_PERF=1`) writing into a preallocated ring, with
+a CSV and a summary at exit. It is free when off — one cached bool and a predictable branch —
+and it stays in the tree, because a performance claim that cannot be re-run is a story.
+
+Samples do not go through `BOOST_LOG`. This build forces severity to `info` (the version
+string is `2.5.0-dev`, and `set_logging_level` clamps for pre-release builds) and the file sink
+is `auto_flush`, so a per-frame log line is a synchronous disk write large enough to be
+mistaken for the bug being hunted.
+
+Interactions carry **both halves**: the first frame that shows a result, and the moment the
+event loop goes idle. That split is the whole point — it is what distinguishes an app that is
+slow from an app that paints quickly and then stays busy, and the two want different fixes.
+
+`PetkosPerfDriver` makes it repeatable. The plate board is custom-painted and the canvas is a
+GL surface, so nothing external can reach either; the driver rides the app's own idle and calls
+the production paths — `rotate_on_sphere`, `select_plate`, `set_plate_printer`, real
+`wxMouseEvent`s posted at the board. Idle rather than a timer, because Windows' default timer
+resolution is ~15.6 ms and would cap a frame-time measurement at 64 fps, hiding exactly the
+range in question.
+
+Two things it got wrong first, both now guarded in code rather than in someone's memory:
+
+- **The app opens on Home**, where the 3D canvas is not shown and `render()` early-returns. The
+  first pass reported 40 orbit frames in 15 ms and not one of them was drawn. A run that
+  measures an idle app looks *fast*, which is the worst possible failure for an instrument. It
+  now selects the editor first and logs an error if it cannot.
+- **`create_plate` refuses past `MAX_PLATE_COUNT`**, so a loop written against the requested
+  count never terminates. It now stops when the list stops growing and names the cap.
+
+### What it measured
+
+At 1 / 6 / 36 plates, Release, one 40 mm cube per plate:
+
+| | 1 | 6 | 36 |
+|---|---|---|---|
+| frame `CanvasRender` p50 | 28.5 ms | 33.9 | **88.1 ms** |
+| `_render_overlays` | **20.6** | 21.0 | 22.4 |
+| `_render_objects` opaque | 3.6 | — | **70.3** |
+| all plate drawing | 0.09 | 0.38 | 2.1 |
+| both raycaster walks | 0.014 | 0.04 | 0.16 |
+| `CanvasSwap` | 0.74 | 0.63 | 0.61 |
+| plate switch → painted | — | 58.7 | 211 (settle 401) |
+| printer assign → painted | 82.9 | 152 | 387 |
+| board row drag → settle | — | 24.9 | 408 |
+
+Everything scales with plate count, and it is **CPU-bound** — the swap stays flat at 0.6 ms
+while the frame triples, so nothing here is the GPU's fault.
+
+`PlateRender` does fire 35.2 times per frame at 36 plates, exactly as the audit said. Each call
+costs 0.056 ms. The whole per-plate render loop, mutex included, is 2.1 ms of an 88 ms frame.
+The two raycaster walks are 0.16 ms together. The frame belongs to two things nobody had named:
+
+- **`_render_overlays` costs a flat ~21 ms every frame**, whatever the plate count. At one plate
+  that is 80% of the frame, which is why an empty project runs at 39 fps.
+- **`_render_objects` costs ~1.9 ms per volume** — not per plate. That is where plate count
+  enters the frame, because plates carry objects.
+
+### One model, one owner
+
+The clicks are the plate board. A printer assignment at 36 plates cost 191 ms, of which 120 ms
+was `SppBoardRefresh`; the board refresh *is* the click. `PlateBoardModel::rebuild` is O(plates)
+whole-config compositions — each row asks `get_extruders()`, which composes that plate's entire
+~1000-key `DynamicPrintConfig` at 1.6 ms a time — and `PlateInspector::reload` then built a
+**second complete model on the stack**, read it, and discarded it, while the board's identical
+and freshly-rebuilt one sat one pointer away.
+
+The board now publishes the model it has already built. Nothing else changed: the inspector only
+ever read those rows.
+
+| at 36 plates | before | after |
+|---|---|---|
+| `BoardRowLayout` | 48 calls, 1931 ms | 24 calls, 1085 ms |
+| `ResolvePlateContext` | 1364 calls, 2077 ms | 752 calls, 1236 ms |
+| `SppBoardRefresh` p50 | 119.6 ms | 76.0 ms |
+| `SetPlatePrinter` p50 | 191.1 ms | 146.8 ms |
+| plate switch → painted | 211 ms | 156 ms |
+| board drag → painted | 217 ms | 178 ms |
+
+Exactly half the rebuilds, which is what the change predicts, and frame time untouched, which
+is also what it predicts.
+
+The unit cost underneath all of it is `PresetBundle::resolve_plate_slicing_config` at
+**1.5–1.7 ms per call**. Its tier-1 sibling `resolve_plate_presets` is **0.003 ms**. The fork
+already invented that narrowing and documented the rule for using it safely; it simply was not
+applied everywhere, and the board is the biggest place it was not.
+
+### Two crashes, read out of the app's own logs
+
+Both were waiting in `datadir/log`, and both are one shape: a pointer trusted after its owner
+had gone.
+
+`crash_Thu_Aug_13_09_52_28` killed the app during startup, jumping to `0x762E7365` — an address
+that is a fragment of a string, which is what a freed vtable reads like. The stack is
+`ShowNetpluginTip` → `RunScript`, reached from a **queued** navigation event: `m_browser` was
+non-null but its `wxWebView` had been destroyed in between, and the existing guard checks only
+for null. `g_webviews` is already the exact set of live views, so liveness is now a question
+with an answer rather than a pointer everyone has to trust.
+
+The second is a latent repeat of one already fixed. `load_wipe_tower_preview` carries a guard
+for the empty extruder palette that took the app down on 12 Aug; two lines below it the plate
+lookup is unguarded, and `get_plate` answers NULL for an index it does not have. The wipe tower
+arrives through an `obj_idx - 1000` encoding, which is precisely where an index outlives the
+plate it named.
+
+### What is not done, and why
+
+**Culling is written and not landed.** The frustum test, the per-plate bounding box it uses, and
+the hoisting of lazy resource generation out of the draw path — so a culled plate still
+registers its raycaster and stays clickable — are all worked out. It recovers at most ~2 ms
+while `_render_objects` costs 70 and `_render_overlays` 21. It goes in after those, or it is
+polish sold as a fix.
+
+**Startup is ~26 s to the first painted frame** and was not attacked. It is the largest single
+number in the whole report and deserves its own pass, with a marker at "main frame shown" so
+the number separates "the window appeared" from "the canvas drew".
+
 ## Work log — 2026-08-12, session 4 (the notification stops shouting and starts pointing)
 
 The trigger was one screenshot: a solid red panel reading "Following objects are laid over the
