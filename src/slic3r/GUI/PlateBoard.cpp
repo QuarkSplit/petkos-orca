@@ -1366,6 +1366,22 @@ PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_
     });
 }
 
+bool PlateBoard::apply_visibility(int plate_count)
+{
+    //One plate is the old single-printer case, and a lone row would only restate the Project
+    //row above it.
+    const bool show = plate_count > 1;
+    if (IsShown() == show)
+        return false;
+
+    Show(show);
+    //The board's parent is the printer panel's content panel, so this is the same layout the
+    //sidebar used to perform on its behalf.
+    if (GetParent() != nullptr)
+        GetParent()->Layout();
+    return true;
+}
+
 void PlateBoard::reload()
 {
     //rows are about to be re-filed; an in-flight caption edit commits rather than
@@ -1400,6 +1416,8 @@ void PlateBoard::reload()
 
     m_model.rebuild(plates, *wxGetApp().preset_bundle, m_grouping);
     m_current_plate = plates.get_curr_plate_index();
+    //A reload means new work arrived, so a heal that gave up earlier is worth trying again.
+    m_thumb_heal_blocked = false;
 
     {
         PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadItems);
@@ -1408,6 +1426,9 @@ void PlateBoard::reload()
         clamp_scroll();
     }
 
+    //Decided here, after the rows exist, so the board is never shown empty and never left
+    //hidden while full.
+    apply_visibility(count);
     //A row count change changes the height this control asks the sizer for, and nothing
     //below it moves until somebody lays the panel out. Only a real change asks, because
     //reload() runs on every preset update and a parent-wide layout on each of those is a
@@ -1447,7 +1468,12 @@ void PlateBoard::reload_plate(int plate_index)
         return;
     }
 
-    m_current_plate = plates.get_curr_plate_index();
+    m_current_plate      = plates.get_curr_plate_index();
+    m_thumb_heal_blocked = false;
+
+    //Cheap, and it costs nothing when nothing changed - but a plate list that grew past one
+    //while the board was hidden has to be able to arrive on screen from this path too.
+    apply_visibility(plates.get_plate_count());
 
     {
         PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadItems);
@@ -2659,21 +2685,25 @@ const wxBitmap *PlateBoard::plate_thumb_bitmap(int plate_index, int px)
     //Self-healing: anything that moves an instance resets the plate's thumbnail
     //(notify_instance_update), and in the 3D editor nothing re-renders it — the strip
     //that used to is Preview-only. So an invalid render is re-requested through the same
-    //canvas call the hover preview uses, at most one plate per paint so a 21-plate
-    //project rebuilds over a second of frames instead of stalling one.
-    if (!plate->thumbnail_data.is_valid() && !m_thumb_refreshed_this_paint) {
-        if (GLCanvas3D *canvas = m_plater->get_view3D_canvas3D(); canvas != nullptr) {
-            m_thumb_refreshed_this_paint = true;
-            //Perf: an offscreen GL render plus a readback, issued from inside a paint handler.
-            PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardThumbHeal, (int32_t) plate_index);
-            canvas->refresh_plate_thumbnail(plate_index);
-            //another paint is owed only when this one actually produced pixels; a canvas
-            //that cannot render right now must not become a repaint spin
-            m_thumb_heal_more = plate->thumbnail_data.is_valid();
-        }
-    }
-    if (!plate->thumbnail_data.is_valid())
+    //canvas call the hover preview uses, at most one plate per paint.
+    //
+    //It is REQUESTED here and performed after the paint. Doing it here put a 512x512
+    //offscreen render and a readback inside the paint handler, so every click that
+    //changed a plate - assigning a printer changes its bed, which invalidates its
+    //thumbnail - waited 44 ms for a picture before any of the row appeared. A paint must
+    //not block on a render it can do immediately afterwards.
+    if (!plate->thumbnail_data.is_valid()) {
+        if (m_thumb_heal_wanted < 0 && !m_thumb_heal_blocked)
+            m_thumb_heal_wanted = plate_index;
+
+        //Show the last good picture of this plate rather than a hole. It is one paint out
+        //of date, which is what a progressive refresh looks like; a cell that empties and
+        //then refills reads as a glitch, and the row's other facts are already correct.
+        if (const auto it = m_thumb_cache.find(plate_index);
+            it != m_thumb_cache.end() && it->second.bmp.IsOk())
+            return &it->second.bmp;
         return nullptr;
+    }
 
     const ThumbnailData &data = plate->thumbnail_data;
     ThumbCacheEntry &    slot = m_thumb_cache[plate_index];
@@ -2898,8 +2928,7 @@ void PlateBoard::draw_row(wxDC &                 dc,
 void PlateBoard::on_paint(wxPaintEvent &evt)
 {
     PETKOS_PERF_SCOPE(Perf::Probe::BoardPaint);
-    m_thumb_refreshed_this_paint = false;
-    m_thumb_heal_more            = false;
+    m_thumb_heal_wanted = -1;
 
     wxAutoBufferedPaintDC dc(this);
     const bool            dark   = wxGetApp().dark_mode();
@@ -2989,9 +3018,33 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
     if (m_dragging)
         draw_drag_pill(dc, dark);
 
-    //one healed thumbnail per paint: schedule the next paint to heal the next row
-    if (m_thumb_heal_more)
-        CallAfter([this]() { Refresh(); });
+    //One healed thumbnail per paint, and the heal happens after this paint rather than
+    //inside it. The repaint that follows a successful heal is what finds the next row
+    //needing one, so a project heals a row at a time without any of them costing a click.
+    if (m_thumb_heal_wanted >= 0) {
+        const int heal_index = m_thumb_heal_wanted;
+        m_thumb_heal_wanted  = -1;
+        CallAfter([this, heal_index]() {
+            if (m_plater == nullptr || !m_plater->is_initialized())
+                return;
+            PartPlate *plate = m_plater->get_partplate_list().get_plate(heal_index);
+            if (plate == nullptr || plate->thumbnail_data.is_valid())
+                return;
+            GLCanvas3D *canvas = m_plater->get_view3D_canvas3D();
+            if (canvas == nullptr)
+                return;
+            {
+                //Perf: the offscreen GL render and readback, now outside any paint.
+                PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardThumbHeal, (int32_t) heal_index);
+                canvas->refresh_plate_thumbnail(heal_index);
+            }
+            //Only paint again when this actually produced pixels. A canvas that cannot
+            //render right now would otherwise turn into a repaint spin.
+            m_thumb_heal_blocked = !plate->thumbnail_data.is_valid();
+            if (!m_thumb_heal_blocked)
+                Refresh();
+        });
+    }
 
     //Perf: a board paint is a surface the user sees, so it closes an interaction just as a
     //canvas frame does. Surface 100 distinguishes it from a canvas type.

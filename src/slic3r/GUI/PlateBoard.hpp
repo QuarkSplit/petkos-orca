@@ -526,11 +526,28 @@ private:
     //buffer's address+size, which changes exactly when the thumbnail is re-rendered
     struct ThumbCacheEntry { const void *pixels = nullptr; size_t size = 0; wxBitmap bmp; };
     std::map<int, ThumbCacheEntry> m_thumb_cache;
-    bool m_thumb_refreshed_this_paint = false; //one re-render request per paint, reset in on_paint
-    bool m_thumb_heal_more            = false; //that request produced pixels, so paint again for the next row
+    //The plate whose thumbnail this paint wants re-rendered, or -1. The render itself is
+    //a 512x512 offscreen pass and a readback - it happens AFTER the paint, never inside
+    //it, because a click that invalidates a thumbnail would otherwise wait 44 ms for
+    //pixels before anything at all appeared. Still one per paint, so a 36-plate project
+    //heals over a second of frames rather than stalling one.
+    int  m_thumb_heal_wanted  = -1;
+    //A canvas that cannot render right now must not become a repaint spin. Set when a heal
+    //produced nothing; cleared whenever the board reloads, which is when new work arrives.
+    bool m_thumb_heal_blocked = false;
     //the row's printer picture, scaled once per model: the vendor cover art the wizard
     //uses, so the board and the wizard agree on what a machine looks like
     std::map<std::string, wxBitmap> m_cover_cache;
+    //Whether the board belongs on screen at all is a property of the plate list, not of
+    //whichever caller happened to reload last. It lives here because THREE paths reload the
+    //board - the sidebar's refresh, its targeted sibling, and on_plate_selection_changed -
+    //and only one of them used to decide this. A board holding 36 rows could therefore stay
+    //hidden for a whole session, and did. Deciding it as part of reloading is what makes
+    //that unforgettable rather than remembered in one place out of three.
+    //
+    //True when the visibility actually changed, which is also when the parent was laid out.
+    bool apply_visibility(int plate_count);
+
     const wxBitmap *plate_thumb_bitmap(int plate_index, int px);
     const wxBitmap *printer_cover_bitmap(const std::string &model, int px);
 

@@ -5210,15 +5210,11 @@ void Sidebar::refresh_plate_board()
     if (p == nullptr || p->plate_board == nullptr || p->plater == nullptr || !p->plater->is_initialized())
         return;
 
+    //reload() decides whether the board belongs on screen, so this no longer does. It used
+    //to be the only path that decided it, which meant the two paths that reload the board
+    //without coming through here - the targeted refresh below, and on_plate_selection_changed
+    //- could leave a full board hidden.
     p->plate_board->reload();
-    //one plate is the old single-printer case, and every row would restate the project
-    //row above it
-    const bool show = p->plater->get_partplate_list().get_plate_count() > 1;
-    if (p->plate_board->IsShown() != show) {
-        p->plate_board->Show(show);
-        if (p->m_panel_printer_content != nullptr)
-            p->m_panel_printer_content->Layout();
-    }
 
     //the inspector describes rows the board has just recomputed, so it follows the same
     //refresh rather than growing a second set of refresh points to keep in step
@@ -5234,10 +5230,6 @@ void Sidebar::refresh_plate_board(int plate_index)
         return;
 
     p->plate_board->reload_plate(plate_index);
-
-    //Deliberately no Show()/Layout() pass here. That one exists for a change in the number
-    //of plates, and this refresh is for a change WITHIN one plate - the row count it would
-    //be testing cannot have moved.
     refresh_plate_scope();
 }
 
