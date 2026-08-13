@@ -112,6 +112,8 @@ void GLCanvas3D::load_render_colors()
 namespace Slic3r {
 namespace GUI {
 
+uint64_t GLCanvas3D::s_frame_id = 0;
+
 #ifdef __WXGTK3__
 // wxGTK3 seems to simulate OSX behavior in regard to HiDPI scaling support.
 RetinaHelper::RetinaHelper(wxWindow* window) : m_window(window), m_self(nullptr) {}
@@ -2012,6 +2014,8 @@ void GLCanvas3D::render(bool only_init)
     m_in_render = true;
     Slic3r::ScopeGuard in_render_guard([this]() { m_in_render = false; });
     (void)in_render_guard;
+
+    ++s_frame_id;
 
     //Perf: the whole-frame span. aux is the canvas type, so a View3D frame and a Preview
     //frame do not average into one meaningless number.

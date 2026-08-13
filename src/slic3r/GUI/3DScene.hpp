@@ -354,6 +354,13 @@ public:
     //BBS: add outline related logic and add virtual specifier
     virtual void render_with_outline(const GUI::Size& cnv_size);
 
+    //The extruder palette is the same for every volume in a frame, so the caller that owns the
+    //loop passes it in. Fetching it here cost a whole DynamicPrintConfig composition PER VOLUME
+    //(measured: 36 of them in a 36-plate frame, 1.49 ms each, 53 ms of an 81 ms frame). The
+    //no-argument versions above keep working for the handful of callers outside a loop.
+    virtual void render(const std::vector<ColorRGBA>& extruder_colors);
+    virtual void render_with_outline(const GUI::Size& cnv_size, const std::vector<ColorRGBA>& extruder_colors);
+
     //BBS: add simple render function for thumbnail
     void simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_objects, std::vector<ColorRGBA>& extruder_colors, bool ban_light =false);
 
@@ -385,7 +392,11 @@ class GLWipeTowerVolume : public GLVolume {
 public:
     GLWipeTowerVolume(const std::vector<ColorRGBA>& colors);
     void render() override;
+    //A wipe tower carries its own per-filament colours (m_colors) and never asks the plater for
+    //them, so the palette the caller hoisted is simply not its business.
+    void render(const std::vector<ColorRGBA>& extruder_colors) override { render(); }
     void render_with_outline(const GUI::Size& cnv_size) override { render(); }
+    void render_with_outline(const GUI::Size& cnv_size, const std::vector<ColorRGBA>& extruder_colors) override { render(); }
 
     std::vector<GUI::GLModel> model_per_colors;
     bool                              IsTransparent();

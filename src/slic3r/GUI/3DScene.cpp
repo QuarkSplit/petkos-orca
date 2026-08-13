@@ -471,14 +471,12 @@ void GLVolume::render()
     if (shader == nullptr)
         return;
 
-    ModelObjectPtrs &model_objects = GUI::wxGetApp().model().objects;
-    std::vector<ColorRGBA> colors = GUI::wxGetApp().plater()->get_extruders_colors();
-
-    simple_render(shader, model_objects, colors);
+    //Outside a loop, so fetching the palette here is fine. Inside one it is not - see the
+    //overload below and GLVolumeCollection::render.
+    render(GUI::wxGetApp().plater()->get_extruders_colors());
 }
 
-//BBS: add outline related logic
-void GLVolume::render_with_outline(const GUI::Size& cnv_size)
+void GLVolume::render(const std::vector<ColorRGBA>& extruder_colors)
 {
     if (!is_active)
         return;
@@ -488,7 +486,30 @@ void GLVolume::render_with_outline(const GUI::Size& cnv_size)
         return;
 
     ModelObjectPtrs &model_objects = GUI::wxGetApp().model().objects;
-    std::vector<ColorRGBA> colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    //simple_render takes a non-const ref it does not modify; the copy is four pointers, not a
+    //config composition.
+    std::vector<ColorRGBA> colors = extruder_colors;
+
+    simple_render(shader, model_objects, colors);
+}
+
+//BBS: add outline related logic
+void GLVolume::render_with_outline(const GUI::Size& cnv_size)
+{
+    render_with_outline(cnv_size, GUI::wxGetApp().plater()->get_extruders_colors());
+}
+
+void GLVolume::render_with_outline(const GUI::Size& cnv_size, const std::vector<ColorRGBA>& extruder_colors)
+{
+    if (!is_active)
+        return;
+
+    GLShaderProgram *shader = GUI::wxGetApp().get_current_shader();
+    if (shader == nullptr)
+        return;
+
+    ModelObjectPtrs &model_objects = GUI::wxGetApp().model().objects;
+    std::vector<ColorRGBA> colors = extruder_colors;
 
     const GUI::OpenGLManager::EFramebufferType framebuffers_type = GUI::OpenGLManager::get_framebuffers_type();
     if (framebuffers_type == GUI::OpenGLManager::EFramebufferType::Unknown) {
@@ -1131,6 +1152,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
 
     const float support_normal_z = get_selection_support_normal_z();
 
+    //The extruder palette is identical for every volume in this loop, and obtaining it composes
+    //the plate's whole ~974-option config. Asking once per volume cost 36 compositions - 53 ms -
+    //in a 36-plate frame. The loop is here, so the hoist belongs here.
+    const std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+
     for (GLVolumeWithIdAndZ& volume : to_render) {
 #if ENABLE_MODIFIERS_ALWAYS_TRANSPARENT
         if (type == ERenderType::Transparent) {
@@ -1230,9 +1256,9 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
 		//BBS: add outline related logic
         if (volume.first->selected && GUI::wxGetApp().show_outline())
-            volume.first->render_with_outline(cnv_size);
+            volume.first->render_with_outline(cnv_size, extruder_colors);
         else
-            volume.first->render();
+            volume.first->render(extruder_colors);
 
 #if ENABLE_ENVIRONMENT_MAP
         if (use_environment_texture)

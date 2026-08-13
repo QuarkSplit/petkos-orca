@@ -133,7 +133,15 @@ private:
     //BBS: GUI refactor: add object manipulation
     GizmoObjectManipulation m_object_manipulation;
 
+    //Asking which gizmos are selectable is not free: GLGizmoMmuSegmentation answers "is there
+    //more than one filament?" by composing the plate's whole config. The toolbars ask this
+    //eleven times a frame to work out where to draw themselves, which measured 16 ms of an 81 ms
+    //frame. The answer cannot change within a frame, so it is computed once per frame and the
+    //other ten calls read it. Not a cache with an invalidation problem: the frame id moves on
+    //every rendered frame, and anything that could change the answer has dirtied the canvas.
     std::vector<size_t> get_selectable_idxs() const;
+    mutable std::vector<size_t> m_selectable_idxs_cache;
+    mutable uint64_t            m_selectable_idxs_frame = 0;
     EType get_gizmo_from_mouse(const Vec2d &mouse_pos) const;
 
     bool activate_gizmo(EType type);

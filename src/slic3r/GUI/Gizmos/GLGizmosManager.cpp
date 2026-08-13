@@ -59,6 +59,13 @@ GLGizmosManager::GLGizmosManager(GLCanvas3D& parent)
 
 std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
 {
+    //One composition per frame instead of eleven. See the note on the members in the header:
+    //is_selectable() reaches GLGizmoMmuSegmentation, which composes the plate's entire config to
+    //count filaments, and the toolbars ask this repeatedly while laying themselves out.
+    const uint64_t frame = GLCanvas3D::frame_id();
+    if (frame != 0 && frame == m_selectable_idxs_frame)
+        return m_selectable_idxs_cache;
+
     std::vector<size_t> out;
     out.reserve(m_gizmos.size());
     if (m_parent.get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
@@ -75,6 +82,9 @@ std::vector<size_t> GLGizmosManager::get_selectable_idxs() const
             if (m_gizmos[i]->is_selectable())
                 out.push_back(i);
     }
+
+    m_selectable_idxs_cache = out;
+    m_selectable_idxs_frame = frame;
     return out;
 }
 

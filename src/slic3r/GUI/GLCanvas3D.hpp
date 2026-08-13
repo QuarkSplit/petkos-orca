@@ -1264,6 +1264,14 @@ private:
     void _rectangular_selection_picking_pass();
     bool _is_fxaa_enabled() const;
     bool _is_ssao_enabled() const;
+public:
+    //Bumped once per rendered frame. Anything that recomputes a per-frame answer can key a
+    //memo on it: within one frame the answer cannot change, and the next frame always
+    //arrives, because whatever changed the answer also dirtied the canvas.
+    static uint64_t frame_id() { return s_frame_id; }
+private:
+    static uint64_t s_frame_id;
+
     int _get_effective_fps_cap() const;
     bool _is_fps_overlay_enabled() const;
     void _render_fps_overlay(int fps) const;
