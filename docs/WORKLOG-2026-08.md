@@ -1339,3 +1339,98 @@ which is ten lines and is now built.
 picker where they belong, they are mutually exclusive, and the batch takes one snapshot. A
 board-level version would additionally have no machine to assign, which is why it is a modifier on
 the next pick rather than an action of its own.
+
+## Work log — 2026-08-13 (the frame, and the 974-option config it was composing 47 times)
+
+The GUI lag is fixed. At 36 plates the frame went **86.6 ms → 5.8 ms**, p99 **119.8 → 13.4 ms**,
+startup **25 s → 12 s**, plate switch **153 ms → 45 ms** to first paint. A whole scripted run that
+took ~100 s takes 23 s.
+
+### It was one mechanism, and reading it as two problems was the error
+
+`Plater::get_extruders_colors()` composes a complete **~974-option `DynamicPrintConfig`** — the
+printer, the process and every filament preset deep-copied, then five whole-config passes — **in
+order to read `filament_colour`**. 1.49 ms a call. The frame called it **47 times**:
+
+| where | per frame | cost |
+|---|---|---|
+| `GLVolumeCollection::render` | 36, one per volume, inside the draw loop | ~53 ms |
+| `GLGizmosManager::get_selectable_idxs` | 11, via the four toolbar renders | ~16 ms |
+
+The earlier entry recorded these as two findings — "a flat ~21 ms of overlays" and "~1.9 ms per
+volume in objects". They are the same call. The overlay path reaches it through
+`GLGizmoMmuSegmentation::on_is_selectable()`, which answers *"is there more than one filament?"* by
+composing the whole config and taking `.size()` on the colour list.
+
+**What identified it: a cost that ignores the scene is not about the scene.** ~21 ms of overlays
+whatever the plate count, whatever the object count, is the signature of work the scene does not
+touch. That is the transferable rule, not the particular function.
+
+### The fix, two shapes of one idea (`16615db75d`)
+
+**Hoist, don't cache** for the 36. The palette is identical for every volume in a frame and the
+loop lives in the caller, so `GLVolumeCollection::render` fetches once and passes it down through
+new `render(colors)` / `render_with_outline(size, colors)` overloads. It is still fetched fresh
+every frame, so a filament colour change lands on the next repaint and there is no invalidation to
+get wrong. Overloads rather than replacements, so the four callers outside a loop keep working and
+the diff against upstream stays small.
+
+`GLWipeTowerVolume` needed the overload too, or wipe towers would have silently taken the base path
+instead of their own per-filament colours — and this is not a compile error, it is a wrong picture.
+It is the **only** `GLVolume` subclass in the tree, which is what makes that exhaustive.
+
+**Memo per frame** for the 11. `GLCanvas3D::s_frame_id` bumps once per rendered frame and
+`get_selectable_idxs()` keys a memo on it. The answer depends only on filament count and app mode,
+neither of which can change mid-frame, and anything that changes either has dirtied the canvas, so
+the next frame always arrives. Between frames it returns what the last painted frame used — which
+is what hit-testing wants, since the click regions then agree with the icons actually on screen.
+
+**Rejected: reading `filament_colour` narrowly off the project config.** It *is* a project option,
+but composition applies the filament preset **after** the project, so a narrow read is not provably
+equal. It wins nothing the hoist does not.
+
+### An instrument with a hole in it is worse than none (`4581afd026`)
+
+`ResolvePlateContext` wrapped only `PartPlate.cpp`'s file-static `resolve_plate_context` helper.
+That helper genuinely does not fire during a frame — so the instrument reported **zero compositions
+per frame**, and that reading was believed for most of a day. The app was doing 47, through
+`Plater::resolve_plate_slicing_config`, the second door into the same composition. Probing it turned
+0 into 47 and the hunt ended the same hour.
+
+**When a span reads zero, prove it can fire at all before concluding the path is cold.**
+
+### An allocation count is a tax on everything, not just its caller
+
+Paths that never read the palette got faster with it: bed 0.106 → 0.022 ms, picking 0.149 → 0.099,
+plate drawing 0.153 → 0.045, and startup halved. 34,586 copies of a 974-option config per run was
+thrashing the allocator for the whole application. This is why the win (86.6 → 5.8) is larger than
+the arithmetic of the removed calls (~70 ms) predicts.
+
+### Verified
+
+Two identical 36-plate runs, `perf-runs/hoist-36` and `hoist2-36`, against `quad-36`. Frame 6.37
+and 5.84 against 86.58; overlays 1.397 and 1.384 against 19.417; objects 1.187 and 1.158 against
+30.449; compositions 2,349 and 2,289 against 34,586. Two runs rather than one because the claim
+includes the variance collapsing, and one run cannot say that.
+
+### The next target, named with evidence rather than deferred vaguely
+
+**The same mechanism has a third costume, in the board.** `PartPlate::get_extruders(true)` calls
+`resolve_plate_context` — one whole-config composition — to read ten `opt_int` values, and
+`PlateBoardModel::rebuild` calls it **once per plate**. At 36 plates that is ~36 ms of the 84 ms
+`SppBoardRefresh`, which is the largest phase of the 133 ms `SetPlatePrinter` click, itself inside a
+461 ms `PrinterAssign` first paint — the one interaction that did **not** improve today.
+
+It is deliberately not fixed in this pass. The frame fix was safe because it caches nothing across
+frames; the board fix is a cache with a real invalidation design, and the value being cached feeds
+**slicing**, where a stale config is a wrong G-code rather than a slow list. The right shape is the
+epoch counter on `Plater` already named in the 2026-08-11 deferrals for per-plate thumbnails — one
+counter would retire both — and it wants its own pass with a build behind it.
+
+### Tooling
+
+`tools/petkos-dev-build.ps1` (`ff3629d0dc`) builds the DLL and exe only, cores-minus-two, below
+normal priority: minutes rather than the ~20 of `build_release_vs2022.bat`, which also builds six
+test binaries, runs gettext and installs ~8,000 resource files that no code change touches.
+**Polling a build log in a loop is what fills a session's context** — wait on one blocking call.
+Touching a widely-included header such as `GLModel.hpp` still costs a wide rebuild.

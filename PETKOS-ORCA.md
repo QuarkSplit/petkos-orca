@@ -164,19 +164,40 @@ impossible. Everything else informs and gets out of the way, naming the object i
 Silent gates, where a button is disabled or does nothing with no message, are the worst case
 and are always a bug.
 
-**Do not optimise the GUI from reading. It has been measured, and reading got it wrong.** The
-per-plate render loop is the obvious suspect and is 2.1 ms of an 88 ms frame at 36 plates. The
-frame belongs to `_render_overlays` (a flat ~21 ms EVERY frame, whatever the plate count) and
-`_render_objects` (~1.9 ms per volume). The clicks belong to the plate board's O(plates) config
-compositions. It is CPU-bound: the buffer swap stays at 0.6 ms while the frame triples.
+**Do not optimise the GUI from reading.** The per-plate render loop is the obvious suspect and
+was never the cost: 2.1 ms of an 88 ms frame at 36 plates. It is CPU-bound throughout — the buffer
+swap stays at 0.6 ms while the frame triples.
+
+**The frame was one mechanism wearing two costumes, and reading them as two problems was the
+error.** A flat ~21 ms in `_render_overlays` and ~1.9 ms per volume in `_render_objects` were both
+`Plater::get_extruders_colors()`, which composes a complete ~974-option `DynamicPrintConfig` — the
+printer, the process and every filament preset, deep-copied, then five whole-config passes — in
+order to read `filament_colour`. 1.49 ms a call, 47 calls a frame: 36 inside the volume loop and
+11 through `GLGizmosManager::get_selectable_idxs`, where `GLGizmoMmuSegmentation` answers "is there
+more than one filament?" by composing the config and taking `.size()`.
+
+Hoisting the palette out of the volume loop and memoising the selectability query on a per-frame
+counter took the frame from **86.6 ms to 5.8 ms** and startup from 25 s to 12 s. Paths that never
+read the palette got 2-5× faster alongside it, because 34,586 copies of a 974-option config per run
+was thrashing the allocator for the whole app. **When a cost ignores the scene, it is not about the
+scene** — that is what identified it, and it is the general rule.
+
+**What is left is not the frame.** At 36 plates the remaining costs are plate switching
+(`SelectPlate` ~71 ms), the board (`BoardRowLayout` ~35 ms, `SppBoardRefresh` ~84 ms) and
+thumbnail rendering (~44 ms). Measure before touching any of them.
 
 **The instrument is in the tree.** `PETKOS_PERF=1` turns on scoped spans; `PETKOS_PERF_SCRIPT`
 drives a scripted run through the production paths; `pwsh -Command "& tools/petkos-perf-run.ps1"`
 takes 1, 6 and 36 plates and `tools/petkos-perf-table.py` puts them side by side. Free when off.
-Four traps it already knows about: the app opens on Home where the canvas does not draw, so a run
+Five traps it already knows about: the app opens on Home where the canvas does not draw, so a run
 that forgets to select the editor measures an idle app and calls it fast; `pwsh -File` flattens
-`-Plates 1,6,36` into 1636; `create_plate` refuses past `MAX_PLATE_COUNT`; and a killed process
-writes no CSV, because the flush is in `GUI_App::OnExit`. Never measure while a build runs.
+`-Plates 1,6,36` into 1636; `create_plate` refuses past `MAX_PLATE_COUNT`; a killed process
+writes no CSV, because the flush is in `GUI_App::OnExit`; and **a probe can be attached to the
+wrong door**. `ResolvePlateContext` originally wrapped only `PartPlate.cpp`'s file-static compose
+helper, which genuinely never fires during a frame — so the instrument reported zero compositions
+per frame while the app was doing 47 through `Plater::resolve_plate_slicing_config`. An instrument
+with a hole in it is worse than none, because it is believed. When a span reads zero, confirm it
+can fire at all before concluding the path is cold. Never measure while a build runs.
 
 **Launch only via `run-petkos-orca.bat`.** It passes an isolated `--datadir`; an un-isolated
 launch has previously run the setup wizard and clobbered the installed Orca's shared config.
