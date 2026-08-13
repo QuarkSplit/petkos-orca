@@ -5228,8 +5228,22 @@ void Sidebar::refresh_plate_board()
 //The scope invariant lives in exactly one function: the set always contains the current
 //plate, holds no duplicates and no index the plate list no longer has, and is never
 //empty. Every mutator below ends here, so no caller has to restate it.
+void Sidebar::refresh_plate_board(int plate_index)
+{
+    if (p == nullptr || p->plate_board == nullptr || p->plater == nullptr || !p->plater->is_initialized())
+        return;
+
+    p->plate_board->reload_plate(plate_index);
+
+    //Deliberately no Show()/Layout() pass here. That one exists for a change in the number
+    //of plates, and this refresh is for a change WITHIN one plate - the row count it would
+    //be testing cannot have moved.
+    refresh_plate_scope();
+}
+
 void Sidebar::refresh_plate_scope()
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::BoardScopeRefresh);
     if (p == nullptr || p->plater == nullptr || !p->plater->is_initialized())
         return;
 
@@ -20173,10 +20187,12 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
     update_project_dirty_from_presets();
     set_plater_dirty(true);
 
-    //the row's machine, bed glyph and state all changed
+    //The row's machine, bed glyph and state all changed - and nothing else did. Rebuilding
+    //every other row to show one row's change composed a whole config per plate, which made
+    //this click grow with the size of the project rather than with what the user altered.
     if (p->sidebar != nullptr) {
         PETKOS_PERF_SCOPE(Perf::Probe::SppBoardRefresh);
-        p->sidebar->refresh_plate_board();
+        p->sidebar->refresh_plate_board(plate_index);
     }
 
     //the current plate's slice/export button state follows on the next timer pass
@@ -20195,8 +20211,10 @@ void Plater::rename_plate(int plate_index, const std::string &name)
     take_snapshot(std::string("Rename plate"));
     plate->set_plate_name(name);
     set_plater_dirty(true);
+    //A name change is confined to one row, so the other rows are not re-read. Same
+    //reasoning as the printer assignment above.
     if (p->sidebar != nullptr)
-        p->sidebar->refresh_plate_board();
+        p->sidebar->refresh_plate_board(plate_index);
 }
 
 void Plater::set_plate_physical_printer(int plate_index, std::string device_id)

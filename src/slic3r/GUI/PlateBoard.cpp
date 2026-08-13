@@ -120,136 +120,143 @@ std::string slot_material_type(const PresetBundle &bundle, int slot)
 
 } // namespace
 
-void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
+void PlateBoardModel::build_project_row(const PresetBundle &bundle, const std::string &project_printer)
 {
-    //Perf: aux is the plate count, but the finding is the CALL COUNT per click - one user
-    //action currently rebuilds this model more than once, and each rebuild costs O(plates)
-    //full config compositions.
-    PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowLayout, (int32_t) plates.get_plate_count());
-    m_rows.clear();
-    m_groups.clear();
-    m_rollup = PlateBoardRollup();
-
-    const std::string              project_printer = bundle.printers.get_selected_preset_name();
-    const std::vector<std::string> colours         = project_filament_colours(bundle);
-
-    m_project_row               = PlateBoardRow();
-    m_project_row.plate_index   = PLATE_BOARD_PROJECT_ROW;
-    m_project_row.printer_name  = project_printer;
+    m_project_row              = PlateBoardRow();
+    m_project_row.plate_index  = PLATE_BOARD_PROJECT_ROW;
+    m_project_row.printer_name = project_printer;
     printer_bed_size(bundle, project_printer, m_project_row.bed_w, m_project_row.bed_d);
     printer_nozzle_diameter(bundle, project_printer, m_project_row.nozzle_diameter);
+}
 
-    const int count = plates.get_plate_count();
-    m_all_inherited = true;
+void PlateBoardModel::build_row(int                             plate_index,
+                                const PartPlateList &           plates,
+                                const PresetBundle &            bundle,
+                                const std::string &             project_printer,
+                                const std::vector<std::string> &colours,
+                                PlateBoardRow &                 row) const
+{
+    const PartPlate *plate = plates.get_plate(plate_index);
+    if (plate == nullptr)
+        return;
+
+    row = PlateBoardRow();
+    row.plate_index = plate_index;
+    row.plate_name  = plate->get_plate_name();
+    row.assigned    = plate->has_printer_assignment();
+
+    if (row.assigned) {
+        row.printer_name = plate->get_printer_preset_name();
+        //a stored name this installation does not have is preserved verbatim and
+        //reported, never cleared, remapped or rendered as unassigned
+        row.preset_missing = !printer_bed_size(bundle, row.printer_name, row.bed_w, row.bed_d);
+    } else {
+        row.printer_name = project_printer;
+        row.bed_w        = m_project_row.bed_w;
+        row.bed_d        = m_project_row.bed_d;
+    }
+
+    //Nozzle belongs to the preset the row is showing, whether that is the plate's own
+    //machine or the project one it is following. A plate stores no nozzle, so this is
+    //read-only wherever it is displayed and is labelled with the preset it came from.
+    printer_nozzle_diameter(bundle, row.printer_name, row.nozzle_diameter);
+
+    //model identity for the row's printer picture and its short caption
+    if (const Preset *preset = bundle.printers.find_preset(row.printer_name, false); preset != nullptr)
+        row.printer_model = preset->config.opt_string("printer_model");
+
+    //The plate's OWN bed type and map mode, not the project's resolved values.
+    //btDefault here is the plate saying it follows the global plate type, which is a
+    //fact worth showing rather than one to resolve away.
+    row.bed_type          = (int) plate->get_bed_type();
+    row.filament_map_mode = (int) plate->get_filament_map_mode();
+
+    //the plate's own geometry wins over the preset's when it has been applied,
+    //because that is the bed the parts are actually sitting on
+    const Vec2d size = plate->get_size();
+    if (size.x() > 0. && size.y() > 0.) {
+        row.bed_w = size.x();
+        row.bed_d = size.y();
+    }
+
+    row.part_count    = plate->instance_count();
+    row.parts_outside = plate->has_instances_outside();
+    row.sliced        = plate->is_slice_result_valid();
+    //A retained result whose context has moved out from under it. The G-code is still
+    //attached and can be inspected; it simply cannot be dispatched under this context.
+    //"Never sliced" and "sliced, then changed" want different repairs, so they are
+    //different states rather than one absence.
+    row.stale         = !row.sliced && plate->has_retained_slice_result();
+
+    //No valid slice means no time: an em-dash in the row, zero in every total, and one
+    //more in the trailing "N not estimated" note. finalise() derives that count from the
+    //rows; without the note the totals would lie by omission.
+    row.has_time = row.sliced &&
+                   plate->get_retained_print_statistics(row.print_time_seconds, row.weight_grams);
+
+    for (int slot : plate->get_extruders(true)) {
+        row.filament_slots.push_back(slot);
+        row.filament_colours.push_back(slot >= 1 && (size_t) slot <= colours.size()
+                                           ? colours[(size_t) slot - 1]
+                                           : std::string());
+    }
+
+    //The slot the material grouping files this plate under. Most grams from the
+    //plate's own slice when it has one; otherwise the lowest slot it uses. This is a
+    //display ordering key and nothing else - it selects no preset and reaches no
+    //slicing decision, so choosing the lowest slot when there is no slice to weigh is
+    //a tie-break, not a substituted context.
+    double best_grams = -1.;
+    //auto, not the type name: PartPlate.hpp is where this vector's element type is
+    //resolved, and naming it again here would be a second place for that answer to be
+    //wrong if the header's include set ever moves.
+    for (const auto &info : plate->get_slice_filaments_info()) {
+        const int slot = info.id + 1;
+        if (std::find(row.filament_slots.begin(), row.filament_slots.end(), slot) == row.filament_slots.end())
+            continue;
+        if ((double) info.used_g > best_grams) {
+            best_grams        = (double) info.used_g;
+            row.dominant_slot = slot;
+        }
+    }
+    if (row.dominant_slot == 0 && !row.filament_slots.empty())
+        row.dominant_slot = *std::min_element(row.filament_slots.begin(), row.filament_slots.end());
+
+    if (row.dominant_slot > 0) {
+        row.material_type = slot_material_type(bundle, row.dominant_slot);
+        if ((size_t) row.dominant_slot <= colours.size())
+            row.material_colour = colours[(size_t) row.dominant_slot - 1];
+    }
+}
+
+void PlateBoardModel::finalise(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle)
+{
+    //Every total here is a pure function of the row set. Deriving them rather than
+    //accumulating them inside the read loop is what lets one changed row produce correct
+    //totals without re-reading the other thirty-five.
+    m_groups.clear();
+    m_rollup = PlateBoardRollup();
 
     //hours per machine, so the rollup can report the longest queue without proposing
     //a single move: max-of-sums is literally what the cell says it is
     std::map<std::string, float> queue_seconds;
     std::set<std::string>        assigned_machines;
     bool                         any_inherited = false;
+    m_all_inherited                            = true;
 
-    for (int i = 0; i < count; ++i) {
-        const PartPlate *plate = plates.get_plate(i);
-        if (plate == nullptr)
-            continue;
-
-        PlateBoardRow row;
-        row.plate_index = i;
-        row.plate_name  = plate->get_plate_name();
-        row.assigned    = plate->has_printer_assignment();
-
+    for (const PlateBoardRow &row : m_rows) {
         if (row.assigned) {
-            m_all_inherited  = false;
-            row.printer_name = plate->get_printer_preset_name();
+            m_all_inherited = false;
             assigned_machines.insert(row.printer_name);
-            //a stored name this installation does not have is preserved verbatim and
-            //reported, never cleared, remapped or rendered as unassigned
-            row.preset_missing = !printer_bed_size(bundle, row.printer_name, row.bed_w, row.bed_d);
         } else {
-            any_inherited    = true;
-            row.printer_name = project_printer;
-            row.bed_w        = m_project_row.bed_w;
-            row.bed_d        = m_project_row.bed_d;
+            any_inherited = true;
         }
-
-        //Nozzle belongs to the preset the row is showing, whether that is the plate's own
-        //machine or the project one it is following. A plate stores no nozzle, so this is
-        //read-only wherever it is displayed and is labelled with the preset it came from.
-        printer_nozzle_diameter(bundle, row.printer_name, row.nozzle_diameter);
-
-        //model identity for the row's printer picture and its short caption
-        if (const Preset *preset = bundle.printers.find_preset(row.printer_name, false); preset != nullptr)
-            row.printer_model = preset->config.opt_string("printer_model");
-
-        //The plate's OWN bed type and map mode, not the project's resolved values.
-        //btDefault here is the plate saying it follows the global plate type, which is a
-        //fact worth showing rather than one to resolve away.
-        row.bed_type          = (int) plate->get_bed_type();
-        row.filament_map_mode = (int) plate->get_filament_map_mode();
-
-        //the plate's own geometry wins over the preset's when it has been applied,
-        //because that is the bed the parts are actually sitting on
-        const Vec2d size = plate->get_size();
-        if (size.x() > 0. && size.y() > 0.) {
-            row.bed_w = size.x();
-            row.bed_d = size.y();
-        }
-
-        row.part_count    = plate->instance_count();
-        row.parts_outside = plate->has_instances_outside();
-        row.sliced        = plate->is_slice_result_valid();
-        //A retained result whose context has moved out from under it. The G-code is still
-        //attached and can be inspected; it simply cannot be dispatched under this context.
-        //"Never sliced" and "sliced, then changed" want different repairs, so they are
-        //different states rather than one absence.
-        row.stale         = !row.sliced && plate->has_retained_slice_result();
-
-        if (row.sliced && plate->get_retained_print_statistics(row.print_time_seconds, row.weight_grams)) {
-            row.has_time = true;
+        if (row.has_time) {
             m_rollup.total_seconds += row.print_time_seconds;
             queue_seconds[row.assigned ? row.printer_name : project_printer] += row.print_time_seconds;
         } else {
-            //no valid slice: an em-dash in the row, zero in every total, and one more
-            //in the trailing "N not estimated" note. Without the note the totals lie
-            //by omission.
             ++m_rollup.not_estimated;
         }
-
-        for (int slot : plate->get_extruders(true)) {
-            row.filament_slots.push_back(slot);
-            row.filament_colours.push_back(slot >= 1 && (size_t) slot <= colours.size()
-                                               ? colours[(size_t) slot - 1]
-                                               : std::string());
-        }
-
-        //The slot the material grouping files this plate under. Most grams from the
-        //plate's own slice when it has one; otherwise the lowest slot it uses. This is a
-        //display ordering key and nothing else - it selects no preset and reaches no
-        //slicing decision, so choosing the lowest slot when there is no slice to weigh is
-        //a tie-break, not a substituted context.
-        double best_grams = -1.;
-        //auto, not the type name: PartPlate.hpp is where this vector's element type is
-        //resolved, and naming it again here would be a second place for that answer to be
-        //wrong if the header's include set ever moves.
-        for (const auto &info : plate->get_slice_filaments_info()) {
-            const int slot = info.id + 1;
-            if (std::find(row.filament_slots.begin(), row.filament_slots.end(), slot) == row.filament_slots.end())
-                continue;
-            if ((double) info.used_g > best_grams) {
-                best_grams        = (double) info.used_g;
-                row.dominant_slot = slot;
-            }
-        }
-        if (row.dominant_slot == 0 && !row.filament_slots.empty())
-            row.dominant_slot = *std::min_element(row.filament_slots.begin(), row.filament_slots.end());
-
-        if (row.dominant_slot > 0) {
-            row.material_type = slot_material_type(bundle, row.dominant_slot);
-            if ((size_t) row.dominant_slot <= colours.size())
-                row.material_colour = colours[(size_t) row.dominant_slot - 1];
-        }
-
-        m_rows.push_back(std::move(row));
     }
 
     m_rollup.plates = (int) m_rows.size();
@@ -276,6 +283,73 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
         m_glyph_reference_mm = std::max(m_glyph_reference_mm, std::max(row.bed_w, row.bed_d));
 
     build_groups(grouping, project_printer, bundle);
+}
+
+void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
+{
+    //Perf: aux is the plate count. This is the O(plates) path, and every row it reads
+    //composes a whole config. It is the right answer when the row SET changed - plates
+    //added, removed, reordered, or a new project. When ONE plate changed, refresh_plate()
+    //below does the same reading for one row and derives the rest.
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowLayout, (int32_t) plates.get_plate_count());
+    m_rows.clear();
+
+    const std::string              project_printer = bundle.printers.get_selected_preset_name();
+    const std::vector<std::string> colours         = project_filament_colours(bundle);
+
+    build_project_row(bundle, project_printer);
+
+    const int count = plates.get_plate_count();
+    m_rows.reserve((size_t) (count > 0 ? count : 0));
+    for (int i = 0; i < count; ++i) {
+        if (plates.get_plate(i) == nullptr)
+            continue;
+        PlateBoardRow row;
+        build_row(i, plates, bundle, project_printer, colours, row);
+        m_rows.push_back(std::move(row));
+    }
+
+    finalise(grouping, project_printer, bundle);
+}
+
+bool PlateBoardModel::refresh_plate(int plate_index, const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
+{
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowRefresh, (int32_t) plate_index);
+
+    //Decline rather than guess. The model is patched in place here, so it may only be
+    //patched while it is provably still describing this plate list: an index the list has,
+    //and a row that still claims that plate. Anything else is a full rebuild's job, and
+    //false is how the caller is told to do one. An optimisation that can decline is not a
+    //second source of truth that can drift.
+    if (plate_index < 0 || plate_index >= plates.get_plate_count())
+        return false;
+    if (plates.get_plate(plate_index) == nullptr)
+        return false;
+
+    size_t pos = m_rows.size();
+    for (size_t r = 0; r < m_rows.size(); ++r) {
+        if (m_rows[r].plate_index == plate_index) {
+            pos = r;
+            break;
+        }
+    }
+    if (pos == m_rows.size())
+        return false;
+
+    const std::string              project_printer = bundle.printers.get_selected_preset_name();
+    const std::vector<std::string> colours         = project_filament_colours(bundle);
+
+    //Cheap - two preset lookups, no composition - and the inherited rows copy their bed
+    //from it, so it is refreshed rather than assumed to be current.
+    build_project_row(bundle, project_printer);
+
+    build_row(plate_index, plates, bundle, project_printer, colours, m_rows[pos]);
+
+    //A plate that changed machine changes which group it belongs to and every total that
+    //counts machines, so the derived half is recomputed in full. That is arithmetic over
+    //rows which already exist, and it composes nothing.
+    finalise(grouping, project_printer, bundle);
+    return true;
 }
 
 void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle)
@@ -1321,20 +1395,74 @@ void PlateBoard::reload()
     m_model.rebuild(plates, *wxGetApp().preset_bundle, m_grouping);
     m_current_plate = plates.get_curr_plate_index();
 
-    sync_glyph_targets();
-    rebuild_items();
-    clamp_scroll();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadItems);
+        sync_glyph_targets();
+        rebuild_items();
+        clamp_scroll();
+    }
 
     //A row count change changes the height this control asks the sizer for, and nothing
     //below it moves until somebody lays the panel out. Only a real change asks, because
     //reload() runs on every preset update and a parent-wide layout on each of those is a
     //storm rather than a refresh.
-    const int best = DoGetBestSize().GetHeight();
-    if (best != m_best_height) {
-        m_best_height = best;
-        InvalidateBestSize();
-        if (GetParent() != nullptr)
-            GetParent()->Layout();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadSize);
+        const int best = DoGetBestSize().GetHeight();
+        if (best != m_best_height) {
+            m_best_height = best;
+            InvalidateBestSize();
+            if (GetParent() != nullptr)
+                GetParent()->Layout();
+        }
+    }
+    Refresh();
+}
+
+void PlateBoard::reload_plate(int plate_index)
+{
+    //Same guards as reload(): the board exists before the plate list does.
+    if (m_plater == nullptr || !m_plater->is_initialized() || wxGetApp().preset_bundle == nullptr)
+        return;
+
+    const PartPlateList &plates = m_plater->get_partplate_list();
+
+    //Grouping by machine re-files a row the moment its machine changes, so the rows can
+    //move here exactly as they do in reload() - which is why an in-flight caption edit
+    //commits and a row preview is dismissed, rather than floating over a row that has
+    //shifted underneath it.
+    commit_rename(true);
+    hide_row_preview();
+
+    if (!m_model.refresh_plate(plate_index, plates, *wxGetApp().preset_bundle, m_grouping)) {
+        //The model declined - the row set is not the one it was built from. Whatever
+        //changed is bigger than one plate, so read all of it.
+        reload();
+        return;
+    }
+
+    m_current_plate = plates.get_curr_plate_index();
+
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadItems);
+        sync_glyph_targets();
+        rebuild_items();
+        clamp_scroll();
+    }
+
+    //The row COUNT cannot have changed here, so the height this control asks for cannot
+    //have either. The check is kept rather than assumed away because it is one integer
+    //compare, and being wrong about it would leave the sidebar laid out for a board of a
+    //different size.
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::BoardReloadSize);
+        const int best = DoGetBestSize().GetHeight();
+        if (best != m_best_height) {
+            m_best_height = best;
+            InvalidateBestSize();
+            if (GetParent() != nullptr)
+                GetParent()->Layout();
+        }
     }
     Refresh();
 }

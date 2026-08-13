@@ -178,6 +178,8 @@ public:
     void on_plate_selection_changed(int current_plate);
     //Rebuild the board's rows from the plate list.
     void refresh_plate_board();
+    //The same refresh for a change confined to one plate. See PlateBoard::reload_plate.
+    void refresh_plate_board(int plate_index);
     //The board as a plain window, for code that needs to reach it without depending on
     //PlateBoard's own header. Carried for the scripted latency run, which posts real mouse
     //events at it because a custom-painted panel has no other way in.

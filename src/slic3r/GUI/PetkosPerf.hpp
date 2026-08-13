@@ -35,6 +35,10 @@ enum class Probe : uint8_t {
     BoardPaint,            //PlateBoard::on_paint, aux = rows drawn
     BoardThumbHeal,        //the offscreen plate render inside a board paint, aux = plate index
     BoardRowLayout,        //PlateBoard row/group layout recompute, aux = row count
+    BoardRowRefresh,       //ONE board row recomputed in place + totals re-derived, aux = plate index
+    BoardReloadItems,      //  sync_glyph_targets + rebuild_items + clamp_scroll
+    BoardReloadSize,       //  the best-size check and any parent Layout it triggers
+    BoardScopeRefresh,     //  Sidebar::refresh_plate_scope, incl. the inspector
     SetPlatePrinter,       //whole Plater::set_plate_printer, aux = plate index
     SppSnapshot,           //  its undo snapshot
     SppReresolve,          //  its preset re-resolution

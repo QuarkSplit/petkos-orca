@@ -99,7 +99,9 @@ double ticks_per_ms()
 const char *const PROBE_NAMES[] = {
     "CanvasRender",     "CanvasSwap",       "PlateListRender",  "PlateRender",
     "PlateListRenderLock", "ResolvePrinterBed", "SetShapes",     "ApplyPrinterToPlate",
-    "BoardPaint",       "BoardThumbHeal",   "BoardRowLayout",   "SetPlatePrinter",
+    "BoardPaint",       "BoardThumbHeal",   "BoardRowLayout",   "BoardRowRefresh",
+    "BoardReloadItems", "BoardReloadSize",  "BoardScopeRefresh",
+    "SetPlatePrinter",
     "SppSnapshot",      "SppReresolve",     "SppApply",         "SppBedUpdate",
     "SppOutsideState",  "SppBoardRefresh",  "SppBackgroundProcess", "SelectPlate",
     "UpdateBedForPlate", "RenderThumbnail", "MouseMove",

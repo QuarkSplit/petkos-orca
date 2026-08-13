@@ -173,6 +173,20 @@ public:
                  const PresetBundle & bundle,
                  PlateBoardGrouping   grouping = PlateBoardGrouping::PlateOrder);
 
+    //Recompute ONE plate's row and re-derive everything that follows from the row set.
+    //Assigning a printer to a plate changes one row, and rebuilding all of them to show
+    //that costs a whole-config composition per plate - O(plates) work for an O(1) change,
+    //which is what made the click grow with the size of the project.
+    //
+    //False when the model cannot safely be patched: a row count that no longer matches the
+    //plate list, or an index whose row is not the plate it claims. The caller then does a
+    //full rebuild, so this is an optimisation that can decline rather than a second source
+    //of truth that can drift.
+    [[nodiscard]] bool refresh_plate(int                  plate_index,
+                                     const PartPlateList &plates,
+                                     const PresetBundle & bundle,
+                                     PlateBoardGrouping   grouping);
+
     const std::vector<PlateBoardRow> &  rows() const { return m_rows; }
     //Empty in plate order: one unnamed group holding everything is a header that says
     //nothing, and drawing it would cost a row of height to state the obvious.
@@ -206,6 +220,25 @@ public:
 
 private:
     void build_groups(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle);
+
+    //The Project row: two preset lookups, no composition. Built before the plate rows
+    //because an inherited row copies its bed from here.
+    void build_project_row(const PresetBundle &bundle, const std::string &project_printer);
+
+    //One row's worth of reading. Split out of rebuild's loop so the targeted refresh above
+    //and the full rebuild cannot describe a row differently.
+    void build_row(int                             plate_index,
+                   const PartPlateList &           plates,
+                   const PresetBundle &            bundle,
+                   const std::string &             project_printer,
+                   const std::vector<std::string> &colours,
+                   PlateBoardRow &                 row) const;
+
+    //Everything that is a pure function of the row set: the rollup totals, the glyph
+    //reference and the grouping. Derived from m_rows rather than accumulated during the
+    //loop, which is what lets one changed row produce correct totals without revisiting
+    //the other thirty-five.
+    void finalise(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle);
 
     std::vector<PlateBoardRow>   m_rows;
     std::vector<PlateBoardGroup> m_groups;
@@ -315,6 +348,12 @@ public:
     //mutated by arrange, 3MF load, undo and the plate list itself, so a cache goes
     //stale exactly when it matters, and MAX_PLATE_COUNT bounds the work at 36 rows.
     void reload();
+
+    //Reload after ONE plate changed. Same result as reload() for that case, without
+    //re-reading every other row - each of which costs a whole-config composition. Falls
+    //back to a full reload() whenever the model declines to be patched, so a caller
+    //never has to know which case it is in.
+    void reload_plate(int plate_index);
 
     //Called by the sidebar's selection sink. Idempotent.
     void on_plate_selection_changed(int current_plate);
