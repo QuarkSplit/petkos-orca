@@ -664,8 +664,16 @@ void GLTexture::render_texture(unsigned int tex_id, float left, float right, flo
 //through here as one textured quad. Building a GLModel per quad meant a VAO and two buffers
 //created, uploaded, drawn and then destroyed - roughly twenty GL calls and six GPU object
 //lifetimes to draw one square - and the overlay does that on the order of a hundred times a
-//frame. Measured at 22.6 ms per frame, unchanged by plate count or object count, which is what
-//identified it: a cost that ignores the scene is not about the scene.
+//frame.
+//
+//Worth 3-5 ms of the frame at 36 plates, measured by building it out and back in once the
+//config-composition cost that used to dwarf it was gone: 11.1 and 8.7 ms without, 6.4 and 5.8 ms
+//with. Only ~1.5 ms of that is the overlay draw itself (RenderOverlays 2.9 -> 1.39); the rest
+//lands on work that draws no textures at all, because ~100 VAO-and-two-buffer lifetimes a frame
+//is allocator pressure the whole frame pays. An earlier version of this comment claimed 22.6 ms
+//on the strength of the flat overlay cost, which turned out to be a different mechanism
+//entirely - see the 2026-08-13 worklog entry. A cost that ignores the scene is not about the
+//scene, but it is not automatically about the nearest suspect either.
 //
 //One quad now lives for the life of the GL context and has its four vertices rewritten per
 //draw. Same vertices, same UVs, same shader, same pixels; what goes away is the allocation.
