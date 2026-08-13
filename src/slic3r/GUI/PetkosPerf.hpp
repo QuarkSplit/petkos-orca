@@ -61,6 +61,15 @@ enum class Probe : uint8_t {
     RenderOverlays,        //_render_overlays: toolbars, plate strip, notifications
     RenderImGui,           //the ImGui draw-list submission at the end of the frame
     RenderSsaoFxaa,        //the optional post passes
+    OvIconScale,           //_check_and_update_toolbar_icon_scale
+    OvToolbars,            //the four GLToolbar renders
+    OvPlateStrip,          //_render_imgui_select_plate_toolbar
+    OvPaintToolbar,        //_render_paint_toolbar
+    OvGizmosOverlay,       //_render_gizmos_overlay
+    OvLabels,              //m_labels.render
+    OvNavigator,           //_render_3d_navigator
+    OvCanvasToolbar,       //_render_canvas_toolbar
+    OvAssemble,            //_render_assemble_control + info + separators
     Count
 };
 

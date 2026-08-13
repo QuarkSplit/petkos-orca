@@ -107,6 +107,9 @@ const char *const PROBE_NAMES[] = {
     "ResolvePlateContext", "ResolvePlatePresets", "SelectPlateSnapshot",
     "RenderBed",        "RenderObjects",    "RenderShadows",     "RenderGizmos",
     "RenderOverlays",   "RenderImGui",      "RenderSsaoFxaa",
+    "OvIconScale",      "OvToolbars",       "OvPlateStrip",   "OvPaintToolbar",
+    "OvGizmosOverlay",  "OvLabels",         "OvNavigator",    "OvCanvasToolbar",
+    "OvAssemble",
 };
 static_assert(sizeof(PROBE_NAMES) / sizeof(PROBE_NAMES[0]) == (size_t) Probe::Count,
               "probe name table is out of step with the Probe enum");

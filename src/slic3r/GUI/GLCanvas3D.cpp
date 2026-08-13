@@ -8786,26 +8786,32 @@ void GLCanvas3D::_render_overlays()
 {
     glsafe(::glDisable(GL_DEPTH_TEST));
 
-    _check_and_update_toolbar_icon_scale();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvIconScale); _check_and_update_toolbar_icon_scale(); }
 
-    _render_assemble_control();
-    _render_assemble_info();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::OvAssemble);
+        _render_assemble_control();
+        _render_assemble_info();
+        _render_separator_toolbar_right();
+        _render_separator_toolbar_left();
+    }
 
-    _render_separator_toolbar_right();
-    _render_separator_toolbar_left();
-    _render_main_toolbar();
-    _render_collapse_toolbar();
-    _render_assemble_view_toolbar();
+    {
+        PETKOS_PERF_SCOPE(Perf::Probe::OvToolbars);
+        _render_main_toolbar();
+        _render_collapse_toolbar();
+        _render_assemble_view_toolbar();
+        _render_return_toolbar();
+    }
     //BBS: GUI refactor: GLToolbar
-    _render_imgui_select_plate_toolbar();
-    _render_return_toolbar();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvPlateStrip); _render_imgui_select_plate_toolbar(); }
     // BBS
     //_render_view_toolbar();
-    _render_paint_toolbar();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvPaintToolbar); _render_paint_toolbar(); }
 
     //BBS: GUI refactor: GLToolbar
     //move gizmos behind of main
-    _render_gizmos_overlay();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvGizmosOverlay); _render_gizmos_overlay(); }
 
     if (m_layers_editing.last_object_id >= 0 && m_layers_editing.object_max_z() > 0.0f)
         m_layers_editing.render_overlay(*this);
@@ -8830,11 +8836,11 @@ void GLCanvas3D::_render_overlays()
                 sorted_instances.emplace_back(model_instance);
             }*/
     }
-    m_labels.render(sorted_instances);
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvLabels); m_labels.render(sorted_instances); }
 
-    _render_3d_navigator();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvNavigator); _render_3d_navigator(); }
 
-    _render_canvas_toolbar();
+    { PETKOS_PERF_SCOPE(Perf::Probe::OvCanvasToolbar); _render_canvas_toolbar(); }
 }
 
 void GLCanvas3D::_render_style_editor()

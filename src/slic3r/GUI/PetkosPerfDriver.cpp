@@ -102,8 +102,16 @@ private:
             //early-returns - so a run that forgets this measures an idle app and reports it as
             //fast. The first pass of this instrument did exactly that: 40 orbit frames in 15 ms
             //and not one of them drawn. Select the editor first, then let the app settle.
-            if (m_tick == 0 && wxGetApp().mainframe != nullptr)
+            if (m_tick == 0 && wxGetApp().mainframe != nullptr) {
                 wxGetApp().mainframe->select_tab(size_t(MainFrame::tp3DEditor));
+                //Frame time is fill-rate sensitive, so a run at one window size cannot be
+                //compared with a run at another. Two runs of IDENTICAL code differed by 60%
+                //on the opaque pass (42.6 vs 68.1 ms at 36 plates) while the overlays - which
+                //are fill-rate light - stayed at 22 ms in both. The size is pinned here so the
+                //comparison is valid by construction rather than by luck, and recorded so a
+                //stray result can be told apart from a real one.
+                wxGetApp().mainframe->SetSize(wxSize(1600, 1000));
+            }
             if (++m_tick > 30) {
                 if (!plater->is_view3D_shown()) {
                     //Say so rather than producing a fast-looking number from an empty canvas.
@@ -111,6 +119,10 @@ private:
                                                 "frame times from this run would be meaningless";
                 }
                 Perf::mark("driver.begin", plater->is_view3D_shown() ? 1 : 0);
+                //width*10000+height, so one integer carries the geometry every frame time in
+                //this run was measured at
+                const Size cs = canvas->get_canvas_size();
+                Perf::mark("driver.canvas_size", cs.get_width() * 10000 + cs.get_height());
                 enter(Phase::Build);
             }
             evt.RequestMore();
