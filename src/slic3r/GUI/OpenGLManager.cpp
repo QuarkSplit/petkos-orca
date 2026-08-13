@@ -4,6 +4,7 @@
 #include "GUI.hpp"
 #include "I18N.hpp"
 #include "3DScene.hpp"
+#include "GLTexture.hpp"
 
 #include "libslic3r/AppConfig.hpp"
 #include "libslic3r/Platform.hpp"
@@ -232,6 +233,10 @@ OpenGLManager::EFramebufferType OpenGLManager::s_framebuffers_type = OpenGLManag
 
 OpenGLManager::~OpenGLManager()
 {
+    // Before the context goes: the shared toolbar quad owns GL buffers for the life of the
+    // context, and freeing them afterwards would be a crash at exit rather than a leak.
+    GLTexture::release_render_quad();
+
     m_shaders_manager.shutdown();
 
     if (m_context != nullptr)

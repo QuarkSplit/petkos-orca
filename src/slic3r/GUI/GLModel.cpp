@@ -433,6 +433,24 @@ void GLModel::init_from(Geometry&& data)
     }
 }
 
+bool GLModel::update_vertices(const std::vector<float>& vertices)
+{
+    // send_to_gpu() drops the CPU-side copy once uploaded, so the count is checked against
+    // what the render data remembers rather than against geometry.vertices.
+    if (m_render_data.vbo_id == 0 || vertices.empty())
+        return false;
+
+    const size_t expected = m_render_data.vertices_count *
+                            Geometry::vertex_stride_floats(m_render_data.geometry.format);
+    if (vertices.size() != expected)
+        return false;
+
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, m_render_data.vbo_id));
+    glsafe(::glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.size() * sizeof(float), vertices.data()));
+    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+    return true;
+}
+
 void GLModel::init_from(const TriangleMesh& mesh)
 {
     init_from(mesh.its);

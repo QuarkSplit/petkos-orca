@@ -132,6 +132,10 @@ namespace GUI {
 
         static void render_texture(unsigned int tex_id, float left, float right, float bottom, float top);
         static void render_sub_texture(unsigned int tex_id, float left, float right, float bottom, float top, const Quad_UVs& uvs);
+        // Frees the quad shared by render_texture/render_sub_texture. Must be called while the
+        // GL context is still current - OpenGLManager's destructor does it - because a buffer
+        // deleted after its context is a crash on exit, not a leak.
+        static void release_render_quad();
 
     private:
         bool load_from_png(const std::string& filename, bool use_mipmaps, ECompressionType compression_type, bool apply_anisotropy);

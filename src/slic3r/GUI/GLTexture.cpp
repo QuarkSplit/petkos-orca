@@ -660,6 +660,28 @@ void GLTexture::render_texture(unsigned int tex_id, float left, float right, flo
     render_sub_texture(tex_id, left, right, bottom, top, FullTextureUVs);
 }
 
+//Every toolbar button, every gizmo icon, and all nine slices of every toolbar border are drawn
+//through here as one textured quad. Building a GLModel per quad meant a VAO and two buffers
+//created, uploaded, drawn and then destroyed - roughly twenty GL calls and six GPU object
+//lifetimes to draw one square - and the overlay does that on the order of a hundred times a
+//frame. Measured at 22.6 ms per frame, unchanged by plate count or object count, which is what
+//identified it: a cost that ignores the scene is not about the scene.
+//
+//One quad now lives for the life of the GL context and has its four vertices rewritten per
+//draw. Same vertices, same UVs, same shader, same pixels; what goes away is the allocation.
+//Released through GLTexture::release_render_quad() from OpenGLManager's destructor, because a
+//GL object freed after its context is a crash at exit rather than a leak.
+static GLModel& shared_quad()
+{
+    static GLModel s_quad;
+    return s_quad;
+}
+
+void GLTexture::release_render_quad()
+{
+    shared_quad().reset();
+}
+
 void GLTexture::render_sub_texture(unsigned int tex_id, float left, float right, float bottom, float top, const GLTexture::Quad_UVs& uvs)
 {
     glsafe(::glEnable(GL_BLEND));
@@ -672,29 +694,44 @@ void GLTexture::render_sub_texture(unsigned int tex_id, float left, float right,
 
     glsafe(::glBindTexture(GL_TEXTURE_2D, (GLuint)tex_id));
 
-    GLModel::Geometry init_data;
-    init_data.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P2T2 };
-    init_data.reserve_vertices(4);
-    init_data.reserve_indices(6);
+    //interleaved P2T2, in the order the four vertices were added before: left-bottom,
+    //right-bottom, right-top, left-top
+    const std::vector<float> vertices = {
+        left,  bottom, uvs.left_bottom.u,  uvs.left_bottom.v,
+        right, bottom, uvs.right_bottom.u, uvs.right_bottom.v,
+        right, top,    uvs.right_top.u,    uvs.right_top.v,
+        left,  top,    uvs.left_top.u,     uvs.left_top.v
+    };
 
-    // vertices
-    init_data.add_vertex(Vec2f(left, bottom),  Vec2f(uvs.left_bottom.u, uvs.left_bottom.v));
-    init_data.add_vertex(Vec2f(right, bottom), Vec2f(uvs.right_bottom.u, uvs.right_bottom.v));
-    init_data.add_vertex(Vec2f(right, top),    Vec2f(uvs.right_top.u, uvs.right_top.v));
-    init_data.add_vertex(Vec2f(left, top),     Vec2f(uvs.left_top.u, uvs.left_top.v));
-
-    // indices
-    init_data.add_triangle(0, 1, 2);
-    init_data.add_triangle(2, 3, 0);
-
-    GLModel model;
-    model.init_from(std::move(init_data));
-
+    //Fast path: the quad is already on the GPU, so this is one 64-byte glBufferSubData.
+    //update_vertices() reports false only before the first upload (the buffers are created
+    //lazily by render()), or if the layout ever stopped matching - either way the answer is to
+    //build the quad once, not to draw a stale rectangle.
+    GLModel& model = shared_quad();
     GLShaderProgram* shader = wxGetApp().get_shader("flat_texture");
     if (shader != nullptr) {
         shader->start_using();
         shader->set_uniform("view_model_matrix", Transform3d::Identity());
         shader->set_uniform("projection_matrix", Transform3d::Identity());
+
+        if (!model.update_vertices(vertices)) {
+            model.reset();
+            GLModel::Geometry init_data;
+            init_data.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P2T2 };
+            init_data.reserve_vertices(4);
+            init_data.reserve_indices(6);
+
+            init_data.add_vertex(Vec2f(left, bottom),  Vec2f(uvs.left_bottom.u, uvs.left_bottom.v));
+            init_data.add_vertex(Vec2f(right, bottom), Vec2f(uvs.right_bottom.u, uvs.right_bottom.v));
+            init_data.add_vertex(Vec2f(right, top),    Vec2f(uvs.right_top.u, uvs.right_top.v));
+            init_data.add_vertex(Vec2f(left, top),     Vec2f(uvs.left_top.u, uvs.left_top.v));
+
+            init_data.add_triangle(0, 1, 2);
+            init_data.add_triangle(2, 3, 0);
+
+            model.init_from(std::move(init_data));
+        }
+
         model.render();
         shader->stop_using();
     }

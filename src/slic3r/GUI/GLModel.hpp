@@ -169,6 +169,12 @@ namespace GUI {
         const Geometry& get_geometry() const { return m_render_data.geometry; }
 
         void init_from(Geometry&& data);
+        // Rewrite the vertices of a model that is already on the GPU, keeping its layout,
+        // vertex count and indices. One glBufferSubData, instead of the destroy-and-recreate
+        // that init_from would need - which is what makes a quad redrawn every frame
+        // affordable. False if the model is not on the GPU yet, or the data does not match
+        // the layout it was built with.
+        [[nodiscard]] bool update_vertices(const std::vector<float>& vertices);
         void init_from(const TriangleMesh& mesh);
         void init_from(const indexed_triangle_set& its);
         void init_from(const Polygons& polygons, float z);
