@@ -2021,6 +2021,15 @@ void GLCanvas3D::render(bool only_init)
     //frame do not average into one meaningless number.
     PETKOS_PERF_SCOPE_AUX(Perf::Probe::CanvasRender, (int32_t) m_canvas_type);
 
+    //Whatever a frame asks about a plate's composed config, it asks with the presets frozen:
+    //nothing between the first draw call and the buffer swap can change a preset. Plates
+    //sharing a context therefore share one composition for the length of the frame.
+    //emplace rather than a ternary: the scope is deliberately non-copyable, so building the
+    //optional from a conditional expression would need a copy that does not exist.
+    std::optional<PresetBundle::ComposeScope> compose_scope;
+    if (wxGetApp().preset_bundle != nullptr)
+        compose_scope.emplace(*wxGetApp().preset_bundle);
+
     if (m_canvas == nullptr)
         return;
 

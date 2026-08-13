@@ -101,6 +101,7 @@ const char *const PROBE_NAMES[] = {
     "PlateListRenderLock", "ResolvePrinterBed", "SetShapes",     "ApplyPrinterToPlate",
     "BoardPaint",       "BoardThumbHeal",   "BoardRowLayout",   "BoardRowRefresh",
     "BoardReloadItems", "BoardReloadSize",  "BoardScopeRefresh",
+    "PlateSetShapeGeom", "PlateReflow",
     "SetPlatePrinter",
     "SppSnapshot",      "SppReresolve",     "SppApply",         "SppBedUpdate",
     "SppOutsideState",  "SppBoardRefresh",  "SppBackgroundProcess", "SelectPlate",

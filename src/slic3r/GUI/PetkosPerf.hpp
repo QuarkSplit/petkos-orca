@@ -39,6 +39,8 @@ enum class Probe : uint8_t {
     BoardReloadItems,      //  sync_glyph_targets + rebuild_items + clamp_scroll
     BoardReloadSize,       //  the best-size check and any parent Layout it triggers
     BoardScopeRefresh,     //  Sidebar::refresh_plate_scope, incl. the inspector
+    PlateSetShapeGeom,     //  PartPlate::set_shape - one plate's outline/grid rebuild
+    PlateReflow,           //  PartPlateList::reflow_layout, aux = plate count
     SetPlatePrinter,       //whole Plater::set_plate_printer, aux = plate index
     SppSnapshot,           //  its undo snapshot
     SppReresolve,          //  its preset re-resolution

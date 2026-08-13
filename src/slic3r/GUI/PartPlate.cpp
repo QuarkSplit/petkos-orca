@@ -4440,6 +4440,8 @@ void PartPlateList::reflow_layout()
 	if (m_plate_list.empty())
 		return;
 
+	PETKOS_PERF_SCOPE_AUX(Perf::Probe::PlateReflow, (int32_t) m_plate_list.size());
+
 	const int cols = std::max(1, m_plate_cols);
 	const size_t row_count = (m_plate_list.size() + cols - 1) / cols;
 
@@ -4627,8 +4629,12 @@ bool PartPlateList::set_plate_shape(int                         index,
 	//stamp the new bed on at the plate's current origin; reflow_layout then shuffles
 	//the neighbours around whatever footprint it turned out to be
 	const Vec2d current_origin = get_plate_origin_2d(index);
-	const bool changed = plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights,
-	                                      current_origin, height_to_lid, height_to_rod);
+	bool changed = false;
+	{
+		PETKOS_PERF_SCOPE(Perf::Probe::PlateSetShapeGeom);
+		changed = plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights,
+		                          current_origin, height_to_lid, height_to_rod);
+	}
 	if (!changed) {
 		//The outline did not move, but two printers can share an outline and differ
 		//in height (P1P vs X1E). set_pos_and_size applies the height override, and

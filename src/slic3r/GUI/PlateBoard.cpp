@@ -299,6 +299,12 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
 
     build_project_row(bundle, project_printer);
 
+    //Every row composes its plate's config to read which extruders it uses. Plates that
+    //share a printer, a process and a filament set share that answer, and in a real project
+    //most of them do - so the loop composes once per distinct context rather than once per
+    //plate. The scope ends with this function, which is what makes it safe.
+    const PresetBundle::ComposeScope compose_scope(bundle);
+
     const int count = plates.get_plate_count();
     m_rows.reserve((size_t) (count > 0 ? count : 0));
     for (int i = 0; i < count; ++i) {

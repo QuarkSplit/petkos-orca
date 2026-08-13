@@ -494,7 +494,78 @@ const ConfigOption *PresetBundle::plate_process_option(const PlateSlicingContext
     return presets.print->config.option(opt_key);
 }
 
+PresetBundle::ComposeTls &PresetBundle::compose_tls()
+{
+    thread_local ComposeTls tls;
+    return tls;
+}
+
+PresetBundle::ComposeScope::ComposeScope(const PresetBundle &bundle) : m_bundle(nullptr)
+{
+    ComposeTls &tls = compose_tls();
+    //Only the outermost scope on this thread owns the cache. A nested one records nothing
+    //and clears nothing, so a helper that opens its own scope cannot pull the answers out
+    //from under the loop that called it.
+    if (tls.depth == 0) {
+        tls.owner = &bundle;
+        m_bundle  = &bundle;
+    }
+    ++tls.depth;
+}
+
+PresetBundle::ComposeScope::~ComposeScope()
+{
+    ComposeTls &tls = compose_tls();
+    --tls.depth;
+    if (m_bundle == nullptr)
+        return;
+    //The owner leaves nothing behind. Anything composed inside the scope is gone with it,
+    //which is what makes the answers unable to outlive the operation that was safe to
+    //share them within.
+    tls.owner = nullptr;
+    tls.cache.clear();
+    tls.cache.shrink_to_fit();
+}
+
 bool PresetBundle::resolve_plate_slicing_config(const PlateSlicingContext             &context,
+                                               std::optional<std::vector<int>>         filament_maps,
+                                               std::optional<std::vector<int>>         filament_volume_maps,
+                                               ResolvedPlateSlicingConfig             &resolved,
+                                               std::string                            &error) const
+{
+    ComposeTls &tls = compose_tls();
+    //No scope on THIS thread - or one belonging to a different bundle - and this composes
+    //exactly as it always did.
+    if (tls.depth <= 0 || tls.owner != this)
+        return compose_plate_slicing_config(context, std::move(filament_maps), std::move(filament_volume_maps), resolved, error);
+
+    for (const ComposeCacheEntry &entry : tls.cache) {
+        if (entry.context == context && entry.filament_maps == filament_maps &&
+            entry.filament_volume_maps == filament_volume_maps) {
+            //A copy, not a composition: one whole-config copy against the six this would
+            //otherwise cost. The caller owns what it is given and several of them write
+            //plate overrides straight onto it, so handing out a reference would let one
+            //plate's overrides land on the next plate's config.
+            resolved = entry.resolved;
+            error    = entry.error;
+            return entry.ok;
+        }
+    }
+
+    ComposeCacheEntry entry;
+    entry.context              = context;
+    entry.filament_maps        = filament_maps;
+    entry.filament_volume_maps = filament_volume_maps;
+    entry.ok = compose_plate_slicing_config(context, filament_maps, filament_volume_maps, entry.resolved, entry.error);
+
+    resolved = entry.resolved;
+    error    = entry.error;
+    const bool ok = entry.ok;
+    tls.cache.push_back(std::move(entry));
+    return ok;
+}
+
+bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext             &context,
                                                 std::optional<std::vector<int>>         filament_maps,
                                                 std::optional<std::vector<int>>         filament_volume_maps,
                                                 ResolvedPlateSlicingConfig             &resolved,

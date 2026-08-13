@@ -282,8 +282,76 @@ public:
                                       ResolvedPlateSlicingConfig            &resolved,
                                       std::string                           &error) const;
 
+    // A window in which plates that share a slicing context share one composition.
+    //
+    // Composing tier 2 copies the printer, the process and every filament preset and then
+    // makes five whole-config passes. Thirty-six plates on one printer compose the same
+    // answer thirty-six times, which is what made a board rebuild and a frame both scale
+    // with the plate count.
+    //
+    // This is a SCOPE, not a cache with a lifetime. It exists between the constructor and
+    // the destructor of one of these and nowhere else, so there is no invalidation rule to
+    // get wrong - which is the whole point, because the value being shared is the one
+    // slicing reads. Inside one UI operation the preset collections and the project config
+    // cannot change, so the context and the two filament maps are the complete key.
+    //
+    // It is also per-THREAD, which is not a detail. The bundle is a global, and the arrange,
+    // fill-bed, orient and send jobs all compose against it from their own threads. A cache
+    // stored on the bundle would have one of them pushing into the very vector a frame was
+    // walking - a data race on the container, so a crash rather than a stale answer. A
+    // thread with no scope of its own composes directly, exactly as before.
+    //
+    // Open one around a loop over plates, or around a frame. Nesting is safe: only the
+    // outermost scope owns the cache.
+    class ComposeScope
+    {
+    public:
+        explicit ComposeScope(const PresetBundle &bundle);
+        ~ComposeScope();
+        ComposeScope(const ComposeScope &)            = delete;
+        ComposeScope &operator=(const ComposeScope &) = delete;
+
+    private:
+        const PresetBundle *m_bundle;
+    };
+
     // ORCA: utility function to find the vendor for a given preset name
     static std::string find_preset_vendor(const std::string& preset_name, Preset::Type type);
+
+private:
+    // The composition itself, with no scope involved. resolve_plate_slicing_config above is
+    // this plus a lookup, which keeps every early return in one place instead of at each of
+    // the eight points this can fail.
+    bool compose_plate_slicing_config(const PlateSlicingContext      &context,
+                                      std::optional<std::vector<int>> filament_maps,
+                                      std::optional<std::vector<int>> filament_volume_maps,
+                                      ResolvedPlateSlicingConfig     &resolved,
+                                      std::string                    &error) const;
+
+    struct ComposeCacheEntry
+    {
+        PlateSlicingContext             context;
+        std::optional<std::vector<int>> filament_maps;
+        std::optional<std::vector<int>> filament_volume_maps;
+        bool                            ok = false;
+        std::string                     error;
+        ResolvedPlateSlicingConfig      resolved;
+    };
+
+    // Per-thread, for the reason given on ComposeScope. `owner` is recorded so a scope
+    // opened on one bundle cannot answer for another, which costs one pointer compare and
+    // removes a whole class of question.
+    struct ComposeTls
+    {
+        const PresetBundle *            owner = nullptr;
+        int                             depth = 0;
+        // A short vector scanned linearly on purpose: a project holds a handful of distinct
+        // contexts, and hashing a context costs more than comparing four strings a few times.
+        std::vector<ComposeCacheEntry>  cache;
+    };
+    static ComposeTls &compose_tls();
+
+public:
 
     PresetBundle();
     PresetBundle(const PresetBundle &rhs);
