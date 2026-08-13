@@ -5252,7 +5252,7 @@ void Sidebar::refresh_plate_scope()
     if (p->plate_board != nullptr)
         p->plate_board->set_scope(m_scoped_plates, m_scope_project);
     if (p->plate_inspector != nullptr)
-        p->plate_inspector->reload(m_scoped_plates, m_scope_project);
+        p->plate_inspector->reload(p->plate_board->model(), m_scoped_plates, m_scope_project);
     //The project printer row is the PROJECT scope's destination, so it says when it is the
     //thing the inspector is describing - exactly as the board's rollup does for itself.
     //Without this the scope could be entered and nothing on screen said which row was in it.

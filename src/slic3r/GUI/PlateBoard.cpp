@@ -3319,7 +3319,7 @@ void PlateInspector::on_bed_type_selected()
     CallAfter([plater]() { plater->update(); });
 }
 
-void PlateInspector::reload(const std::vector<int> &scoped_plates, bool project_scope)
+void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int> &scoped_plates, bool project_scope)
 {
     //is_initialized(): the inspector is built inside Plater::priv's constructor, where
     //there is no plate list and no resolver to ask. Every one of the crashes this guard
@@ -3327,8 +3327,8 @@ void PlateInspector::reload(const std::vector<int> &scoped_plates, bool project_
     if (m_plater == nullptr || !m_plater->is_initialized() || wxGetApp().preset_bundle == nullptr)
         return;
 
-    PlateBoardModel model;
-    model.rebuild(m_plater->get_partplate_list(), *wxGetApp().preset_bundle);
+    //The board rebuilt this immediately above us, in the one call that owns it. Building a
+    //second one here doubled the cost of every plate click for a model that is only read.
     const std::vector<PlateBoardRow> &rows = model.rows();
 
     //only members that name a real row: if the set is ever handed an index the model has

@@ -318,6 +318,10 @@ public:
 
     //Called by the sidebar's selection sink. Idempotent.
     void on_plate_selection_changed(int current_plate);
+    //The rows the board has already computed. Published so nothing else has to build a
+    //second copy of them: a rebuild is O(plates) whole-config compositions, and the
+    //inspector used to pay that a second time for a model it only ever read.
+    const PlateBoardModel &model() const { return m_model; }
 
     //The scope set, for rendering only. Sidebar::m_scoped_plates owns it, exactly as
     //PartPlateList::m_current_plate owns the current plate; the board stores neither and
@@ -522,7 +526,7 @@ public:
 
     //scoped_plates is Sidebar::m_scoped_plates verbatim. Safe to call before the plater
     //finishes constructing: it checks Plater::is_initialized() and draws nothing.
-    void reload(const std::vector<int> &scoped_plates, bool project_scope);
+    void reload(const PlateBoardModel &model, const std::vector<int> &scoped_plates, bool project_scope);
 
 private:
     void build_rows();
