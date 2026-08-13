@@ -19420,6 +19420,12 @@ PartPlateList& Plater::get_partplate_list()
 bool Plater::resolve_plate_slicing_config(PartPlate *plate, ResolvedPlateSlicingConfig &resolved,
                                           std::string &error, bool apply_plate_overrides) const
 {
+    //Perf: the SECOND entry into the same whole-config composition. The first probe only
+    //wrapped PartPlate.cpp's file-static helper, so a reading of "the tier-2 compose never
+    //fires during a frame" was true of that helper and false of the app - this path fired
+    //eleven times a frame and the instrument could not see it. An instrument with a hole in
+    //it is worse than none, because it is believed.
+    PETKOS_PERF_SCOPE(Perf::Probe::ResolvePlateContext);
     error.clear();
     PresetBundle *bundle = wxGetApp().preset_bundle;
     if (plate == nullptr) {
