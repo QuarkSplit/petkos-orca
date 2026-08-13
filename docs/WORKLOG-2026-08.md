@@ -1418,14 +1418,47 @@ includes the variance collapsing, and one run cannot say that.
 **The same mechanism has a third costume, in the board.** `PartPlate::get_extruders(true)` calls
 `resolve_plate_context` — one whole-config composition — to read ten `opt_int` values, and
 `PlateBoardModel::rebuild` calls it **once per plate**. At 36 plates that is ~36 ms of the 84 ms
-`SppBoardRefresh`, which is the largest phase of the 133 ms `SetPlatePrinter` click, itself inside a
-461 ms `PrinterAssign` first paint — the one interaction that did **not** improve today.
+`SppBoardRefresh`, which is the largest phase of the `SetPlatePrinter` click, itself inside the
+`PrinterAssign` first paint — still the worst interaction in the app at roughly 300 ms.
+
+That figure needs its caveat stated, because a single run misled this entry once already.
+`PrinterAssign` samples **twice per run**, and after the fix it reads 461, 184, 305 and 250 ms
+across four runs against a tight 401, 425, 418 before it. So it did improve, by something like a
+quarter, and the spread is far too wide to quote a number to three digits. `PlateSwitch` samples
+eleven times a run and is unambiguous: 153, 164, 170 before against 57, 45, 72, 66 after.
+**Interaction spans with n=2 are for direction, not magnitude.**
 
 It is deliberately not fixed in this pass. The frame fix was safe because it caches nothing across
 frames; the board fix is a cache with a real invalidation design, and the value being cached feeds
 **slicing**, where a stale config is a wrong G-code rather than a slow list. The right shape is the
 epoch counter on `Plater` already named in the 2026-08-11 deferrals for per-plate thumbnails — one
 counter would retire both — and it wants its own pass with a build behind it.
+
+### The toolbar quad, and a claim that had to be built out to be checked
+
+`GLTexture::render_sub_texture` draws every toolbar button, gizmo icon and all nine slices of every
+toolbar border. It used to build a `GLModel` per quad — a VAO and two buffers created, uploaded,
+drawn and destroyed, about twenty GL calls and six GPU object lifetimes per square — around a
+hundred times a frame. It now keeps one quad for the life of the GL context and rewrites its four
+vertices per draw (`GLModel::update_vertices`, one 64-byte `glBufferSubData`), released from
+`OpenGLManager`'s destructor because a GL object freed after its context is a crash at exit rather
+than a leak.
+
+**Its comment claimed 22.6 ms a frame and no run supported that.** With the change in, the frame
+measured 86.6 ms against 88.6 without — inside an 86–101 ms run-to-run spread. The claim was
+inherited from the flat overlay cost, which turned out to be the config composition above.
+
+Settled by building it out and back in, now that nothing dwarfs it: **11.1 and 8.7 ms without,
+6.4 and 5.8 ms with.** Worth 3–5 ms, roughly a third of the remaining frame, of which only ~1.5 ms
+is the overlay draw itself (`RenderOverlays` ~2.9 → 1.39). The rest lands on work that draws no
+textures at all — `ResolvePlateContext` 1.42 → 1.05 ms, `BoardRowLayout` 39.5 → 25.8 — which is the
+allocator tax again, from a different source.
+
+Two method notes from that check. **The first out-build measured 11.1 ms straight off a
+seventeen-minute all-core compile; repeating it on a settled machine gave 8.7.** A measurement taken
+immediately after a long build is a measurement of a hot machine. And **reverting a change that
+touches a widely-included header costs the wide rebuild twice**, once out and once back — worth it
+to replace a guess with a number, but budget for it.
 
 ### Tooling
 
@@ -1434,3 +1467,112 @@ normal priority: minutes rather than the ~20 of `build_release_vs2022.bat`, whic
 test binaries, runs gettext and installs ~8,000 resource files that no code change touches.
 **Polling a build log in a loop is what fills a session's context** — wait on one blocking call.
 Touching a widely-included header such as `GLModel.hpp` still costs a wide rebuild.
+
+## Work log — 2026-08-13, second half (the click, and two faults that were forging the numbers)
+
+The frame was the morning's work. The afternoon's is the printer-assign click, which is the
+interaction this fork exists to make good: upstream's is worse, and a fleet slicer whose
+"put this plate on that machine" costs half a second is arguing against itself.
+
+### Two measurement faults, found in the middle of it
+
+**A stray `find / -name brush.h` from the previous session had been running since 09:55.** Seven
+hours, most of a core, through every measurement taken today. Killed. Nothing in the harness would
+have shown it: the perf runs report the app's own spans, not what else the machine is doing.
+
+**And the room.** London heatwave, 38 C outside, and the laptop is thermally limited: the CPU sat
+at 133% of base during runs against a 180% ceiling, and the same binary measured 11.1 ms straight
+off a long build and 8.7 ms settled.
+
+Together those make **every cross-run comparison taken hours apart worthless on this machine.**
+What survives, and what this entry quotes:
+
+- **within-run ratios** - two spans measured in the same process, which share whatever clock the
+  machine happened to be running at
+- **back-to-back A/B runs** - build out, measure, build in, measure, nothing else in between
+
+Quoting a number to three digits across a session boundary is now a stated error here, not a
+stylistic preference.
+
+### The board was O(plates) for an O(1) change (`0acf25f8c5`)
+
+Assigning a printer to one plate rebuilt all 36 rows, and every row composes a whole config to
+read which extruders its plate uses.
+
+The model now separates **reading** a row from **deriving** what follows from the row set. The
+rollup totals, the glyph reference and the grouping are pure functions of `m_rows`, so deriving
+them instead of accumulating them inside the read loop is what lets one row change and every total
+stay correct. `refresh_plate()` re-reads one row and derives the rest.
+
+It **declines rather than guesses**: it patches the model in place, so it only does so while the
+model is provably still describing this plate list, and otherwise returns false and the caller does
+a full rebuild. An optimisation that can decline is not a second source of truth that can drift.
+
+  BoardRowRefresh  1.5-1.7 ms  against BoardRowLayout 29-34 ms, same run
+  SppBoardRefresh  64% of the click before, 9% after
+
+The three probes added alongside settle what the rest of a board reload costs: item rebuild
+0.006 ms, sizer pass 0.016 ms, inspector 2.5 ms. The old 83 ms was almost entirely the model.
+
+### One composition per context, for as long as one operation lasts (`a05d8fbcb6`)
+
+The board fix removed the O(plates) rebuild from *one* click. `PresetBundle::ComposeScope` removes
+the O(plates) composition from every path that still has one, which is the mechanism rather than
+the instance.
+
+Inside one operation the preset collections and the project config cannot change, so a plate's
+slicing context plus its two filament maps is the complete key, and plates sharing a context share
+one composition.
+
+**It is a scope, not a cache with a lifetime.** It exists between a constructor and a destructor
+and nowhere else, and the owner clears it on the way out. That is deliberate: the value being
+shared is the one slicing reads, so rather than write an invalidation rule and hope it covers every
+mutation site, nothing is permitted to outlive the operation it was safe to share within.
+
+**It is per-thread, and that was nearly a crash.** The bundle is a global, and ArrangeJob,
+FillBedJob, OrientJob and SendJob all compose against it from their own threads. A cache stored on
+the bundle would have had a background job pushing into the very vector a frame was walking - a
+data race on the container, so a crash rather than a stale answer. Caught by asking who else calls
+the function, before the first build of it finished. A thread with no scope of its own composes
+exactly as it always did, and the owning bundle is recorded so a scope opened on one bundle cannot
+answer for another.
+
+Cache hits still copy the resolved config rather than return a reference, because several callers
+apply that plate's own overrides straight onto what they are handed, and a reference would land one
+plate's overrides on the next plate's config. One whole-config copy against six is the win.
+
+  composition, per call   1.50 ms -> 0.39 ms
+  full board rebuild      34.2 ms -> 7.1 ms
+  plate switch, painted   75.8 ms -> 25.5 ms
+  frame                   9.75 ms -> 7.48 ms
+
+### What the click is made of now, and where the next work is
+
+`SetPlatePrinter` is ~51 ms of work followed by a ~198 ms wait for the first paint. Neither half is
+presets any more.
+
+**`PartPlateList::reflow_layout` is 22.6 ms mean and 79 ms at worst**, and the mechanism is named:
+`PartPlate::reposition()` calls `set_shape()`, which regenerates the plate's render data, and
+reflow calls it for every plate. `set_shape` does early-out on an unchanged shape, but only after
+translating and allocating three point vectors, and a plate that genuinely moved pays the full
+~2.4 ms rebuild.
+
+The fault underneath is that **a plate's position is baked into its geometry rather than being a
+transform.** `m_shape_local` exists because somebody already met this and stopped halfway: the
+untranslated profile is kept, but `m_shape` is still world-space and every move rewrites it. Moving
+a plate should be a matrix, not a regeneration. That is the fix, and it reaches the plate's render
+path, its picking and its `contains()` tests, so it wants its own pass.
+
+**The ~198 ms to first paint is not the driver.** The perf driver runs on `wxEVT_IDLE` with
+`RequestMore()`, and idle runs after paints, so the gap is real event-loop and paint latency rather
+than harness pacing. Inside it sits the board's thumbnail heal: a 512x512 offscreen GL render
+issued from **inside the paint handler**, 44 ms, and an assign invalidates the thumbnail of the
+plate it changed, so the click pays it every time. A paint should never block on a render it could
+do afterwards.
+
+### Startup logs at info, and it is mostly presets
+
+A measured run writes a 1.9 MB log: 7,986 info lines, of which **7,718 are preset loading** -
+`PresetCollection::set_printer_hold_alias` 5,573 times and `Preset::set_visible_from_appconfig`
+2,145. That is startup, not the frame, and startup is 12 s. It is also the category of thing that
+rides through a perf run unnoticed, so it is written down here rather than left to be rediscovered.
