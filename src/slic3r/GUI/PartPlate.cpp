@@ -5156,6 +5156,33 @@ int PartPlateList::create_plate(bool adjust_position)
 
 	origin = compute_origin(new_index, cols);
 	plate = new PartPlate(this, origin, m_plate_width, m_plate_depth, m_plate_height, m_plater, m_model, true, printer_technology);
+
+	//PetkosOrca: a new plate is born on a machine, not on nothing.
+	//
+	//It used to be born with an EMPTY slicing context, which the resolver reads as "follow the
+	//project printer". That empty field is the single-printer assumption encoded: it is the reason
+	//there has to be a project printer at all, the reason a plate can be "unresolved", and the
+	//reason the sidebar could not say which machine a pick was for. A plate that always carries its
+	//own complete identity has none of those questions.
+	//
+	//It copies the plate it was created from, which is what makes the ordinary case work without a
+	//project-wide default: pick a printer on plate 1, add plate 2, and plate 2 is already on it.
+	//Falling back to the project selection happens only for the very first plate, where there is no
+	//sibling to copy and the selection is the only machine the app knows about.
+	//get_curr_plate() indexes m_plate_list without a bounds check, and the list is empty while the
+	//FIRST plate is being made, so the index has to be checked here rather than there.
+	const PartPlate *source = (m_current_plate >= 0 && m_current_plate < (int) m_plate_list.size())
+		? m_plate_list[m_current_plate] : nullptr;
+	if (source != nullptr && source->has_slicing_context_assignment()) {
+		PlateSlicingContext seeded = source->get_slicing_context();
+		//Geometry and results belong to the plate that made them, never to the copy.
+		plate->set_slicing_context(seeded);
+	} else if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr &&
+			bundle->printers.get_selected_idx() != size_t(-1)) {
+		PlateSlicingContext seeded;
+		seeded.printer_preset_name = bundle->printers.get_selected_preset_name();
+		plate->set_slicing_context(seeded);
+	}
 	assert(plate != NULL);
 
 	if (printer_technology == ptFFF)
@@ -7028,7 +7055,33 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
 		m_plate_list[index]->set_sliced_config(plate_data_list[i]->sliced_config);
 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
-		m_plate_list[index]->set_slicing_context(plate_data_list[i]->slicing_context);
+		{
+			//PetkosOrca: fill in at the boundary rather than tolerating a hole behind it.
+			//
+			//A project written by upstream Orca, or by this fork before plates carried their own
+			//identity, has plates with no printer name. Read verbatim that means "follow the project",
+			//which is the fallback this fork says must not exist. Resolving it HERE - once, at the one
+			//place a project enters the app - is what lets everything downstream assume a plate is
+			//complete, instead of every consumer carrying its own "and if it is empty..." branch.
+			PlateSlicingContext context = plate_data_list[i]->slicing_context;
+			if (PresetBundle *bundle = wxGetApp().preset_bundle; bundle != nullptr) {
+				//A project DECLARES a printer, a process and its filaments. Whatever it declares is
+				//written onto every plate that did not carry its own, so the project arrives fully
+				//populated in this fork's model rather than half in it. A Bambu project opens with
+				//every plate on the Bambu machine, named, which is what it always meant - it simply
+				//said it once at the top instead of once per plate.
+				if (context.printer_preset_name.empty() && bundle->printers.get_selected_idx() != size_t(-1))
+					context.printer_preset_name = bundle->printers.get_selected_preset_name();
+				if (context.print_preset_name.empty() && bundle->prints.get_selected_idx() != size_t(-1))
+					context.print_preset_name = bundle->prints.get_selected_preset_name();
+				if (context.filament_preset_names.empty())
+					context.filament_preset_names = bundle->filament_presets;
+				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": plate " << (index + 1) << " opens on '"
+					<< context.printer_preset_name << "' / '" << context.print_preset_name << "' with "
+					<< context.filament_preset_names.size() << " filament(s)";
+			}
+			m_plate_list[index]->set_slicing_context(context);
+		}
 		if (plate_data_list[i]->plate_index != index)
 		{
 			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;

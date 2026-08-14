@@ -214,9 +214,11 @@ private:
             } else {
                 const int count = plater->get_partplate_list().get_plate_count();
                 const int plate = count > 0 ? (m_done % count) : 0;
-                //alternate between a named printer and clearing back to the project, so
-                //both write paths get timed rather than only the one
-                const std::string &name = (m_done % 2 == 0) ? m_assign_presets.front() : m_empty;
+                //Alternate between the two collected presets. This used to alternate a named
+                //printer with an EMPTY name to time the "clear back to the project" path as well;
+                //a plate always names a printer now, so that path does not exist and an empty name
+                //is refused. Two real presets keep the assignment being timed a real one.
+                const std::string &name = m_assign_presets[m_done % m_assign_presets.size()];
                 plater->set_plate_printer(plate, name);
                 ++m_done;
                 m_quiet = 20;
@@ -596,7 +598,6 @@ private:
     int                      m_pick_miss = 0;
     int                      m_pick_off = 0;
     std::vector<std::string> m_assign_presets;
-    const std::string        m_empty;
 };
 
 } // namespace
