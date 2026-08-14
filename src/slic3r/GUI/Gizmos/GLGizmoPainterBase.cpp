@@ -1346,18 +1346,28 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
         }
     }
 
+    // A patch may carry any state up to EnforcerBlockerType::ExtruderMax, because the painting belongs to the
+    // object and outlives whichever machine the editing cursor is currently showing. m_ebt_colors only has an
+    // entry per slot that machine has, so the state is not an index into it - looking at four-material paint
+    // while the cursor sits on a one-slot machine read past the end of the vector. Entry 0 is the volume's own
+    // filament, which is exactly what the slicer prints a facet in when its painted slot is absent (see
+    // Print::object_extruders), so an unavailable slot draws as what will actually come out of the nozzle.
+    auto patch_color = [this](size_t color_idx) {
+        if (m_ebt_colors.empty())
+            return GLVolume::NEUTRAL_COLOR;
+        return m_ebt_colors[color_idx < m_ebt_colors.size() ? color_idx : 0];
+    };
+
     for (size_t buffer_idx = 0; buffer_idx < m_triangle_patches.size(); ++buffer_idx) {
         if (this->has_VBOs(buffer_idx)) {
             const TrianglePatch& patch = m_triangle_patches[buffer_idx];
             ColorRGBA color;
             if (patch.is_fragment() && !patch.neighbor_types.empty()) {
-                size_t color_idx = (size_t)*patch.neighbor_types.begin();
-                color = m_ebt_colors[color_idx];
+                color = patch_color((size_t)*patch.neighbor_types.begin());
                 color.a(0.85);
             }
             else {
-                size_t color_idx = (size_t)patch.type;
-                color = m_ebt_colors[color_idx];
+                color = patch_color((size_t)patch.type);
             }
             //to make black not too hard too see
             ColorRGBA new_color = adjust_color_for_rendering(color);

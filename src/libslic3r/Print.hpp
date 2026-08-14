@@ -907,6 +907,18 @@ enum FilamentCompatibilityType {
     InvalidTemperatureRange
 };
 
+// A plate's machine carries a fixed number of filament slots, and an object may be painted for more of them
+// than this machine has. That is a translation to perform at slice time, never a reason to refuse the slice
+// and never a reason to touch what the user painted: the paint belongs to the object and outlives any one
+// plate's machine. Multi-material segmentation already ignores painted states above the slot count, because
+// it only projects states below filament_colour.size() + 1, so a facet painted for a slot this machine does
+// not have prints in its volume's own filament. This collects the same view for everything that asks which
+// filaments an object uses - tool ordering, the prime tower, filament maps - so those agree with the
+// geometry instead of emitting a tool change to a filament that does not exist.
+// Appends the 0-based filament indices the volume's painting names and that this machine has; returns how
+// many painted states were above the limit, so one caller per slice can say so.
+size_t collect_volume_painted_extruders(const ModelVolume &mv, size_t filament_count, std::vector<unsigned int> &object_extruders);
+
 // The complete print tray with possibly multiple objects.
 class Print : public PrintBaseWithState<PrintStep, psCount>
 {

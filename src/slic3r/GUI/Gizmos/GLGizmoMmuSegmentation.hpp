@@ -136,6 +136,9 @@ private:
 
     void init_model_triangle_selectors();
 
+    // A filament slot a volume names may not exist on the machine this plate is assigned to.
+    int  extruder_color_index(int extruder_id) const;
+
     // ORCA
     bool draw_color_button(int idx, std::string id_str, const ColorRGBA& color, ColorRGBA& map_color, bool active, float scale);
 

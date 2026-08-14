@@ -713,6 +713,14 @@ void GLGizmoMmuSegmentation::update_model_object()
     }
 }
 
+// The 0-based palette entry for a 1-based filament slot, for a machine that may not have that slot. See
+// init_model_triangle_selectors for why an absent slot resolves to the first one.
+int GLGizmoMmuSegmentation::extruder_color_index(int extruder_id) const
+{
+    const int idx = std::max(0, extruder_id - 1);
+    return idx < int(m_extruders_colors.size()) ? idx : 0;
+}
+
 void GLGizmoMmuSegmentation::init_model_triangle_selectors()
 {
     const ModelObject *mo = m_c->selection_info()->model_object();
@@ -731,7 +739,11 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
         if (!mv->is_model_part())
             continue;
 
-        int extruder_idx = (mv->extruder_id() > 0) ? mv->extruder_id() - 1 : 0;
+        // A volume can name a filament slot the plate's current machine does not have - it is the same fact
+        // as painting for one, and the same rule applies: the assignment is kept and the engine prints it in
+        // the first slot (PrintRegion::collect_object_printing_extruders). Entry 0 of ebt_colors is what
+        // unpainted facets draw as, so it follows the engine rather than reading past the end of the palette.
+        int extruder_idx = extruder_color_index(mv->extruder_id());
         std::vector<ColorRGBA> ebt_colors;
         ebt_colors.push_back(m_extruders_colors[size_t(extruder_idx)]);
         ebt_colors.insert(ebt_colors.end(), m_extruders_colors.begin(), m_extruders_colors.end());
@@ -740,8 +752,12 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
         const TriangleMesh* mesh = &mv->mesh();
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors, 0.2));
         // Reset of TriangleSelector is done inside TriangleSelectorMmGUI's constructor, so we don't need it to perform it again in deserialize().
-        EnforcerBlockerType max_ebt = (EnforcerBlockerType)std::min(m_extruders_colors.size(), (size_t)EnforcerBlockerType::ExtruderMax);
-        m_triangle_selectors.back()->deserialize(mv->mmu_segmentation_facets.get_data(), false, max_ebt);
+        // The selector is read back into the volume by update_model_object() on the first edit, so whatever it
+        // declines to load here is destroyed rather than merely hidden. Capping the load at the count of slots
+        // the cursor's machine currently has therefore erased a four-material object's painting the moment its
+        // owner opened this gizmo on a one-slot plate. The full painting loads; TriangleSelectorPatch::render
+        // is what decides how a slot this machine does not have is drawn.
+        m_triangle_selectors.back()->deserialize(mv->mmu_segmentation_facets.get_data(), false);
         m_triangle_selectors.back()->request_update_render_data();
         m_triangle_selectors.back()->set_wireframe_needed(true);
         m_volumes_extruder_idxs.push_back(mv->extruder_id());
@@ -752,8 +768,7 @@ void GLGizmoMmuSegmentation::update_triangle_selectors_colors()
 {
     for (int i = 0; i < m_triangle_selectors.size(); i++) {
         TriangleSelectorPatch* selector = dynamic_cast<TriangleSelectorPatch*>(m_triangle_selectors[i].get());
-        int extruder_idx = m_volumes_extruder_idxs[i];
-        int extruder_color_idx = std::max(0, extruder_idx - 1);
+        int extruder_color_idx = extruder_color_index(m_volumes_extruder_idxs[i]);
         std::vector<ColorRGBA> ebt_colors;
         ebt_colors.push_back(m_extruders_colors[extruder_color_idx]);
         ebt_colors.insert(ebt_colors.end(), m_extruders_colors.begin(), m_extruders_colors.end());

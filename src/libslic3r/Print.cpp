@@ -464,6 +464,21 @@ bool Print::is_step_done(PrintObjectStep step) const
     return true;
 }
 
+// See the declaration in Print.hpp for the rule this implements.
+size_t collect_volume_painted_extruders(const ModelVolume &mv, size_t filament_count, std::vector<unsigned int> &object_extruders)
+{
+    size_t over_limit = 0;
+    for (int extruder : mv.get_extruders()) {
+        assert(extruder > 0);
+        if (extruder > int(filament_count)) {
+            ++ over_limit;
+            continue;
+        }
+        object_extruders.push_back(unsigned(extruder - 1));
+    }
+    return over_limit;
+}
+
 // returns 0-based indices of used extruders
 std::vector<unsigned int> Print::object_extruders() const
 {
@@ -475,15 +490,11 @@ std::vector<unsigned int> Print::object_extruders() const
 		for (const PrintRegion &region : object->all_regions())
         	region.collect_object_printing_extruders(*this, extruders);
 
+    const size_t filament_count = m_config.filament_colour.size();
     for (const PrintObject* object : m_objects) {
         const ModelObject* mo = object->model_object();
-        for (const ModelVolume* mv : mo->volumes) {
-            std::vector<int> volume_extruders = mv->get_extruders();
-            for (int extruder : volume_extruders) {
-                assert(extruder > 0);
-                extruders.push_back(extruder - 1);
-            }
-        }
+        for (const ModelVolume* mv : mo->volumes)
+            collect_volume_painted_extruders(*mv, filament_count, extruders);
 
         // layer range
         for (auto layer_range : mo->layer_config_ranges) {
@@ -491,8 +502,10 @@ std::vector<unsigned int> Print::object_extruders() const
                 //BBS: actually when user doesn't change filament by height range(value is default 0), height range should not save key "extruder".
                 //Don't know why height range always save key "extruder" because of no change(should only save difference)...
                 //Add protection here to avoid overflow
+                // Same rule as the painted states above: a height range naming a slot this machine does not
+                // have contributes no filament to this plate rather than a tool change to one that is absent.
                 auto value = layer_range.second.option("extruder")->getInt();
-                if (value > 0)
+                if (value > 0 && value <= int(filament_count))
                     extruders.push_back(value - 1);
             }
         }
@@ -1330,6 +1343,26 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     if (m_objects.empty())
         return {std::string()};
+
+    // A plate whose machine has fewer filament slots than its objects reference still slices, and says so
+    // once. Nothing in the project is changed - the painting and the per-object assignments are the user's
+    // and they outlive any one plate's machine (see collect_volume_painted_extruders) - so the sentence
+    // carries the two numbers that explain the difference and nothing else. One message per slice, not one
+    // per object or per facet: a message that grows with the count of things it is about fails hardest at
+    // the moment it matters most.
+    {
+        int highest_used = 0;
+        for (const PrintObject *object : m_objects)
+            for (const ModelVolume *mv : object->model_object()->volumes)
+                for (int used : mv->get_extruders())
+                    highest_used = std::max(highest_used, used);
+        const int filament_count = int(m_config.filament_colour.size());
+        if (highest_used > filament_count)
+            warn((boost::format(L("Plate %1% uses filament %2%, and the printer assigned to it has %3%. "
+                                  "Filaments above %3% are not on this machine, so those regions print in one that is. "
+                                  "Nothing in the project was changed."))
+                  % (this->get_plate_index() + 1) % highest_used % filament_count).str());
+    }
 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };

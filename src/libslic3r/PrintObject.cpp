@@ -4308,14 +4308,12 @@ std::vector<unsigned int> PrintObject::object_extruders() const
     for (const PrintRegion &region : this->all_regions())
         region.collect_object_printing_extruders(*this->print(), extruders);
 
+    // Same view of the painting as Print::object_extruders(): a painted slot this plate's machine does not
+    // have contributes no filament here, because multi-material segmentation will not project it either.
+    const size_t filament_count = this->print()->config().filament_colour.size();
     const ModelObject* mo = this->model_object();
-    for (const ModelVolume* mv : mo->volumes) {
-        std::vector<int> volume_extruders = mv->get_extruders();
-        for (int extruder : volume_extruders) {
-            assert(extruder > 0);
-            extruders.push_back(extruder - 1);
-        }
-    }
+    for (const ModelVolume* mv : mo->volumes)
+        collect_volume_painted_extruders(*mv, filament_count, extruders);
     sort_remove_duplicates(extruders);
     return extruders;
 }
