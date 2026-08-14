@@ -194,19 +194,25 @@ private:
     // Exact effective configuration that produced the retained G-code. Live
     // plate overrides are resolved separately and never overwrite this snapshot.
     DynamicPrintConfig m_sliced_config;
+    //Why a retained slice this plate ARRIVED with was dropped at load (version skew, missing
+    //presets). Non-empty only while nothing is attached: any freshly set sliced config clears
+    //it, because the reason describes a slice that no longer exists, not this one.
+    std::string m_sliced_config_dropped_reason;
 
-    // Plate-owned context. Empty fields explicitly inherit the corresponding
-    // Project-row defaults; named presets are always resolved exactly.
+    // Plate-owned context, and the only holder of it. An empty field is not
+    // inheritance - there is no project printer behind it - it is a plate that has not
+    // been given one yet, which PartPlateList::complete_plate_contexts fixes at the
+    // moment the plate comes into being. See PlateSlicingContext.hpp.
     std::string m_printer_preset_name;
     std::string m_printer_vendor_id;
     std::string m_print_preset_name;
     std::vector<std::string> m_filament_preset_names;
     std::string m_physical_printer_id;
 
-    // Printable height of the assigned printer, 0 meaning "follow the project
-    // printer". Applied inside set_pos_and_size so that every code path that
-    // (re)sizes this plate — reflow, delete, project-printer change — keeps the
-    // assigned machine's height instead of stamping the list-wide one back on.
+    // Printable height of this plate's own printer, 0 meaning it has not been applied
+    // yet. Applied inside set_pos_and_size so that every code path that (re)sizes this
+    // plate - reflow, delete, reassignment - keeps the machine's own height instead of
+    // stamping the list-wide one back on.
     double m_printable_height { 0.0 };
 
     // SoftFever
@@ -370,8 +376,8 @@ public:
     //set the plate's name
     void set_plate_name(const std::string& name);
 
-    //Printer preset this plate is assigned to. Empty means the plate follows the
-    //project's printer, which is how every plate behaved before per-plate machines.
+    //The printer this plate prints on. Never empty in a live project: see
+    //PartPlateList::complete_plate_contexts.
     const std::string& get_printer_preset_name() const { return m_printer_preset_name; }
     void set_printer_preset_name(const std::string& name)
     {
@@ -382,12 +388,28 @@ public:
         //the plate renders its machine next to its name, so the name texture is stale now
         invalidate_plate_name_texture();
     }
+    //True once the plate has been given a printer, which every live plate has. Kept as a
+    //name for the question rather than inlined, because the two moments where it is
+    //genuinely false - a plate mid-construction, and a project written before per-plate
+    //machines - are the two moments completion exists for.
     bool has_printer_assignment() const { return !m_printer_preset_name.empty(); }
-    bool has_slicing_context_assignment() const
-    {
-        return !m_printer_preset_name.empty() || !m_printer_vendor_id.empty()
-            || !m_print_preset_name.empty() || !m_filament_preset_names.empty();
-    }
+    bool has_complete_context() const { return get_slicing_context().is_complete(); }
+
+    //How many PROCESS settings this plate carries of its own, on top of the process it
+    //names. Not a count of every key in m_config: bed type, print sequence, spiral mode and
+    //the filament maps have had their own per-plate controls since long before this and
+    //have their own rows in the UI, so counting them here would report a plate as edited
+    //for having a bed type.
+    //
+    //It exists because a plate that names "0.20 Standard" and then overrides twelve of its
+    //values is not describing itself by the name alone. A translation from another machine
+    //produces exactly that state, and a row that showed only the name would be a half-truth
+    //about settings somebody chose.
+    size_t process_override_count() const;
+    std::vector<std::string> process_override_keys() const;
+    //Drop them. The user's own choice, offered because a carried set is still a set of
+    //values they may not want; never done on their behalf.
+    void clear_process_overrides();
 
     PlateSlicingContext get_slicing_context() const
     {
@@ -409,8 +431,8 @@ public:
     const std::vector<std::string>& get_filament_preset_names() const { return m_filament_preset_names; }
     const std::string& get_physical_printer_id() const { return m_physical_printer_id; }
 
-    //How tall this plate can print: the assigned printer's height when it has one,
-    //otherwise whatever the plate was last sized to (the project printer's height).
+    //How tall this plate can print: its printer's height once the bed has been applied,
+    //and whatever the plate was last sized to before that.
     double get_printable_height() const { return m_printable_height > 0.0 ? m_printable_height : (double)m_height; }
     void set_printable_height(double height) { m_printable_height = height; }
 
@@ -606,8 +628,10 @@ public:
     //from the plate's GCodeResult, so they survive a reopen and never report another
     //plate's figures; the Print object they used to come from is rebuilt per slice.
     bool get_retained_print_statistics(float &print_time_seconds, double &weight_grams) const;
-    void set_sliced_config(const DynamicPrintConfig &config) { m_sliced_config = config; }
+    void set_sliced_config(const DynamicPrintConfig &config) { m_sliced_config = config; m_sliced_config_dropped_reason.clear(); }
     const DynamicPrintConfig &get_sliced_config() const { return m_sliced_config; }
+    const std::string &sliced_config_dropped_reason() const { return m_sliced_config_dropped_reason; }
+    void set_sliced_config_dropped_reason(const std::string &reason) { m_sliced_config_dropped_reason = reason; }
 
     //is slice result ready for print
     bool is_slice_result_ready_for_print() const { return is_slice_result_ready_for_print(is_slice_result_valid()); }
@@ -692,7 +716,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -710,7 +734,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {
@@ -1055,8 +1079,53 @@ public:
     //CLI mode there is no wxApp instance to read it from, so a named assignment reports
     //failure instead of being substituted.
     bool resolve_printer_bed(const std::string &preset_name, PlateBed &bed) const;
-    //Give one plate the bed of its exact assigned printer. An empty assignment explicitly
-    //inherits the Project row; a missing named preset is an error.
+
+    //GIVE EVERY PLATE A COMPLETE CONTEXT OF ITS OWN.
+    //
+    //This is what replaces the project printer. The old rule - an empty field reads as
+    //the globally selected preset - ran on every slice, every frame and every board
+    //rebuild, and it is the whole of why a project could hold several machines in its
+    //data and still slice on one. This runs once per plate instead, at the two moments a
+    //plate can exist without a context: it has just been created, or it came out of a
+    //project written before per-plate machines. After it, every field is a name the
+    //plate owns.
+    //
+    //Each plate is seeded from the previous complete one, so a new plate lands on the
+    //machine the user was already working on and a legacy project keeps whatever
+    //machines it did record. Only when no plate has one is the current preset selection
+    //read, because a first plate has to come from somewhere.
+    //
+    //Returns how many plates it completed. Does nothing in CLI mode, which resolves
+    //plate contexts against the project config loaded from the 3MF and never through the
+    //preset bundle.
+    //A plate in an EXISTING session. Each plate is completed from the last complete one,
+    //so a new plate lands on the machine the user is already working on. Only when no plate
+    //has a context at all is the bundle's current selection used - the first plate of a
+    //session, where the selection is a real remembered choice and the only holder there is.
+    int complete_plate_contexts();
+
+    //A LOADED project. The seed is what the FILE declared, read out of the 3MF's own config,
+    //so this is correct wherever it is called from and whatever the bundle happens to hold.
+    //That is the repair: the previous shape sampled the bundle and was therefore only correct
+    //at one instant, which is how every plate of a Bambu project ended up named
+    //"Default Filament" and quoting 21 hours.
+    int complete_plate_contexts(const PlateSlicingContext &declared);
+
+    //True when this process has a preset bundle to resolve plate beds from, which is
+    //every GUI run and no CLI run. See the definition.
+    bool plate_beds_come_from_presets() const;
+
+    //How many distinct printers the project holds. One is a single-machine project; more
+    //is what makes naming a plate's machine on its label worth the pixels.
+    int distinct_printer_count() const;
+
+    //The label rule above is a property of the SET, so the plate that changed is not the
+    //only one whose label goes stale: crossing between one machine and several restyles
+    //every plate at once. Called from the paths that write a plate's printer.
+    void refresh_plate_labels_if_machine_count_changed();
+    //Give one plate the bed of its exact assigned printer. A plate that names no printer,
+    //and a named preset this build does not have, are both unresolved: the plate is marked
+    //invalid and reported, and no bed is drawn in place of the one it asked for.
     //reflow=false skips the per-plate relayout so a caller applying several beds in a
     //row can do one trailing reflow_layout() instead of N visible shuffles.
     bool apply_printer_to_plate(int index, bool reflow = true);
@@ -1147,6 +1216,10 @@ public:
     void set_filament_count(int filament_count);
     void on_filament_deleted(int filament_count, int filament_id);
     void on_filament_added(int filament_count);
+
+    //Last value refresh_plate_labels_if_machine_count_changed acted on. Not state the
+    //app reads: purely the memory that makes "did this cross the boundary?" answerable.
+    int m_last_distinct_printer_count { -1 };
 
     std::map<int, bool> m_allow_bed_type_in_double_nozzle;
     BedTextureInfo bed_texture_info[btCount];

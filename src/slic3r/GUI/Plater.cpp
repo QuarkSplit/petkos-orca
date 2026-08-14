@@ -761,7 +761,6 @@ struct Sidebar::priv
     //fired last wins - the scope marker would vanish on the next mouse move. So all three
     //record state here and paint_printer_panel is the only thing that paints.
     bool                  printer_panel_focused       = false;
-    bool                  printer_panel_project_scope = false;
     std::function<void()> paint_printer_panel;
     // Filament Track Switch status overlay: an icon floated over the left/single extruder AMS area,
     // shown only when the switch is installed (green when ready, red when not calibrated).
@@ -2613,7 +2612,7 @@ Sidebar::Sidebar(Plater *parent)
             //and hidden below two, so on a small project the scope was unreachable and the
             //inspector always read PLATE 01. Clicking the project printer says the same thing
             //the rollup says, and the picker still opens underneath it.
-            set_project_scope();
+            focus_current_plate();
             p->combo_printer->wxEvtHandler::ProcessEvent(evt);
         });
         // ORCA Hide Cover automatically if there is not enough space
@@ -2640,10 +2639,9 @@ Sidebar::Sidebar(Plater *parent)
                 return;
             const bool hovered = !printer_preset_hovered->empty();
             const wxColour bg  = StateColor::darkModeColorFor(p->printer_panel_focused       ? panel_color.bg_focus :
-                                                              p->printer_panel_project_scope ? panel_color.bg_scope :
                                                                                                panel_color.bg_normal);
             p->panel_printer_preset->SetBackgroundColor(bg);
-            p->panel_printer_preset->SetBorderColor(p->printer_panel_focused || hovered || p->printer_panel_project_scope
+            p->panel_printer_preset->SetBorderColor(p->printer_panel_focused || hovered
                                                         ? panel_color.bd_focus
                                                         : panel_color.bd_normal);
             if (p->btn_edit_printer != nullptr)
@@ -2701,7 +2699,7 @@ Sidebar::Sidebar(Plater *parent)
         //The panel and the printer image both forward their click here as well, so that path
         //calls this twice; set_project_scope is idempotent and the second call re-asserts the
         //same invariant.
-        p->combo_printer->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) { set_project_scope(); e.Skip(); });
+        p->combo_printer->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent &e) { focus_current_plate(); e.Skip(); });
 
         /* ORCA This part moved to titlebar
         p->btn_connect_printer = new ScalableButton(p->panel_printer_preset, wxID_ANY, "monitor_signal_strong");
@@ -4255,6 +4253,12 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     if (filament_id > filament_count)
         return;
 
+    // Deleting a filament prunes every painted facet that named it, across the whole model, and it is the
+    // one path allowed to do that. An operation that destroys paint has to be undoable, so the snapshot is
+    // taken here rather than at either entry point - the sidebar button and the object menu both land here,
+    // as does change_filament - and it is taken before the first mutation, which is the tab selection below.
+    wxGetApp().plater()->take_snapshot(std::string("Delete filament"));
+
     if (wxGetApp().preset_bundle->is_the_only_edited_filament(filament_id) || (filament_id == 0)) {
         wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(wxGetApp().preset_bundle->filament_presets[0], false, "", true);
     }
@@ -5256,27 +5260,15 @@ void Sidebar::refresh_plate_scope()
     m_scoped_plates = std::move(rebuilt);
 
     if (p->plate_board != nullptr)
-        p->plate_board->set_scope(m_scoped_plates, m_scope_project);
+        p->plate_board->set_scope(m_scoped_plates);
     if (p->plate_inspector != nullptr)
-        p->plate_inspector->reload(p->plate_board->model(), m_scoped_plates, m_scope_project);
-    //The project printer row is the PROJECT scope's destination, so it says when it is the
-    //thing the inspector is describing - exactly as the board's rollup does for itself.
-    //Without this the scope could be entered and nothing on screen said which row was in it.
-    if (p->printer_panel_project_scope != m_scope_project) {
-        p->printer_panel_project_scope = m_scope_project;
-        if (p->paint_printer_panel)
-            p->paint_printer_panel();
-    }
+        p->plate_inspector->reload(p->plate_board->model(), m_scoped_plates);
 }
 
 void Sidebar::toggle_scoped_plate(int plate_index)
 {
     if (p == nullptr || p->plater == nullptr || !p->plater->is_initialized())
         return;
-
-    //A plate scope and the project scope are different kinds, so extending the plate
-    //selection leaves the project kind rather than adding the project to a set of plates.
-    m_scope_project = false;
 
     const int current = p->plater->get_partplate_list().get_curr_plate_index();
     //The current plate can never be removed: the inspector would then be describing
@@ -5292,13 +5284,13 @@ void Sidebar::toggle_scoped_plate(int plate_index)
     refresh_plate_scope();
 }
 
-void Sidebar::set_project_scope()
+void Sidebar::focus_current_plate()
 {
     if (p == nullptr)
         return;
-    //the current plate is untouched: pointing the inspector at the project is not a
-    //selection change, and the 3D scene keeps showing what it was showing
-    m_scope_project = true;
+    //the current plate is untouched: narrowing the scope is not a selection change, and
+    //the 3D scene keeps showing what it was showing
+    m_scoped_plates.clear();
     refresh_plate_scope();
 }
 
@@ -5323,7 +5315,6 @@ void Sidebar::on_plate_selection_changed(int current_plate)
     //across a selection change would leave an inspector editing plates they have since
     //navigated away from.
     m_scoped_plates.clear();
-    m_scope_project = false;
     refresh_plate_scope();
 
     //The Process panel's Plate scope describes the CURRENT plate, so it re-points here for
@@ -5466,7 +5457,16 @@ void Sidebar::auto_calc_flushing_volumes(const int filament_idx, const int extru
     auto& preset_bundle = wxGetApp().preset_bundle;
     auto filament_ptr = preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
     int filament_count = filament_ptr ? filament_ptr->size() : 0;
-    int extruder_count = preset_bundle->get_printer_extruder_count();
+    //There is no flush matrix to calculate without a nozzle count, and 0 is not one: it
+    //would leave extruder_indices empty and this whole function would quietly do nothing
+    //while reporting success. See PresetBundle::get_printer_extruder_count_checked.
+    const std::optional<int> checked_extruder_count = preset_bundle->get_printer_extruder_count_checked();
+    if (!checked_extruder_count.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << ": the edited printer declares no nozzle diameter, so flushing volumes cannot be calculated";
+        return;
+    }
+    const int extruder_count = *checked_extruder_count;
 
     if (filament_idx < 0) {
         filament_indices.resize(filament_count);
@@ -5505,7 +5505,16 @@ void Sidebar::auto_calc_flushing_volumes_internal(const int modify_id, const int
     auto& project_config = preset_bundle->project_config;
     const auto& full_config = wxGetApp().preset_bundle->full_config();
     auto& ams_multi_color_filament = preset_bundle->ams_multi_color_filment;
-    size_t extruder_nums = preset_bundle->get_printer_extruder_count();
+    //get_flush_volumes_matrix divides by this. A 0 from get_printer_extruder_count means
+    //"no printer to count nozzles on", and passing it in is an integer division by zero
+    //rather than a small matrix. See PresetBundle::get_printer_extruder_count_checked.
+    const std::optional<int> checked_extruder_nums = preset_bundle->get_printer_extruder_count_checked();
+    if (!checked_extruder_nums.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << ": the edited printer declares no nozzle diameter, so the flush matrix has no shape to be read at";
+        return;
+    }
+    const size_t extruder_nums = size_t(*checked_extruder_nums);
     int nozzle_flush_dataset = full_config.option<ConfigOptionIntsNullable>("nozzle_flush_dataset")->values[extruder_id];
     std::vector<double> init_matrix = get_flush_volumes_matrix((project_config.option<ConfigOptionFloats>("flush_volumes_matrix"))->values, extruder_id, extruder_nums);
 
@@ -7903,6 +7912,32 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             // For exporting from the amf/3mf we shouldn't check printer_presets for the containing information about "Print Host upload"
                             // BBS: add preset combo box re-active logic
                             // currently found only needs re-active here
+                            //THE MIGRATION, and it belongs HERE: inside the 3MF branch, after
+                            //load_config_model has installed and selected everything the project
+                            //declared, and before load_current_presets - which pushes the presets
+                            //into the tabs and updates the bed, and therefore reads plate contexts.
+                            //
+                            //The seed is the bundle's selection at exactly this instant, which is
+                            //the file's own declaration resolved into installed names. Not the raw
+                            //ids out of the config: load_config_file_config RENAMES a project's
+                            //presets as it installs them, so the raw id names a preset the bundle
+                            //does not have.
+                            {
+                                PlateSlicingContext declared;
+                                declared.printer_preset_name   = preset_bundle->printers.get_selected_preset_name();
+                                declared.print_preset_name     = preset_bundle->prints.get_selected_preset_name();
+                                declared.filament_preset_names = preset_bundle->filament_presets;
+                                const int completed = partplate_list.complete_plate_contexts(declared);
+                                if (completed > 0) {
+                                    BOOST_LOG_TRIVIAL(info)
+                                        << "load_files: completed " << completed << " of "
+                                        << partplate_list.get_plate_count() << " plate(s) from what the project declared: printer '"
+                                        << declared.printer_preset_name << "', process '" << declared.print_preset_name
+                                        << "', " << declared.filament_preset_names.size() << " filament(s)";
+                                    partplate_list.apply_printer_assignments();
+                                }
+                            }
+
                             wxGetApp().load_current_presets(false, false);
                             // Update filament colors for the MM-printer profile in the full config
                             // to avoid black (default) colors for Extruders in the ObjectList,
@@ -8106,6 +8141,8 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     for (unsigned int i = 0; i < project_presets.size(); i++) { delete project_presets[i]; }
                     project_presets.clear();
                 }
+
+
             }
         } catch (const ConfigurationError &e) {
             std::string message = GUI::format(_L("Failed loading file \"%1%\". An invalid configuration was found."), filename.string()) + "\n\n" + e.what();
@@ -11154,11 +11191,10 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 wxGetApp().plater()->sidebar().auto_calc_flushing_volumes(-1);
             }
 
-            // Project changes affect only plates that explicitly inherit Project. Monitor focus is
-            // not printer identity, so synchronize against this plate's exact physical target.
+            // Monitor focus is not printer identity, so synchronize against the current
+            // plate's own physical target rather than whatever machine is being watched.
             PartPlate *context_plate = partplate_list.get_curr_plate();
-            if (context_plate != nullptr && !context_plate->has_printer_assignment() &&
-                !context_plate->get_physical_printer_id().empty()) {
+            if (context_plate != nullptr && !context_plate->get_physical_printer_id().empty()) {
                 if (Slic3r::DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager()) {
                     MachineObject *obj = dev->get_my_machine(context_plate->get_physical_printer_id());
                     if (obj && obj->is_multi_extruders()) {
@@ -11197,6 +11233,45 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     // filament color when the preset defines one; this repaints the swatch to match.
     if (preset_type == Preset::TYPE_FILAMENT)
         combo->update();
+
+    //THE SIDEBAR COMBOS EDIT THE CURRENT PLATE.
+    //
+    //They used to edit "the project", and the plates that had not been told otherwise
+    //followed along. With no project to edit, picking a preset here means what it looks
+    //like it means: this plate uses this preset, and the tabs are now showing it. Writing
+    //through the Plater paths keeps every consequence - the undo snapshot, the bed, the
+    //bounds re-check, the re-resolution of dependents - in one place rather than two.
+    //
+    //follow_plate_presets moves the cursor the other way, on a plate change, and would
+    //write these values straight back; it does nothing when the plate already agrees, and
+    //after this write it always does.
+    if (PartPlate *current = partplate_list.get_curr_plate(); current != nullptr) {
+        const int plate_index = partplate_list.get_curr_plate_index();
+        switch (preset_type) {
+        case Preset::TYPE_PRINTER:
+            q->set_plate_printer(plate_index, wxGetApp().preset_bundle->printers.get_selected_preset_name());
+            break;
+        case Preset::TYPE_PRINT:
+            q->set_plate_process(plate_index, wxGetApp().preset_bundle->prints.get_selected_preset_name());
+            break;
+        case Preset::TYPE_FILAMENT:
+            //The whole slot list, because that is what the field is: one call, one
+            //snapshot, and no chance of a slot count drifting out of step with the library.
+            q->set_plate_filaments(plate_index, wxGetApp().preset_bundle->filament_presets);
+            break;
+        default:
+            break;
+        }
+
+        //A printer change re-resolves the plate's dependents, so the plate can end up on a
+        //process the tabs are not showing - the values that were chosen came with it, and
+        //the name did not. Point the cursor at what the plate actually ended up with, or
+        //the Process tab describes a preset this plate does not use. Deferred for the same
+        //reason as in notify_plate_selection_changed: this is running inside a combo's own
+        //selection event.
+        if (preset_type == Preset::TYPE_PRINTER)
+            q->CallAfter([this, plate_index]() { q->follow_plate_presets(plate_index); });
+    }
 
     // update plater with new config
     q->on_config_change(wxGetApp().preset_bundle->full_config());
@@ -11706,8 +11781,20 @@ void Plater::priv::on_action_add_plate(SimpleEvent&)
 {
     if (q != nullptr) {
         take_snapshot("add partplate");
+        //The plate the user is on is the holder: "add a plate" means another one like this,
+        //not another one like whatever preset is selected. Captured before the new plate
+        //exists, because completion walks the whole list.
+        PlateSlicingContext seed;
+        if (const PartPlate *current = this->partplate_list.get_curr_plate())
+            seed = current->get_slicing_context();
+
         this->partplate_list.create_plate();
         int new_plate = this->partplate_list.get_plate_count() - 1;
+        if (seed.is_complete())
+            this->partplate_list.complete_plate_contexts(seed);
+        else
+            this->partplate_list.complete_plate_contexts();
+        this->partplate_list.apply_printer_to_plate(new_plate, true);
         this->partplate_list.select_plate(new_plate);
         update();
 
@@ -12018,6 +12105,17 @@ void Plater::notify_plate_selection_changed(int current_plate)
     if (!is_initialized() || p->sidebar == nullptr)
         return;
     p->sidebar->on_plate_selection_changed(current_plate);
+
+    //The settings tabs describe the plate on screen. See Plater::follow_plate_presets: in a
+    //single-machine project this does nothing at all.
+    //
+    //Deferred on purpose. This runs from inside PartPlateList::select_plate, and moving the cursor
+    //selects presets, which rebuilds the settings pages and fires config-change events that read
+    //the plate list. CallAfter lets that stack unwind first, so the tabs are rebuilt against a
+    //plate list that has finished changing. (It used to be a modal dialog that ran on this stack;
+    //a cursor move no longer opens one - see Tab::select_preset's from_plate_cursor - but the
+    //deferral is still what keeps the rebuild off a half-mutated list.)
+    CallAfter([this, current_plate]() { follow_plate_presets(current_plate); });
 }
 
 void Plater::priv::on_action_request_model_id(wxCommandEvent& evt)
@@ -13602,6 +13700,25 @@ void Plater::priv::update_after_undo_redo(const UndoRedo::Snapshot& snapshot, bo
 
     wxGetApp().obj_list()->update_after_undo_redo();
 
+    //Undo restores the plates themselves - PartPlate serialises its slicing context, so the printer,
+    //process and filaments a plate names come back with the snapshot - but the board is built from
+    //the plate list rather than reading it as it draws, so nothing had told it to look again. A
+    //rolled-back printer assignment stayed on screen, which is a board describing a project the app
+    //no longer holds. Every row, because a snapshot can move any number of them; O(plates) is the
+    //right cost for an operation the user performs by hand.
+    if (this->sidebar != nullptr)
+        this->sidebar->refresh_plate_board();
+
+    //The settings tabs are the same kind of stale for the same reason: they are a cursor onto the
+    //current plate, and undo can have changed what that plate names. Deferred for the same reason
+    //as the other two cursor moves - this is running inside the undo jump itself, and a preset
+    //selection rebuilds pages and fires config-change events. follow_plate_presets returns
+    //immediately when nothing differs, which is every undo in a single-machine project.
+    if (q != nullptr && q->is_initialized()) {
+        const int current_plate = this->partplate_list.get_curr_plate_index();
+        q->CallAfter([this, current_plate]() { q->follow_plate_presets(current_plate); });
+    }
+
     if (wxGetApp().get_mode() == comSimple && model_has_advanced_features(this->model)) {
         // If the user jumped to a snapshot that require user interface with advanced features, switch to the advanced mode without asking.
         // There is a little risk of surprising the user, as he already must have had the advanced or advanced mode active for such a snapshot to be taken.
@@ -13768,6 +13885,10 @@ int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_
     //get_partplate_list().update_slice_context_to_current_plate(p->background_process);
     //p->preview->update_gcode_result(p->partplate_list.get_current_slice_result());
     reset(transfer_preset_changes);
+    // The project layer names decisions about THIS project, so it ends with it - unless the user
+    // asked for the modified presets to be kept, which is the same answer for both stores.
+    if (!transfer_preset_changes)
+        wxGetApp().preset_bundle->project_overrides.clear();
     reset_project_dirty_after_save();
     reset_project_dirty_initial_presets();
     wxGetApp().update_saved_preset_from_current_preset();
@@ -14534,7 +14655,19 @@ void Plater::_calib_pa_pattern(const Calib_Params& params)
 
         auto cur_plate = get_partplate_list().get_plate(plate_idx);
         if (!cur_plate) {
+            //A plate is seeded by whoever ASKED for it; create_plate seeds nothing. The
+            //calibration pattern is laid out for the machine the user is calibrating, so the
+            //current plate is the holder - without this the extra plates the pattern needs
+            //name no printer and the calibration cannot slice on any of them.
+            PlateSlicingContext seed;
+            if (const PartPlate *current = get_partplate_list().get_curr_plate())
+                seed = current->get_slicing_context();
             plate_idx = get_partplate_list().create_plate();
+            if (seed.is_complete())
+                get_partplate_list().complete_plate_contexts(seed);
+            else
+                get_partplate_list().complete_plate_contexts();
+            get_partplate_list().apply_printer_to_plate(plate_idx, true);
             cur_plate = get_partplate_list().get_plate(plate_idx);
         }
 
@@ -18385,11 +18518,12 @@ void Plater::on_filament_count_change(size_t num_filaments)
         part_plate->update_first_layer_print_sequence(num_filaments);
     }
 
-    for (ModelObject* mo : wxGetApp().model().objects) {
-        for (ModelVolume* mv : mo->volumes) {
-            mv->update_extruder_count(num_filaments);
-        }
-    }
+    // Paint data is mutable only by painting, or by an explicit user deletion of a filament. A change in
+    // how many slots the cursor is currently showing is neither. This function runs whenever the filament
+    // count changes for any reason at all - a plate click, a printer swap, a project load - and upstream
+    // pruned every volume's painting against the new count here, which in this fork destroys the paint of
+    // every object in the project each time the user looks at a smaller machine. on_filaments_delete below
+    // is the one path where the user genuinely asked for a filament to go away, and it still prunes.
 }
 
 void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int replace_filament_id)
@@ -18614,7 +18748,17 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 
 void Plater::update_flush_volume_matrix(size_t old_nozzle_size, size_t new_nozzle_size)
 {
-    size_t nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
+    //Both branches below resize flush_multiplier to this, and every later read of the flush
+    //matrix divides by that vector's size - so a 0 here does not shrink the matrix, it makes
+    //the next read a division by zero. 0 from get_printer_extruder_count is "no printer to
+    //count nozzles on", which is a refusal rather than a size.
+    const std::optional<int> checked_nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count_checked();
+    if (!checked_nozzle_nums.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << ": the edited printer declares no nozzle diameter, so the flush matrix cannot be resized; leaving it as it is";
+        return;
+    }
+    const size_t nozzle_nums = size_t(*checked_nozzle_nums);
     Slic3r::DynamicPrintConfig *project_config = &wxGetApp().preset_bundle->project_config;
 
     // Verify whether it is the first time start Studio
@@ -18970,7 +19114,8 @@ const GLCanvas3D* Plater::canvas3D() const
 
 GLCanvas3D* Plater::get_view3D_canvas3D()
 {
-    return p ? p->view3D->get_canvas3d() : nullptr;
+    //view3D needs its own check: p being set does not mean the panels exist yet.
+    return (p != nullptr && p->view3D != nullptr) ? p->view3D->get_canvas3d() : nullptr;
 }
 
 GLCanvas3D* Plater::get_preview_canvas3D()
@@ -20058,22 +20203,60 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
     plate->set_slicing_context(context);
 
     NotificationManager *notifications = plater->get_notification_manager();
-    const std::string    printer_name  = context.printer_preset_name.empty()
-        ? bundle->printers.get_edited_preset().name : context.printer_preset_name;
+    const std::string    printer_name  = context.printer_preset_name;
 
     if (reresolved.process_switched()) {
+        //The values that were chosen land on the PLATE, not on the preset: they are this
+        //plate's configuration, and writing them into a shared preset would change every
+        //other plate that names it. Plate overrides are applied last in composition, so
+        //this is exactly "the machine's own tuning, with the choices on top".
+        if (reresolved.carried_process_count > 0)
+            plate->config()->apply(reresolved.carried_process, true);
+
         BOOST_LOG_TRIVIAL(info) << "reresolve_plate_after_printer_change"
-            << boost::format(": plate %1%: process '%2%' cannot run on '%3%'; switched to '%4%'%5%")
+            << boost::format(": plate %1%: process '%2%' cannot run on '%3%'; switched to '%4%' (%5%) carrying %6% chosen setting(s)%7%")
                % (plate->get_index() + 1) % reresolved.process_from % printer_name % reresolved.process_to
-               % (reresolved.process_now_inherits ? " (the project's own process)" : " (the printer's own default process)");
-        if (notifications != nullptr)
+               % (reresolved.process_declaration_failed.empty()
+                      ? std::string("the printer's own default")
+                      : reresolved.process_declaration_failed + ", so the first compatible process was used instead")
+               % reresolved.carried_process_count
+               % (reresolved.carried_whole_process ? ", the whole process (no parent profile here to tell tuning from choice)" : "");
+        if (!reresolved.dropped_process_keys.empty())
+            BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+                << boost::format(": plate %1%: '%2%' has no definition for %3% of the carried setting(s), starting with '%4%'")
+                   % (plate->get_index() + 1) % reresolved.process_to % reresolved.dropped_process_keys.size()
+                   % reresolved.dropped_process_keys.front();
+
+        if (notifications != nullptr) {
+            //One sentence, a count rather than a list, and it leads with what was KEPT.
+            //"Your process could not run here" is the app's problem; "your settings came
+            //with you" is the user's answer to it.
+            //Where the new process came from. Normally it is the machine's own declaration; when
+            //that declaration was itself wrong, saying "the machine's own" would be false and would
+            //hide the one fact worth knowing - the process is not the one this printer asked for,
+            //and the reason is in the vendor's profile rather than in anything the user did.
+            wxString message;
+            if (reresolved.process_declaration_failed.empty())
+                message = wxString::Format(_L("Plate %d moved to \"%s\". Its process is now \"%s\", the machine's own."),
+                                           plate->get_index() + 1, from_u8(printer_name), from_u8(reresolved.process_to));
+            else
+                message = wxString::Format(_L("Plate %d moved to \"%s\". %s, so it is now on \"%s\", the first process this machine can actually run."),
+                                           plate->get_index() + 1, from_u8(printer_name),
+                                           from_u8(reresolved.process_declaration_failed), from_u8(reresolved.process_to));
+            //What was KEPT. "Your process could not run here" is the app's problem; "your settings
+            //came with you" is the user's answer to it, so it is never dropped from the message.
+            if (reresolved.carried_process_count > 0)
+                message += " " + wxString::Format(_L("The %d setting(s) that were chosen came with it."),
+                                                  (int) reresolved.carried_process_count);
+            else
+                message += " " + _L("Nothing had been changed from the old one.");
+            if (!reresolved.dropped_process_keys.empty())
+                message += " " + wxString::Format(_L("%d setting(s) do not exist on this machine and were left behind."),
+                                                  (int) reresolved.dropped_process_keys.size());
             notifications->push_notification(
                 NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
-                into_u8(reresolved.process_now_inherits
-                    ? wxString::Format(_L("Plate %d: process \"%s\" cannot run on the project printer. The plate now follows the project process \"%s\"."),
-                                       plate->get_index() + 1, from_u8(reresolved.process_from), from_u8(reresolved.process_to))
-                    : wxString::Format(_L("Plate %d: process \"%s\" cannot run on \"%s\". Switched to \"%s\", the printer's own default."),
-                                       plate->get_index() + 1, from_u8(reresolved.process_from), from_u8(printer_name), from_u8(reresolved.process_to))));
+                into_u8(message));
+        }
     } else if (!reresolved.process_unresolved.empty()) {
         BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
             << boost::format(": plate %1%: process '%2%' cannot run on '%3%' and no switch target exists: %4%")
@@ -20104,6 +20287,104 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
     }
 }
 
+//See the header. The cursor follows the plate; it never stands behind it.
+void Plater::follow_plate_presets(int plate_index)
+{
+    //Re-entrancy: Tab::select_preset fires config-change events that reach back through
+    //the sidebar. One cursor move at a time, or a two-machine project can chase itself.
+    static bool following = false;
+    if (following)
+        return;
+
+    //A project load installs its own presets and selects plates on the way; the cursor
+    //must not chase those intermediate states.
+    if (m_loading_project)
+        return;
+
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (plate == nullptr || bundle == nullptr || !is_initialized())
+        return;
+
+    const PlateSlicingContext context = plate->get_slicing_context();
+    const bool printer_differs = !context.printer_preset_name.empty() &&
+                                 context.printer_preset_name != bundle->printers.get_selected_preset_name();
+    const bool process_differs = !context.print_preset_name.empty() &&
+                                 context.print_preset_name != bundle->prints.get_selected_preset_name();
+    const bool filaments_differ = !context.filament_preset_names.empty() &&
+                                  context.filament_preset_names != bundle->filament_presets;
+    if (!printer_differs && !process_differs && !filaments_differ)
+        return;
+
+    //A preset this build does not have cannot be shown by a tab. The plate keeps it - a
+    //project may be headed for a machine that has it - and the cursor simply stays put.
+    if (printer_differs && bundle->printers.find_preset(context.printer_preset_name, false) == nullptr)
+        return;
+
+    Slic3r::ScopeGuard restore([]() { following = false; });
+    following = true;
+
+    //Which field failed, so the message can name that one. Reporting the printer when the PROCESS
+    //selection was the one that failed produced "the tabs are still showing X, plate 2 prints on X" -
+    //two faults said as one sentence because one flag answered both, which is the case this fork's
+    //own message bar calls out.
+    //
+    //The last argument is from_plate_cursor: this is the cursor following the plate, not the user
+    //picking a preset, so nothing here may open a dialog. Unsaved edits are parked rather than
+    //decided about (Tab::park_dirty_edits), which is why a cursor move can no longer be DECLINED -
+    //there is no longer anyone to decline it. What is left below is genuine failure: a preset that
+    //will not select, or a printer technology switch that was refused.
+    bool        failed = false;
+    wxString    failed_field, failed_showing, failed_wanted;
+    if (printer_differs) {
+        Tab *tab = wxGetApp().get_tab(Preset::TYPE_PRINTER);
+        if (tab != nullptr && !tab->select_preset(context.printer_preset_name, false, "", false, false, true)) {
+            failed         = true;
+            failed_field   = _L("printer");
+            failed_showing = from_u8(bundle->printers.get_selected_preset_name());
+            failed_wanted  = from_u8(context.printer_preset_name);
+        }
+    }
+    if (!failed && process_differs && bundle->prints.find_preset(context.print_preset_name, false) != nullptr) {
+        Tab *tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        if (tab != nullptr && !tab->select_preset(context.print_preset_name, false, "", false, false, true)) {
+            failed         = true;
+            failed_field   = _L("process");
+            failed_showing = from_u8(bundle->prints.get_selected_preset_name());
+            failed_wanted  = from_u8(context.print_preset_name);
+        }
+    }
+    if (!failed && filaments_differ) {
+        //Filament slots take no dialog of their own: set_filament_preset is the same call
+        //the sidebar's own filament combo makes.
+        for (size_t i = 0; i < context.filament_preset_names.size(); ++i) {
+            if (i < bundle->filament_presets.size() &&
+                bundle->filament_presets[i] == context.filament_preset_names[i])
+                continue;
+            if (bundle->filaments.find_preset(context.filament_preset_names[i], false) == nullptr)
+                continue;
+            bundle->set_filament_preset(i, context.filament_preset_names[i]);
+        }
+        if (p->sidebar != nullptr)
+            p->sidebar->update_presets(Preset::TYPE_FILAMENT);
+    }
+
+    if (failed) {
+        //The tabs are now describing a different plate from the one on screen. Nobody chose that, so
+        //it has to be said once rather than left to be discovered.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": plate %1%: the %2% selection failed, the tabs stay on '%3%' while the plate uses '%4%'")
+               % (plate_index + 1) % into_u8(failed_field) % into_u8(failed_showing) % into_u8(failed_wanted);
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("The %s tab is still showing \"%s\". Plate %d uses \"%s\"."),
+                                         failed_field, failed_showing, plate_index + 1, failed_wanted)));
+    } else {
+        on_config_change(bundle->full_config());
+    }
+}
+
 //The user's own choice of process for one plate.
 //
 //The plate keeps a retained slice: is_slice_result_valid() compares the snapshot the G-code was
@@ -20123,7 +20404,7 @@ void Plater::set_plate_process(int plate_index, std::string preset_name)
     take_snapshot(std::string("Assign plate process"));
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
         << boost::format(": plate %1% process -> '%2%'")
-           % (plate_index + 1) % (preset_name.empty() ? std::string("(follow the project)") : preset_name);
+           % (plate_index + 1) % (preset_name.empty() ? std::string("(none, so the plate is unresolved)") : preset_name);
 
     PlateSlicingContext context = plate->get_slicing_context();
     context.print_preset_name = preset_name;
@@ -20152,11 +20433,37 @@ void Plater::set_plate_process(int plate_index, std::string preset_name)
         schedule_background_process();
 }
 
+//The user's own choice to drop what this plate changed about its process. Offered by the
+//process picker when there is something to drop, and never taken automatically: the values
+//were chosen by somebody, possibly for another machine, which is a translation problem and
+//not a reason for the app to discard them.
+void Plater::clear_plate_process_overrides(int plate_index)
+{
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    if (plate == nullptr || plate->process_override_count() == 0)
+        return;
+
+    take_snapshot(std::string("Clear plate process settings"));
+    const std::vector<std::string> keys = plate->process_override_keys();
+    plate->clear_process_overrides();
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+        << boost::format(": plate %1%: dropped %2% process setting(s), starting with '%3%'")
+           % (plate_index + 1) % keys.size() % keys.front();
+
+    update_project_dirty_from_presets();
+    set_plater_dirty(true);
+    if (p->sidebar != nullptr)
+        p->sidebar->refresh_plate_board(plate_index);
+    if (plate_index == p->partplate_list.get_curr_plate_index())
+        schedule_background_process();
+}
+
 //The user's own choice of materials for one plate.
 //
-//An empty list clears the slot back to the project's filaments. Nothing here substitutes a
-//material: an incompatible choice is recorded and named, because filament is what the object is
-//made of and swapping it silently has a real cost in the physical world.
+//An empty list leaves the plate with no materials, which is an unresolved plate and is reported
+//as one; there are no project filaments behind it to fall back to. Nothing here substitutes a
+//material either: an incompatible choice is recorded and named, because filament is what the
+//object is made of and swapping it silently has a real cost in the physical world.
 void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names)
 {
     PartPlate *plate = p->partplate_list.get_plate(plate_index);
@@ -20198,20 +20505,44 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
 
 //The one write path for a plate's printer assignment. Owns every consequence of a
 //reassignment: the undo snapshot, the bed update, the bounds re-check and the slice
-//invalidation. An empty preset_name clears the assignment back to "follow the
-//project printer". A missing preset is preserved verbatim — the project will be
-//reopened on a machine that has it, so nothing here rewrites, clears or remaps it.
-void Plater::set_plate_printer(int plate_index, std::string preset_name)
+//invalidation. A missing preset is preserved verbatim — the project will be reopened on a
+//machine that has it, so nothing here rewrites, clears or remaps it.
+bool Plater::set_plate_printer(int plate_index, std::string preset_name)
 {
     PartPlate* plate = p->partplate_list.get_plate(plate_index);
     if (plate == nullptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__
             << boost::format(": no plate at index %1%, nothing assigned") % plate_index;
-        return;
+        return false;
     }
 
-    if (plate->get_printer_preset_name() == preset_name)
-        return;
+    //AN EMPTY NAME IS NOT A VALUE. The project printer is gone, so there is nothing behind
+    //an empty field for it to mean: a plate written empty here names no machine, cannot be
+    //drawn at any bed size and cannot be sliced. It used to mean "follow the project", and
+    //the write path kept accepting it long after the thing it followed stopped existing.
+    //Refused out loud, because a silent write is what makes an unresolved plate impossible
+    //to date afterwards.
+    if (preset_name.empty()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": refusing to clear plate %1%'s printer - a plate names its own machine or it is unresolved, and there is no project printer to fall back to")
+               % (plate_index + 1);
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d keeps its printer. A plate has to name a machine — there is no project printer to fall back to."),
+                                         plate_index + 1)));
+        return false;
+    }
+
+    //Already there. Nothing to do and nothing wrong - but this returns the same false a refusal
+    //returns, so a caller cannot tell "no change was needed" from "the change was rejected". The
+    //driver's assign phase reported one as the other for a whole run. The write path is not going
+    //to grow a third return value for it; saying so is what makes the two distinguishable in a log.
+    if (plate->get_printer_preset_name() == preset_name) {
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+            << boost::format(": plate %1% already names printer '%2%', nothing to assign") % (plate_index + 1) % preset_name;
+        return false;
+    }
 
     //Perf: this is the click that feels worst, so it is timed as a whole and phase by
     //phase. Which phase dominates decides whether the fix is a cache, a narrower
@@ -20290,6 +20621,7 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
         PETKOS_PERF_SCOPE(Perf::Probe::SppBackgroundProcess);
         schedule_background_process();
     }
+    return true;
 }
 
 void Plater::rename_plate(int plate_index, const std::string &name)
@@ -20329,6 +20661,19 @@ void Plater::set_plate_physical_printer(int plate_index, std::string device_id)
 //no assignment and so could never hand a cleared plate its project bed back.
 void Plater::set_plate_printers(const std::vector<int>& plate_indices, std::string preset_name)
 {
+    //Same rule as the single-plate path, because it is the same field: an empty name is not
+    //a value, and a batch is not a licence to write one several times.
+    if (preset_name.empty()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": refusing to clear the printer on %1% plate(s) - a plate names its own machine or it is unresolved")
+               % plate_indices.size();
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(_L("Those plates keep their printers. A plate has to name a machine — there is no project printer to fall back to.")));
+        return;
+    }
+
     std::vector<int> changed;
     for (int idx : plate_indices) {
         PartPlate* plate = p->partplate_list.get_plate(idx);
@@ -20791,7 +21136,17 @@ int Plater::duplicate_plate(int plate_index)
     if (plate_index == -1)
         index = p->partplate_list.get_curr_plate_index();
 
+    //Undoable, like delete_plate two functions below, which has always taken one. Duplicating
+    //now copies a whole context and a set of overrides, so getting it wrong costs more than a
+    //stray copy of some geometry.
+    take_snapshot("Duplicate plate");
+
     ret = p->partplate_list.duplicate_plate(index);
+
+    //the copy is a new row with its own machine, and the reflow may have moved every other
+    //plate, so the board is rebuilt rather than patched
+    if (p->sidebar != nullptr)
+        p->sidebar->refresh_plate_board();
 
     //need to call update
     update();

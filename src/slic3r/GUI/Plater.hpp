@@ -191,14 +191,16 @@ public:
     //project is not a plate and giving it one would make "is plate -1 selected" a
     //question the rest of the code has to keep answering.
     const std::vector<int>& scoped_plates() const { return m_scoped_plates; }
-    bool is_project_scope() const { return m_scope_project; }
     //Modifier-click on a board row: changes the scope set and never the current plate.
     //The current plate can never be removed from the set.
     void toggle_scoped_plate(int plate_index);
     //Clicking the board's project-wide line, or the project printer row above it, which
     //is the same row and is reachable when the rollup is not (the rollup is zero-height
     //at one plate and the whole board is hidden below two). Leaves the current plate alone.
-    void set_project_scope();
+    //Collapse the scope back to the current plate alone. This is what the old
+    //set_project_scope became: there is no project row to point at, so "step back out of
+    //a multi-plate selection" is the whole of what the gesture ever has to mean.
+    void focus_current_plate();
     //Re-assert the invariant above and push the result at the board and the inspector.
     void refresh_plate_scope();
     //The collapsed printer-section title: the project printer when the project holds
@@ -323,7 +325,6 @@ private:
     //Owned here, not by the board: the board renders the scope exactly as it renders the
     //current plate, and storing it in two places is how two lists come to disagree.
     std::vector<int> m_scoped_plates;
-    bool             m_scope_project{false};
 };
 
 class Plater: public wxPanel
@@ -593,12 +594,39 @@ public:
     void send_job_finished(wxCommandEvent& evt);
     void publish_job_finished(wxCommandEvent& evt);
     void open_platesettings_dialog(wxCommandEvent& evt);
-    //The one write path for a plate's printer assignment. Every caller (the plate
-    //settings dialog, the plate board) goes through here, so the consequences of a
-    //reassignment — undo snapshot, bed update, bounds re-check, slice invalidation,
-    //dirty marking — are handled in exactly one place. An empty preset_name clears
-    //the assignment back to "follow the project printer".
-    void set_plate_printer(int plate_index, std::string preset_name);
+    //POINT THE SETTINGS TABS AT THE PLATE THE USER IS LOOKING AT.
+    //
+    //The preset collections still hold one selection each, but it is no longer a fact
+    //about the project - it is the editing cursor, which preset the tabs are showing. So
+    //it follows the current plate instead of standing behind it.
+    //
+    //Only fields that actually differ are moved, which in a single-machine project is
+    //none of them: the cursor never moves, and Orca's unsaved-changes dialog never
+    //appears. When they do differ the dialog is exactly right, because a plate on another
+    //machine genuinely is a different thing to be editing. If the user declines it, the
+    //tabs are left where they were and told so, rather than silently describing one plate
+    //while the badge names another.
+    //
+    //The filament list is made to be exactly the plate's slots, not merely overwritten as
+    //far as the plate goes: the cursor is a view of ONE plate, and a slot left over from a
+    //wider plate is a slot the next whole-list write would copy back onto this one.
+    void follow_plate_presets(int plate_index);
+
+    //The one write path for a plate's printer assignment. Every caller (the plate settings
+    //dialog, the plate board) goes through here, so the consequences of a reassignment -
+    //undo snapshot, dependent re-resolution, bed update, bounds re-check, dirty marking -
+    //are handled in exactly one place.
+    //
+    //An EMPTY preset_name is refused, loudly. There is no project printer to fall back to,
+    //so an empty field is not "follow the project", it is a plate that cannot be sliced or
+    //drawn - and writing one silently is how a plate ends up unresolved with nothing in the
+    //log to say when. A missing preset is a different thing and is preserved verbatim: the
+    //project will be reopened on a machine that has it, so nothing here rewrites, clears or
+    //remaps it.
+    //
+    //Returns false when nothing was written, so a caller that needs to know can tell a
+    //refusal from a no-op reassignment to the same printer.
+    bool set_plate_printer(int plate_index, std::string preset_name);
 
     // PetkosOrca: the other two halves of a plate's slicing identity, which the app could write
     // and the user could not.
@@ -610,10 +638,12 @@ public:
     // process with no way to disagree. An automatic decision the user cannot overrule is not a
     // convenience; it is the app doing something to them.
     //
-    // An empty name clears the slot back to "follow the project", which is what an empty context
-    // field means everywhere else. A preset this build does not have is recorded verbatim and
-    // reported as unresolved rather than remapped, exactly as the printer path does.
+    // A preset this build does not have is recorded verbatim and reported as unresolved rather
+    // than remapped, exactly as the printer path does.
     void set_plate_process(int plate_index, std::string preset_name);
+    //Drop the process settings this plate carries of its own. One snapshot, one refresh,
+    //and never called on the user's behalf: see PartPlate::process_override_count.
+    void clear_plate_process_overrides(int plate_index);
     void set_plate_filaments(int plate_index, std::vector<std::string> preset_names);
     //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
     //had. The board's inline editor and any MCP surface should both land here.
@@ -827,11 +857,11 @@ public:
     // cannot pay that per frame.
     //
     // A thin forward to PresetBundle::plate_process_option, which is tier 1 of
-    // resolve_plate_slicing_config and the single home of the plate-inheritance rule. It
-    // substitutes nothing: an empty per-plate name is explicit inheritance from the Project row,
-    // a named preset resolves by exact name and is never remapped, and anything unresolved
-    // yields nullptr rather than the Project's value. See that declaration for which keys may be
-    // read this way - process options only, and only those no later composition layer carries.
+    // resolve_plate_slicing_config and the single home of the plate-context rule. It
+    // substitutes nothing: an empty per-plate name is an unresolved plate rather than
+    // inheritance, a named preset resolves by exact name and is never remapped, and anything
+    // unresolved yields nullptr. See that declaration for which keys may be read this way -
+    // process options only, and only those no later composition layer carries.
     const ConfigOption *get_plate_process_option(const PartPlate *plate, const std::string &opt_key) const;
     void validate_current_plate(bool& model_fits, bool& validate_error);
     // Rebuild the missing-plugin sets from the active presets and (re)show/close their notifications.

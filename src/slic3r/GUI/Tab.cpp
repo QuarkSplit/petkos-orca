@@ -1513,6 +1513,14 @@ void Tab::on_roll_back_value(const bool to_sys /*= true*/)
         }
     }
 
+    //"Reset all settings to the last saved preset" has to mean the project layer too, or the values
+    //it just cleared from the page stay live in every plate's slice with nothing on screen saying so.
+    //The button's meaning is unambiguous, which is what makes clearing them here safe: the user asked
+    //for the preset as saved.
+    if (!to_sys && m_preset_bundle != nullptr && m_type == Preset::TYPE_PRINT)
+        for (const std::string &key : m_presets->current_dirty_options())
+            m_preset_bundle->clear_project_override(key);
+
     // BBS: restore all pages in preset
     m_presets->discard_current_changes();
 
@@ -1826,6 +1834,34 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
 
     if (wxGetApp().plater() == nullptr) {
         return;
+    }
+
+    //PetkosOrca: the Global scope of the params panel edits the PROJECT, not the preset. The preset
+    //combos are an editing cursor that follows the current plate, so storing a global edit as dirty
+    //state on whichever preset the cursor happens to be pointing at is storing it somewhere that is
+    //about to move. It goes to the project layer as it is typed, and every plate composes it.
+    //
+    //The same line is what makes the per-option revert arrow work: reverting sets the value back to
+    //the saved preset's and arrives here like any other change, so the project entry goes away and
+    //the preset stops being overridden. Without it the arrow would clear the display and leave the
+    //value live in every slice.
+    //
+    //Only the process comes here - see Tab::park_dirty_edits. A printer's settings are facts about
+    //one machine and a project holds several; a filament's belong to one material and are the wrong
+    //shape for a composed config. Both of those park against their own preset instead.
+    if (m_preset_bundle != nullptr && m_presets != nullptr && m_config != nullptr &&
+        m_type == Preset::TYPE_PRINT) {
+        //A per-extruder field arrives as "key#index"; the option is the whole vector, and comparing
+        //the whole vector against the saved preset's is what says whether any element deviates.
+        std::string key = opt_key;
+        if (auto n = key.find('#'); n != std::string::npos)
+            key = key.substr(0, n);
+        const ConfigOption *edited = m_config->option(key);
+        const ConfigOption *saved  = m_presets->get_selected_preset().config.option(key);
+        if (edited == nullptr || saved == nullptr || *edited == *saved)
+            m_preset_bundle->clear_project_override(key);
+        else
+            m_preset_bundle->park_as_project_overrides(*m_config, {key});
     }
 
     // Keep this preset's "plugins" manifest in sync when a plugin picker changes, so full_config() and
@@ -2233,9 +2269,10 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
     //Orca: sync filament num if it's a multi tool printer
     if (opt_key == "extruders_count" && !m_config->opt_bool("single_extruder_multi_material")){
         auto num_extruder = boost::any_cast<size_t>(value);
-        // Never shrink below the highest filament the model references: painting and
-        // per-object/volume assignments above the new count are truncated irreversibly
-        // (ModelVolume::update_extruder_count) on the next scene reload.
+        // Never shrink below the highest filament the model references. Painting and per-object
+        // assignments above the count survive it now - nothing prunes them but an explicit
+        // filament deletion - but a slot an object names and the machine does not have prints in
+        // the object's own filament, so shrinking here silently changes what comes out.
         size_t num_filaments = std::max(num_extruder, (size_t)std::max(0, wxGetApp().model().get_max_used_filament()));
         int         old_filament_size = wxGetApp().preset_bundle->filament_presets.size();
         std::vector<std::string> new_colors;
@@ -2448,6 +2485,100 @@ void Tab::cache_config_diff(const std::vector<std::string>& selected_options, co
     m_cache_config.apply_only(config ? *config : m_presets->get_edited_preset().config, selected_options);
 }
 
+//See the header for the rule. This is the whole of "a cursor move never dialogs": with the dirty diff
+//moved out of the preset, PresetCollection::current_is_dirty() is false and every dialog site in
+//select_preset - this tab's and the dependent collections' - is simply not reached.
+bool Tab::park_dirty_edits()
+{
+    if (m_presets == nullptr || m_preset_bundle == nullptr || !m_presets->current_is_dirty())
+        return false;
+
+    const std::vector<std::string> dirty = m_presets->current_dirty_options();
+    if (dirty.empty())
+        return false;
+
+    const std::string preset_name = m_presets->get_selected_preset_name();
+    if (m_type == Preset::TYPE_PRINT) {
+        //Wall count, layer height, infill, print order: the user changed these while looking at the
+        //project, so they are the project's, and every plate composes them.
+        m_preset_bundle->park_as_project_overrides(m_presets->get_edited_preset().config, dirty);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+            << boost::format(": moved %1% unsaved option(s) from process preset '%2%' into the project layer")
+               % dirty.size() % preset_name;
+    } else {
+        //Everything else waits for the preset it was made against.
+        //
+        //A PRINTER: nozzle diameter, bed shape, machine limits, custom G-code. None of it means
+        //anything on another machine, so it does not travel.
+        //
+        //A FILAMENT: this is a statement about one material, and it also cannot be a project layer
+        //for a structural reason. A filament option inside a preset is one entry long; the same
+        //option in a composed config is one entry per slot. They are not the same value, and
+        //layering the first over the second would rewrite how many filaments the project has.
+        DynamicPrintConfig &stash = m_parked_preset_edits[preset_name];
+        stash.apply_only(m_presets->get_edited_preset().config, dirty, true);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+            << boost::format(": parked %1% unsaved option(s) on %2% preset '%3%', to be restored when it is next selected")
+               % dirty.size() % Preset::get_type_string(m_type) % preset_name;
+    }
+
+    m_presets->discard_current_changes();
+    return true;
+}
+
+void Tab::restore_parked_edits()
+{
+    if (m_presets == nullptr || m_preset_bundle == nullptr)
+        return;
+
+    if (m_type != Preset::TYPE_PRINT) {
+        auto it = m_parked_preset_edits.find(m_presets->get_selected_preset_name());
+        if (it == m_parked_preset_edits.end())
+            return;
+        m_presets->get_edited_preset().config.apply(it->second, true);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+            << boost::format(": restored parked edits for %1% preset '%2%'") % Preset::get_type_string(m_type) % it->first;
+        m_parked_preset_edits.erase(it);
+        return;
+    }
+
+    //A project override shows here as a modified option, which is exactly what it is: the project
+    //overrides the preset. The alternative - leave the preset clean - would make the value real in
+    //every slice and invisible on the page that is supposed to be showing it.
+    m_preset_bundle->apply_project_overrides(m_presets->get_edited_preset().config);
+}
+
+void Tab::park_all_dirty_edits(bool include_preset_local)
+{
+    for (Preset::Type type : {Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT}) {
+        if (type != Preset::TYPE_PRINT && !include_preset_local)
+            continue;
+        if (Tab *tab = wxGetApp().get_tab(type))
+            tab->park_dirty_edits();
+    }
+}
+
+bool Tab::dirty_beyond_project(const PresetCollection &presets) const
+{
+    if (!presets.current_is_dirty())
+        return false;
+    //Only a process has a project layer standing over it. A printer's settings are facts about one
+    //machine and a project holds several; a filament's are one material's, and its options are the
+    //wrong shape for a composed config anyway. See Tab::park_dirty_edits.
+    if (m_preset_bundle == nullptr || m_preset_bundle->project_overrides.empty() ||
+        presets.type() != Preset::TYPE_PRINT)
+        return true;
+
+    const DynamicPrintConfig &edited = presets.get_edited_preset().config;
+    for (const std::string &key : presets.current_dirty_options()) {
+        const ConfigOption *project = m_preset_bundle->project_overrides.option(key);
+        const ConfigOption *now     = edited.option(key);
+        if (project == nullptr || now == nullptr || *project != *now)
+            return true;
+    }
+    return false;
+}
+
 void Tab::apply_config_from_cache()
 {
     bool was_applied = false;
@@ -2513,6 +2644,13 @@ void Tab::on_presets_changed()
         // If the printer tells us that the print or filament/sla_material preset has been switched or invalidated,
         // refresh the print or filament/sla_material tab page.
         // But if there are options, moved from the previously selected preset, update them to edited preset
+        //
+        //A dependent tab is selected from here rather than through its own select_preset, so this is
+        //where its parked edits and the project layer have to be put back. Without it a printer
+        //switch that leaves the process preset unchanged - the common case, one process shared by
+        //two machines - showed the process page clean while the project's overrides were still real
+        //in every slice.
+        tab->restore_parked_edits();
         tab->apply_config_from_cache();
         tab->load_current_preset();
     }
@@ -6785,10 +6923,16 @@ void Tab::update_preset_choice()
 // Select a preset by a name.If !defined(name), then the default preset is selected.
 // If the current profile is modified, user is asked to save the changes.
 bool Tab::select_preset(
-    std::string preset_name, bool delete_current /*=false*/, const std::string &last_selected_ph_printer_name /* =""*/, bool force_select, bool force_no_transfer)
+    std::string preset_name, bool delete_current /*=false*/, const std::string &last_selected_ph_printer_name /* =""*/, bool force_select, bool force_no_transfer, bool from_plate_cursor)
 {
-    BOOST_LOG_TRIVIAL(info) << boost::format("select preset, name %1%, delete_current %2%")
-        %preset_name %delete_current;
+    BOOST_LOG_TRIVIAL(info) << boost::format("select preset, name %1%, delete_current %2%, from_plate_cursor %3%")
+        %preset_name %delete_current %from_plate_cursor;
+    //See the header. The cursor following the plate is not a decision about presets, so it asks
+    //nothing: the unsaved edits are moved somewhere that survives the move, which leaves every
+    //dirty check below false and every dialog site unreachable. Parking covers all three
+    //collections because selecting a printer inspects the process and filament ones as well.
+    if (from_plate_cursor)
+        Tab::park_all_dirty_edits();
     if (preset_name.empty()) {
         if (delete_current) {
             // Find an alternate preset to be selected after the current preset is deleted.
@@ -7035,6 +7179,10 @@ bool Tab::select_preset(
                 m_dependent_tabs = { Preset::Type::TYPE_SLA_PRINT, Preset::Type::TYPE_SLA_MATERIAL };
         }
 
+        // Whatever belongs on the preset that has just been selected goes back on it before the UI
+        // reads it: this machine's parked tuning, or the project layer over a process or filament.
+        restore_parked_edits();
+
         // check if there is something in the cache to move to the new selected preset
         apply_config_from_cache();
 
@@ -7096,6 +7244,13 @@ bool Tab::select_preset(
 bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr*/, const std::string &new_printer_name /*= ""*/, bool no_transfer, bool no_transfer_variant)
 {
     if (presets == nullptr) presets = m_presets;
+
+    //Nothing to decide when every unsaved option is one the project layer already holds. The
+    //selection proceeds and restore_parked_edits puts the project's values back on the newly
+    //selected preset, so "discard" would have discarded nothing and "transfer" would have
+    //transferred what is going to be applied anyway.
+    if (!dirty_beyond_project(*presets))
+        return true;
 
     UnsavedChangesDialog dlg(m_type, presets, new_printer_name, no_transfer);
     if (dlg.ShowModal() == wxID_CANCEL)

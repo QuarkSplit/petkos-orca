@@ -2594,9 +2594,11 @@ void PartPlate::generate_plate_name_texture()
 	// generate m_name_texture texture from m_name with generate_from_text_string
 	m_name_texture.reset();
 	auto text = m_name.empty()? _L("Untitled") : from_u8(m_name);
-	//a plate pinned to its own printer wears that printer's name; this is the
-	//at-a-glance affordance for which machine each plate goes to
-	if (has_printer_assignment())
+	//The plate wears its machine's name only when the project holds more than one
+	//machine. Every plate has a printer now, so an unconditional suffix would repeat
+	//the same string on all thirty-six plates of a single-machine project and
+	//distinguish nothing. It appears exactly when it tells the plates apart.
+	if (m_partplate_list != nullptr && m_partplate_list->distinct_printer_count() > 1)
 		text += wxString::FromUTF8(" \xE2\x86\x92 ") + from_u8(m_printer_preset_name);
 
     // ORCA also scale font size to prevent low res texture
@@ -2639,6 +2641,14 @@ void PartPlate::generate_plate_name_texture()
 
 void PartPlate::invalidate_plate_name_texture()
 {
+	//A texture that was never created has nothing to invalidate — and this is reachable from
+	//set_slicing_context during PartPlateList CONSTRUCTION, where m_plater points at a Plater
+	//whose members do not exist yet. The texture id is plate-local state, so it is the one
+	//guard that is safe to read at any time; reaching into the plater before it is real was
+	//a startup crash (crash_Fri_Aug_14_22_22_39).
+	if (m_name_texture.get_id() == 0)
+		return;
+
 	m_plate_name_edit_icon.mesh_raycaster.reset();
 
 	auto canvas = (m_plater != nullptr) ? m_plater->get_view3D_canvas3D() : nullptr;
@@ -4346,6 +4356,11 @@ void PartPlateList::init()
 	}
 	first_plate->set_index(0);
 
+	//A new project's first plate must not be observable without a context. Does nothing when
+	//this runs from the constructor, where there is no bundle yet; GUI_App::load_current_presets
+	//covers that moment, and this covers File > New, which happens long after it.
+	complete_plate_contexts();
+
 	m_plate_count = 1;
 	m_plate_cols = 1;
 	m_current_plate = 0;
@@ -4583,8 +4598,127 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 	return true;
 }
 
-// Give one plate its effective printer bed. An empty assignment explicitly
-// inherits the Project row. A named assignment must resolve exactly.
+//Where a plate's bed comes from. In the GUI it is the plate's own printer preset, always.
+//In CLI there is no wxApp and no preset bundle: the 3MF's project config is the only bed
+//source there, and it arrives through set_shapes/reset_size. Two different sources for one
+//fact is exactly the sort of thing this fork deletes, but this one is a real difference in
+//what exists at runtime rather than a fallback, so it is named instead of hidden.
+bool PartPlateList::plate_beds_come_from_presets() const
+{
+	return m_plater != nullptr && wxApp::GetInstance() != nullptr && wxGetApp().preset_bundle != nullptr;
+}
+
+//The per-plate settings that had their own controls before a plate could carry a whole
+//process. Each has a row of its own in the inspector or the plate dialog, so none of them
+//is a "changed process setting" for the purposes of the count above.
+//
+//The set itself is Slic3r::is_plate_owned_process_setting in PlateSlicingContext.hpp, and
+//it is shared with PresetBundle::carry_process_intent on purpose: what a plate owns a
+//control for is exactly what a machine change must not carry across as intent. A second
+//copy of the list here is how print_sequence came to be carried, uncounted and unclearable.
+std::vector<std::string> PartPlate::process_override_keys() const
+{
+	std::vector<std::string> keys;
+	for (const std::string &key : m_config.keys())
+		if (!is_plate_owned_process_setting(key))
+			keys.push_back(key);
+	return keys;
+}
+
+size_t PartPlate::process_override_count() const
+{
+	size_t count = 0;
+	for (const std::string &key : m_config.keys())
+		if (!is_plate_owned_process_setting(key))
+			++count;
+	return count;
+}
+
+void PartPlate::clear_process_overrides()
+{
+	for (const std::string &key : process_override_keys())
+		m_config.erase(key);
+}
+
+int PartPlateList::distinct_printer_count() const
+{
+	std::set<std::string> names;
+	for (const PartPlate *plate : m_plate_list)
+		if (plate != nullptr && !plate->get_printer_preset_name().empty())
+			names.insert(plate->get_printer_preset_name());
+	return (int) names.size();
+}
+
+void PartPlateList::refresh_plate_labels_if_machine_count_changed()
+{
+	const int count = distinct_printer_count();
+	//Only the crossing matters. Going from three machines to four changes no label, so
+	//thirty-six textures are not thrown away to discover that.
+	const bool crossed = (m_last_distinct_printer_count <= 1) != (count <= 1);
+	m_last_distinct_printer_count = count;
+	if (!crossed)
+		return;
+	for (PartPlate *plate : m_plate_list)
+		if (plate != nullptr)
+			plate->invalidate_plate_name_texture();
+}
+
+//See the header. A plate in an existing session: the holder is a sibling plate, and only
+//when there is no sibling with a context is it the bundle's current selection - which at
+//that point is a remembered choice and the only holder in the building.
+int PartPlateList::complete_plate_contexts()
+{
+	if (m_plater == nullptr || wxApp::GetInstance() == nullptr)
+		return 0;
+	PresetBundle *bundle = wxGetApp().preset_bundle;
+	if (bundle == nullptr)
+		return 0;
+
+	PlateSlicingContext selection;
+	selection.printer_preset_name   = bundle->printers.get_selected_preset_name();
+	selection.print_preset_name     = bundle->prints.get_selected_preset_name();
+	selection.filament_preset_names = bundle->filament_presets;
+	return complete_plate_contexts(selection);
+}
+
+//See the header. The seed is handed in, and nothing here reads a global.
+int PartPlateList::complete_plate_contexts(const PlateSlicingContext &declared)
+{
+	//CLI mode has no wxApp instance and no bundle; it resolves each plate against the
+	//project config the 3MF carried. Same null-in-CLI signal the rest of this file uses.
+	if (m_plater == nullptr || wxApp::GetInstance() == nullptr)
+		return 0;
+	PresetBundle *bundle = wxGetApp().preset_bundle;
+	if (bundle == nullptr)
+		return 0;
+
+	int completed = 0;
+	//The seed walks forward: plate N is completed from the last plate that already had a
+	//complete context, and only a plate with none of its own falls back to what was handed
+	//in. So one machine recorded anywhere in a legacy project carries to the plates that
+	//recorded none, rather than every plate independently taking the file's global answer.
+	PlateSlicingContext seed = declared;
+	for (PartPlate *plate : m_plate_list) {
+		if (plate == nullptr)
+			continue;
+		PlateSlicingContext context = plate->get_slicing_context();
+		if (bundle->complete_plate_context(context, seed)) {
+			plate->set_slicing_context(context);
+			++completed;
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+				<< boost::format(": plate %1% completed to printer '%2%', process '%3%', %4% filament(s)")
+				   % (plate->get_index() + 1) % context.printer_preset_name % context.print_preset_name
+				   % context.filament_preset_names.size();
+		}
+		if (context.is_complete())
+			seed = context;
+	}
+	return completed;
+}
+
+// Give one plate its own printer's bed. The name must resolve exactly: there is no
+// project bed to fall back to, so an unresolved printer is reported and nothing is drawn
+// in its place.
 bool PartPlateList::apply_printer_to_plate(int index, bool reflow)
 {
 	PETKOS_PERF_SCOPE_AUX(Perf::Probe::ApplyPrinterToPlate, (int32_t) index);
@@ -4594,51 +4728,42 @@ bool PartPlateList::apply_printer_to_plate(int index, bool reflow)
 	PartPlate* plate = m_plate_list[index];
 
 	PlateBed bed;
-	const bool inherited = !plate->has_printer_assignment();
-	const bool resolved  = inherited || resolve_printer_bed(plate->get_printer_preset_name(), bed);
-	if (!resolved) {
+	if (!resolve_printer_bed(plate->get_printer_preset_name(), bed)) {
 		plate->update_apply_result_invalid(true);
 		BOOST_LOG_TRIVIAL(error) << __FUNCTION__
 			<< boost::format(": plate %1% printer '%2%' is unresolved")
 			   % (index + 1) % plate->get_printer_preset_name();
 		return false;
 	}
-	if (inherited) {
-		bed.shape = m_shape;
-		bed.exclude_areas = m_exclude_areas;
-		bed.wrapping_exclude_areas = m_wrapping_exclude_areas;
-		bed.extruder_areas = m_extruder_areas;
-		bed.extruder_heights = m_extruder_heights;
-		bed.printable_height = 0.0;
-	}
 
 	//record the height before reshaping so set_pos_and_size inside set_plate_shape
-	//already applies it; 0 clears the override and the plate follows the project again
-	plate->set_printable_height(inherited ? 0.0 : bed.printable_height);
+	//already applies it
+	plate->set_printable_height(bed.printable_height);
 
 	//set_plate_shape reports whether the bed actually moved, which is a different
 	//question from whether we honoured the assignment. Callers care about the latter.
 	set_plate_shape(index, bed.shape, bed.exclude_areas, bed.extruder_areas, bed.extruder_heights, m_height_to_lid, m_height_to_rod, reflow);
 	plate->set_local_wrapping_exclude_area(bed.wrapping_exclude_areas);
+	refresh_plate_labels_if_machine_count_changed();
 
 	return true;
 }
 
 void PartPlateList::apply_printer_assignments()
 {
-	bool any_assigned = false;
+	bool any_applied = false;
 	for (int i = 0; i < (int)m_plate_list.size(); ++i) {
-		if (m_plate_list[i] == nullptr || !m_plate_list[i]->has_printer_assignment())
+		if (m_plate_list[i] == nullptr)
 			continue;
 
-		any_assigned = true;
-		//reflow=false: one trailing reflow below instead of one per assigned plate
+		any_applied = true;
+		//reflow=false: one trailing reflow below instead of one per plate
 		apply_printer_to_plate(i, false);
 	}
 
 	//each apply above deferred its reflow, so this single pass is the only one and it
 	//accounts for every plate whose footprint changed
-	if (any_assigned)
+	if (any_applied)
 		reflow_layout();
 }
 
@@ -5214,6 +5339,20 @@ int PartPlateList::create_plate(bool adjust_position)
 		wxGetApp().obj_list()->on_plate_added(plate);
 	}
 
+	//DELIBERATELY NOT SEEDED HERE, and this is the second time that mistake has been made.
+	//
+	//load_from_3mf_structure calls this once per plate and then writes each plate's context
+	//from the file. A completion pass inside create_plate does not only fill the new plate:
+	//it fills EVERY plate in the list, so on iteration N it tops up plates 0..N-1 - which the
+	//file has already written as empty - with whatever the bundle held before the project was
+	//opened. Only the plate created on the current iteration is corrected afterwards, so the
+	//rest keep the stale names, and complete_plate_context only fills empty fields so nothing
+	//later corrects them. That is the 6h45m -> 21h03m fault re-entered through a different door.
+	//
+	//A plate is seeded by whoever ASKED for it: Plater::priv::on_action_add_plate seeds from
+	//the current plate, and the load path seeds from what the file declared. Neither of them
+	//is this function.
+
 	BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(":created a new plate %1%") % new_index;
 	return new_index;
 }
@@ -5227,6 +5366,28 @@ int PartPlateList::duplicate_plate(int index)
     PartPlate* new_plate = NULL;
     old_plate = get_plate(index);
     new_plate = get_plate(new_plate_index);
+    if (old_plate == NULL || new_plate == NULL)
+        return new_plate_index;
+
+    //A PLATE IS A COPYABLE UNIT, not a bag of geometry.
+    //
+    //This copied objects and instances and nothing else, which was survivable while a plate
+    //was only a rectangle. A plate now carries a printer, a process, a material per slot, a
+    //dispatch target and an arbitrary set of process overrides, and duplicating it dropped
+    //every one of them: the copy took whatever create_plate seeded it with, which is the LAST
+    //complete plate in the list rather than the one being duplicated. Duplicating plate 1
+    //while plate 5 was on another machine put the copy on plate 5's machine.
+    //
+    //"Duplicate" means this plate again. The context and the overrides are the plate.
+    new_plate->set_slicing_context(old_plate->get_slicing_context());
+    new_plate->config()->apply(*old_plate->config(), true);
+    if (!old_plate->get_plate_name().empty())
+        new_plate->set_plate_name(old_plate->get_plate_name());
+    //Reflow, exactly as on_action_add_plate does. The copy takes the source plate's machine,
+    //which can have a bed of a different size from the one create_plate laid out for it, and
+    //the neighbours have to shuffle around the real footprint. Deferring that left the
+    //duplicate overlapping the plate beside it until some unrelated edit reflowed the list.
+    apply_printer_to_plate(new_plate_index, true);
 
     // get the offset between plate centers
     Vec3d plate_to_plate_offset = new_plate->m_origin - old_plate->m_origin;
@@ -5591,10 +5752,11 @@ void PartPlateList::update_all_plates_pos_and_size(bool adjust_position, bool wi
 
 		//compute origin1 for PartPlate
 		origin1 = compute_origin(i, m_plate_cols);
-		//A plate pinned to its own printer keeps that printer's footprint; only plates
-		//following the project printer take the new list-wide size.
-		const Vec2d sz = plate->has_printer_assignment() ? plate->get_size()
-		                                                 : Vec2d((double)m_plate_width, (double)m_plate_depth);
+		//Every plate keeps its own printer's footprint. A reflow moves plates, it does not
+		//resize them, and there is no list-wide size for one to be resized to. In CLI the
+		//list size IS the bed source, so it still applies there.
+		const Vec2d sz = plate_beds_come_from_presets() ? plate->get_size()
+		                                               : Vec2d((double)m_plate_width, (double)m_plate_depth);
 		plate->set_pos_and_size(origin1, (int)sz.x(), (int)sz.y(), m_plate_height, adjust_position, do_clear);
 
 		// set default wipe pos when switch plate
@@ -6311,6 +6473,7 @@ void PartPlateList::postprocess_bed_index_for_selected(arrangement::ArrangePolyg
 	}
 
 	//create a new plate which can hold this arrange_polygon
+	const size_t plates_before = m_plate_list.size();
 	int plate_index = create_plate(false);
 
 	while (plate_index != -1)
@@ -6323,6 +6486,17 @@ void PartPlateList::postprocess_bed_index_for_selected(arrangement::ArrangePolyg
 
 		plate_index = create_plate(false);
 	}
+
+	//A PLATE IS SEEDED BY WHOEVER ASKED FOR IT, and here that is arrange. create_plate
+	//deliberately seeds nothing, so without this the plates just created name no printer:
+	//they cannot be drawn at any bed size and cannot be sliced. Each is completed from the
+	//last plate that already has a context, which is the same rule "add a plate" follows.
+	//
+	//ArrangeJob::finalize then overwrites the plates it can identify with the context of the
+	//plate they actually overflowed FROM - the exact answer, since an object must not change
+	//machine by failing to fit. This is the floor under the ones it cannot identify.
+	if (m_plate_list.size() > plates_before)
+		complete_plate_contexts();
 
 	return;
 }
@@ -6564,16 +6738,17 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
 		assert(plate != NULL);
 
 		PlateBed plate_bed;
-		const bool assigned = plate->has_printer_assignment();
-		const bool own_bed  = assigned && resolve_printer_bed(plate->get_printer_preset_name(), plate_bed);
-		if (assigned && !own_bed) {
+		const bool own_bed = resolve_printer_bed(plate->get_printer_preset_name(), plate_bed);
+		if (!own_bed && plate_beds_come_from_presets()) {
 			plate->update_apply_result_invalid(true);
 			BOOST_LOG_TRIVIAL(error) << __FUNCTION__
 				<< boost::format(": plate %1% printer '%2%' is unresolved; existing geometry retained")
 				   % (i + 1) % plate->get_printer_preset_name();
 			continue;
 		}
-		if (!assigned) {
+		if (!own_bed) {
+			//CLI: the shape handed in is the project config's, which is what resolves a
+			//plate there. See plate_beds_come_from_presets.
 			plate_bed.shape = shape;
 			plate_bed.exclude_areas = exclude_areas;
 			plate_bed.wrapping_exclude_areas = wrapping_exclude_areas;
@@ -7027,6 +7202,9 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		m_plate_list[index]->m_locked = plate_data_list[i]->locked;
 		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
 		m_plate_list[index]->set_sliced_config(plate_data_list[i]->sliced_config);
+		//After set_sliced_config, which clears the reason: this plate's retained slice was
+		//dropped at load and the row must say so rather than render as never sliced.
+		m_plate_list[index]->set_sliced_config_dropped_reason(plate_data_list[i]->sliced_config_dropped_reason);
 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
 		m_plate_list[index]->set_slicing_context(plate_data_list[i]->slicing_context);
 		if (plate_data_list[i]->plate_index != index)
@@ -7158,8 +7336,14 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 
 	}
 
-	//The project bed was applied before we knew each plate's assignment, so give the
-	//assigned plates their own beds now that the names have been read.
+	//No completion here. This function has no seed to complete FROM: the project's own
+	//declaration lives in the 3MF's config, which this loader never sees. Sampling the
+	//bundle instead is what once wrote "Default Filament" onto every plate and quoted
+	//21h03m for a 6h45m print. Plater::priv::load_files reads the file's declaration and
+	//passes it to complete_plate_contexts(declared).
+	//
+	//The list-wide bed was applied before we knew each plate's printer, so give every
+	//plate its own bed now that the names have been read.
 	apply_printer_assignments();
 
 	print();

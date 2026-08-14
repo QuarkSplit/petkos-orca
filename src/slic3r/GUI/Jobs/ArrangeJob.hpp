@@ -8,6 +8,7 @@
 
 #include "Job.hpp"
 #include "libslic3r/Arrange.hpp"
+#include "libslic3r/PlateSlicingContext.hpp"
 
 namespace Slic3r {
 
@@ -49,12 +50,20 @@ class ArrangeJob : public Job
     void prepare_partplate();
     void prepare_wipe_tower();
 
-    //Per-plate machines: when any plate is pinned to its own printer, one uniform
-    //bed no longer describes the world. Assigned plates are arranged one at a time
-    //against their own bed and their items never migrate (moving an item would
-    //change which machine prints it); the unassigned plates still form a shared
-    //pool over the project bed with the old cross-plate behaviour.
-    void arrange_per_plate(Ctl& ctl, bool enable_wrapping);
+    //Per-plate machines: every plate owns a printer and therefore a bed, so one uniform
+    //bed never describes the world and there is no shared pool of unassigned plates left
+    //to fall back to. Each plate is arranged on its own, against its own bed, and its
+    //items never migrate to another plate - moving one would change which machine prints
+    //it. What does not fit goes to an overflow bed of the SAME shape, which finalize turns
+    //into a plate carrying this plate's context.
+    void arrange_per_plate(Ctl& ctl);
+
+    //Overflow beds, numbered after every existing plate. An item that does not fit its
+    //plate lands on one of arrange's extra beds of the SAME shape, which finalize turns
+    //into a real plate. Each entry is the context that plate must be given, so an object
+    //never changes machine by failing to fit. Index is (bed - m_overflow_bed_base).
+    int                              m_overflow_bed_base = 0;
+    std::vector<PlateSlicingContext> m_overflow_plate_contexts;
 
     ArrangePolygon prepare_arrange_polygon(int object_idx, int instance_idx);
 

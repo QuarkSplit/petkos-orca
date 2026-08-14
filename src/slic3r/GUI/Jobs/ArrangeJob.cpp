@@ -299,8 +299,11 @@ void ArrangeJob::prepare_all() {
 
     prepare_wipe_tower();
 
-    const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
-    const bool enable_wrapping = project.config.opt_bool("enable_wrapping_detection");
+    //Wrapping detection is a printer property, so it is read off the plate whose bed these
+    //exclusion regions are being built against - the current one - and not off a project
+    //that no longer has a printer.
+    const ResolvedPlateSlicingConfig current = resolve_arrange_plate(plate_list.get_curr_plate());
+    const bool enable_wrapping = current.config.opt_bool("enable_wrapping_detection");
 
     // add the virtual object into unselect list if has
     plate_list.preprocess_exclude_areas(m_unselected, enable_wrapping, MAX_NUM_PLATES);
@@ -377,30 +380,34 @@ void ArrangeJob::prepare_wipe_tower()
         extruder_ids = ppl.get_extruders(true);
     }
 
-    PartPlate *project_template = nullptr;
-    for (int i = 0; i < plate_count; ++i) {
-        PartPlate *candidate = ppl.get_plate(i);
-        if (!candidate->has_printer_assignment()) {
-            project_template = candidate;
-            break;
-        }
-    }
+    //A BED THAT DOES NOT EXIST YET BELONGS TO THE PLATE THAT WILL OVERFLOW ONTO IT.
+    //
+    //finalize gives every overflow plate the context of its SOURCE plate, because an object
+    //must not change machine by failing to fit. The last plate in the list is not that
+    //plate: it is whichever plate happens to be last, on whatever machine, and estimating a
+    //future bed's wipe tower against it describes a machine nothing will print on.
+    //
+    //Which plate overflows is not known until arrange has run, so what prepare can name is
+    //the plate this arrange is anchored to - the one the user is looking at, which is also
+    //where arrange_per_plate sends items with no plate of their own. There is no project
+    //template to be a plate's shape instead.
+    PartPlate *future_template = ppl.get_curr_plate();
+    if (future_template == nullptr && plate_count > 0)
+        future_template = ppl.get_plate(0);
 
     int bedid_unlocked = 0;
-    const int bed_limit = project_template == nullptr ? plate_count : MAX_NUM_PLATES;
+    const int bed_limit = future_template == nullptr ? plate_count : MAX_NUM_PLATES;
     for (int bedid = 0; bedid < bed_limit; bedid++) {
-        const bool future_project_plate = bedid >= plate_count;
-        PartPlate* pl = future_project_plate ? project_template : ppl.get_plate(bedid);
-        if (!future_project_plate && pl->is_locked())
+        const bool future_plate = bedid >= plate_count;
+        PartPlate* pl = future_plate ? future_template : ppl.get_plate(bedid);
+        if (!future_plate && pl->is_locked())
             continue;
-        const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(future_project_plate ? nullptr : pl);
+        const ResolvedPlateSlicingConfig resolved = resolve_arrange_plate(pl);
         const bool enable_prime_tower = resolved.config.opt_bool("enable_prime_tower");
         const bool smooth_timelapse = resolved.config.opt_enum<TimelapseType>("timelapse_type") == TimelapseType::tlSmooth;
-        const bool sequential = future_project_plate
-            ? resolved.config.opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject
-            : pl->get_real_print_seq() == PrintSequence::ByObject;
+        const bool sequential = pl->get_real_print_seq() == PrintSequence::ByObject;
         const bool plate_needs_wipe_tower = enable_prime_tower && !sequential && (need_wipe_tower || smooth_timelapse);
-        if (!future_project_plate) {
+        if (!future_plate) {
             auto wti = get_wipe_tower(*m_plater, bedid);
             if (wti) {
                 // wipe tower is already there
@@ -412,7 +419,7 @@ void ArrangeJob::prepare_wipe_tower()
             }
         }
         if (plate_needs_wipe_tower) {
-            if (!future_project_plate) {
+            if (!future_plate) {
                 auto plate_extruders = pl->get_extruders(true);
                 extruder_ids.clear();
                 extruder_ids.insert(plate_extruders.begin(), plate_extruders.end());
@@ -577,7 +584,7 @@ void ArrangeJob::check_unprintable()
         const int g = only_on_partplate ? 0 : ap.src_bed_idx;
         if (g >= 0 && g < (int)logical_to_plate.size()) {
             PartPlate* plate = ppl.get_plate(logical_to_plate[g]);
-            if (plate != nullptr && plate->has_printer_assignment())
+            if (plate != nullptr)
                 return plate->get_printable_height();
         }
         return (double)params.printable_height;
@@ -633,44 +640,10 @@ void ArrangeJob::process(Ctl &ctl)
             <<", bbox:"<<get_extents(item.poly).min.transpose()<<","<<get_extents(item.poly).max.transpose();
     }
 
-    //Per-plate machines: once a plate is pinned to its own printer the single
-    //project bed stops being true, so arrange plate by plate instead. Projects
-    //with no assignments take the old single-call path, unchanged.
-    bool per_plate_beds = false;
-    {
-        PartPlateList& ppl = m_plater->get_partplate_list();
-        if (only_on_partplate) {
-            PartPlate* cur = ppl.get_plate(current_plate_index);
-            per_plate_beds = (cur != nullptr) && cur->has_printer_assignment();
-        }
-        else {
-            for (int i = 0; i < ppl.get_plate_count(); ++i)
-                if (ppl.get_plate(i)->has_printer_assignment()) { per_plate_beds = true; break; }
-        }
-    }
-
-    const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
-    const DynamicPrintConfig &project_config = project.config;
-    const bool enable_wrapping = project_config.opt_bool("enable_wrapping_detection");
-    Points bedpts;
-    if (!per_plate_beds) {
-        if (project.is_bbl_printer && params.avoid_extrusion_cali_region && project_config.opt_bool("scan_first_layer"))
-            partplate_list.preprocess_nonprefered_areas(m_unselected, MAX_NUM_PLATES);
-
-        update_arrange_params(params, &project_config, m_selected);
-        update_selected_items_inflation(m_selected, &project_config, params);
-        update_unselected_items_inflation(m_unselected, &project_config, params);
-        update_selected_items_axis_align(m_selected, &project_config, params);
-        bedpts = get_shrink_bedpts(&project_config, params);
-        partplate_list.preprocess_exclude_areas(params.excluded_regions, enable_wrapping, 1, scale_(1));
-        BOOST_LOG_TRIVIAL(debug) << "arrange bedpts:" << bedpts[0].transpose() << ", " << bedpts[1].transpose()
-                                 << ", " << bedpts[2].transpose() << ", " << bedpts[3].transpose();
-    }
-
-    if (per_plate_beds)
-        arrange_per_plate(ctl, enable_wrapping);
-    else
-        arrangement::arrange(m_selected, m_unselected, bedpts, params);
+    //There is one arrange path, because there is one kind of plate: every plate owns a
+    //printer and therefore a bed. The single-project-bed call this used to fall back to
+    //is gone with the project printer that made it true.
+    arrange_per_plate(ctl);
 
     // sort by item id
     std::sort(m_selected.begin(), m_selected.end(), [](auto a, auto b) {return a.itemid < b.itemid; });
@@ -702,7 +675,7 @@ void ArrangeJob::process(Ctl &ctl)
 }
 
 //Arrange with per-plate beds. Sticky first, pool second; see the header comment.
-void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
+void ArrangeJob::arrange_per_plate(Ctl& ctl)
 {
     PartPlateList& ppl = m_plater->get_partplate_list();
 
@@ -718,35 +691,36 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
     }
     const int unlocked_count = (int)logical_to_plate.size();
 
-    std::vector<int> pool_beds;     //logical beds of plates following the project printer
-    std::vector<int> sticky_beds;   //logical beds of plates pinned to their own printer
-    for (int g = 0; g < unlocked_count; ++g) {
-        if (ppl.get_plate(logical_to_plate[g])->has_printer_assignment())
-            sticky_beds.push_back(g);
-        else
-            pool_beds.push_back(g);
-    }
+    //Where a homeless item goes. An item with no source plate - freshly imported, or
+    //dropped outside every bed - used to fall into the pool of plates that shared the
+    //project bed. There is no such pool, and picking an arbitrary plate would decide which
+    //machine prints it. The current plate is the one the user is looking at, which is
+    //where the object visually already is, so that is the plate that adopts it.
+    int homeless_bed = -1;
+    for (int g = 0; g < unlocked_count; ++g)
+        if (logical_to_plate[g] == current_plate_index) { homeless_bed = g; break; }
+    if (homeless_bed < 0 && unlocked_count > 0)
+        homeless_bed = 0;   //the current plate is locked; the first unlocked one is the only other honest answer
 
-    // Group selected items by their existing target. Items without a plate may
-    // enter the Project-row pool, but are never silently assigned to an arbitrary
-    // physical plate when the project has no unassigned plates.
+    // Group selected items by the plate they are already on.
     std::map<int, std::vector<size_t>> sticky_groups;
-    std::vector<size_t> pool_items;
-    auto is_sticky_bed = [&sticky_beds](int g) {
-        return std::find(sticky_beds.begin(), sticky_beds.end(), g) != sticky_beds.end();
-    };
     for (size_t k = 0; k < m_selected.size(); ++k) {
         const int src = m_selected[k].src_bed_idx;
-        if (src >= 0 && is_sticky_bed(src))
-            sticky_groups[src].push_back(k);
-        else if (!pool_beds.empty())
-            pool_items.push_back(k);
+        const int bed = (src >= 0 && src < unlocked_count) ? src : homeless_bed;
+        if (bed >= 0)
+            sticky_groups[bed].push_back(k);
         else {
             m_selected[k].bed_idx = arrangement::UNARRANGED;
             BOOST_LOG_TRIVIAL(error) << "arrange: " << m_selected[k].name
-                                     << " has no target plate and the project has no Project-row plate";
+                                     << " has no target plate and every plate is locked";
         }
     }
+
+    //Overflow beds are numbered after every existing one. They become new plates in
+    //finalize, and each carries the context of the plate it overflowed from - an object
+    //must not change machine by failing to fit.
+    m_overflow_bed_base = unlocked_count;
+    m_overflow_plate_contexts.clear();
 
     //progress spans all the sub-arranges as if they were one
     size_t done = 0;
@@ -760,10 +734,11 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
         return name.rfind("ExcludedRegion", 0) == 0 || name.rfind("WrappingRegion", 0) == 0;
     };
 
-    //sticky plates: one arrange per plate, on that plate's own bed
-    for (int g : sticky_beds) {
-        auto it = sticky_groups.find(g);
-        if (it == sticky_groups.end() || it->second.empty())
+    //one arrange per plate, on that plate's own bed
+    for (const std::pair<const int, std::vector<size_t>> &group : sticky_groups) {
+        const int g  = group.first;
+        auto      it = sticky_groups.find(g);
+        if (it->second.empty())
             continue;
         if (ctl.was_canceled())
             return;
@@ -834,12 +809,16 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
                 % (plate_idx + 1) % plate->get_printer_preset_name() % sel_g.size();
             arrangement::arrange(sel_g, unsel_g, bed_g, params_g);
 
-            //bed 0 means it fits this plate. Anything else means it did not fit, and
-            //it goes to the unprintable area: spilling onto a neighbouring plate would
-            //silently change which machine prints it.
+            //Bed 0 is this plate. Bed k>0 is arrange's k-th extra bed OF THE SAME SHAPE,
+            //which is the honest home for an overflow: it is the same machine by
+            //construction. Those become new plates in finalize, each carrying this
+            //plate's context, so nothing changes machine by not fitting. A negative bed
+            //could not be placed at all and goes to the unprintable area.
             std::map<int, size_t> by_itemid;
             for (size_t k : it->second)
                 by_itemid[m_selected[k].itemid] = k;
+            //one overflow plate per extra bed this plate needed, allocated on first use
+            std::map<int, int> overflow_bed_of;
             for (ArrangePolygon& res : sel_g) {
                 auto slot = by_itemid.find(res.itemid);   //arrange may reorder
                 if (slot == by_itemid.end())
@@ -847,10 +826,31 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
                 if (res.bed_idx == 0) {
                     res.bed_idx = g;
                 }
+                else if (res.bed_idx > 0 && !only_on_partplate) {
+                    auto known = overflow_bed_of.find(res.bed_idx);
+                    if (known == overflow_bed_of.end()) {
+                        const int bed = m_overflow_bed_base + (int) m_overflow_plate_contexts.size();
+                        m_overflow_plate_contexts.push_back(plate->get_slicing_context());
+                        known = overflow_bed_of.emplace(res.bed_idx, bed).first;
+                        BOOST_LOG_TRIVIAL(info) << boost::format("arrange: plate %1% overflows onto a new plate on the same machine ('%2%')")
+                            % (plate_idx + 1) % plate->get_printer_preset_name();
+                    }
+                    res.bed_idx = known->second;
+                }
+                else if (res.bed_idx > 0) {
+                    //Arranging ONE plate, from its own context menu. finalize routes this
+                    //through postprocess_bed_index_for_current_plate, which maps every bed
+                    //past the first onto a single index and creates no plate - so an overflow
+                    //bed here is not a new plate on the same machine, it is a phantom. The
+                    //user asked to arrange this plate, not to acquire another one, so what
+                    //does not fit goes to the unprintable area where they can see it.
+                    BOOST_LOG_TRIVIAL(warning) << "arrange: " << res.name << " does not fit plate "
+                                               << (plate_idx + 1) << ", sending it to the unprintable area";
+                    res.bed_idx = arrangement::UNARRANGED;
+                }
                 else {
-                    if (res.bed_idx > 0)
-                        BOOST_LOG_TRIVIAL(warning) << "arrange: " << res.name << " does not fit plate "
-                                                   << (plate_idx + 1) << ", sending it to the unprintable area";
+                    BOOST_LOG_TRIVIAL(warning) << "arrange: " << res.name << " could not be placed on plate "
+                                               << (plate_idx + 1) << ", sending it to the unprintable area";
                     res.bed_idx = arrangement::UNARRANGED;
                 }
                 m_selected[slot->second] = std::move(res);
@@ -859,87 +859,6 @@ void ArrangeJob::arrange_per_plate(Ctl& ctl, bool enable_wrapping)
         done += it->second.size();
     }
 
-    //the pool: every unassigned plate still shares the project bed, so they are
-    //arranged together with the old cross-plate semantics, including creating new
-    //(project-bed) plates for overflow
-    if (!pool_items.empty() && !pool_beds.empty()) {
-        if (ctl.was_canceled())
-            return;
-
-        //the pool renumbers its beds 0..N; ordinals past the existing pool map to
-        //brand-new plates appended after every existing plate
-        auto ordinal_of_logical = [&](int logical) -> int {
-            auto it = std::lower_bound(pool_beds.begin(), pool_beds.end(), logical);
-            if (it != pool_beds.end() && *it == logical)
-                return (int)(it - pool_beds.begin());
-            if (logical >= unlocked_count)
-                return (int)pool_beds.size() + (logical - unlocked_count);
-            return -1;   //an assigned bed; not part of the pool
-        };
-        auto logical_of_ordinal = [&](int j) -> int {
-            if (j < (int)pool_beds.size())
-                return pool_beds[j];
-            return unlocked_count + (j - (int)pool_beds.size());
-        };
-
-        ArrangePolygons unsel_pool;
-        for (const ArrangePolygon& ap : m_unselected) {
-            if (ap.bed_idx == PartPlateList::MAX_PLATES_COUNT || is_region_name(ap.name))
-                continue;
-            const int j = ordinal_of_logical(ap.bed_idx);
-            if (j < 0)
-                continue;   //fixed on an assigned plate; that arrange already saw it
-            unsel_pool.emplace_back(ap);
-            unsel_pool.back().bed_idx = j;
-        }
-        const int geometry_plate = logical_to_plate[pool_beds.front()];
-        ppl.preprocess_exclude_areas(unsel_pool, enable_wrapping, MAX_NUM_PLATES, 0, geometry_plate);
-
-        const ResolvedPlateSlicingConfig project = resolve_arrange_plate(nullptr);
-        const DynamicPrintConfig &project_config = project.config;
-        arrangement::ArrangeParams params_pool = params;
-        params_pool.clearance_height_to_rod = project_config.opt_float("extruder_clearance_height_to_rod");
-        params_pool.clearance_height_to_lid = project_config.opt_float("extruder_clearance_height_to_lid");
-        params_pool.clearance_radius        = project_config.opt_float("extruder_clearance_radius");
-        params_pool.printable_height        = project_config.opt_float("printable_height");
-        params_pool.nozzle_height           = project_config.opt_float("nozzle_height");
-        params_pool.align_center            = project_config.option<ConfigOptionPoint>("best_object_pos")->value;
-        params_pool.is_seq_print            = project_config.opt_enum<PrintSequence>("print_sequence") == PrintSequence::ByObject;
-        params_pool.bed_shrink_x            = params_pool.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
-        params_pool.bed_shrink_y            = params_pool.is_seq_print ? BED_SHRINK_SEQ_PRINT : 0;
-        params_pool.excluded_regions.clear();
-        ppl.preprocess_exclude_areas(params_pool.excluded_regions, enable_wrapping, 1, scale_(1), geometry_plate);
-        params_pool.progressind = make_progress(done);
-
-        ArrangePolygons sel_pool;
-        sel_pool.reserve(pool_items.size());
-        for (size_t k : pool_items)
-            sel_pool.emplace_back(m_selected[k]);
-
-        if (project.is_bbl_printer && params_pool.avoid_extrusion_cali_region && project_config.opt_bool("scan_first_layer"))
-            ppl.preprocess_nonprefered_areas(unsel_pool, MAX_NUM_PLATES);
-        update_arrange_params(params_pool, &project_config, sel_pool);
-        update_selected_items_inflation(sel_pool, &project_config, params_pool);
-        update_unselected_items_inflation(unsel_pool, &project_config, params_pool);
-        update_selected_items_axis_align(sel_pool, &project_config, params_pool);
-        const Points project_bed = get_shrink_bedpts(&project_config, params_pool);
-
-        BOOST_LOG_TRIVIAL(info) << boost::format("arrange: pool of %1% unassigned plates: %2% items on the project bed")
-            % pool_beds.size() % sel_pool.size();
-        arrangement::arrange(sel_pool, unsel_pool, project_bed, params_pool);
-
-        std::map<int, size_t> by_itemid;
-        for (size_t k : pool_items)
-            by_itemid[m_selected[k].itemid] = k;
-        for (ArrangePolygon& res : sel_pool) {
-            auto slot = by_itemid.find(res.itemid);
-            if (slot == by_itemid.end())
-                continue;
-            if (res.bed_idx >= 0)
-                res.bed_idx = logical_of_ordinal(res.bed_idx);
-            m_selected[slot->second] = std::move(res);
-        }
-    }
 }
 
 ArrangeJob::ArrangeJob() : m_plater{wxGetApp().plater()} { }
@@ -980,14 +899,25 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     }
     else
         plate_list.clear(false, false, true, -1);
+    //Which plate each overflow bed became. postprocess rewrites bed_idx into a real plate
+    //index and creates the plate on the way, so the mapping only exists across that one
+    //call - it is captured here rather than recomputed, because recomputing it would mean
+    //a second implementation of postprocess's locked-plate arithmetic.
+    std::map<int, int> overflow_plate_of_bed;
+
     //BBS: adjust the bed_index, create new plates, get the max bed_index
     for (ArrangePolygon& ap : m_selected) {
         //if (ap.bed_idx < 0) continue;  // bed_idx<0 means unarrangable
+        const int bed_before = ap.bed_idx;
         //BBS: partplate postprocess
         if (only_on_partplate)
             plate_list.postprocess_bed_index_for_current_plate(ap);
         else
             plate_list.postprocess_bed_index_for_selected(ap);
+
+        if (bed_before >= m_overflow_bed_base && ap.bed_idx >= 0 &&
+            bed_before - m_overflow_bed_base < (int) m_overflow_plate_contexts.size())
+            overflow_plate_of_bed[bed_before] = ap.bed_idx;
 
         beds = std::max(ap.bed_idx, beds);
 
@@ -1007,6 +937,25 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
         beds = std::max(ap.bed_idx, beds);
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(":arrange unselected %4%: bed_id %1%, trans {%2%,%3%}") % ap.bed_idx % unscale<double>(ap.translation(X)) % unscale<double>(ap.translation(Y)) % ap.name;
     }
+
+    //An overflow plate carries the machine of the plate it overflowed from. create_plate
+    //seeds nothing - a plate is seeded by whoever asked for it - so without this the plate
+    //postprocess just created would name no printer at all, and an object that merely did
+    //not fit would land on a plate that cannot be drawn or sliced.
+    for (const std::pair<const int, int> &mapped : overflow_plate_of_bed) {
+        PartPlate *created = plate_list.get_plate(mapped.second);
+        if (created == nullptr)
+            continue;
+        const PlateSlicingContext &context = m_overflow_plate_contexts[mapped.first - m_overflow_bed_base];
+        if (created->get_slicing_context() == context)
+            continue;
+        created->set_slicing_context(context);
+        plate_list.apply_printer_to_plate(mapped.second, false);
+        BOOST_LOG_TRIVIAL(info) << boost::format("arrange: plate %1% was created for overflow and takes printer '%2%'")
+            % (mapped.second + 1) % context.printer_preset_name;
+    }
+    if (!overflow_plate_of_bed.empty())
+        plate_list.reflow_layout();
 
     for (ArrangePolygon& ap : m_locked) {
         beds = std::max(ap.bed_idx, beds);
@@ -1316,7 +1265,7 @@ PlacementResult place_instances_on_plate(Plater *plater, int plate_idx,
 
             BOOST_LOG_TRIVIAL(info) << boost::format("place: %1% new item(s) onto plate %2% ('%3%'), around %4% fixed item(s)")
                                            % selected.size() % (plate_idx + 1)
-                                           % (plate->has_printer_assignment() ? plate->get_printer_preset_name() : std::string("project printer"))
+                                           % plate->get_printer_preset_name()
                                            % fixed.size();
             arrangement::arrange(selected, fixed, bedpts, params);
             result.arranged = true;

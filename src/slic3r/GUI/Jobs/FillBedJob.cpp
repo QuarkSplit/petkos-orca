@@ -262,19 +262,17 @@ void FillBedJob::process(Ctl &ctl)
     update_arrange_params(params, &plate_config, m_selected);
     m_bedpts = get_shrink_bedpts(&plate_config, params);
 
-    //filling happens on the current plate; when that plate is pinned to its own
-    //printer, fill against that printer's bed and height, not the project's
+    //Filling happens on the current plate, against that plate's own printer's bed and
+    //height. There is no project bed to fill against instead.
     {
-        if (cur_plate->has_printer_assignment()) {
-            if (cur_plate->get_local_shape().empty())
-                throw RuntimeError((boost::format("Plate %1% is assigned to printer '%2%' but has no resolved bed geometry")
-                                    % (cur_plate->get_index() + 1) % cur_plate->get_printer_preset_name()).str());
-            Points bed;
-            for (const Vec2d& pt : cur_plate->get_local_shape())
-                bed.emplace_back(scaled(pt.x()), scaled(pt.y()));
-            m_bedpts = arrangement::get_shrink_bedpts(std::move(bed), params);
-            params.printable_height = (float)cur_plate->get_printable_height();
-        }
+        if (cur_plate->get_local_shape().empty())
+            throw RuntimeError((boost::format("Plate %1% is on printer '%2%' but has no resolved bed geometry")
+                                % (cur_plate->get_index() + 1) % cur_plate->get_printer_preset_name()).str());
+        Points bed;
+        for (const Vec2d& pt : cur_plate->get_local_shape())
+            bed.emplace_back(scaled(pt.x()), scaled(pt.y()));
+        m_bedpts = arrangement::get_shrink_bedpts(std::move(bed), params);
+        params.printable_height = (float)cur_plate->get_printable_height();
     }
 
     auto &partplate_list               = m_plater->get_partplate_list();

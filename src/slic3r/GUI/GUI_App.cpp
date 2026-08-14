@@ -8831,6 +8831,17 @@ void GUI_App::load_current_presets(bool active_preset_combox/*= false*/, bool ch
     if (check_printer_presets_)
         check_printer_presets();
 
+    //The plate list exists before the preset bundle finishes loading, so the first plate of
+    //a session is created with nothing to take a context from. This is the moment there IS
+    //something, and it has to happen BEFORE the tab loop below: that loop pushes presets into
+    //the tabs, which updates the bed, which reads every plate's context. A plate still empty
+    //at that point leaves its bed unapplied and nothing re-applies it afterwards.
+    //
+    //Idempotent - it fills empty fields and touches nothing else - so a later preset reload
+    //cannot retarget a plate the user has assigned.
+    if (plater() != nullptr && !plater()->is_loading_project())
+        plater()->get_partplate_list().complete_plate_contexts();
+
     auto& edited_printer_preset = preset_bundle->printers.get_edited_preset();
     PrinterTechnology printer_technology = edited_printer_preset.printer_technology();
     // ORCA: Sync filament count with the printer's nozzle count before loading presets for multi-tool printers.

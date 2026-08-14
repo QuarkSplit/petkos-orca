@@ -282,6 +282,13 @@ protected:
 	DynamicPrintConfig 	m_cache_config;
     std::vector<std::string> m_cache_options;
 
+    //PetkosOrca: unsaved edits parked against the preset they were made on. See Tab::park_dirty_edits
+    //- a printer's tuning and a filament's material settings belong to that printer and that
+    //material, so they wait here for it rather than following the editing cursor onto whatever
+    //preset the next plate uses. Keyed by the preset name they were made against. In memory only:
+    //this is a within-session store, which is why the quit path still asks about what is in it.
+    std::map<std::string, DynamicPrintConfig> m_parked_preset_edits;
+
 
 	bool				m_page_switch_running = false;
 	bool				m_page_switch_planned = false;
@@ -342,8 +349,37 @@ public:
     void		update_btns_enabling();
     void		update_preset_choice();
     // Select a new preset, possibly delete the current one.
-    bool select_preset(std::string preset_name = "", bool delete_current = false, const std::string &last_selected_ph_printer_name = "", bool force_select = false, bool force_no_transfer = false);
+    //
+    //PetkosOrca: from_plate_cursor says this selection is the editing cursor following the plate the
+    //user just clicked, rather than a preset the user picked. A cursor move is not a decision about
+    //presets and must never open a dialog: the plate already knows what it slices with, and asking
+    //"transfer or discard?" on every plate click both interrupts navigation and offers two wrong
+    //answers - discard loses the edit, transfer drags it onto the next plate's preset. Unsaved edits
+    //are PARKED instead; see Tab::park_dirty_edits.
+    bool select_preset(std::string preset_name = "", bool delete_current = false, const std::string &last_selected_ph_printer_name = "", bool force_select = false, bool force_no_transfer = false, bool from_plate_cursor = false);
 	bool		may_discard_current_dirty_preset(PresetCollection* presets = nullptr, const std::string& new_printer_name = "", bool no_transfer = false, bool no_transfer_variant = false);
+
+    //Move this tab's unsaved edits out of the preset, so a selection that is not the user's choice of
+    //preset cannot destroy them and cannot need a dialog to decide. A PROCESS edit is a statement
+    //about the project and goes to the project layer, which every plate composes. A printer or
+    //filament edit belongs to that machine or that material and waits in m_parked_preset_edits for
+    //its preset to be selected again. Returns true if anything was parked.
+    bool        park_dirty_edits();
+    //Put back what belongs on the preset that has just been selected: this machine's or this
+    //material's parked edits, or the project layer's overrides for a process preset. Without this the
+    //value is live in every slice and absent from the panel, which is the same lie as a silent gate.
+    void        restore_parked_edits();
+    //Park every tab that a cursor move or a quit is about to disturb. The printer tab's selection
+    //checks the process and filament collections too, so parking one tab is not enough to keep a
+    //dialog from opening. include_preset_local is false at quit: a preset-local park lives in memory
+    //and dies with the process, so at the end of a session those are exactly the edits still worth
+    //one question, and the dialog is the only thing that can offer to save them.
+    static void park_all_dirty_edits(bool include_preset_local = true);
+    //Whether a collection holds unsaved edits that the project layer does not already account for.
+    //A project override shows on the page as a modified option because that is what it is - the
+    //project overriding the preset - but it is stored, so it can neither be lost nor usefully be
+    //asked about, and both answers a save/discard dialog offers for it are wrong.
+    bool        dirty_beyond_project(const PresetCollection &presets) const;
 
     virtual void    clear_pages();
     virtual void    update_description_lines();

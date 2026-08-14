@@ -590,6 +590,14 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
         auto check = [](bool yes_or_no) {
             if (yes_or_no)
                 return true;
+            //PetkosOrca: quitting is not a decision about presets. A process setting the user changed
+            //at the Global scope is the project's, so it goes to the project layer and leaves nothing
+            //to ask about - the project save above is the question that covers it, and asking a second
+            //time was how one plate click's worth of dirt turned into a dialog on the way out. A
+            //printer's tuning and a filament's material settings have nowhere to go that survives the
+            //process, so that question stays: this dialog is the only thing that can offer to save
+            //them, and dropping them silently would be exactly the loss the check exists to prevent.
+            Tab::park_all_dirty_edits(false);
             return wxGetApp().check_and_save_current_preset_changes(_L("Closing application"), _L("Closing Application while some presets are modified."));
         };
 
