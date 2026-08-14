@@ -45,6 +45,11 @@ static std::vector<std::string> s_project_options {
     "flush_volumes_matrix",
     // BBS
     "filament_colour",
+    // PetkosOrca: how the spool in this slot LOOKS. It sits beside the colour and not in the
+    // filament preset for the same reason the colour does not: two slots routinely hold the same
+    // preset - same brand, same material - and differ only in what is on the spool. A silver PLA
+    // and a yellow PLA are one preset and two finishes.
+    "filament_finish",
     "filament_colour_type",
     "filament_multi_colour",
     "wipe_tower_x",
@@ -3604,6 +3609,10 @@ void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> ne
     ConfigOptionInts* filament_volume_map = project_config.option<ConfigOptionInts>("filament_volume_map");
 
     filament_color->resize(n);
+    // Same length as the colours, always: a slot with a colour and no finish would read as
+    // Standard by luck rather than by rule.
+    if (ConfigOptionEnumsGeneric *filament_finish = project_config.option<ConfigOptionEnumsGeneric>("filament_finish"))
+        filament_finish->values.resize(n, (int) FilamentFinish::ffStandard);
     // Sync filament multi colour
     filament_multi_color->values.resize(n);
     for (size_t i = 0; i < n; i++) {
@@ -3644,6 +3653,10 @@ void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
     ConfigOptionInts* filament_volume_map = project_config.option<ConfigOptionInts>("filament_volume_map");
 
     filament_color->resize(n);
+    // Same length as the colours, always: a slot with a colour and no finish would read as
+    // Standard by luck rather than by rule.
+    if (ConfigOptionEnumsGeneric *filament_finish = project_config.option<ConfigOptionEnumsGeneric>("filament_finish"))
+        filament_finish->values.resize(n, (int) FilamentFinish::ffStandard);
     // Sync filament multi colour
     filament_multi_color->values.resize(n);
     for (size_t i = 0; i < n; i++) {
@@ -3695,6 +3708,9 @@ void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
     ConfigOptionInts* filament_map = project_config.option<ConfigOptionInts>("filament_map");
     ConfigOptionInts* filament_nozzle_map = project_config.option<ConfigOptionInts>("filament_nozzle_map");
     ConfigOptionInts* filament_volume_map = project_config.option<ConfigOptionInts>("filament_volume_map");
+    if (ConfigOptionEnumsGeneric *filament_finish = project_config.option<ConfigOptionEnumsGeneric>("filament_finish");
+        filament_finish != nullptr && filament_finish->values.size() > to_del_flament_id)
+        filament_finish->values.erase(filament_finish->values.begin() + to_del_flament_id);
     if (filament_color->values.size() > to_del_flament_id) {
         filament_color->values.erase(filament_color->values.begin() + to_del_flament_id);
         if (filament_map->values.size() > to_del_flament_id) {

@@ -27,6 +27,11 @@ namespace Slic3r { namespace GUI {
 //a scripted run that records nothing looks exactly like a fast one.
 void petkos_perf_driver_start();
 
+//PetkosOrca: the acceptance run. Inert unless PETKOS_ACCEPT is set. Drives one real job all the
+//way through - a model split across two plates on two different printers in two materials, sliced
+//and saved - using nothing but the application's own APIs.
+void petkos_acceptance_start();
+
 }} // namespace Slic3r::GUI
 
 #endif // slic3r_GUI_PetkosPerfDriver_hpp_

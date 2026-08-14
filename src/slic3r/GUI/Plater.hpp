@@ -599,6 +599,22 @@ public:
     //dirty marking — are handled in exactly one place. An empty preset_name clears
     //the assignment back to "follow the project printer".
     void set_plate_printer(int plate_index, std::string preset_name);
+
+    // PetkosOrca: the other two halves of a plate's slicing identity, which the app could write
+    // and the user could not.
+    //
+    // A plate's context has five fields. Only the printer had a write path. print_preset_name and
+    // filament_preset_names were written solely by the 3MF loader and by
+    // reresolve_plate_context_for_printer - so a downloaded project arrived carrying per-plate
+    // filaments nobody could change, and moving a plate to another printer silently re-pointed its
+    // process with no way to disagree. An automatic decision the user cannot overrule is not a
+    // convenience; it is the app doing something to them.
+    //
+    // An empty name clears the slot back to "follow the project", which is what an empty context
+    // field means everywhere else. A preset this build does not have is recorded verbatim and
+    // reported as unresolved rather than remapped, exactly as the printer path does.
+    void set_plate_process(int plate_index, std::string preset_name);
+    void set_plate_filaments(int plate_index, std::vector<std::string> preset_names);
     //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
     //had. The board's inline editor and any MCP surface should both land here.
     void rename_plate(int plate_index, const std::string &name);

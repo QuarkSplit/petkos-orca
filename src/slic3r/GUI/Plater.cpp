@@ -20104,6 +20104,98 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
     }
 }
 
+//The user's own choice of process for one plate.
+//
+//The plate keeps a retained slice: is_slice_result_valid() compares the snapshot the G-code was
+//made under against the plate's current context, so the result goes stale by itself rather than
+//being discarded here. Losing a slice because a name changed is a cost the user did not ask for.
+void Plater::set_plate_process(int plate_index, std::string preset_name)
+{
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    if (plate == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": no plate at index %1%, nothing assigned") % plate_index;
+        return;
+    }
+    if (plate->get_print_preset_name() == preset_name)
+        return;
+
+    take_snapshot(std::string("Assign plate process"));
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+        << boost::format(": plate %1% process -> '%2%'")
+           % (plate_index + 1) % (preset_name.empty() ? std::string("(follow the project)") : preset_name);
+
+    PlateSlicingContext context = plate->get_slicing_context();
+    context.print_preset_name = preset_name;
+    plate->set_slicing_context(context);
+
+    //Say so if the choice does not resolve. It is still recorded - it is the user's choice, and a
+    //project may be headed for a machine that has the preset - but an unresolved plate must never
+    //be silent, because the only other place it shows up is a slice that will not start.
+    ResolvedPlateSlicingConfig resolved;
+    std::string                error;
+    if (!resolve_plate_slicing_config(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": plate %1% does not resolve after the change: %2%") % (plate_index + 1) % error;
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d cannot slice with this process: %s"),
+                                         plate_index + 1, from_u8(error))));
+    }
+
+    update_project_dirty_from_presets();
+    set_plater_dirty(true);
+    if (p->sidebar != nullptr)
+        p->sidebar->refresh_plate_board(plate_index);
+    if (plate_index == p->partplate_list.get_curr_plate_index())
+        schedule_background_process();
+}
+
+//The user's own choice of materials for one plate.
+//
+//An empty list clears the slot back to the project's filaments. Nothing here substitutes a
+//material: an incompatible choice is recorded and named, because filament is what the object is
+//made of and swapping it silently has a real cost in the physical world.
+void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names)
+{
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    if (plate == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": no plate at index %1%, nothing assigned") % plate_index;
+        return;
+    }
+    if (plate->get_slicing_context().filament_preset_names == preset_names)
+        return;
+
+    take_snapshot(std::string("Assign plate filaments"));
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+        << boost::format(": plate %1% filaments -> %2% slot(s)") % (plate_index + 1) % preset_names.size();
+
+    PlateSlicingContext context = plate->get_slicing_context();
+    context.filament_preset_names = std::move(preset_names);
+    plate->set_slicing_context(context);
+
+    ResolvedPlateSlicingConfig resolved;
+    std::string                error;
+    if (!resolve_plate_slicing_config(plate, resolved, error)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": plate %1% does not resolve after the change: %2%") % (plate_index + 1) % error;
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d cannot slice with these filaments: %s"),
+                                         plate_index + 1, from_u8(error))));
+    }
+
+    update_project_dirty_from_presets();
+    set_plater_dirty(true);
+    if (p->sidebar != nullptr)
+        p->sidebar->refresh_plate_board(plate_index);
+    if (plate_index == p->partplate_list.get_curr_plate_index())
+        schedule_background_process();
+}
+
 //The one write path for a plate's printer assignment. Owns every consequence of a
 //reassignment: the undo snapshot, the bed update, the bounds re-check and the slice
 //invalidation. An empty preset_name clears the assignment back to "follow the

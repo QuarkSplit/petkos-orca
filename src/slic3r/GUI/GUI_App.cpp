@@ -1072,6 +1072,8 @@ void GUI_App::post_init()
     //Inert unless PETKOS_PERF_SCRIPT is set. Started here because this is the first point
     //at which the plater, the canvas and the preset bundle all exist.
     petkos_perf_driver_start();
+    //Same window, same reason: the plater, the canvas and the preset bundle all exist here.
+    petkos_acceptance_start();
 
 //BBS: remove the single instance currently
 #ifdef _WIN32

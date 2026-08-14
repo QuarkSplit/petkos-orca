@@ -1,6 +1,8 @@
 #include "PetkosPerfDriver.hpp"
 #include "PetkosPerf.hpp"
 
+#include <chrono>
+#include <map>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -9,6 +11,8 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/log/trivial.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/operations.hpp>
 
 #include <wx/event.h>
 #include <wx/timer.h>
@@ -23,6 +27,9 @@
 #include "MainFrame.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
+//Tab: the acceptance run pushes a filament-colour change the way the colour picker does, which
+//goes through the printer tab as well as the plater.
+#include "Tab.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -593,6 +600,383 @@ private:
 };
 
 } // namespace
+
+//=============================================================================================
+// PetkosOrca: the acceptance run.
+//
+// The latency work could be measured and the per-plate work could be unit-checked, but neither
+// answers the question the user actually asked, which is whether a real job can be got through
+// this application without wasting his time. So this drives one: a five-part model, split across
+// two plates, on two DIFFERENT printers, in two different materials, sliced and saved.
+//
+// It uses the application's own APIs and nothing else - load_files, add_to_plate, set_plate_printer,
+// set_plate_filaments, reslice, export_3mf. Constructing the 3MF externally would have been easier
+// and would have proved nothing, because the thing under test is the app, not the file format.
+//
+//   PETKOS_ACCEPT="project=<path>,printerA=<name>,printerB=<name>,filamentA=<name>,filamentB=<name>,out=<path>"
+//
+// Every stage says PASS or FAIL by name. A stage that cannot run says so and the run stops there
+// rather than continuing to a green summary it has not earned.
+//=============================================================================================
+
+struct AcceptSpec
+{
+    std::string project;
+    std::string printerA, printerB;
+    std::string filamentA, filamentB;
+    //The two spools, as colour and finish. Silver is grey PLUS metallic, which is the whole
+    //reason filament_finish exists - #C0C0C0 on its own is just light grey.
+    std::string colourA { "#C0C0C0" }, colourB { "#FFF144" };
+    std::string finishA { "metallic" }, finishB { "standard" };
+    //Deliberately DIFFERENT process settings per plate. This is the thing per-plate process
+    //exists for and the only way to show it works: two plates, one project, one process preset
+    //between them, and two different answers in the G-code.
+    int         wallsA { 2 }, wallsB { 6 };
+    int         infillA { 10 }, infillB { 45 };
+    std::string out;
+};
+
+static AcceptSpec parse_accept(const std::string &s)
+{
+    AcceptSpec spec;
+    std::vector<std::string> parts;
+    boost::split(parts, s, boost::is_any_of(","), boost::token_compress_on);
+    for (const std::string &part : parts) {
+        const size_t eq = part.find('=');
+        if (eq == std::string::npos)
+            continue;
+        const std::string key = part.substr(0, eq);
+        const std::string val = part.substr(eq + 1);
+        if (key == "project")        spec.project = val;
+        else if (key == "printerA")  spec.printerA = val;
+        else if (key == "printerB")  spec.printerB = val;
+        else if (key == "filamentA") spec.filamentA = val;
+        else if (key == "filamentB") spec.filamentB = val;
+        else if (key == "colourA")   spec.colourA = val;
+        else if (key == "colourB")   spec.colourB = val;
+        else if (key == "finishA")   spec.finishA = val;
+        else if (key == "finishB")   spec.finishB = val;
+        else if (key == "wallsA")    spec.wallsA = std::atoi(val.c_str());
+        else if (key == "wallsB")    spec.wallsB = std::atoi(val.c_str());
+        else if (key == "infillA")   spec.infillA = std::atoi(val.c_str());
+        else if (key == "infillB")   spec.infillB = std::atoi(val.c_str());
+        else if (key == "out")       spec.out = val;
+    }
+    return spec;
+}
+
+class AcceptDriver : public wxEvtHandler
+{
+public:
+    explicit AcceptDriver(AcceptSpec spec) : m_spec(std::move(spec))
+    {
+        wxGetApp().mainframe->PushEventHandler(this);
+        Bind(wxEVT_IDLE, &AcceptDriver::on_idle, this);
+    }
+
+private:
+    enum class Step { Settle, Load, Materials, Split, Assign, Process, SliceA, SliceB, Save, Report, Done };
+
+    void fail(const std::string &stage, const std::string &why)
+    {
+        BOOST_LOG_TRIVIAL(error) << "PETKOS_ACCEPT: FAIL " << stage << " - " << why;
+        m_failed = true;
+        m_step   = Step::Report;
+    }
+
+    void on_idle(wxIdleEvent &evt)
+    {
+        Plater *plater = wxGetApp().plater();
+        if (plater == nullptr || !plater->is_initialized()) {
+            evt.RequestMore();
+            return;
+        }
+
+        switch (m_step) {
+        case Step::Settle:
+            //The app opens on Home, where the canvas does not draw and the plater is not the
+            //thing on screen. A run that forgets this measures an idle app and calls it fast.
+            if (m_tick == 0)
+                wxGetApp().mainframe->select_tab(size_t(MainFrame::tp3DEditor));
+            if (++m_tick >= 30)
+                m_step = Step::Load;
+            evt.RequestMore();
+            break;
+
+        case Step::Load: {
+            if (m_spec.project.empty()) { fail("load", "no project= given"); evt.RequestMore(); break; }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: loading " << m_spec.project;
+            const std::vector<size_t> loaded = plater->load_files(std::vector<std::string>{m_spec.project});
+            m_objects = (int) wxGetApp().model().objects.size();
+            if (m_objects <= 0) { fail("load", "the project produced no objects"); evt.RequestMore(); break; }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS load - " << m_objects << " object(s), "
+                                       << loaded.size() << " file(s)";
+            m_step = Step::Materials;
+            m_tick = 0;
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Materials: {
+            //Two spools, because the job is two colours. The project arrives with one slot, so the
+            //extruder numbers the split step is about to assign would have nothing to point at -
+            //everything would quietly come out in slot 1's colour, which is exactly the silent
+            //yes this fork forbids.
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (bundle == nullptr) { fail("materials", "no preset bundle"); evt.RequestMore(); break; }
+
+            bundle->set_num_filaments(2, std::vector<std::string>{m_spec.colourA, m_spec.colourB});
+
+            //set_num_filaments applies its colour list to the slots it ADDS, so growing 1 -> 2 left
+            //slot 1 with whatever the project came with and put the first requested colour in slot
+            //2. The finishes below are written by index, so the two fell out of step and the job
+            //came out with a yellow slot marked metallic. Both are stated by index here, so colour
+            //and finish cannot disagree about which spool is which.
+            if (auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour"))
+                colours->values = { m_spec.colourA, m_spec.colourB };
+
+            //Finish sits beside colour in the project config, per slot, because two slots can hold
+            //the same preset and differ only in what is on the spool.
+            static const std::map<std::string, FilamentFinish> names {
+                {"standard", ffStandard}, {"matte", ffMatte}, {"glossy", ffGlossy},
+                {"silk", ffSilk}, {"metallic", ffMetallic} };
+            auto finish_of = [](const std::string &n) {
+                const auto it = names.find(n);
+                return it == names.end() ? ffStandard : it->second;
+            };
+            if (auto *finishes = bundle->project_config.option<ConfigOptionEnumsGeneric>("filament_finish")) {
+                finishes->values = { (int) finish_of(m_spec.finishA), (int) finish_of(m_spec.finishB) };
+            } else {
+                fail("materials", "filament_finish is not a project option");
+                evt.RequestMore();
+                break;
+            }
+
+            //Pushed the way the colour picker pushes its own change, so everything downstream -
+            //the volume colours, the sidebar, the wipe tower - hears about it once, through the
+            //path that already exists.
+            DynamicPrintConfig changed = bundle->project_config;
+            wxGetApp().get_tab(Preset::TYPE_PRINTER)->load_config(changed);
+            plater->on_config_change(changed);
+
+            const auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+            const size_t slots = colours != nullptr ? colours->values.size() : 0;
+            if (slots < 2) { fail("materials", "only " + std::to_string(slots) + " filament slot(s)"); evt.RequestMore(); break; }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS materials - slot 1 " << m_spec.colourA
+                                       << " " << m_spec.finishA << ", slot 2 " << m_spec.colourB
+                                       << " " << m_spec.finishB;
+            m_step = Step::Split;
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Split: {
+            //Half the model on each plate, and each half in its own material slot. Which objects
+            //make up "half" is a judgement about the model, not about the app, so it is the plain
+            //split and it is stated rather than dressed up as anatomy.
+            PartPlateList &list = plater->get_partplate_list();
+            while (list.get_plate_count() < 2) {
+                const int before = list.get_plate_count();
+                list.create_plate(false);
+                if (list.get_plate_count() == before) { fail("split", "cannot create a second plate"); break; }
+            }
+            if (m_failed) { evt.RequestMore(); break; }
+
+            const int half = (m_objects + 1) / 2;
+            for (int i = 0; i < m_objects; ++i) {
+                ModelObject *object = wxGetApp().model().objects[i];
+                const int    plate  = i < half ? 0 : 1;
+                const int    slot   = plate + 1;   // extruder 1 on plate 1, extruder 2 on plate 2
+                object->config.set_key_value("extruder", new ConfigOptionInt(slot));
+                for (int inst = 0; inst < (int) object->instances.size(); ++inst)
+                    list.add_to_plate(i, inst, plate);
+            }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS split - " << half << " object(s) on plate 1 in slot 1, "
+                                       << (m_objects - half) << " on plate 2 in slot 2";
+            m_step = Step::Assign;
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Assign: {
+            if (!m_spec.printerA.empty()) plater->set_plate_printer(0, m_spec.printerA);
+            if (!m_spec.printerB.empty()) plater->set_plate_printer(1, m_spec.printerB);
+            if (!m_spec.filamentA.empty()) plater->set_plate_filaments(0, {m_spec.filamentA});
+            if (!m_spec.filamentB.empty()) plater->set_plate_filaments(1, {m_spec.filamentB});
+
+            //The point of the whole exercise: two plates that resolve to two DIFFERENT machines.
+            //Asking the resolver is the only honest way to check it, because that is what slicing
+            //reads - a label in the sidebar has been wrong about this before.
+            PartPlateList &list = plater->get_partplate_list();
+            std::string a_name, b_name, error;
+            ResolvedPlateSlicingConfig resolved;
+            if (plater->resolve_plate_slicing_config(list.get_plate(0), resolved, error) && resolved.printer_preset)
+                a_name = resolved.printer_preset->name;
+            else
+                fail("assign", "plate 1 does not resolve: " + error);
+            if (!m_failed) {
+                if (plater->resolve_plate_slicing_config(list.get_plate(1), resolved, error) && resolved.printer_preset)
+                    b_name = resolved.printer_preset->name;
+                else
+                    fail("assign", "plate 2 does not resolve: " + error);
+            }
+            if (!m_failed && a_name == b_name)
+                fail("assign", "both plates resolved to the same machine '" + a_name + "'");
+            if (!m_failed) {
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS assign - plate 1 on '" << a_name
+                                           << "', plate 2 on '" << b_name << "'";
+                m_step = Step::Process;
+                m_tick = 0;
+            }
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Process: {
+            //Per-plate process overrides, written the way TabPrintPlate::on_value_change writes
+            //them - straight onto the plate's own config. Both plates still SHARE one process
+            //preset; what differs is what each plate says on top of it. Before this existed those
+            //values could only be typed into the project's preset, which a reassigned plate does
+            //not use, so they reached nothing at all.
+            PartPlateList &list = plater->get_partplate_list();
+            const int walls[2]  = { m_spec.wallsA, m_spec.wallsB };
+            const int infill[2] = { m_spec.infillA, m_spec.infillB };
+            for (int i = 0; i < 2; ++i) {
+                PartPlate *plate = list.get_plate(i);
+                if (plate == nullptr) { fail("process", "no plate " + std::to_string(i + 1)); break; }
+                plate->config()->set_key_value("wall_loops", new ConfigOptionInt(walls[i]));
+                plate->config()->set_key_value("sparse_infill_density", new ConfigOptionPercent(infill[i]));
+            }
+            if (m_failed) { evt.RequestMore(); break; }
+
+            //Read back through the resolver, because that is what slicing reads. A value sitting
+            //in a config nobody composes is exactly the failure this whole change is about.
+            bool ok = true;
+            for (int i = 0; i < 2; ++i) {
+                ResolvedPlateSlicingConfig resolved;
+                std::string                error;
+                if (!plater->resolve_plate_slicing_config(list.get_plate(i), resolved, error)) {
+                    fail("process", "plate " + std::to_string(i + 1) + " does not resolve: " + error);
+                    ok = false;
+                    break;
+                }
+                const auto *w = resolved.config.option<ConfigOptionInt>("wall_loops");
+                const auto *d = resolved.config.option<ConfigOptionPercent>("sparse_infill_density");
+                const int   gw = w != nullptr ? w->value : -1;
+                const int   gd = d != nullptr ? (int) d->value : -1;
+                if (gw != walls[i] || gd != infill[i]) {
+                    fail("process", "plate " + std::to_string(i + 1) + " would slice with wall_loops=" +
+                         std::to_string(gw) + ", infill=" + std::to_string(gd) + "%, not " +
+                         std::to_string(walls[i]) + "/" + std::to_string(infill[i]) + "%");
+                    ok = false;
+                    break;
+                }
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: plate " << (i + 1) << " will slice with wall_loops="
+                                           << gw << ", sparse_infill_density=" << gd << "%";
+            }
+            if (ok) {
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS process - two plates, one preset, "
+                                              "different settings each";
+                m_step = Step::SliceA;
+                m_tick = 0;
+            }
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::SliceA:
+        case Step::SliceB: {
+            const int      index = m_step == Step::SliceA ? 0 : 1;
+            PartPlateList &list  = plater->get_partplate_list();
+            PartPlate     *plate = list.get_plate(index);
+            if (plate == nullptr) { fail("slice", "no plate to slice"); evt.RequestMore(); break; }
+
+            //An empty plate is not a failure and never becomes valid, so waiting for it is waiting
+            //forever. Say it was skipped and why, rather than reporting a slice that did not happen.
+            if (plate->instance_count() == 0) {
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: skip slice - plate " << (index + 1)
+                                           << " has nothing on it";
+                m_step = m_step == Step::SliceA ? Step::SliceB : Step::Save;
+                m_tick = 0;
+                evt.RequestMore();
+                break;
+            }
+
+            if (m_tick == 0) {
+                plater->select_plate(index);
+                plater->reslice();
+                m_slice_started = std::chrono::steady_clock::now();
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: slicing plate " << (index + 1) << "...";
+            }
+            ++m_tick;
+
+            if (plate->is_slice_result_valid()) {
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - m_slice_started).count();
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS slice - plate " << (index + 1)
+                                           << " sliced in " << secs << "s";
+                m_step = m_step == Step::SliceA ? Step::SliceB : Step::Save;
+                m_tick = 0;
+            } else {
+                //Wall clock, not an idle count. Idle events fire as fast as the loop turns, so a
+                //count is a measure of how busy the UI thread is rather than of how long slicing
+                //has had - and a big model would "time out" in seconds while still working.
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - m_slice_started).count();
+                if (secs > 900)
+                    fail("slice", "plate " + std::to_string(index + 1) + " did not finish slicing in 15 minutes");
+            }
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Save: {
+            if (m_spec.out.empty()) { fail("save", "no out= given"); evt.RequestMore(); break; }
+            const boost::filesystem::path out(m_spec.out);
+            boost::system::error_code ec;
+            boost::filesystem::create_directories(out.parent_path(), ec);
+            //WithGcode: a saved project that drops the slice it just made would hand the user the
+            //work again, which is the whole complaint this run exists to answer.
+            const int rc = plater->export_3mf(out, SaveStrategy::SplitModel | SaveStrategy::WithGcode);
+            if (rc < 0 || !boost::filesystem::exists(out))
+                fail("save", "export_3mf returned " + std::to_string(rc));
+            else
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: PASS save - " << out.string() << " ("
+                                           << boost::filesystem::file_size(out) << " bytes)";
+            if (!m_failed)
+                m_step = Step::Report;
+            evt.RequestMore();
+            break;
+        }
+
+        case Step::Report:
+            BOOST_LOG_TRIVIAL(warning) << (m_failed ? "PETKOS_ACCEPT: RUN FAILED" : "PETKOS_ACCEPT: RUN PASSED");
+            m_step = Step::Done;
+            if (wxGetApp().mainframe != nullptr)
+                wxGetApp().mainframe->Close(true);
+            break;
+
+        case Step::Done:
+            break;
+        }
+    }
+
+    AcceptSpec m_spec;
+    Step       m_step    { Step::Settle };
+    int        m_tick    { 0 };
+    int        m_objects { 0 };
+    bool       m_failed  { false };
+    std::chrono::steady_clock::time_point m_slice_started {};
+};
+
+void petkos_acceptance_start()
+{
+    const char *env = std::getenv("PETKOS_ACCEPT");
+    if (env == nullptr || env[0] == '\0')
+        return;
+    BOOST_LOG_TRIVIAL(warning) << "PETKOS_ACCEPT: starting acceptance run '" << env << "'";
+    new AcceptDriver(parse_accept(env));
+}
 
 void petkos_perf_driver_start()
 {
