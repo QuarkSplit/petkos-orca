@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -25,6 +26,8 @@
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "I18N.hpp"
+#include "DeviceCore/DevManager.h"
+#include "DeviceManager.hpp"
 #include "NotificationManager.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
@@ -120,19 +123,9 @@ std::string slot_material_type(const PresetBundle &bundle, int slot)
 
 } // namespace
 
-void PlateBoardModel::build_project_row(const PresetBundle &bundle, const std::string &project_printer)
-{
-    m_project_row              = PlateBoardRow();
-    m_project_row.plate_index  = PLATE_BOARD_PROJECT_ROW;
-    m_project_row.printer_name = project_printer;
-    printer_bed_size(bundle, project_printer, m_project_row.bed_w, m_project_row.bed_d);
-    printer_nozzle_diameter(bundle, project_printer, m_project_row.nozzle_diameter);
-}
-
 void PlateBoardModel::build_row(int                             plate_index,
                                 const PartPlateList &           plates,
                                 const PresetBundle &            bundle,
-                                const std::string &             project_printer,
                                 const std::vector<std::string> &colours,
                                 PlateBoardRow &                 row) const
 {
@@ -141,24 +134,18 @@ void PlateBoardModel::build_row(int                             plate_index,
         return;
 
     row = PlateBoardRow();
-    row.plate_index = plate_index;
-    row.plate_name  = plate->get_plate_name();
-    row.assigned    = plate->has_printer_assignment();
+    row.plate_index  = plate_index;
+    row.plate_name   = plate->get_plate_name();
+    row.printer_name = plate->get_printer_preset_name();
+    row.process_name      = plate->get_print_preset_name();
+    row.device_id         = plate->get_physical_printer_id();
+    row.process_overrides = plate->process_override_count();
+    //a stored name this installation does not have is preserved verbatim and
+    //reported, never cleared, remapped or rendered as something else
+    row.preset_missing = !printer_bed_size(bundle, row.printer_name, row.bed_w, row.bed_d);
 
-    if (row.assigned) {
-        row.printer_name = plate->get_printer_preset_name();
-        //a stored name this installation does not have is preserved verbatim and
-        //reported, never cleared, remapped or rendered as unassigned
-        row.preset_missing = !printer_bed_size(bundle, row.printer_name, row.bed_w, row.bed_d);
-    } else {
-        row.printer_name = project_printer;
-        row.bed_w        = m_project_row.bed_w;
-        row.bed_d        = m_project_row.bed_d;
-    }
-
-    //Nozzle belongs to the preset the row is showing, whether that is the plate's own
-    //machine or the project one it is following. A plate stores no nozzle, so this is
-    //read-only wherever it is displayed and is labelled with the preset it came from.
+    //Nozzle belongs to the preset the row is showing. A plate stores no nozzle, so this
+    //is read-only wherever it is displayed and is labelled with the preset it came from.
     printer_nozzle_diameter(bundle, row.printer_name, row.nozzle_diameter);
 
     //model identity for the row's printer picture and its short caption
@@ -194,10 +181,40 @@ void PlateBoardModel::build_row(int                             plate_index,
     row.has_time = row.sliced &&
                    plate->get_retained_print_statistics(row.print_time_seconds, row.weight_grams);
 
+    //A slice this plate arrived with and no longer has. See PlateBoardRow::dropped_reason:
+    //it is a third state and not a variety of "stale", because nothing is attached.
+    row.dropped_reason = plate->sliced_config_dropped_reason();
+
+    //WHETHER THIS PLATE COMPOSES AT ALL - "can I dispatch this" is the question the board
+    //exists to answer, and it was the one thing a row never said. It is composed HERE and
+    //never in a paint: this is the expensive read on the path, and the shared ComposeScope
+    //the full rebuild holds collapses it to one composition per distinct context instead of
+    //one per plate. A targeted refresh composes once, for the one plate that changed.
+    //
+    //Skipped when the plate has a current slice, because a slice is only current if this
+    //same composition has just succeeded - is_slice_result_valid() recomposes to decide it.
+    //That is not an optimisation layered over the answer, it is the answer.
+    if (!row.sliced) {
+        DynamicPrintConfig composed;
+        std::string        error;
+        if (!plate->compose_slicing_config(composed, error)) {
+            row.unresolved        = true;
+            row.unresolved_reason = error;
+        }
+    }
+
+    //The plate's own colours when it carries them - the AMS sync writes them per plate -
+    //and the library's otherwise. Reading the library unconditionally showed the wrong
+    //colour for exactly the plates whose materials had been set deliberately.
+    const std::vector<std::string> *plate_colours = &colours;
+    if (const ConfigOptionStrings *own = plate->config()->option<ConfigOptionStrings>("filament_colour");
+        own != nullptr && !own->values.empty())
+        plate_colours = &own->values;
+
     for (int slot : plate->get_extruders(true)) {
         row.filament_slots.push_back(slot);
-        row.filament_colours.push_back(slot >= 1 && (size_t) slot <= colours.size()
-                                           ? colours[(size_t) slot - 1]
+        row.filament_colours.push_back(slot >= 1 && (size_t) slot <= plate_colours->size()
+                                           ? (*plate_colours)[(size_t) slot - 1]
                                            : std::string());
     }
 
@@ -229,7 +246,7 @@ void PlateBoardModel::build_row(int                             plate_index,
     }
 }
 
-void PlateBoardModel::finalise(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle)
+void PlateBoardModel::finalise(PlateBoardGrouping grouping, const PresetBundle &bundle)
 {
     //Every total here is a pure function of the row set. Deriving them rather than
     //accumulating them inside the read loop is what lets one changed row produce correct
@@ -240,34 +257,23 @@ void PlateBoardModel::finalise(PlateBoardGrouping grouping, const std::string &p
     //hours per machine, so the rollup can report the longest queue without proposing
     //a single move: max-of-sums is literally what the cell says it is
     std::map<std::string, float> queue_seconds;
-    std::set<std::string>        assigned_machines;
-    bool                         any_inherited = false;
-    m_all_inherited                            = true;
+    std::set<std::string>        machines;
 
     for (const PlateBoardRow &row : m_rows) {
-        if (row.assigned) {
-            m_all_inherited = false;
-            assigned_machines.insert(row.printer_name);
-        } else {
-            any_inherited = true;
-        }
+        machines.insert(row.printer_name);
         if (row.has_time) {
             m_rollup.total_seconds += row.print_time_seconds;
-            queue_seconds[row.assigned ? row.printer_name : project_printer] += row.print_time_seconds;
+            queue_seconds[row.printer_name] += row.print_time_seconds;
         } else {
             ++m_rollup.not_estimated;
         }
     }
 
     m_rollup.plates = (int) m_rows.size();
-    //Distinct MACHINES, not distinct kinds of assignment. Adding one for "some plate is
-    //inherited" counted the project printer twice whenever a plate was also explicitly
-    //assigned to it - a one-click state, because the picker lists the project printer as an
-    //ordinary entry. The set answers the question the cell asks: how many machines is this
-    //project spread over.
-    if (any_inherited && !project_printer.empty())
-        assigned_machines.insert(project_printer);
-    m_rollup.machines = (int) assigned_machines.size();
+    //Distinct MACHINES. Every plate names one, so this is a straight count of the set
+    //rather than a count of kinds of assignment - which is what once made one machine
+    //reached two ways read as two.
+    m_rollup.machines = (int) machines.size();
     for (const std::pair<const std::string, float> &queue : queue_seconds)
         m_rollup.longest_queue_seconds = std::max(m_rollup.longest_queue_seconds, queue.second);
 
@@ -282,7 +288,7 @@ void PlateBoardModel::finalise(PlateBoardGrouping grouping, const std::string &p
     for (const PlateBoardRow &row : m_rows)
         m_glyph_reference_mm = std::max(m_glyph_reference_mm, std::max(row.bed_w, row.bed_d));
 
-    build_groups(grouping, project_printer, bundle);
+    build_groups(grouping, bundle);
 }
 
 void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
@@ -294,10 +300,7 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
     PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowLayout, (int32_t) plates.get_plate_count());
     m_rows.clear();
 
-    const std::string              project_printer = bundle.printers.get_selected_preset_name();
-    const std::vector<std::string> colours         = project_filament_colours(bundle);
-
-    build_project_row(bundle, project_printer);
+    const std::vector<std::string> colours = project_filament_colours(bundle);
 
     //Every row composes its plate's config to read which extruders it uses. Plates that
     //share a printer, a process and a filament set share that answer, and in a real project
@@ -311,11 +314,11 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
         if (plates.get_plate(i) == nullptr)
             continue;
         PlateBoardRow row;
-        build_row(i, plates, bundle, project_printer, colours, row);
+        build_row(i, plates, bundle, colours, row);
         m_rows.push_back(std::move(row));
     }
 
-    finalise(grouping, project_printer, bundle);
+    finalise(grouping, bundle);
 }
 
 bool PlateBoardModel::refresh_plate(int plate_index, const PartPlateList &plates, const PresetBundle &bundle, PlateBoardGrouping grouping)
@@ -342,23 +345,18 @@ bool PlateBoardModel::refresh_plate(int plate_index, const PartPlateList &plates
     if (pos == m_rows.size())
         return false;
 
-    const std::string              project_printer = bundle.printers.get_selected_preset_name();
-    const std::vector<std::string> colours         = project_filament_colours(bundle);
+    const std::vector<std::string> colours = project_filament_colours(bundle);
 
-    //Cheap - two preset lookups, no composition - and the inherited rows copy their bed
-    //from it, so it is refreshed rather than assumed to be current.
-    build_project_row(bundle, project_printer);
-
-    build_row(plate_index, plates, bundle, project_printer, colours, m_rows[pos]);
+    build_row(plate_index, plates, bundle, colours, m_rows[pos]);
 
     //A plate that changed machine changes which group it belongs to and every total that
     //counts machines, so the derived half is recomputed in full. That is arithmetic over
     //rows which already exist, and it composes nothing.
-    finalise(grouping, project_printer, bundle);
+    finalise(grouping, bundle);
     return true;
 }
 
-void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::string &project_printer, const PresetBundle &bundle)
+void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const PresetBundle &bundle)
 {
     //Plate order is one flat list. It draws no group header at all: a single unnamed group
     //holding everything is a header that states nothing and costs a row of height to do it.
@@ -368,15 +366,14 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
     const std::string mode_key = grouping == PlateBoardGrouping::ByMachine  ? "m:" :
                                  grouping == PlateBoardGrouping::ByCapacity ? "c:" : "f:";
 
-    //A machine group, addressed by the preset name it collects. The empty name is the
-    //inherited group: plates with no assignment of their own, following the Project row.
-    auto machine_caption = [&](const std::string &machine) {
-        return machine.empty() ? into_u8(_L("Following the project printer")) : machine;
+    //A machine group, addressed by the preset name it collects. Every plate names a
+    //machine, so there is no group for the absence of one.
+    auto machine_caption = [](const std::string &machine) {
+        return machine.empty() ? into_u8(_L("No printer")) : machine;
     };
     auto machine_detail = [&](const std::string &machine) {
-        double            w = 0., d = 0.;
-        const std::string name = machine.empty() ? project_printer : machine;
-        if (!printer_bed_size(bundle, name, w, d))
+        double w = 0., d = 0.;
+        if (!printer_bed_size(bundle, machine, w, d))
             return std::string();
         return into_u8(wxString::Format("%.0f x %.0f mm", w, d));
     };
@@ -385,7 +382,7 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
         std::map<std::string, PlateBoardGroup> by_machine;
         for (int i = 0; i < (int) m_rows.size(); ++i) {
             const PlateBoardRow &row     = m_rows[(size_t) i];
-            const std::string    machine = row.assigned ? row.printer_name : std::string();
+            const std::string &  machine = row.printer_name;
 
             PlateBoardGroup &group = by_machine[machine];
             if (group.rows.empty()) {
@@ -411,17 +408,11 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
         if (grouping == PlateBoardGrouping::ByCapacity) {
             //Sorted by descending queue hours, which puts the longest-queue machine first:
             //the only ordering that makes the rollup's headline cell actionable without the
-            //panel proposing a single move. The inherited group sorts with the rest rather
-            //than being pinned last, because a group that cannot sink is not "by capacity".
+            //panel proposing a single move.
             std::stable_sort(m_groups.begin(), m_groups.end(),
                              [](const PlateBoardGroup &a, const PlateBoardGroup &b) {
                                  return a.queue_seconds > b.queue_seconds;
                              });
-        } else {
-            //by machine: the inherited group is the final one, because it is the absence of
-            //an assignment rather than one more machine
-            std::stable_partition(m_groups.begin(), m_groups.end(),
-                                  [&](const PlateBoardGroup &g) { return g.key != mode_key; });
         }
         return;
     }
@@ -462,8 +453,8 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
             bucket.colour = row.material_colour;
         }
 
-        const std::string machine = row.assigned ? row.printer_name : std::string();
-        PlateBoardGroup & group   = bucket.machines[machine];
+        const std::string &machine = row.printer_name;
+        PlateBoardGroup &  group   = bucket.machines[machine];
         if (group.rows.empty()) {
             group.key           = "f:" + material_key + "/" + machine;
             group.caption       = machine_caption(machine);
@@ -518,8 +509,10 @@ void PlateBoardModel::build_groups(PlateBoardGrouping grouping, const std::strin
 
 std::string PlateBoardModel::summary_text() const
 {
-    if (m_rows.size() <= 1 || m_all_inherited)
-        return m_project_row.printer_name;
+    //One machine is worth naming; several are worth counting. Naming one of several would
+    //be the collapsed section describing part of what it hides.
+    if (m_rollup.machines == 1 && !m_rows.empty())
+        return m_rows.front().printer_name;
     //_L_PLURAL, the tree's own plural macro, rather than a fixed plural: with the count
     //fixed to count machines instead of kinds of assignment, one machine reached two ways is
     //now genuinely 1, and "1 machines" would be the visible half of the bug just removed.
@@ -566,6 +559,13 @@ wxColour board_sel(bool dark)    { return theme(dark, "#BFE1DE"); } //checked it
 wxColour board_scope(bool dark)  { return theme(dark, "#EBF9F0"); } //in the scope set, not current
 wxColour board_hover(bool dark)  { return theme(dark, "#E5F0EE"); } //focused item background
 wxColour board_accent(bool dark) { return theme(dark, "#009688"); } //ORCA colour
+//GROUNDS, kept apart from the inks above because nothing in the type system keeps them
+//apart: a wxColour is a wxColour, so a fill can take a text colour and did. board_soft
+//(#323A3D) was the brush for both empty tiles, which painted a near-black square as the
+//loudest object on a panel whose whole subject is which machine a plate goes to - and
+//dark mode lightens it, so it was a light-mode-only fault that never showed up in testing.
+wxColour board_tile(bool dark)      { return theme(dark, "#F4F6F6"); } //an empty picture cell
+wxColour board_tile_line(bool dark) { return theme(dark, "#DCE2E2"); } //its edge
 wxColour board_warn(bool dark)   { return theme(dark, "#FF6F00"); } //secondary / attention
 wxColour board_err(bool dark)    { return theme(dark, "#D01B1B"); } //error
 
@@ -788,12 +788,8 @@ PlatePrinterPopup::PlatePrinterPopup(wxWindow *             parent,
 
     m_current_name = current_name;
     //the nozzle the plate is on now, which is the value a machine pick carries over
-    {
-        const std::string effective = !current_name.empty() ? current_name
-                                                            : wxGetApp().preset_bundle->printers.get_selected_preset_name();
-        if (const Preset *cur = wxGetApp().preset_bundle->printers.find_preset(effective, false); cur != nullptr)
-            m_current_variant = cur->config.opt_string("printer_variant");
-    }
+    if (const Preset *cur = wxGetApp().preset_bundle->printers.find_preset(current_name, false); cur != nullptr)
+        m_current_variant = cur->config.opt_string("printer_variant");
 
     build_items(current_name);
     SetSize(wxSize(std::max(parent->GetSize().GetWidth(), FromDIP(280)), FromDIP(100)));
@@ -830,18 +826,20 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
     const PresetBundle &bundle = *wxGetApp().preset_bundle;
 
     //how many plates already sit on each machine, so the picker can say so, and which
-    //plates have no assignment of their own, which is the only set the bulk footer
-    //may touch
+    //plates share this plate's machine, which is the only set the bulk footer may touch:
+    //"the others that are where this one is" is a set the user can see on the board.
     std::map<std::string, int> plate_counts;
-    const PartPlateList &      plates = m_plater->get_partplate_list();
+    const PartPlateList &      plates  = m_plater->get_partplate_list();
+    const PartPlate *          subject = plates.get_plate(m_plate_index);
+    const std::string          current_machine = subject != nullptr ? subject->get_printer_preset_name() : std::string();
     for (int i = 0; i < plates.get_plate_count(); ++i) {
         const PartPlate *plate = plates.get_plate(i);
         if (plate == nullptr)
             continue;
-        if (plate->has_printer_assignment())
-            ++plate_counts[plate->get_printer_preset_name()];
-        else
-            m_unassigned_plates.push_back(i);
+        ++plate_counts[plate->get_printer_preset_name()];
+        if (i != m_plate_index && !current_machine.empty() &&
+            plate->get_printer_preset_name() == current_machine)
+            m_sibling_plates.push_back(i);
     }
 
     //the bed this plate is on right now, so a candidate that is smaller in either axis can
@@ -853,15 +851,7 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
         current_d = size.y();
     }
 
-    //1. clearing the assignment is always the first item, so the pre-per-plate meaning
-    //   of a plate is always one click away
-    Item same;
-    same.name  = std::string();
-    same.label = _L("Same as Global");
-    same.detail = from_u8(bundle.printers.get_selected_preset_name());
-    m_items.push_back(same);
-
-    //2. an assignment this installation cannot resolve is offered back verbatim, so
+    //1. a printer this installation cannot resolve is offered back verbatim, so
     //   opening the picker cannot be the thing that discards it
     if (!current_name.empty() && bundle.printers.find_preset(current_name, false) == nullptr) {
         Item keep;
@@ -872,7 +862,7 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
         m_items.push_back(keep);
     }
 
-    //3. the installed printers, grouped by brand
+    //2. the installed printers, grouped by brand
     std::map<std::string, std::vector<const Preset *>> by_vendor;
     for (const Preset &preset : bundle.printers()) {
         if (!preset.is_visible || preset.is_default)
@@ -948,11 +938,11 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
         m_items.push_back(scope);
     }
 
-    if (!m_unassigned_plates.empty()) {
+    if (!m_sibling_plates.empty()) {
         Item bulk;
         bulk.is_bulk_toggle = true;
-        bulk.label          = wxString::Format(_L("Also assign to every unassigned plate (%d)"),
-                                               (int) m_unassigned_plates.size());
+        bulk.label          = wxString::Format(_L("Also move the %d other plate(s) on this machine"),
+                                               (int) m_sibling_plates.size());
         m_items.push_back(bulk);
     }
 }
@@ -1002,8 +992,8 @@ void PlatePrinterPopup::commit(const std::string &preset_name)
     std::vector<int> targets;
     if (m_bulk_to_scope)
         targets = m_scoped_plates;
-    else if (m_bulk_to_unassigned)
-        targets = m_unassigned_plates;
+    else if (m_bulk_to_siblings)
+        targets = m_sibling_plates;
     if (!targets.empty() && std::find(targets.begin(), targets.end(), plate) == targets.end())
         targets.push_back(plate);
 
@@ -1072,9 +1062,9 @@ void PlatePrinterPopup::on_mouse(wxMouseEvent &evt)
         //the footer is a modifier, not a destination: ticking it stays in the popup so
         //the machine can still be picked
         if (m_items[index].is_bulk_toggle) {
-            m_bulk_to_unassigned = !m_bulk_to_unassigned;
+            m_bulk_to_siblings = !m_bulk_to_siblings;
             //the two footers name different visible sets, so exactly one can be armed
-            if (m_bulk_to_unassigned)
+            if (m_bulk_to_siblings)
                 m_bulk_to_scope = false;
             Refresh();
             return;
@@ -1083,7 +1073,7 @@ void PlatePrinterPopup::on_mouse(wxMouseEvent &evt)
         if (m_items[index].is_scope_toggle) {
             m_bulk_to_scope = !m_bulk_to_scope;
             if (m_bulk_to_scope)
-                m_bulk_to_unassigned = false;
+                m_bulk_to_siblings = false;
             Refresh();
             return;
         }
@@ -1158,7 +1148,7 @@ void PlatePrinterPopup::on_paint(wxPaintEvent &evt)
         }
 
         if (item.is_bulk_toggle || item.is_scope_toggle) {
-            const bool armed = item.is_scope_toggle ? m_bulk_to_scope : m_bulk_to_unassigned;
+            const bool armed = item.is_scope_toggle ? m_bulk_to_scope : m_bulk_to_siblings;
             dc.SetPen(wxPen(board_line(dark)));
             dc.DrawLine(FromDIP(6), y, width - FromDIP(6), y);
 
@@ -1340,7 +1330,11 @@ PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_
     const bool sliced_ok  = load_board_icon(this, "checked", 14, m_icon_sliced);
     const bool stale_ok   = load_board_icon(this, "warning", 14, m_icon_stale);
     const bool problem_ok = load_board_icon(this, "error", 14, m_icon_problem);
-    m_icons_ok            = sliced_ok || stale_ok || problem_ok;
+    //A dropped slice is not stale and not a problem: the plate is fine, the result is simply
+    //gone and has to be made again. "Do this again" is what the refresh mark says, and it is
+    //the fourth fact rather than a fourth shade of one of the other three.
+    const bool dropped_ok = load_board_icon(this, "refresh", 14, m_icon_dropped);
+    m_icons_ok            = sliced_ok || stale_ok || problem_ok || dropped_ok;
 
     m_anim_timer.SetOwner(this, PLATE_BOARD_ANIM_TIMER_ID);
     m_hover_timer.SetOwner(this, PLATE_BOARD_HOVER_TIMER_ID);
@@ -1363,6 +1357,17 @@ PlateBoard::PlateBoard(wxWindow *parent, Plater *plater) : wxPanel(parent, wxID_
         if (!evt.IsShown())
             hide_row_preview();
         evt.Skip();
+    });
+    //THE LAYOUT IS A FUNCTION OF THE WIDTH, so it is recomputed when the width changes. A
+    //tile band's column count is read off the client size when the items are built; frozen
+    //at that value, narrowing the sidebar would stop DRAWING plates that the hit test still
+    //resolves clicks on - a control that has quietly become a lie about what is on screen,
+    //which is the same silent gate as a button that does nothing.
+    Bind(wxEVT_SIZE, [this](wxSizeEvent &evt) {
+        evt.Skip();
+        rebuild_items();
+        clamp_scroll();
+        Refresh();
     });
 }
 
@@ -1609,6 +1614,7 @@ void PlateBoard::rebuild_items()
 {
     m_items.clear();
     m_content_height = 0;
+    m_item_quantum   = 0;
 
     const std::vector<PlateBoardRow>   &rows   = m_model.rows();
     const std::vector<PlateBoardGroup> &groups = m_model.groups();
@@ -1621,6 +1627,7 @@ void PlateBoard::rebuild_items()
         item.height = height;
         item.y      = m_content_height;
         m_content_height += height;
+        m_item_quantum   = m_item_quantum > 0 ? std::min(m_item_quantum, height) : height;
         m_items.push_back(item);
     };
 
@@ -1651,10 +1658,52 @@ void PlateBoard::rebuild_items()
             continue;
         }
 
+        //A group whose header already names its machine, holding more than a handful of
+        //plates, draws them as tiles. See PLATE_BOARD_TILE_ABOVE: under that header the
+        //row's arrow and machine picture repeat a fact the header states once.
+        if (group.names_machine && (int) group.rows.size() > PLATE_BOARD_TILE_ABOVE) {
+            int tile = 0, gap = 0, inset = 0;
+            tile_metrics(tile, gap, inset);
+            const int cols = tile_columns(GetClientSize().GetWidth());
+            for (int first = 0; first < (int) group.rows.size(); first += cols) {
+                Item band;
+                band.group      = g;
+                band.tile_first = first;
+                band.tile_count = std::min(cols, (int) group.rows.size() - first);
+                band.tile_cols  = cols;
+                band.height     = tile + gap;
+                band.y          = m_content_height;
+                m_content_height += band.height;
+                m_item_quantum   = m_item_quantum > 0 ? std::min(m_item_quantum, band.height) : band.height;
+                m_items.push_back(band);
+            }
+            continue;
+        }
+
         const int height = m_row_height;
         for (int row_index : group.rows)
             push(false, g, row_index, height);
     }
+}
+
+void PlateBoard::tile_metrics(int &tile, int &gap, int &inset) const
+{
+    //34 px is a plate you can tell apart - the bed reads at proportion and the number is
+    //legible - in half a rich row's height. The inset is the index gutter a row spends on
+    //its plate number, kept so a band lines up with the rows above and below it.
+    tile  = FromDIP(34);
+    gap   = FromDIP(4);
+    inset = FromDIP(8);
+}
+
+int PlateBoard::tile_columns(int width) const
+{
+    int tile = 0, gap = 0, inset = 0;
+    tile_metrics(tile, gap, inset);
+    //At least one column, whatever the width: a band of zero columns is a group whose plates
+    //are laid out nowhere, which loses them rather than crowding them.
+    const int usable = std::max(tile, width - 2 * inset);
+    return std::max(1, (usable + gap) / (tile + gap));
 }
 
 int PlateBoard::rollup_height() const
@@ -1683,10 +1732,34 @@ void PlateBoard::clamp_scroll()
 
 int PlateBoard::find_row_item(int plate_index) const
 {
-    const std::vector<PlateBoardRow> &rows = m_model.rows();
+    const std::vector<PlateBoardRow>   &rows   = m_model.rows();
+    const std::vector<PlateBoardGroup> &groups = m_model.groups();
     for (int i = 0; i < (int) m_items.size(); ++i) {
         const Item &item = m_items[(size_t) i];
-        if (!item.header && item.row >= 0 && item.row < (int) rows.size() &&
+        if (item.header)
+            continue;
+
+        //A plate drawn as a tile lives in a BAND, which has no row of its own. This is the
+        //ONE place that knows it: every caller that has to turn a plate into an item -
+        //scrolling to the selection, anchoring the hover preview, resolving a drag onto a
+        //group - goes through here, so a tiled group cannot lose any of them one at a time.
+        if (item.tile_count > 0) {
+            if (item.group < 0 || item.group >= (int) groups.size())
+                continue;
+            const PlateBoardGroup &group = groups[(size_t) item.group];
+            for (int c = 0; c < item.tile_count; ++c) {
+                const int index = item.tile_first + c;
+                if (index < 0 || index >= (int) group.rows.size())
+                    break;
+                const int row_index = group.rows[(size_t) index];
+                if (row_index >= 0 && row_index < (int) rows.size() &&
+                    rows[(size_t) row_index].plate_index == plate_index)
+                    return i;
+            }
+            continue;
+        }
+
+        if (item.row >= 0 && item.row < (int) rows.size() &&
             rows[(size_t) item.row].plate_index == plate_index)
             return i;
     }
@@ -1753,12 +1826,28 @@ void PlateBoard::on_plate_selection_changed(int current_plate)
 
 wxSize PlateBoard::DoGetBestSize() const
 {
-    //past a handful of standard rows the board scrolls instead of growing. A narrow
+    //Past a handful of standard rows the board scrolls instead of growing. A narrow
     //sidebar's real failure mode is not a long list, it is a long list pushing the nozzle,
     //bed and extruder controls below it off the screen.
-    const int cap     = PLATE_BOARD_VISIBLE_ROWS * m_row_height;
-    const int content = std::min(m_content_height, cap);
-    return wxSize(-1, rollup_height() + grouping_height() + content + FromDIP(4));
+    //
+    //The cap is a whole number of rich rows, and the content is snapped to a whole number of
+    //ITEMS. An item bisected by the panel's own edge, with nothing saying the list continues,
+    //is the strongest "this app is broken" signal the sidebar can produce, and it was showing
+    //on a project with three plates in it.
+    //
+    //Snapped to the last item that fits ENTIRELY, not to a quantum: headers are 26 px, tile
+    //bands 38 and rows 64, so no single unit divides the list and a quantum would bisect
+    //exactly the bands tiling exists for. m_item_quantum is the floor rather than the unit,
+    //so a board that cannot fit even its first item still shows something.
+    const int cap = PLATE_BOARD_VISIBLE_ROWS * m_row_height;
+    int       whole = 0;
+    for (const Item &item : m_items) {
+        if (item.y + item.height > cap)
+            break;
+        whole = item.y + item.height;
+    }
+    const int floor_height = m_item_quantum > 0 ? m_item_quantum : m_row_height;
+    return wxSize(-1, rollup_height() + grouping_height() + std::max(whole, floor_height) + FromDIP(4));
 }
 
 int PlateBoard::segment_at(int x) const
@@ -1819,11 +1908,50 @@ PlateBoard::Hit PlateBoard::hit_test(const wxPoint &pos) const
     for (const Item &item : m_items) {
         if (y < item.y || y >= item.y + item.height)
             continue;
+        if (item.tile_count > 0) {
+            //A band is several plates on one line, so which one it is depends on x. Landing
+            //between two tiles is not a hit on either - the gap belongs to neither plate,
+            //and a click that picked the nearest would select a plate the user did not
+            //point at.
+            const int row_index = tile_at(item, item.y, wxPoint(pos.x, y));
+            if (row_index < 0)
+                return hit;
+            hit.kind  = HitKind::Row;
+            hit.index = row_index;
+            return hit;
+        }
         hit.kind  = item.header ? HitKind::GroupHeader : HitKind::Row;
         hit.index = item.header ? item.group : item.row;
         return hit;
     }
     return hit;
+}
+
+int PlateBoard::tile_at(const Item &item, int band_y, const wxPoint &pos) const
+{
+    const std::vector<PlateBoardGroup> &groups = m_model.groups();
+    if (item.group < 0 || item.group >= (int) groups.size())
+        return -1;
+    const PlateBoardGroup &group = groups[(size_t) item.group];
+
+    int tile = 0, gap = 0, inset = 0;
+    tile_metrics(tile, gap, inset);
+
+    const int local = pos.x - inset;
+    if (local < 0)
+        return -1;
+    const int column = local / (tile + gap);
+    if (column < 0 || column >= item.tile_count)
+        return -1;
+    if (local - column * (tile + gap) >= tile)
+        return -1; //the gap between two tiles
+    if (pos.y - band_y >= tile)
+        return -1; //the gap under the band
+
+    const int index = item.tile_first + column;
+    if (index < 0 || index >= (int) group.rows.size())
+        return -1;
+    return group.rows[(size_t) index];
 }
 
 void PlateBoard::on_scroll(wxMouseEvent &evt)
@@ -1975,11 +2103,17 @@ int PlateBoard::drop_group_at(const wxPoint &pos) const
         //It is here because a 26 px header in a 34 px row list is a target the user has to
         //aim at, while the run of rows underneath it means the same machine and is twenty
         //times the area.
-        for (const Item &item : m_items)
-            if (!item.header && item.row == hit.index) {
-                group_index = item.group;
-                break;
-            }
+        //
+        //Resolved through find_row_item rather than by scanning for item.row: a plate drawn
+        //as a tile has no item of its own, so matching on item.row would find nothing in
+        //exactly the large machine groups tiling exists for - and drag-to-assign would die
+        //there without saying a word.
+        const std::vector<PlateBoardRow> &rows = m_model.rows();
+        if (hit.index >= 0 && hit.index < (int) rows.size()) {
+            const int item_index = find_row_item(rows[(size_t) hit.index].plate_index);
+            if (item_index >= 0)
+                group_index = m_items[(size_t) item_index].group;
+        }
     }
 
     const std::vector<PlateBoardGroup> &groups = m_model.groups();
@@ -2017,7 +2151,7 @@ void PlateBoard::on_left_down(wxMouseEvent &evt)
     m_drag_armed   = false;
     m_dragging     = false;
     m_drag_attempt = false;
-    m_drag_plate   = PLATE_BOARD_PROJECT_ROW;
+    m_drag_plate   = PLATE_BOARD_NO_PLATE;
     m_drop_group   = -1;
 
     if (m_plater == nullptr || !m_plater->is_initialized())
@@ -2224,12 +2358,11 @@ void PlateBoard::end_drag(bool commit)
     }
 }
 
-void PlateBoard::set_scope(const std::vector<int> &scoped_plates, bool project_scope)
+void PlateBoard::set_scope(const std::vector<int> &scoped_plates)
 {
-    if (m_scoped_plates == scoped_plates && m_scope_project == project_scope)
+    if (m_scoped_plates == scoped_plates)
         return;
     m_scoped_plates = scoped_plates;
-    m_scope_project = project_scope;
     Refresh();
 }
 
@@ -2311,12 +2444,11 @@ void PlateBoard::on_mouse(wxMouseEvent &evt)
 
     switch (hit.kind) {
     case HitKind::Rollup:
-        //The rollup is the one thing the board draws that is about the whole project
-        //rather than about a plate, so it is where PROJECT scope is pointed at. Global
-        //editing has to be a destination you can click, not a mode inferred from what was
-        //last touched; the project printer combo pinned above the board stays the editor,
-        //and this only moves the inspector's scope onto it.
-        m_plater->sidebar().set_project_scope();
+        //The rollup states the project's totals and nothing about it is editable, because
+        //a project no longer holds a printer, a process or a material for the rollup to be
+        //the way in to. Clicking it collapses the scope back to the current plate, which
+        //is the one thing "step back out" can honestly mean here.
+        m_plater->sidebar().focus_current_plate();
         return;
 
     case HitKind::Segment:
@@ -2403,14 +2535,6 @@ void PlateBoard::draw_rollup(wxDC &dc, bool dark, int width)
 {
     const PlateBoardRollup &rollup = m_model.rollup();
     const int               height = rollup_height();
-
-    //the rollup is the PROJECT scope's destination, so it says when it is the thing the
-    //inspector is describing
-    if (m_scope_project) {
-        dc.SetBrush(wxBrush(board_sel(dark)));
-        dc.SetPen(*wxTRANSPARENT_PEN);
-        dc.DrawRoundedRectangle(0, 0, width, height, FromDIP(4));
-    }
 
     //Figures render as figures, each a value over its label. The time tiles exist only
     //once at least one plate has an estimate: a fresh project showing two em-dash tiles
@@ -2614,15 +2738,174 @@ void PlateBoard::draw_state_icon(wxDC &dc, const PlateBoardRow &row, int x, int 
     //machine being up, and a status light that is right one row in eight is worse than
     //none. Order is by what needs attention first.
     const ScalableBitmap *icon = nullptr;
-    if (row.parts_outside || row.preset_missing)
+    if (row.parts_outside || row.preset_missing || row.unresolved)
         icon = &m_icon_problem;
     else if (row.stale)
         icon = &m_icon_stale;
     else if (row.sliced)
         icon = &m_icon_sliced;
+    //Last, and after sliced on purpose: the reason is written when a project is loaded and
+    //nothing here can promise it is cleared when the plate is sliced again. A plate with a
+    //current result says so, whatever it arrived as.
+    else if (!row.dropped_reason.empty())
+        icon = &m_icon_dropped;
 
     if (icon != nullptr && icon->bmp().IsOk())
         dc.DrawBitmap(icon->bmp(), x, y, true);
+}
+
+//The bed, in plan, inside a square cell. Scaled against the largest bed anywhere in the
+//project rather than against a fixed millimetre constant: a constant has to be chosen for the
+//largest machine anybody might own, which spends most of the range on beds nobody here has and
+//leaves a 220 mm bed and a 256 mm bed a couple of pixels apart. Scaled to the project, the
+//largest machine fills the cell and every other bed is exactly its true fraction of it.
+//
+//This is also what the glyph animation was always for. It has been interpolating bed
+//dimensions that no draw call read since the row became pictures.
+void PlateBoard::draw_bed_plan(wxDC &dc, const wxRect &cell, double bed_w, double bed_d, bool dark) const
+{
+    if (bed_w <= 0. || bed_d <= 0.)
+        return;
+    const double reference = std::max(1., m_model.glyph_reference_mm());
+    const int    inset     = FromDIP(5);
+    const int    room      = std::max(1, std::min(cell.GetWidth(), cell.GetHeight()) - 2 * inset);
+    const int    w         = std::max(2, (int) std::lround(room * std::min(1., bed_w / reference)));
+    const int    d         = std::max(2, (int) std::lround(room * std::min(1., bed_d / reference)));
+
+    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+    dc.SetPen(wxPen(board_dim(dark), 1));
+    dc.DrawRectangle(cell.x + (cell.GetWidth() - w) / 2, cell.y + (cell.GetHeight() - d) / 2, w, d);
+}
+
+//One plate at 34 px. See PLATE_BOARD_TILE_ABOVE for why a large machine group draws these.
+void PlateBoard::draw_plate_tile(wxDC &dc, const wxRect &cell, int row_index, bool dark,
+                                 const std::vector<int> &dragged) const
+{
+    const std::vector<PlateBoardRow> &rows = m_model.rows();
+    if (row_index < 0 || row_index >= (int) rows.size())
+        return;
+    const PlateBoardRow &row = rows[(size_t) row_index];
+
+    const bool current = row.plate_index == m_current_plate;
+    const bool scoped  = std::find(m_scoped_plates.begin(), m_scoped_plates.end(), row.plate_index) !=
+                        m_scoped_plates.end();
+    const bool hovered = m_hover.kind == HitKind::Row && m_hover.index == row_index;
+    //Needs a person before it can print, for one of three reasons.
+    const bool problem = row.preset_missing || row.unresolved || row.parts_outside;
+
+    //THE GROUND IS WHAT THE ROW SAYS WITH A FULL-WIDTH FILL - current, in the scope set,
+    //under the pointer, or none of the three - so a tiled group and a row group do not have
+    //to be learned twice. Hover and drag get the same treatment they get on a row for the
+    //same reason: a gesture that answers in one part of the board and not in another is a
+    //control that works sometimes.
+    const wxColour fill = current   ? board_sel(dark) :
+                          scoped    ? board_scope(dark) :
+                          hovered   ? board_hover(dark) :
+                                      board_tile(dark);
+    const wxColour edge = problem ? board_err(dark) : current ? board_accent(dark) : board_tile_line(dark);
+    //One error colour, two edges. Dashed is "this does not compose", solid is "this printer
+    //is not installed": the same severity and two different repairs, and at this size a
+    //second red would read as the same red rather than as a second fact.
+    const wxPenStyle edge_style = row.unresolved && !row.preset_missing ? wxPENSTYLE_SHORT_DASH
+                                                                       : wxPENSTYLE_SOLID;
+
+    dc.SetBrush(wxBrush(fill));
+    dc.SetPen(wxPen(edge, current ? FromDIP(2) : 1, edge_style));
+    dc.DrawRoundedRectangle(cell, FromDIP(3));
+
+    //the bed in proportion, so two machines are still visibly two machines at 34 px
+    draw_bed_plan(dc, cell, row.bed_w, row.bed_d, dark);
+
+    dc.SetFont(Label::Body_9);
+    dc.SetTextForeground(problem ? board_err(dark) : board_dim(dark));
+    const wxString number = wxString::Format("%d", row.plate_index + 1);
+    const wxSize   extent = dc.GetTextExtent(number);
+    dc.DrawText(number, cell.x + (cell.GetWidth() - extent.GetWidth()) / 2,
+                cell.y + (cell.GetHeight() - extent.GetHeight()) / 2);
+
+    //THE CORNER MARK IS THE SLICE STATE, and it is a mark rather than a fill because the
+    //fills that could carry it - #BFE1DE, #EBF9F0, #F4F6F6 - are one pale grey-green at this
+    //size, and board_scope already means "in the scope set" on this same tile. Three
+    //saturated colours in one small shape are three facts; three pale grounds are one.
+    wxColour mark;
+    bool     has_mark = true;
+    if (row.sliced)
+        mark = board_accent(dark); //there is a result to send
+    else if (row.stale)
+        mark = board_warn(dark);   //there is a result and it no longer matches the plate
+    else if (!row.dropped_reason.empty())
+        mark = board_dim(dark);    //there was a result and it was dropped
+    else
+        has_mark = false;
+
+    if (has_mark) {
+        const int size   = FromDIP(7);
+        wxPoint   pts[3] = {wxPoint(cell.GetRight() - size, cell.y + 1),
+                            wxPoint(cell.GetRight() - 1, cell.y + 1),
+                            wxPoint(cell.GetRight() - 1, cell.y + size)};
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(mark));
+        dc.DrawPolygon(3, pts);
+    }
+
+    //The drag set is on screen before the drop, which is the one condition this design puts
+    //on a bulk write. A row draws this as a dashed outline; a tile owes the same guarantee,
+    //or a drag begun in a tiled group carries plates nothing on screen names.
+    if (!dragged.empty() &&
+        std::find(dragged.begin(), dragged.end(), row.plate_index) != dragged.end()) {
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.SetPen(wxPen(board_accent(dark), 1, wxPENSTYLE_SHORT_DASH));
+        dc.DrawRoundedRectangle(cell.x - 1, cell.y - 1, cell.GetWidth() + 2, cell.GetHeight() + 2, FromDIP(3));
+    }
+}
+
+void PlateBoard::draw_tile_band(wxDC &                 dc,
+                                bool                   dark,
+                                int                    width,
+                                int                    y,
+                                const Item &           item,
+                                const PlateBoardGroup &group,
+                                const std::vector<int> &dragged) const
+{
+    int tile = 0, gap = 0, inset = 0;
+    tile_metrics(tile, gap, inset);
+
+    for (int c = 0; c < item.tile_count; ++c) {
+        const int index = item.tile_first + c;
+        if (index < 0 || index >= (int) group.rows.size())
+            break;
+        const wxRect cell(inset + c * (tile + gap), y, tile, tile);
+        //The band was laid out against a width the control may since have lost. Drawing past
+        //the edge is worse than stopping - but stopping is only honest because wxEVT_SIZE
+        //rebuilds the bands, so this clamp covers one frame rather than hiding a plate.
+        if (cell.x + tile > width)
+            break;
+        draw_plate_tile(dc, cell, group.rows[(size_t) index], dark, dragged);
+    }
+}
+
+void PlateBoard::draw_scroll_thumb(wxDC &dc, bool dark, int width, int top, int visible)
+{
+    //Nothing to say when everything is on screen. The board is deliberately shorter than its
+    //content - the filament and process controls below it are the actual slicer and must keep
+    //their place - so the rows that are off the bottom are the normal case, and a list that
+    //scrolls with nothing saying so is a list whose remaining plates do not exist as far as
+    //the user is concerned.
+    if (visible <= 0 || m_content_height <= visible)
+        return;
+
+    const int track      = FromDIP(3);
+    const int x          = width - track;
+    const int thumb      = std::max(FromDIP(18), (int) ((double) visible * visible / m_content_height));
+    const int span       = std::max(0, visible - thumb);
+    const int max_scroll = std::max(1, m_content_height - visible);
+    const int y          = top + (int) std::lround((double) m_scroll_px / max_scroll * span);
+
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(board_line(dark)));
+    dc.DrawRoundedRectangle(x, top, track, visible, track / 2.);
+    dc.SetBrush(wxBrush(board_dim(dark)));
+    dc.DrawRoundedRectangle(x, y, track, thumb, track / 2.);
 }
 
 void PlateBoard::begin_rename(int plate_index, const wxRect &rect)
@@ -2825,12 +3108,17 @@ void PlateBoard::draw_row(wxDC &                 dc,
     if (const wxBitmap *thumb = plate_thumb_bitmap(row.plate_index, img)) {
         dc.DrawBitmap(*thumb, plate_img_x, img_y, true);
     } else {
-        //no render yet: a quiet framed cell with the plate number, which is a state, not
-        //a broken image
-        dc.SetBrush(wxBrush(board_soft(dark)));
-        dc.SetPen(wxPen(board_line(dark)));
+        //No render yet. Rather than a blank cell with a number in it, draw the BED this plate
+        //prints on, in plan, scaled against the largest bed in the project - which is the same
+        //proportion the glyph reference already exists for. A plate with no thumbnail then
+        //still says the thing that matters when you are assigning plates: how big is this
+        //machine, and is it bigger or smaller than the others. That is more information than
+        //the empty tile carried, in the same pixels.
+        dc.SetBrush(wxBrush(board_tile(dark)));
+        dc.SetPen(wxPen(board_tile_line(dark)));
         dc.DrawRoundedRectangle(plate_img_x, img_y, img, img, FromDIP(4));
-        dc.SetFont(Label::Head_13);
+        draw_bed_plan(dc, wxRect(plate_img_x, img_y, img, img), row.bed_w, row.bed_d, dark);
+        dc.SetFont(Label::Body_10);
         dc.SetTextForeground(board_dim(dark));
         const wxSize ne = dc.GetTextExtent(index_text);
         dc.DrawText(index_text, plate_img_x + (img - ne.GetWidth()) / 2, img_y + (img - ne.GetHeight()) / 2);
@@ -2854,11 +3142,9 @@ void PlateBoard::draw_row(wxDC &                 dc,
         const int arrow_x0 = plate_col_x + col_w + FromDIP(4);
         const int arrow_x1 = arrow_x0 + FromDIP(18);
         const int arrow_y  = img_y + img / 2;
-        //assigned reads in accent, inherited in dim: the dimming is what says
-        //"changeable default, not a choice"
-        const wxColour arrow_colour = row.preset_missing ? board_err(dark)
-                                      : row.assigned     ? board_accent(dark)
-                                                         : board_dim(dark);
+        //One accent, one error colour. The dim third state said "changeable default,
+        //not a choice", and there are no defaults left for it to describe.
+        const wxColour arrow_colour = row.preset_missing ? board_err(dark) : board_accent(dark);
         dc.SetPen(wxPen(arrow_colour, FromDIP(2)));
         dc.DrawLine(arrow_x0, arrow_y, arrow_x1, arrow_y);
         dc.DrawLine(arrow_x1 - FromDIP(5), arrow_y - FromDIP(4), arrow_x1, arrow_y);
@@ -2869,9 +3155,12 @@ void PlateBoard::draw_row(wxDC &                 dc,
         if (const wxBitmap *cover = printer_cover_bitmap(row.printer_model, img)) {
             dc.DrawBitmap(*cover, machine_img_x, img_y, true);
         } else {
-            dc.SetBrush(wxBrush(board_soft(dark)));
-            dc.SetPen(wxPen(board_line(dark)));
+            //Same rule as the plate cell: no cover art for this machine, so say its bed size
+            //instead of painting a rectangle that means "we have no picture".
+            dc.SetBrush(wxBrush(board_tile(dark)));
+            dc.SetPen(wxPen(board_tile_line(dark)));
             dc.DrawRoundedRectangle(machine_img_x, img_y, img, img, FromDIP(4));
+            draw_bed_plan(dc, wxRect(machine_img_x, img_y, img, img), row.bed_w, row.bed_d, dark);
         }
 
         //the caption is the MODEL when the preset declares one — short and human — and
@@ -2881,9 +3170,7 @@ void PlateBoard::draw_row(wxDC &                 dc,
         if (row.preset_missing)
             machine_caption += _L(" (not installed)");
         dc.SetFont(Label::Body_10);
-        dc.SetTextForeground(row.preset_missing ? board_err(dark)
-                             : row.assigned     ? board_fg(dark)
-                                                : board_dim(dark));
+        dc.SetTextForeground(row.preset_missing ? board_err(dark) : board_fg(dark));
         const wxString shown = wxControl::Ellipsize(machine_caption, dc, wxELLIPSIZE_END, col_w + FromDIP(16));
         const wxSize   ext   = dc.GetTextExtent(shown);
         int            mx    = machine_col_x + (col_w - ext.GetWidth()) / 2;
@@ -2908,6 +3195,29 @@ void PlateBoard::draw_row(wxDC &                 dc,
         const wxString hours = format_hours(row.print_time_seconds);
         const wxSize   ext   = dc.GetTextExtent(hours);
         dc.DrawText(hours, right - ext.GetWidth(), y + FromDIP(22));
+    } else {
+        //WHERE THE HOURS WOULD BE is where the eye already looks for this row's standing,
+        //and a plate that will not compose has no hours to put there - the composition IS
+        //what an estimate comes from, so the two can never collide.
+        //
+        //preset_missing is said here only when there is no machine caption to carry it: the
+        //caption strikes the name through and appends "(not installed)", and a row under a
+        //header that names the machine has no caption at all, so without this the fact
+        //vanished for exactly the rows that are hardest to read. Unresolved is a different
+        //problem with a different repair - the printer IS installed, something else in the
+        //context does not resolve - so it gets its own word rather than sharing that one.
+        wxString standing;
+        if (row.preset_missing && names_machine_above)
+            standing = _L("Not installed");
+        else if (row.unresolved && !row.preset_missing)
+            standing = _L("Unresolved");
+        if (!standing.IsEmpty()) {
+            dc.SetTextForeground(board_err(dark));
+            const wxString shown = wxControl::Ellipsize(standing, dc, wxELLIPSIZE_END,
+                                                        std::max(FromDIP(30), right - content_right));
+            const wxSize   ext   = dc.GetTextExtent(shown);
+            dc.DrawText(shown, right - ext.GetWidth(), y + FromDIP(22));
+        }
     }
 
     dc.SetFont(Label::Body_9);
@@ -2982,6 +3292,10 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
                     dc.DrawRectangle(1, y + 1, width - 2, item.height - 2);
                 }
             }
+        } else if (item.tile_count > 0) {
+            //A band draws its own plates and its own drag outlines; there is no row to draw.
+            if (item.group >= 0 && item.group < (int) groups.size())
+                draw_tile_band(dc, dark, width, y, item, groups[(size_t) item.group], dragged);
         } else if (item.row >= 0 && item.row < (int) rows.size()) {
             const PlateBoardGroup *group = item.group >= 0 && item.group < (int) groups.size()
                                                ? &groups[(size_t) item.group]
@@ -3009,6 +3323,10 @@ void PlateBoard::on_paint(wxPaintEvent &evt)
             dc.DrawRectangle(1, top + 1, width - 2, m_header_height - 2);
         }
     }
+
+    //Inside the clip and last, so it rides over the rows rather than under them, and so it
+    //cannot be painted over the rollup or the grouping control above the scroll region.
+    draw_scroll_thumb(dc, dark, width, top, visible);
 
     dc.DestroyClippingRegion();
 
@@ -3087,10 +3405,10 @@ void PlateBoard::draw_drag_pill(wxDC &dc, bool dark)
 // PlateSwatchStrip
 // ----------------------------------------------------------------------------
 
-//What a plate shows for filament is USAGE: which library slots its instances reference.
-//That is a fact the file already carries. A filament combo scoped to a plate would write
-//nowhere, because filament selection is not per-plate, so this strip is read-only by
-//construction rather than by a disabled flag.
+//What a plate shows for filament is which slots its instances reference and what is
+//loaded in them. The plate owns that list - filament_preset_names is a plate-context
+//field like any other - so the strip is also where it is changed: clicking a swatch
+//picks the material for that slot on this plate.
 class PlateSwatchStrip : public wxPanel
 {
 public:
@@ -3099,12 +3417,12 @@ public:
         SetBackgroundStyle(wxBG_STYLE_PAINT);
         SetMinSize(wxSize(-1, FromDIP(18)));
         Bind(wxEVT_PAINT, &PlateSwatchStrip::on_paint, this);
+        Bind(wxEVT_LEFT_UP, &PlateSwatchStrip::on_click, this);
     }
 
-    //slots are the 1-based library slot numbers, in slot order. The colour is whatever
-    //the project library holds for that slot, or an empty string when the library is
-    //shorter than the slot the plate references, which is drawn hollow rather than
-    //guessed at.
+    //slots are the 1-based slot numbers, in slot order. The colour is whatever this
+    //plate holds for that slot, or an empty string when the plate references a slot it
+    //has no material for, which is drawn hollow rather than guessed at.
     void set_slots(const std::vector<std::pair<int, std::string>> &slots)
     {
         if (m_slots == slots)
@@ -3113,7 +3431,33 @@ public:
         Refresh();
     }
 
+    //The swatch IS the control. A material row of its own would be a second place showing
+    //the same thing, and the thing the user points at to change a filament is the colour
+    //they are looking at. Passing an empty callback makes the strip read-only again, which
+    //is what every scope other than one plate wants.
+    void set_on_slot_clicked(std::function<void(int)> handler)
+    {
+        m_on_slot_clicked = std::move(handler);
+        SetCursor(wxCursor(m_on_slot_clicked ? wxCURSOR_HAND : wxCURSOR_ARROW));
+    }
+
 private:
+    //Where each swatch was drawn, so a click can name the slot it landed on rather than
+    //recomputing the layout and eventually disagreeing with the paint.
+    std::vector<std::pair<wxRect, int>> m_hit_boxes;
+    std::function<void(int)>            m_on_slot_clicked;
+
+    void on_click(wxMouseEvent &evt)
+    {
+        if (!m_on_slot_clicked)
+            return;
+        for (const std::pair<wxRect, int> &box : m_hit_boxes)
+            if (box.first.Contains(evt.GetPosition())) {
+                m_on_slot_clicked(box.second);
+                return;
+            }
+    }
+
     void on_paint(wxPaintEvent &)
     {
         wxAutoBufferedPaintDC dc(this);
@@ -3127,10 +3471,14 @@ private:
         int       x   = 0;
         const int y   = std::max(0, (GetClientSize().GetHeight() - box) / 2);
 
+        m_hit_boxes.clear();
         dc.SetFont(Label::Body_9);
         for (const std::pair<int, std::string> &slot : m_slots) {
             if (x + box + FromDIP(18) > GetClientSize().GetWidth())
                 break;
+            //the number beside the swatch is part of the target: an 11 px square is not
+            //a click area anyone should have to hit exactly
+            m_hit_boxes.emplace_back(wxRect(x, 0, box + FromDIP(20), GetClientSize().GetHeight()), slot.first);
 
             //an unparsable or absent colour draws hollow. Substituting a plausible one
             //would put a filament on screen that the library does not contain.
@@ -3253,10 +3601,12 @@ void PlateInspector::build_rows()
     grid->Add(m_printer_label, 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(m_printer_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
 
-    m_source_label = make_label(_L("Source"));
-    m_source_value = make_value(wxString());
-    grid->Add(m_source_label, 0, wxALIGN_CENTER_VERTICAL);
-    grid->Add(m_source_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
+    m_process_label = make_label(_L("Process"));
+    m_process_value = make_value(wxString());
+    m_process_value->SetCursor(wxCursor(wxCURSOR_HAND));
+    m_process_value->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &) { on_process_click(); });
+    grid->Add(m_process_label, 0, wxALIGN_CENTER_VERTICAL);
+    grid->Add(m_process_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
 
     m_nozzle_label = make_label(_L("Nozzle"));
     m_nozzle_value = make_value(wxString());
@@ -3287,6 +3637,7 @@ void PlateInspector::build_rows()
 
     m_filament_label = make_label(_L("Filament"));
     m_filament_value = new PlateSwatchStrip(m_body);
+    m_filament_value->set_on_slot_clicked([this](int slot) { on_filament_slot_click(slot); });
     grid->Add(m_filament_label, 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(m_filament_value, 1, wxEXPAND);
 
@@ -3294,6 +3645,13 @@ void PlateInspector::build_rows()
     m_mapping_value = make_value(wxString());
     grid->Add(m_mapping_label, 0, wxALIGN_CENTER_VERTICAL);
     grid->Add(m_mapping_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
+
+    m_device_label = make_label(_L("Prints on"));
+    m_device_value = make_value(wxString());
+    m_device_value->SetCursor(wxCursor(wxCURSOR_HAND));
+    m_device_value->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &) { on_device_click(); });
+    grid->Add(m_device_label, 0, wxALIGN_CENTER_VERTICAL);
+    grid->Add(m_device_value, 1, wxALIGN_CENTER_VERTICAL | wxEXPAND);
 
     //Print sequence, both filament sequences and spiral vase stay in the dialog. This is
     //the door to them, and it opens on the plate the badge names rather than on whichever
@@ -3361,7 +3719,7 @@ void PlateInspector::open_picker()
 {
     if (m_plater == nullptr || !m_plater->is_initialized())
         return;
-    if (m_plate_index == PLATE_BOARD_PROJECT_ROW)
+    if (m_plate_index == PLATE_BOARD_NO_PLATE)
         return;
 
     //the scope the board is rendering is the scope the picker may act on, so the two can
@@ -3376,16 +3734,14 @@ void PlateInspector::open_picker()
 
 void PlateInspector::on_nozzle_click()
 {
-    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_PROJECT_ROW)
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
         return;
     PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
     if (plate == nullptr)
         return;
 
-    PresetBundle *bundle = wxGetApp().preset_bundle;
-    const std::string effective = plate->has_printer_assignment() ? plate->get_printer_preset_name()
-                                                                  : bundle->printers.get_selected_preset_name();
-    const Preset *current = bundle->printers.find_preset(effective, false);
+    PresetBundle *bundle  = wxGetApp().preset_bundle;
+    const Preset *current = bundle->printers.find_preset(plate->get_printer_preset_name(), false);
     if (current == nullptr)
         return;
     const std::string model = current->config.opt_string("printer_model");
@@ -3422,9 +3778,250 @@ void PlateInspector::on_nozzle_click()
     PopupMenu(&menu);
 }
 
+//The process this plate slices with.
+//
+//Only processes that will actually run on this plate's printer are offered. A menu that
+//lists what cannot resolve is a menu that turns half its entries into an error message
+//after the click. A stored name this installation does not have is offered back verbatim
+//at the top, because opening the picker must never be the thing that discards it.
+void PlateInspector::on_process_click()
+{
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
+        return;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
+    if (plate == nullptr)
+        return;
+
+    PresetBundle *bundle  = wxGetApp().preset_bundle;
+    const Preset *printer = bundle->printers.find_preset(plate->get_printer_preset_name(), false);
+    if (printer == nullptr) {
+        //Nothing to filter against, so nothing honest to offer. Say which question cannot
+        //be answered rather than showing an empty menu.
+        m_plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+            into_u8(wxString::Format(_L("Plate %d is on \"%s\", which this installation does not have, so its processes cannot be listed."),
+                                     m_plate_index + 1, from_u8(plate->get_printer_preset_name()))));
+        return;
+    }
+
+    const PresetWithVendorProfile printer_profile = bundle->printers.get_preset_with_vendor_profile(*printer);
+    const std::string             current         = plate->get_print_preset_name();
+
+    std::vector<const Preset *> candidates;
+    for (const Preset &preset : bundle->prints) {
+        if (!preset.is_visible || preset.is_default)
+            continue;
+        const PresetWithVendorProfile profile = bundle->prints.get_preset_with_vendor_profile(preset);
+        if (is_compatible_with_printer(profile, printer_profile, &bundle->project_config))
+            candidates.push_back(&preset);
+    }
+
+    wxMenu                   menu;
+    const int                base_id = wxID_HIGHEST + 4400;
+    std::vector<std::string> names;
+
+    if (!current.empty() && bundle->prints.find_preset(current, false) == nullptr) {
+        names.push_back(current);
+        menu.AppendCheckItem(base_id, wxString::Format(_L("Keep %s (not installed)"), from_u8(current)))->Check(true);
+        menu.AppendSeparator();
+    }
+    for (const Preset *preset : candidates) {
+        names.push_back(preset->name);
+        wxMenuItem *item = menu.AppendCheckItem((int) (base_id + names.size() - 1), from_u8(preset->name));
+        if (preset->name == current)
+            item->Check(true);
+    }
+    if (names.empty()) {
+        menu.Append(base_id + 9000, wxString::Format(_L("No process in this installation runs on \"%s\""),
+                                                     from_u8(printer->name)))->Enable(false);
+        PopupMenu(&menu);
+        return;
+    }
+
+    //What this plate changed about whichever process it names, and the way to drop it.
+    //Offered rather than done: a carried set is still values somebody chose, and clearing
+    //them is a decision with a physical consequence.
+    const size_t overrides = plate->process_override_count();
+    if (overrides > 0) {
+        menu.AppendSeparator();
+        menu.Append(base_id + 9001,
+                    wxString::Format(_L("Clear the %d setting(s) this plate changed"), (int) overrides));
+    }
+
+    Plater *  plater      = m_plater;
+    const int plate_index = m_plate_index;
+    menu.Bind(wxEVT_MENU, [plater, plate_index, names, base_id](wxCommandEvent &evt) {
+        if (evt.GetId() == base_id + 9001) {
+            plater->clear_plate_process_overrides(plate_index);
+            return;
+        }
+        const size_t i = (size_t) (evt.GetId() - base_id);
+        if (i < names.size())
+            plater->set_plate_process(plate_index, names[i]);
+    });
+    PopupMenu(&menu);
+}
+
+//The material in one of this plate's slots.
+//
+//A slot is a MATERIAL, not a colour. A project routinely wants several at once - PETG for
+//the support interface, PLA everywhere else - and this is the surface where that is
+//decided, which is why the menu leads with the material type rather than with the preset
+//name. The swatch is the control because the swatch is the thing showing the value.
+//
+//Filament is also the one field the re-resolution mechanism will not rewrite on the user's
+//behalf, because substituting a material is a silent yes with a cost in the physical
+//world. So this is the only way it changes, and it changes one slot at a time: writing a
+//whole new list to alter one slot is how the other slots get quietly reset.
+void PlateInspector::on_filament_slot_click(int slot)
+{
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
+        return;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
+    if (plate == nullptr || slot < 1)
+        return;
+
+    PlateSlicingContext context = plate->get_slicing_context();
+    if ((size_t) slot > context.filament_preset_names.size())
+        return;
+    const std::string current = context.filament_preset_names[(size_t) slot - 1];
+
+    PresetBundle *bundle  = wxGetApp().preset_bundle;
+    const Preset *printer = bundle->printers.find_preset(context.printer_preset_name, false);
+    const Preset *process = bundle->prints.find_preset(context.print_preset_name, false);
+    if (printer == nullptr || process == nullptr)
+        return;
+
+    const PresetWithVendorProfile printer_profile = bundle->printers.get_preset_with_vendor_profile(*printer);
+    const PresetWithVendorProfile process_profile = bundle->prints.get_preset_with_vendor_profile(*process);
+
+    //Compatible with BOTH the printer and the process, which is exactly the pair of checks
+    //the composer makes after the click. Two surfaces asking one question is a problem only
+    //when they can answer it differently, and these cannot: it is the same pair of calls.
+    std::vector<const Preset *> candidates;
+    for (const Preset &preset : bundle->filaments) {
+        if (!preset.is_visible || preset.is_default)
+            continue;
+        const PresetWithVendorProfile profile = bundle->filaments.get_preset_with_vendor_profile(preset);
+        if (is_compatible_with_printer(profile, printer_profile, &bundle->project_config) &&
+            is_compatible_with_print(profile, process_profile, printer_profile))
+            candidates.push_back(&preset);
+    }
+
+    wxMenu                   menu;
+    const int                base_id = wxID_HIGHEST + 4500;
+    std::vector<std::string> names;
+
+    menu.Append(base_id + 9000, wxString::Format(_L("Slot %d"), slot))->Enable(false);
+    menu.AppendSeparator();
+    if (!current.empty() && bundle->filaments.find_preset(current, false) == nullptr) {
+        names.push_back(current);
+        menu.AppendCheckItem(base_id, wxString::Format(_L("Keep %s (not installed)"), from_u8(current)))->Check(true);
+        menu.AppendSeparator();
+    }
+    //Grouped by material type, so choosing "the PETG one" is one glance rather than a
+    //scan of forty preset names that all start with the same vendor.
+    std::map<std::string, std::vector<const Preset *>> by_type;
+    for (const Preset *preset : candidates) {
+        std::string type;
+        if (const ConfigOptionStrings *opt = preset->config.option<ConfigOptionStrings>("filament_type");
+            opt != nullptr && !opt->values.empty())
+            type = opt->values.front();
+        by_type[type.empty() ? into_u8(_L("Unnamed material")) : type].push_back(preset);
+    }
+    for (const std::pair<const std::string, std::vector<const Preset *>> &group : by_type) {
+        menu.AppendSeparator();
+        menu.Append(base_id + 9100 + (int) names.size(), from_u8(group.first))->Enable(false);
+        for (const Preset *preset : group.second) {
+            names.push_back(preset->name);
+            wxMenuItem *item = menu.AppendCheckItem((int) (base_id + names.size() - 1), from_u8(preset->name));
+            if (preset->name == current)
+                item->Check(true);
+        }
+    }
+    if (names.empty()) {
+        menu.Append(base_id + 9001, _L("No filament in this installation runs on this plate"))->Enable(false);
+        PopupMenu(&menu);
+        return;
+    }
+
+    Plater *                 plater      = m_plater;
+    const int                plate_index = m_plate_index;
+    const int                slot_index  = slot - 1;
+    std::vector<std::string> list        = context.filament_preset_names;
+    menu.Bind(wxEVT_MENU, [plater, plate_index, slot_index, names, base_id, list](wxCommandEvent &evt) mutable {
+        const size_t i = (size_t) (evt.GetId() - base_id);
+        if (i >= names.size() || (size_t) slot_index >= list.size())
+            return;
+        list[(size_t) slot_index] = names[i];
+        plater->set_plate_filaments(plate_index, std::move(list));
+    });
+    PopupMenu(&menu);
+}
+
+//Which physical machine this plate is dispatched to.
+//
+//A separate property from the printer preset, and deliberately so: several machines can
+//share one slicing preset, and one machine changes nozzle over its life. Clearing it is
+//the first entry, because a plate that slices but has not been told where to print is a
+//real and common state rather than an incomplete one.
+void PlateInspector::on_device_click()
+{
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
+        return;
+    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
+    if (plate == nullptr)
+        return;
+
+    const std::string current = plate->get_physical_printer_id();
+
+    std::vector<std::pair<std::string, wxString>> devices; //id, label
+    if (DeviceManager *dev = wxGetApp().getDeviceManager()) {
+        for (const std::pair<const std::string, MachineObject *> &entry : dev->get_my_machine_list()) {
+            if (entry.second == nullptr)
+                continue;
+            wxString label = from_u8(entry.second->get_dev_name());
+            if (label.empty())
+                label = from_u8(entry.first);
+            devices.emplace_back(entry.first, label);
+        }
+    }
+    //A stored device this account can no longer see is offered back rather than dropped:
+    //the project may be opened on the machine that owns it.
+    if (!current.empty() &&
+        std::find_if(devices.begin(), devices.end(),
+                     [&current](const std::pair<std::string, wxString> &d) { return d.first == current; }) == devices.end())
+        devices.emplace_back(current, wxString::Format(_L("%s (not on this account)"), from_u8(current)));
+
+    wxMenu      menu;
+    const int   base_id = wxID_HIGHEST + 4600;
+    wxMenuItem *none    = menu.AppendCheckItem(base_id, _L("Not assigned to a machine"));
+    none->Check(current.empty());
+    if (!devices.empty())
+        menu.AppendSeparator();
+    for (size_t i = 0; i < devices.size(); ++i) {
+        wxMenuItem *item = menu.AppendCheckItem((int) (base_id + 1 + i), devices[i].second);
+        if (devices[i].first == current)
+            item->Check(true);
+    }
+    if (devices.empty())
+        menu.Append(base_id + 9000, _L("No machines are bound to this account"))->Enable(false);
+
+    Plater *  plater      = m_plater;
+    const int plate_index = m_plate_index;
+    menu.Bind(wxEVT_MENU, [plater, plate_index, devices, base_id](wxCommandEvent &evt) {
+        const int i = evt.GetId() - base_id;
+        if (i == 0)
+            plater->set_plate_physical_printer(plate_index, std::string());
+        else if (i >= 1 && (size_t) (i - 1) < devices.size())
+            plater->set_plate_physical_printer(plate_index, devices[(size_t) (i - 1)].first);
+    });
+    PopupMenu(&menu);
+}
+
 void PlateInspector::on_more_plate_settings()
 {
-    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_PROJECT_ROW)
+    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
         return;
 
     //Posted rather than constructed here. Plater::open_platesettings_dialog already
@@ -3478,7 +4075,7 @@ void PlateInspector::on_bed_type_selected()
 {
     if (m_syncing || m_plater == nullptr || !m_plater->is_initialized())
         return;
-    if (m_plate_index == PLATE_BOARD_PROJECT_ROW)
+    if (m_plate_index == PLATE_BOARD_NO_PLATE)
         return;
 
     PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
@@ -3506,7 +4103,7 @@ void PlateInspector::on_bed_type_selected()
     CallAfter([plater]() { plater->update(); });
 }
 
-void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int> &scoped_plates, bool project_scope)
+void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int> &scoped_plates)
 {
     //is_initialized(): the inspector is built inside Plater::priv's constructor, where
     //there is no plate list and no resolver to ask. Every one of the crashes this guard
@@ -3526,28 +4123,35 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
             if (row.plate_index == idx)
                 scope.push_back(&row);
 
-    const bool project = project_scope || scope.empty();
-    const bool single  = !project && scope.size() == 1;
+    //Every scope names at least one plate. The scope that named none described the
+    //project's printer, and there is no such thing to describe.
+    const bool single = scope.size() == 1;
+    const bool empty  = scope.empty();
 
-    m_plate_index = single ? scope.front()->plate_index : PLATE_BOARD_PROJECT_ROW;
+    m_plate_index = single ? scope.front()->plate_index : PLATE_BOARD_NO_PLATE;
 
-    if (project)
-        m_badge_text = _L("PROJECT");
+    if (empty)
+        m_badge_text = _L("NO PLATE");
     else if (single)
         m_badge_text = wxString::Format(_L("PLATE %02d"), scope.front()->plate_index + 1);
     else
         m_badge_text = wxString::Format(_L("%d PLATES"), (int) scope.size());
     m_header->Refresh();
 
-    const PlateBoardRow &project_row = model.project_row();
+    if (empty) {
+        //Nothing selected and nothing to say about it. Every row below writes to a plate,
+        //so with no plate the panel shows the one honest thing and stops.
+        m_body->Show(false);
+        m_last_shape = 0;
+        Layout();
+        if (GetParent() != nullptr)
+            GetParent()->Layout();
+        return;
+    }
+    m_body->Show(m_expanded);
 
     // ---- Printer -----------------------------------------------------------
-    if (project) {
-        m_printer_value->SetLabel(from_u8(project_row.printer_name));
-        //the combo pinned above the board is the project printer's editor; this row
-        //states it rather than offering a second way to change it
-        m_printer_value->SetCursor(wxCursor(wxCURSOR_ARROW));
-    } else if (single) {
+    if (single) {
         wxString name = from_u8(scope.front()->printer_name);
         if (scope.front()->preset_missing)
             name += _L(" (not installed)");
@@ -3566,34 +4170,27 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
         m_printer_value->SetCursor(wxCursor(wxCURSOR_HAND));
     }
 
-    // ---- Source ------------------------------------------------------------
-    //Whether the printer above is this plate's own assignment or the Project row it is
-    //still following. The board greys an inherited chip; this says the same thing in
-    //words, because the greying is a convention and this is the row that has to be read
-    //before the picker is opened.
-    m_source_label->Show(!project);
-    m_source_value->Show(!project);
+    // ---- Process -----------------------------------------------------------
+    //A plate-context field like the printer, so it is written the same way: click the
+    //value, pick from what will run here.
+    m_process_label->Show(single);
+    m_process_value->Show(single);
     if (single) {
-        m_source_value->SetLabel(scope.front()->assigned ? _L("Assigned to this plate")
-                                                         : _L("Same as Global"));
-    } else if (!project) {
-        int assigned = 0;
-        for (const PlateBoardRow *row : scope)
-            assigned += row->assigned ? 1 : 0;
-        m_source_value->SetLabel(assigned == 0                  ? _L("Same as Global") :
-                                 assigned == (int) scope.size() ? _L("Assigned to these plates") :
-                                                                  _L("Mixed"));
+        wxString process = scope.front()->process_name.empty() ? wxString(_L("None"))
+                                                               : from_u8(scope.front()->process_name);
+        //The name plus what this plate changed about it. A plate carried over from another
+        //machine keeps the values that were chosen and takes the new machine's process
+        //name, so the name on its own would be the smaller half of the truth.
+        if (scope.front()->process_overrides > 0)
+            process += wxString::Format(_L("  +%d changed"), (int) scope.front()->process_overrides);
+        m_process_value->SetLabel(process);
     }
 
     // ---- Nozzle ------------------------------------------------------------
     //Read-only in every scope. A plate stores one printer string; the nozzle is a
     //property of the preset, so an editable-looking nozzle scoped to a plate would be a
     //lie the moment anyone clicked it.
-    if (project) {
-        m_nozzle_value->SetLabel(project_row.nozzle_diameter > 0.
-                                     ? wxString::Format("%.2f mm", project_row.nozzle_diameter)
-                                     : wxString::FromUTF8("\xe2\x80\x93"));
-    } else if (single) {
+    if (single) {
         const wxString diameter = scope.front()->nozzle_diameter > 0.
                                       ? wxString::Format("%.2f mm", scope.front()->nozzle_diameter)
                                       : wxString::FromUTF8("\xe2\x80\x93");
@@ -3611,29 +4208,17 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
     } else {
         m_bed_choice->Show(false);
         m_bed_value->Show(true);
-        if (project) {
-            //the project bed combo above the board is the editor for this one
-            m_bed_value->SetLabel(bed_type_label(0));
-        } else {
-            std::set<int> bed_types;
-            for (const PlateBoardRow *row : scope)
-                bed_types.insert(row->bed_type);
-            m_bed_value->SetLabel(bed_types.size() == 1 ? bed_type_label(*bed_types.begin()) : _L("Mixed"));
-        }
+        std::set<int> bed_types;
+        for (const PlateBoardRow *row : scope)
+            bed_types.insert(row->bed_type);
+        m_bed_value->SetLabel(bed_types.size() == 1 ? bed_type_label(*bed_types.begin()) : _L("Mixed"));
     }
 
-    // ---- Filament usage ----------------------------------------------------
+    // ---- Filament ----------------------------------------------------------
+    //The union across the selection, in slot order, with the colours the model already
+    //resolved: two places resolving one plate's materials is two places to disagree.
     std::vector<std::pair<int, std::string>> swatches;
-    if (project) {
-        //PROJECT scope shows the library itself, not any plate's usage of it
-        const ConfigOptionStrings *colour_opt =
-            wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
-        if (colour_opt != nullptr)
-            for (size_t i = 0; i < colour_opt->values.size(); ++i)
-                swatches.emplace_back((int) i + 1, colour_opt->values[i]);
-    } else {
-        //the union across the selection, in slot order, with the colours the model already
-        //resolved: two places resolving one library is two places to disagree about it
+    {
         std::map<int, std::string> used;
         for (const PlateBoardRow *row : scope)
             for (size_t i = 0; i < row->filament_slots.size(); ++i)
@@ -3643,6 +4228,12 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
             swatches.emplace_back(slot.first, slot.second);
     }
     m_filament_value->set_slots(swatches);
+    //Writable only when the badge names one plate. A material picked into a mixed scope
+    //would write a slot on plates whose other slots the panel is not showing.
+    if (single)
+        m_filament_value->set_on_slot_clicked([this](int slot) { on_filament_slot_click(slot); });
+    else
+        m_filament_value->set_on_slot_clicked(nullptr);
 
     // ---- Mapping -----------------------------------------------------------
     //Per-plate and read-only. Omitted outside PLATE scope: a single summary line cannot
@@ -3652,12 +4243,29 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
     if (single)
         m_mapping_value->SetLabel(filament_map_mode_label(scope.front()->filament_map_mode));
 
+    // ---- Prints on ---------------------------------------------------------
+    //The physical machine. Its own field, because a slicing preset is not a machine: one
+    //preset can serve several, and one machine changes nozzle over its life.
+    m_device_label->Show(single);
+    m_device_value->Show(single);
+    if (single) {
+        wxString device = _L("Not assigned");
+        if (!scope.front()->device_id.empty()) {
+            device = from_u8(scope.front()->device_id);
+            if (DeviceManager *dev = wxGetApp().getDeviceManager())
+                if (MachineObject *obj = dev->get_my_machine(scope.front()->device_id);
+                    obj != nullptr && !obj->get_dev_name().empty())
+                    device = from_u8(obj->get_dev_name());
+        }
+        m_device_value->SetLabel(device);
+    }
+
     m_more_btn->Show(single);
 
     m_body->Layout();
     Layout();
 
-    const int shape = project ? 0 : (single ? 1 : 2);
+    const int shape = single ? 1 : 2;
     if (shape != m_last_shape) {
         m_last_shape = shape;
         InvalidateBestSize();
