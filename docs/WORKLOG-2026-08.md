@@ -1,9 +1,9 @@
 # Work log — August 2026
 
-Dated build history and closed audit findings for the fork, split out of `PETKOS-ORCA.md` on
+Dated build history and closed audit findings for the fork, split out of `PODSLICER.md` on
 2026-08-11 so the root file states current architecture rather than its own history.
 
-**Read this when you need provenance, not before starting work.** `PETKOS-ORCA.md` is the
+**Read this when you need provenance, not before starting work.** `PODSLICER.md` is the
 authority on how the fork behaves now; anything here is a record of how it got there and may
 describe states that no longer exist.
 
@@ -1576,3 +1576,239 @@ A measured run writes a 1.9 MB log: 7,986 info lines, of which **7,718 are prese
 `PresetCollection::set_printer_hold_alias` 5,573 times and `Preset::set_visible_from_appconfig`
 2,145. That is startup, not the frame, and startup is 12 s. It is also the category of thing that
 rides through a perf run unnoticed, so it is written down here rather than left to be rediscovered.
+
+## Work log — 2026-08-14 (the project printer was never a printer)
+
+### What it actually was
+
+`PlateSlicingContext` had five fields and a rule: an empty field means the plate follows the
+project. That rule is where the singular engine lived. Not in a missing feature — the data layer
+had held a per-plate printer since `4cf3af2bda` — but in what *absence* was defined to mean. As
+long as "empty" resolved to the globally selected preset, every plate that had not been explicitly
+told otherwise had one machine standing behind it, and the resolver read that machine on every
+slice, every frame and every board rebuild.
+
+The project printer is not a printer. It is the settings tabs' **cursor** — which preset is
+currently being edited — and the application had been reading a cursor as a fact about the project.
+
+So the deletion is not "remove a field". It is: **empty stops meaning anything.** A plate names its
+own printer, its own process and its own materials, or it is unresolved, which is an error to fix at
+its source. The global selection survives as what it always was, an editing cursor, and it now
+follows the current plate instead of standing behind every plate.
+
+The difference between a state and a default is how many times it is read.
+`PresetBundle::complete_plate_context` is the only remaining read of the global selection on a
+plate's behalf, and it runs **once per plate, at the moment the plate comes into being** — a plate
+being created, or a project written before per-plate machines being loaded.
+
+### What that deleted
+
+| Gone | It was |
+|---|---|
+| the inheritance branches in `resolve_plate_presets` and `compose_plate_slicing_config` | the mechanism itself: an empty name read the edited preset |
+| `PartPlate::has_slicing_context_assignment()` | "is this plate explicitly configured", a question with one answer now |
+| `apply_printer_to_plate`'s `inherited` branch and `PlateBoardModel::build_project_row` | a second bed source and a row describing it |
+| the board's inherited group, `m_all_inherited`, `PlateBoardRow::assigned`, the dim third state in the row painter | "changeable default, not a choice" — there are no defaults left to describe |
+| the picker's "Same as Global" first entry | the one-click way back to the state being deleted |
+| `Sidebar::set_project_scope`, `m_scope_project`, `is_project_scope`, `printer_panel_project_scope`, the inspector's whole PROJECT branch and its Source row | a scope whose only content was the project printer |
+| `ArrangeJob`'s pool/sticky split and its whole single-project-bed path | two arrange algorithms because plates came in two kinds |
+| `reresolve_plate_context_for_printer`'s `process_now_inherits` rule | a process re-inheriting a pairing that no longer exists |
+
+`PLATE_BOARD_PROJECT_ROW` became `PLATE_BOARD_NO_PLATE`. The name was the lie: -1 never meant the
+project, it meant "the scope is not exactly one plate".
+
+### Every plate-context field now has a user-facing write path
+
+One idiom throughout: **click the value, get a menu of what will actually resolve here.** A menu
+that lists what cannot resolve is a menu that turns half its entries into an error message after the
+click, so each list is filtered by the same compatibility calls the composer makes afterwards — and
+a stored name this installation does not have is always offered back verbatim at the top, because
+opening a picker must never be the thing that discards it.
+
+| Field | Where it is written |
+|---|---|
+| `printer_preset_name` | the row chip, the inspector's Printer row, a drag onto a machine group, the sidebar printer combo |
+| `printer_vendor_id` | never by hand: recorded by the re-resolution mechanism from the resolved printer |
+| `print_preset_name` | **new** — the inspector's Process row, and the sidebar process combo |
+| `filament_preset_names` | **new** — click a swatch, pick that slot's material; and the sidebar filament combos |
+| `physical_printer_id` | **new** — the inspector's "Prints on" row, alongside the send dialog that already wrote it |
+
+The swatch strip is where filament is changed because the swatch is the thing showing the value; a
+separate materials row would be a second place displaying the same fact. It writes **one slot at a
+time**, because writing a whole new list to alter one slot is how the other slots get quietly reset.
+And it is writable only when the badge names one plate.
+
+### The cursor follows the plate (`Plater::follow_plate_presets`)
+
+Selecting a plate points the settings tabs at that plate's presets. Only fields that actually
+differ are moved, so in a single-machine project the cursor never moves and Orca's unsaved-changes
+dialog never appears. When they do differ the dialog is exactly right — a plate on another machine
+genuinely is a different thing to be editing — and if the user declines it, the tabs stay where they
+were and say so, rather than silently describing one plate while the badge names another.
+
+The other direction is the same idea: the sidebar's printer, process and filament combos now write
+to the current plate. They used to edit "the project", with the untold plates following along.
+
+### The consequences that were not obvious
+
+**A new plate is a copy of the last one.** That is what `complete_plate_contexts` does, and it also
+answers three questions that used to be answered by "the project": what shape a plate that does not
+exist yet has (`ArrangeJob`'s future beds), what an arrange overflow lands on, and what a plate
+imported without a machine becomes.
+
+**Arrange overflow keeps its machine.** An item that will not fit goes onto one of arrange's extra
+beds *of the same shape*, which is the same machine by construction; `finalize` gives the plate it
+creates the context of the plate it overflowed from. Without that, an object would change machine by
+failing to fit — a silent yes with a cost in the physical world.
+
+**A homeless item joins the current plate.** Items with no source plate used to fall into the pool
+of plates sharing the project bed. The current plate is the one the user is looking at and where the
+object visually already is; anything else would be the app deciding which machine prints it.
+
+**The plate label says its machine only when that distinguishes.** Every plate has a printer now, so
+an unconditional suffix would repeat one string on all thirty-six plates of a single-machine project.
+Crossing between one machine and several restyles every label, not just the one that changed, because
+the rule is a property of the set.
+
+**Swatches read the plate's own colours.** `PartPlate::config()` already carried `filament_colour`
+(the AMS sync writes it there), and the board was reading the project library regardless — so the
+plates whose materials had been set deliberately were exactly the ones showing the wrong colour.
+
+**CLI keeps a second bed source, named rather than hidden.** There is no wxApp and no preset bundle
+in CLI; a plate resolves against the project config the 3MF carried, which arrives through
+`set_shapes`. `PartPlateList::plate_beds_come_from_presets()` is where that difference is stated.
+CLI's global arrange pool became "the plates that share the first plate's machine" — a bed is the
+property the pool ever really needed — and the legacy bed translation still runs, because a project
+written before per-plate machines still names no printer on any plate when CLI reads it.
+
+### The trap this walked into, which had already been sprung once today
+
+`e0039df8bf` ("A plate is never incomplete") is the same design, from this morning, and it was
+reverted in `1e6a972028` because it silently tripled print times. This session rebuilt the design
+and reproduced the bug exactly before finding the plan note that diagnosed it.
+
+The fault is timing, not the seed. `PartPlateList::load_from_3mf_structure` runs BEFORE
+`load_config_model` and `load_project_embedded_presets` put the project's own presets into the
+bundle. Completing the plates there samples whatever was selected before the file was opened -
+`Default Setting`, `Default Filament` - and writes them onto every plate as concrete names, after
+which they outrank the real presets the 3MF was carrying. `Default Filament` caps
+`filament_max_volumetric_speed` at 2, about six times below the real value:
+
+    working    filament_settings_id = "Generic PETG(...)"   max_volumetric_speed 12  ->  6h45m, 174.7 g
+    populated  filament_settings_id = "Default Filament"    max_volumetric_speed 2   -> 21h03m,   0.00 g
+
+**Every in-app check passed on that build.** The scope check passed, the save round-tripped, the
+plates were all complete. Only reading the emitted G-code caught it, which is the general lesson:
+a change can be correct in the data model and wrong in the output, and "complete" is not the same
+as "right".
+
+The first fix was a timing rule - refuse to complete while a project is loading - and the tell that
+it was a patch was the length of the comment defending it. A rule enforced by a flag breaks again
+the next time somebody adds a call site, and the same file already says that a workaround needing a
+paragraph to justify it is the code asking to be fixed.
+
+**The repair is that the seed is an argument.** `complete_plate_context(context, seed)` takes the
+seed by reference and reads no global state at all, so a caller has to name where the values come
+from. That is the difference between a value somebody chose and whatever was selected when the code
+happened to run, and a signature that cannot reach a global cannot get it wrong from any call site.
+
+- A plate in an existing session is completed from the last complete plate; only with no plate at
+  all does the bundle's selection get used, and there it is a remembered choice.
+- A loaded project is completed from what the FILE declared. `load_files` reads
+  `printer_settings_id`, `print_settings_id` and `filament_settings_id` out of the 3MF's own config
+  before that config is moved into the bundle, and passes them in. Correct whenever it runs.
+
+And the driver now asserts that no plate names a preset that `is_default`. A placeholder is a
+complete context, so the completeness check could never have caught this on its own.
+
+### The acceptance check
+
+`PetkosPerfDriver`'s new Context phase, on by default, asks three questions of the code slicing
+itself reads, in rising strength:
+
+1. Does every plate carry a complete context of its own?
+2. Does an **empty** context refuse to resolve? That refusal *is* the deletion.
+3. **Does moving the global selection change what a plate slices with?** The cursor is moved out
+   from under plate 1 and the plate must not notice; the selection is restored afterwards. This is
+   the one a well-behaved caller cannot fake.
+
+### Podslicer, and the pass that renamed it (2026-08-14, afternoon)
+
+Petko named the fork: a pack of orcas is a pod. `SLIC3R_APP_FULL_NAME` -> `Podslicer` (display only,
+109 uses, all dialog captions), `SLIC3R_APP_KEY` -> `Podslicer` (config file, wx app name, 3MF
+`Application` metadata). `SLIC3R_APP_NAME` stays `OrcaSlicer` because it goes into the G-code header
+and firmware parsers sniff that prefix - `version.inc` already carried that warning.
+
+Renaming the app key renames the config file, which is how the 2026-07-29 rename left an orphan.
+`AppConfig::loading_path()` now adopts the config written under any previous key rather than opening
+factory-fresh beside it.
+
+`PETKOS-ORCA.md` -> `PODSLICER.md`.
+
+### What the parallel pass found, and it was mostly about this session's own work
+
+Four agents ran against a read-only tree while the compiler had it. Two of the findings were fatal
+and both were mine.
+
+**The 21-hour fault, re-entered through a different door.** `create_plate()` completed EVERY plate in
+the list, and `load_from_3mf_structure` calls it once per plate. On iteration N it topped up plates
+0..N-1 - which the file had just written as empty - with whatever the bundle held before the project
+was opened. Only the current iteration's plate was corrected afterwards. Completion only fills empty
+fields, so nothing later corrected the rest.
+
+The rule this establishes, and it is the same rule the seed-as-an-argument change was reaching for:
+**a plate is seeded by whoever ASKED for it.** `on_action_add_plate` seeds from the plate the user is
+on; the load path seeds from what the file declared. `create_plate` seeds nothing.
+
+**And the migration was in the wrong branch.** `if (type_3mf)` runs 7387-7982 and `else` runs
+7983-8125; the capture landed at 8117. The whole mechanism was dead for every project the app
+actually opens. A brace-depth check said "inside" because `} else {` never returns to depth zero -
+worth remembering, because it is a plausible-looking verification that proves nothing.
+
+**A hard stop nobody had hit yet.** `compose_plate_slicing_config` refuses a context whose filament
+is incompatible, and re-resolution deliberately never rewrote filament - so pointing a downloaded
+Bambu plate at a machine this farm owns left the plate unable to SLICE. Six plates by four slots is
+54 manual repairs before anything runs. `translate_filament_to_printer` fixes it, and it sharpens
+rather than breaks the rule it amends: "never substitute a filament" protects a MATERIAL choice, and
+PLA re-expressed as the target machine's PLA is not a substitution. One string decides it.
+
+**A preset-name defect visible in the live config.** `load_external_preset` builds the project suffix
+from a name that already carries one, so it accretes on every save/reopen:
+`PolyTerra PLA @BBL A1M(helldiver-colored.3mf)(helldiver-colored.3mf)(helldiver-colored.3mf)`, found
+in a real sliced file on disk, and doubled on all three collections in `PetkosOrca.conf`. The
+previous author met this and left a commented-out `//TODO` regex three lines above. It is not
+cosmetic here: plate contexts STORE these names, so a name that grows every round trip eventually
+stops matching what the bundle installs.
+
+**The board evicts the inspector.** There is no scrollbar anywhere in `PlateBoard.cpp`; the board
+asks for four rows, the sidebar gives about 2.5, and the shortfall lands on the last child - so the
+plate inspector is not visible in the running app at all. Both screenshots show rows bisected top and
+bottom on a three-plate project.
+
+**And `board_soft` (#323A3D, a TEXT colour) was the brush for both empty picture cells**, which made a
+near-black square the loudest object on a panel about which machine a plate goes to. Dark mode
+lightens it, so it was a light-mode-only fault that never showed up in testing. The empty cells now
+draw the plate's bed in plan, scaled against the project's largest - which is also what the glyph
+animation has been interpolating for nothing since the row became pictures.
+
+### The demand evidence for all of this
+
+Upstream's canonical request, **#7238**, was closed *not planned* **by a stale bot: zero reactions,
+two comments, both the bot, no human reply.** The demand does not show up as reactions. It shows up
+as **the same request independently refiled at least twelve times in three years** - #1277, #1309,
+#3593, #3942, #7221, #7238, #8420, #8596, #10551, #11445, plus discussions #6357 and #7506 - at least
+six auto-closed unanswered. Fifteen are closed by this tree.
+
+Do not claim the high-reaction neighbours that turn up in the same searches: toolchangers (#2050, 67
+reactions), per-feature filament (#7106, 37), custom bed surfaces (#836, 36), filament-scope
+overrides (#12401, 21). Podslicer does none of those.
+
+### The instrument that would have caught the 21-hour slice
+
+`tools/petkos-gcode-check.py` reads what a slice ACTUALLY used out of the emitted G-code - the only
+artefact that cannot be wrong about what gets made. It knows the incident by signature: a placeholder
+preset, `filament_max_volumetric_speed` below 4, or `0.00 g`. It found the suffix-growth bug on its
+first real file. `tools/petkos-verify.ps1` now slices and reads it as a fourth question, and
+`tools/petkos-import-check.ps1` runs the whole cross-printer workflow end to end: open a real
+Bambu-authored 3MF, retarget it to a machine this farm owns, slice, and check the project's own
+wall/infill/pattern choices are still in the G-code.
