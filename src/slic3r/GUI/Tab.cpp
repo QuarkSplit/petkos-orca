@@ -88,7 +88,41 @@ int mode_to_selection(ConfigOptionMode mode)
 // Forward declaration for early use; definitions live later in this translation unit.
 static void validate_custom_gcode_cb(Tab* tab, const wxString& title, const t_config_option_key& opt_key, const boost::any& value);
 
-static const std::vector<std::string> plate_keys = { "curr_bed_type", "skirt_start_angle", "first_layer_print_sequence", "first_layer_sequence_choice", "other_layers_print_sequence", "other_layers_sequence_choice", "print_sequence", "spiral_mode"};
+//The options a plate carries that no process preset has: the bed it prints on, and the order
+//its objects are laid down in. Each of these has a mirrored PartPlate member, which is why
+//TabPrintPlate::on_value_change special-cases them one at a time rather than only storing them.
+static const std::vector<std::string> plate_only_keys = { "curr_bed_type", "skirt_start_angle", "first_layer_print_sequence", "first_layer_sequence_choice", "other_layers_print_sequence", "other_layers_sequence_choice", "print_sequence", "spiral_mode"};
+
+//PetkosOrca: every PROCESS option a plate may override, which is all of them.
+//
+//This set used to BE the eight keys above, and those eight were the whole per-plate process
+//story: bed type and print order. Two things followed from that, and the second is the worse
+//one. A project with one plate needing supports and one not was ten per-object toggles on one
+//plate and the inverse on the other. And a plate moved onto another printer silently took that
+//printer's own default process - reresolve_plate_context_for_printer does this, correctly, and
+//says so - after which the Process panel could not adjust it at all, because that panel edits
+//the PROJECT's process preset and the plate no longer used it. Settings typed there reached
+//nothing, with the panel still showing the project's preset name as though they had.
+//
+//Nothing new is needed to carry these. A plate override is written into PartPlate::config(),
+//layered over the plate's resolved process by Plater::resolve_plate_slicing_config, persisted
+//with the plate in the 3MF, and covered by the plate's own undo snapshot. The eight keys above
+//already exercised every one of those paths; they were simply the only eight let through.
+//
+//A function rather than a namespace-scope vector: Preset::print_options() returns a file-static
+//in another translation unit, so reading it from a static initialiser here is an ordering
+//question with no answer. A function-local static is initialised on first use.
+static const std::vector<std::string>& plate_keys()
+{
+    static const std::vector<std::string> keys = []() {
+        std::vector<std::string> k = Preset::print_options();
+        for (const std::string &extra : plate_only_keys)
+            if (std::find(k.begin(), k.end(), extra) == k.end())
+                k.push_back(extra);
+        return k;
+    }();
+    return keys;
+}
 
 static std::pair<std::string, std::string> extruder_variant_keys[]{
     {},                                                  // invalid
@@ -3463,7 +3497,22 @@ void TabPrintModel::update_model_config()
     }
     m_config->apply(*m_parent_tab->m_config);
     if (m_type != Preset::TYPE_PLATE) {
-        m_config->apply_only(*wxGetApp().plate_tab->get_config(), plate_keys);
+        //An object sits on a plate, so the plate's overrides are its baseline: preset, then
+        //plate, then object. Read them from the PLATE, not from the plate tab's composed config.
+        //
+        //That tab's config is the print preset plus whichever plate it was last bound to, and it
+        //is bound only when someone opens the Plate scope or picks a plate in the object tree. So
+        //an object on plate 3 could inherit plate 1's values, or a plate the user had navigated
+        //away from entirely. With eight keys in this set that was nearly invisible; now that a
+        //plate can override any process option it would be an object tab quietly describing
+        //another plate's settings as this one's defaults.
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr && plater->is_initialized()) {
+            if (PartPlate *plate = plater->get_partplate_list().get_curr_plate(); plate != nullptr) {
+                //Only the keys the plate actually carries, and only those this tab owns. Applying
+                //the whole config would push the plate's inherited values in as overrides.
+                m_config->apply_only(*plate->config(), intersect(m_keys, plate->config()->keys()));
+            }
+        }
     }
     m_null_keys.clear();
     if (!m_object_configs.empty()) {
@@ -3718,18 +3767,26 @@ void TabPrintModel::update_custom_dirty(std::vector<std::string> &dirty_options,
 
 //BBS: GUI refactor
 TabPrintPlate::TabPrintPlate(ParamsPanel* parent) :
-    TabPrintModel(parent, plate_keys)
+    TabPrintModel(parent, plate_keys())
 {
     m_parent_tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
     m_type = Preset::TYPE_PLATE;
-    m_keys = concat(m_keys, plate_keys);
+    m_keys = concat(m_keys, plate_only_keys);
 }
 
 void TabPrintPlate::build()
 {
-    m_presets = &m_prints;
-    load_initial_data();
+    //The whole process tree, pruned to m_keys - which is now every process option, so a plate
+    //gets the same Quality / Strength / Speed / Support pages the Project process has.
+    //TabPrintModel::build() renders the full Print tab and then drops every line whose key this
+    //tab does not carry; TabPrintObject has always got its option tree exactly this way. The
+    //plate tab hand-built one page of six lines instead, which is why "per-plate process
+    //settings" meant bed type and print order and nothing else.
+    TabPrintModel::build();
 
+    //The plate-only options have no slot in a process preset and no line anywhere in the tree
+    //above, so both have to be made here. curr_bed_type seeds from the project's bed so an
+    //untouched plate opens showing the bed it will actually print on.
     m_config->option("curr_bed_type", true);
     if (m_preset_bundle->project_config.has("curr_bed_type")) {
         BedType global_bed_type = m_preset_bundle->project_config.opt_enum<BedType>("curr_bed_type");
@@ -3741,12 +3798,13 @@ void TabPrintPlate::build()
     m_config->option("other_layers_print_sequence", true);
     m_config->option("other_layers_sequence_choice", true);
 
-    auto page = add_options_page(L("Plate Settings"), "empty");
+    //skirt_start_angle, print_sequence and spiral_mode are process options and the tree above
+    //already carries a line for each, so repeating them here would put the same control on two
+    //pages. Their PartPlate side-effects live in on_value_change and fire from wherever the
+    //control is edited, so nothing is lost by letting them sit in their natural pages.
+    auto page = add_options_page(L("Plate"), "empty");
     auto optgroup = page->new_optgroup("");
     optgroup->append_single_option_line("curr_bed_type");
-    optgroup->append_single_option_line("skirt_start_angle");
-    optgroup->append_single_option_line("print_sequence");
-    optgroup->append_single_option_line("spiral_mode");
     optgroup->append_single_option_line("first_layer_sequence_choice");
     optgroup->append_single_option_line("other_layers_sequence_choice");
 
@@ -3754,6 +3812,42 @@ void TabPrintPlate::build()
         line.undo_to_sys = true;
     }
     optgroup->have_sys_config = [this] { m_back_to_sys = true; return true; };
+
+    //This page is about the plate as a plate rather than as a process, so it leads. Same move
+    //TabPrintModel::build() makes for its own Frequent page, which ends up second.
+    m_pages.pop_back();
+    m_pages.insert(m_pages.begin(), page);
+}
+
+//Keys that live in a plate's config but are written by the app rather than by the user through
+//this tab: the filament grouping the slicer computes and the nozzle facts it records. They are
+//in the plate's config for the slicer's benefit, so counting them as "this plate has settings"
+//would mark every plate in every project.
+static const std::vector<std::string> plate_machine_keys = {
+    "filament_map", "filament_nozzle_map", "filament_volume_map", "nozzle_volume_type",
+    "extruder_nozzle_stats", "enable_filament_dynamic_map", "has_filament_switcher" };
+
+bool TabPrintPlate::plate_has_overrides(PartPlate *plate) const
+{
+    if (plate == nullptr)
+        return false;
+    return !substruct(intersect(m_keys, plate->config()->keys()), plate_machine_keys).empty();
+}
+
+void TabPrintPlate::set_plate(PartPlate *plate)
+{
+    //An empty binding is a real state, not a failure: it is what the panel shows when no plate
+    //is current, and set_model_config({}) is how every other caller says it.
+    if (plate == nullptr) {
+        set_model_config({});
+        return;
+    }
+    //Seed the working copy from the plate, so the panel opens showing the overrides this plate
+    //already carries rather than the previous plate's. Writes go straight to plate->config()
+    //from on_value_change; this copy exists because TabPrintModel's map is keyed to ModelConfig
+    //and PartPlate holds a DynamicPrintConfig.
+    m_plate_config.assign_config(*plate->config());
+    set_model_config({{plate, &m_plate_config}});
 }
 
 void TabPrintPlate::reset_model_config()
@@ -3762,10 +3856,13 @@ void TabPrintPlate::reset_model_config()
     wxGetApp().plater()->take_snapshot(std::string("Reset Options"));
     for (auto plate_item : m_object_configs) {
         auto rmkeys = intersect(m_keys, plate_item.second->keys());
+        auto plate = dynamic_cast<PartPlate*>(plate_item.first);
         for (auto& k : rmkeys) {
             plate_item.second->erase(k);
+            //Same write-through as on_value_change: the tab's copy is not the plate.
+            if (plate != nullptr)
+                plate->config()->erase(k);
         }
-        auto plate = dynamic_cast<PartPlate*>(plate_item.first);
         plate->reset_bed_type();
         plate->reset_skirt_start_angle();
         plate->set_print_seq(PrintSequence::ByDefault);
@@ -3786,17 +3883,30 @@ void TabPrintPlate::on_value_change(const std::string& opt_key, const boost::any
     }
     if (!has_key(k))
         return;
-    if (!m_object_configs.empty())
-        wxGetApp().plater()->take_snapshot((boost::format("Change Option %s") % k).str());
+    //An edit with nothing bound writes nowhere. The loops below simply run zero times, which is a
+    //silent no-op - the exact shape of the fault this scope exists to fix, and it would be
+    //invisible because the control keeps the value the user typed. It should not be reachable
+    //(ParamsPanel::bind_plate_scope points the tab at the current plate before showing it), so if
+    //it happens the binding is broken and that is worth saying out loud rather than swallowing.
+    if (m_object_configs.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "TabPrintPlate::on_value_change: no plate is bound, so '" << k
+                                 << "' was not applied to anything. The Plate scope is showing a"
+                                    " tab with no target.";
+        return;
+    }
+    wxGetApp().plater()->take_snapshot((boost::format("Change Option %s") % k).str());
     bool set = true;
     if (m_back_to_sys) {
         for (auto plate_item : m_object_configs) {
             plate_item.second->erase(k);
             auto plate = dynamic_cast<PartPlate*>(plate_item.first);
+            //The same write-through as the set branch: reverting an override has to remove it
+            //from the plate, not only from the tab's working copy, or the value stays live in
+            //the slice while the panel shows it back at its inherited default.
+            if (plate != nullptr)
+                plate->config()->erase(k);
             if (k == "curr_bed_type")
                 plate->reset_bed_type();
-            if (k == "skirt_start_angle")
-                plate->config()->erase("skirt_start_angle");
             if (k == "print_sequence")
                 plate->set_print_seq(PrintSequence::ByDefault);
             if (k == "first_layer_sequence_choice")
@@ -3812,6 +3922,17 @@ void TabPrintPlate::on_value_change(const std::string& opt_key, const boost::any
         for (auto plate_item : m_object_configs) {
             plate_item.second->apply_only(*m_config, { k });
             auto plate = dynamic_cast<PartPlate*>(plate_item.first);
+            //PetkosOrca: m_object_configs holds a COPY of the plate's config - a file-static
+            //ModelConfig in GUI_ObjectSettings.cpp, because PartPlate stores a plain
+            //DynamicPrintConfig and this map wants a ModelConfig. Writing only that copy is
+            //exactly why the eight keys below each needed a mirrored PartPlate setter to take
+            //effect, and why a key without one silently did nothing at all. That was invisible
+            //while the tab carried only those eight. The plate's own config is what
+            //Plater::resolve_plate_slicing_config layers and what the 3MF persists, so write it
+            //here, once and generically; the mirrored setters below stay for the PartPlate
+            //members they also feed.
+            if (plate != nullptr)
+                plate->config()->apply_only(*m_config, { k });
             BedType bed_type;
             PrintSequence print_seq;
             LayerSeq first_layer_seq_choice;

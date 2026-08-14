@@ -33,6 +33,7 @@
 
 class ModeSwitchButton;
 class SwitchButton;
+class MultiSwitchButton;
 class StaticBox;
 
 namespace Slic3r {
@@ -82,7 +83,7 @@ class ParamsPanel : public wxPanel
         StaticBox* m_top_panel{ nullptr };
         ScalableButton* m_process_icon{ nullptr };
         wxStaticText* m_title_label { nullptr };
-        SwitchButton* m_mode_region { nullptr };
+        MultiSwitchButton* m_mode_region { nullptr };
         ScalableButton *m_tips_arrow{nullptr};
         bool m_tips_arror_blink{false};
         ScalableButton* m_mode_icon { nullptr }; // ORCA
@@ -154,8 +155,24 @@ class ParamsPanel : public wxPanel
         bool is_active_and_shown_tab(wxPanel*tab);
         void update_mode();
         void msw_rescale();
+        //PetkosOrca: the three layers a process value can come from, in the order they are
+        //applied. The panel used to offer the outer and the inner one and nothing between, so
+        //the plate - the thing that actually owns a printer and gets sliced - had no settings
+        //surface at all. Left to right is broad to narrow, which is also the layering order:
+        //the project's preset, then this plate's overrides, then the selected objects'.
+        enum Scope { ScopeGlobal = 0, ScopePlate = 1, ScopeObjects = 2 };
+
         void switch_to_global();
+        void switch_to_plate();
         void switch_to_object(bool with_tips = false);
+        //Point the plate tab at whichever plate is current. Called on entering the Plate scope
+        //and whenever the current plate changes while that scope is showing, because a scope
+        //that keeps describing the plate you navigated away from is worse than none.
+        void bind_plate_scope();
+        //Refresh the "this scope holds something" markers on the switch.
+        void update_scope_markers();
+        //The current plate changed. Re-point the Plate scope and refresh the markers.
+        void on_plate_selection_changed();
 
         void notify_object_config_changed();
         void switch_to_object_if_has_object_configs();

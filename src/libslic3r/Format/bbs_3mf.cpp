@@ -370,6 +370,13 @@ static constexpr const char* PLATER_PRINT_PRESET_ATTR = "plater_print_preset";
 static constexpr const char* PLATER_FILAMENT_PRESETS_ATTR = "plater_filament_presets";
 static constexpr const char* PLATER_PHYSICAL_PRINTER_ATTR = "plater_physical_printer";
 static constexpr const char* PLATER_SLICED_CONFIG_PREFIX = "plater_sliced_config:";
+// PetkosOrca: a plate's own config overrides, every key of them. The named attributes further
+// down (BED_TYPE_ATTR, PRINT_SEQUENCE_ATTR and the rest) are a whitelist, and that whitelist is
+// the reason per-plate settings could only ever be bed type and print order: a plate can now
+// carry any process option, and a key with no attribute of its own would be written nowhere and
+// silently lost on save. The named attributes are still written, so a project opened in upstream
+// Orca or an older build of this fork keeps what those versions understand.
+static constexpr const char* PLATER_PLATE_CONFIG_PREFIX = "plater_plate_config:";
 static constexpr const char* PLATE_IDX_ATTR = "index";
 static constexpr const char* PRINTER_MODEL_ID_ATTR = "printer_model_id";
 static constexpr const char* EXTRUDER_TYPE_ATTR = "extruder_type";
@@ -4502,6 +4509,34 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             else if (key == PLATER_PHYSICAL_PRINTER_ATTR) {
                 m_curr_plater->slicing_context.physical_printer_id = xml_unescape(value.c_str());
             }
+            else if (boost::algorithm::starts_with(key, PLATER_PLATE_CONFIG_PREFIX)) {
+                // A plate's overrides are user intent and part of the project's identity, not a
+                // cache. So the failure rule here is the opposite of the sliced snapshot's below:
+                // one unreadable key never drops the others and never fails the load. It is named
+                // in the log and skipped. Dropping the set whole - correct for a cache that has to
+                // vouch for its G-code - would be a silent yes about settings someone chose.
+                //
+                // Read through the option directly rather than set_deserialize, for the same
+                // reason the sliced branch does: handle_legacy edits what it reads.
+                const std::string option_key = key.substr(std::strlen(PLATER_PLATE_CONFIG_PREFIX));
+                std::string reason;
+                if (option_key.empty()) {
+                    reason = "it carries an option with no name";
+                } else {
+                    try {
+                        ConfigOption *option = m_curr_plater->config.option(option_key, true);
+                        if (option == nullptr)
+                            reason = "option '" + option_key + "' is not known to this build";
+                        else if (!option->deserialize(value))
+                            reason = "option '" + option_key + "' could not be read back";
+                    } catch (const std::exception &ex) {
+                        reason = std::string("option '") + option_key + "': " + ex.what();
+                    }
+                }
+                if (!reason.empty())
+                    BOOST_LOG_TRIVIAL(warning) << "3mf import: plate " << (m_curr_plater->plate_index + 1)
+                                               << " override not restored, " << reason;
+            }
             else if (boost::algorithm::starts_with(key, PLATER_SLICED_CONFIG_PREFIX)) {
                 // The retained slice is a cache, not part of the project's identity, so an option
                 // this build cannot read back exactly costs the user that cache and nothing else.
@@ -8206,6 +8241,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                             stream << " ";
                     }
                     stream << "\"/>\n";
+                }
+
+                // Every key the plate carries, serialised the way the sliced snapshot above
+                // already is. This is the record that actually round-trips; the named attributes
+                // above are kept for compatibility with builds that only know those.
+                for (const std::string &key : plate_data->config.keys()) {
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\""
+                           << PLATER_PLATE_CONFIG_PREFIX << key << "\" " << VALUE_ATTR << "=\""
+                           << xml_escape_double_quotes_attribute_value(plate_data->config.opt_serialize(key)) << "\"/>\n";
                 }
 
                 const bool has_retained_gcode = save_gcode && plate_data->is_sliced_valid

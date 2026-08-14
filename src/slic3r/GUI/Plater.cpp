@@ -5326,6 +5326,12 @@ void Sidebar::on_plate_selection_changed(int current_plate)
     m_scope_project = false;
     refresh_plate_scope();
 
+    //The Process panel's Plate scope describes the CURRENT plate, so it re-points here for
+    //exactly the reason above - and it is a separate panel, so it does not learn about the
+    //selection any other way.
+    if (ParamsPanel *params = wxGetApp().params_panel())
+        params->on_plate_selection_changed();
+
     //A plate on a different machine prints through a different route. Redo that
     //decision only when the machine actually changed, so an ordinary plate click does
     //not reload the device webview.

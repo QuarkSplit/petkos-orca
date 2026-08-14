@@ -17,6 +17,7 @@
 #include "Widgets/SwitchButton.hpp"
 #include "Widgets/Button.hpp"
 #include "GUI_Factories.hpp"
+#include "PartPlate.hpp"
 
 
 namespace Slic3r {
@@ -262,9 +263,15 @@ ParamsPanel::ParamsPanel( wxWindow* parent, wxWindowID id, const wxPoint& pos, c
 
         //int width, height;
         // BBS: new layout
-        m_mode_region = new SwitchButton(m_top_panel);
-        m_mode_region->SetMaxSize({em_unit(this) * 12, -1});
-        m_mode_region->SetLabels(_L("Global"), _L("Objects"));
+        //PetkosOrca: three scopes, not two. Global is the project's process preset, Objects is
+        //the selected objects' overrides, and between them sits the plate - which owns a printer,
+        //is the unit that gets sliced, and had no settings surface at all. A plate moved onto
+        //another printer takes that printer's default process, so Global stops describing it and
+        //every value typed there reaches nothing; Plate is where those values now go.
+        m_mode_region = new MultiSwitchButton(m_top_panel);
+        m_mode_region->SetMaxSize({em_unit(this) * 18, -1});
+        m_mode_region->SetOptions({_L("Global"), _L("Plate"), _L("Objects")});
+        m_mode_region->SetSelection(ScopeGlobal);
         //m_mode_region->GetSize(&width, &height);
         m_tips_arrow = new ScalableButton(m_top_panel, wxID_ANY, "tips_arrow");
         m_tips_arrow->Hide();
@@ -393,7 +400,7 @@ ParamsPanel::ParamsPanel( wxWindow* parent, wxWindowID id, const wxPoint& pos, c
     //m_page_view->SetScrollRate( 5, 5 );
 
     if (m_mode_region)
-        m_mode_region->Bind(wxEVT_TOGGLEBUTTON, &ParamsPanel::OnToggled, this);
+        m_mode_region->Bind(wxCUSTOMEVT_MULTISWITCH_SELECTION, &ParamsPanel::OnToggled, this);
     //Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { wxGetApp().plater()->search(false); }, wxID_FIND);
     //m_export_to_file->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { wxGetApp().mainframe->export_config(); });
     //m_import_from_file->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { wxGetApp().mainframe->load_config_file(); });
@@ -578,8 +585,14 @@ void ParamsPanel::set_active_tab(wxPanel* tab)
     Tab* cur_tab = dynamic_cast<Tab *> (tab);
 
     if (cur_tab == nullptr) {
-        if (!m_mode_region->GetValue()) {
+        const int scope = m_mode_region != nullptr ? m_mode_region->GetSelection() : int(ScopeGlobal);
+        if (scope == ScopeGlobal) {
             cur_tab = (Tab*) m_tab_print;
+        } else if (scope == ScopePlate) {
+            //Point the tab at the current plate first: whether it has anything to show is a
+            //question about the plate it is bound to, and binding it is this scope's whole job.
+            bind_plate_scope();
+            cur_tab = (Tab*) m_tab_print_plate;
         } else if (m_tab_print_part && ((TabPrintModel*) m_tab_print_part)->has_model_config()) {
             cur_tab = (Tab*) m_tab_print_part;
         } else if (m_tab_print_layer && ((TabPrintModel*)m_tab_print_layer)->has_model_config()) {
@@ -590,7 +603,9 @@ void ParamsPanel::set_active_tab(wxPanel* tab)
             cur_tab = (Tab*)m_tab_print_plate;
         }
         Show(cur_tab != nullptr);
-        wxGetApp().sidebar().show_object_list(m_mode_region->GetValue());
+        //The object list belongs to the Objects scope alone. It used to appear for anything that
+        //was not Global, which is the two-state assumption this switch has just stopped making.
+        wxGetApp().sidebar().show_object_list(scope == ScopeObjects);
         if (m_current_tab == cur_tab)
             return;
         if (cur_tab)
@@ -697,13 +712,34 @@ void ParamsPanel::msw_rescale()
 
 void ParamsPanel::switch_to_global()
 {
-    m_mode_region->SetValue(false);
+    m_mode_region->SetSelection(ScopeGlobal);
     set_active_tab(nullptr);
+}
+
+void ParamsPanel::switch_to_plate()
+{
+    m_mode_region->SetSelection(ScopePlate);
+    set_active_tab(nullptr);
+}
+
+void ParamsPanel::bind_plate_scope()
+{
+    auto *tab_plate = dynamic_cast<TabPrintPlate *>(wxGetApp().get_plate_tab());
+    if (tab_plate == nullptr)
+        return;
+    Plater *plater = wxGetApp().plater();
+    //The same window Plater::resolve_current_plate_slicing_config guards: the sidebar asks the
+    //plater questions while priv is still being constructed, and there is no current plate yet.
+    if (plater == nullptr || !plater->is_initialized()) {
+        tab_plate->set_plate(nullptr);
+        return;
+    }
+    tab_plate->set_plate(plater->get_partplate_list().get_curr_plate());
 }
 
 void ParamsPanel::switch_to_object(bool with_tips)
 {
-    m_mode_region->SetValue(true);
+    m_mode_region->SetSelection(ScopeObjects);
     set_active_tab(nullptr);
     if (with_tips) {
         m_highlighter.init(std::pair(m_tips_arrow, &m_tips_arror_blink), m_top_panel);
@@ -736,17 +772,49 @@ void ParamsPanel::notify_object_config_changed()
     }
     if (has_config == m_has_object_config) return;
     m_has_object_config = has_config;
-    if (has_config)
-        m_mode_region->SetTextColor2(StateColor(std::pair{0xfffffe, (int) StateColor::Checked}, std::pair{wxGetApp().get_label_clr_modified(), 0}));
-    else
-        m_mode_region->SetTextColor2(StateColor());
-    m_mode_region->Rescale();
+    update_scope_markers();
+}
+
+void ParamsPanel::on_plate_selection_changed()
+{
+    if (m_mode_region == nullptr)
+        return;
+    //Whether a plate carries overrides is a per-plate fact, so the markers move with the
+    //selection even when the panel is showing another scope.
+    update_scope_markers();
+    //And if the Plate scope is the one on screen, it has to be re-pointed. A scope that keeps
+    //editing the plate the user navigated away from is the same fault as the panel editing the
+    //project's preset: a control that names one thing and writes another.
+    if (m_mode_region->GetSelection() == ScopePlate)
+        set_active_tab(nullptr);
+}
+
+void ParamsPanel::update_scope_markers()
+{
+    if (m_mode_region == nullptr)
+        return;
+    //A dot after a scope's name means that scope is carrying something. The two-way switch said
+    //this by recolouring the Objects label, which a multi-way switch cannot do per option - and
+    //that recolour only ever covered Objects anyway. A marker per scope says more: whether THIS
+    //plate holds overrides was previously discoverable only by switching to it and reading.
+    const wxString dot = wxString::FromUTF8("\xe2\x80\xa2");
+    auto label = [&dot](const wxString &name, bool marked) { return marked ? name + " " + dot : name; };
+
+    bool plate_marked = false;
+    if (auto *tab_plate = dynamic_cast<TabPrintPlate *>(wxGetApp().get_plate_tab())) {
+        Plater *plater = wxGetApp().plater();
+        if (plater != nullptr && plater->is_initialized())
+            plate_marked = tab_plate->plate_has_overrides(plater->get_partplate_list().get_curr_plate());
+    }
+
+    m_mode_region->SetOptionText(ScopePlate, label(_L("Plate"), plate_marked));
+    m_mode_region->SetOptionText(ScopeObjects, label(_L("Objects"), m_has_object_config));
 }
 
 void ParamsPanel::switch_to_object_if_has_object_configs()
 {
     if (m_has_object_config)
-        m_mode_region->SetValue(true);
+        m_mode_region->SetSelection(ScopeObjects);
     set_active_tab(nullptr);
 }
 

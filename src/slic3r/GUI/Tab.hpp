@@ -535,6 +535,8 @@ protected:
 };
 
 
+class PartPlate;
+
 class TabPrintPlate : public TabPrintModel
 {
 public:
@@ -545,10 +547,30 @@ public:
 	void reset_model_config() override;
 	int show_spiral_mode_settings_dialog(bool is_object_config) { return m_config_manipulation.show_spiral_mode_settings_dialog(is_object_config); }
 
+	//PetkosOrca: bind this tab to one plate directly, with no object-list selection involved.
+	//The Plate scope in the Process panel is the caller. Until this existed the only way to
+	//reach a plate's settings was to select the plate row in the object tree, which is why a
+	//per-plate process was effectively unreachable - and why the panel's only visible scopes
+	//were the project's preset and the objects on it.
+	void set_plate(PartPlate *plate);
+
+	//Whether a plate carries any override this tab owns. The scope switch marks its Plate
+	//position with it, so a plate that has settings on it can be seen without switching to it -
+	//which is the only way anyone would ever find out otherwise.
+	bool plate_has_overrides(PartPlate *plate) const;
+
 protected:
 	virtual void    on_value_change(const std::string& opt_key, const boost::any& value) override;
 	virtual void    notify_changed(ObjectBase* object) override;
 	virtual void	update_custom_dirty(std::vector<std::string> &dirty_options, std::vector<std::string> &nonsys_options) override;
+
+private:
+	//The tab's working copy of the plate's overrides. PartPlate stores a plain
+	//DynamicPrintConfig and TabPrintModel's map wants a ModelConfig, so an adapter has to
+	//exist somewhere; owning it here is what lets a caller bind a plate without supplying
+	//storage of its own. It is a display buffer only - on_value_change writes the plate's
+	//own config directly, because that is what the slicer and the 3MF read.
+	ModelConfig m_plate_config;
 };
 
 class TabPrintObject : public TabPrintModel
