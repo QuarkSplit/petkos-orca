@@ -74,10 +74,19 @@ def read_project(path: pathlib.Path) -> dict:
                 target = next((p for p in plates if p["index"] == idx), None)
                 if target is None:
                     continue
-                if meta.get("prediction") is not None:
-                    target["printTimeSeconds"] = int(float(meta["prediction"]))
-                if meta.get("weight") is not None:
-                    target["weightGrams"] = round(float(meta["weight"]), 1)
+                # An attribute can be PRESENT and empty - a plate whose slice recorded no figure.
+                # That is a null, not a zero and not a crash: reporting 0 g would be a measurement
+                # nobody took, and it reaches a price and a machine booking.
+                def _num(key):
+                    raw = (meta.get(key) or "").strip()
+                    try:
+                        return float(raw)
+                    except ValueError:
+                        return None
+                if (v := _num("prediction")) is not None:
+                    target["printTimeSeconds"] = int(v)
+                if (v := _num("weight")) is not None:
+                    target["weightGrams"] = round(v, 1)
                 filaments = [_items(f) for f in plate_node.findall("filament")]
                 if filaments:
                     target["filamentsUsed"] = filaments
