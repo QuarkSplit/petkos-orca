@@ -1,6 +1,7 @@
 #include "PetkosPerfDriver.hpp"
 #include "PetkosPerf.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <cstdlib>
@@ -48,6 +49,14 @@ struct Spec
     int         pick    = 1;
     //PetkosOrca: the per-plate settings check. Cheap, so it runs unless switched off.
     int         scope   = 1;
+    //The check that the project printer is gone. On by default: it costs one resolve
+    //per plate and it is the assertion the whole per-plate architecture rests on.
+    int         context = 1;
+    //Where to write plate 1's G-code, if anywhere. Off by default because a real slice is
+    //the most expensive thing this driver can do; on when the run is a correctness check
+    //rather than a latency measurement. It is the only artefact that cannot be wrong about
+    //what a plate was sliced with, because it IS what gets made.
+    std::string gcode;
     bool        quit    = true;
     std::string printer;
     //Where the run writes the project it built, so persistence can be inspected without the app.
@@ -75,6 +84,8 @@ Spec parse_spec(const std::string &s)
         else if (key == "drag")    spec.drags = num();
         else if (key == "pick")    spec.pick = num();
         else if (key == "scope")   spec.scope = num();
+        else if (key == "context") spec.context = num();
+        else if (key == "gcode")   spec.gcode = val;
         else if (key == "save")    spec.save = val;
         else if (key == "preview") spec.preview = num();
         else if (key == "quit")    spec.quit = num() != 0;
@@ -99,7 +110,7 @@ public:
     }
 
 private:
-    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Board, Drag, Finish, Done };
+    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Slice, SliceWait, Board, Drag, Finish, Done };
 
     void on_idle(wxIdleEvent &evt)
     {
@@ -208,16 +219,65 @@ private:
         case Phase::Assign:
             if (m_quiet > 0) {
                 --m_quiet;
-            } else if (m_done >= m_spec.assigns || m_assign_presets.empty()) {
+            } else if (m_assign_presets.empty()) {
+                //An assign phase that does nothing must not look like an assign phase that ran.
+                //This transition used to be silent, so a run with assign=1 produced no ASSIGN line
+                //of any kind and every later check quietly tested an UNASSIGNED plate.
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ASSIGN SKIPPED - no printer preset to assign; "
+                                            "nothing was reassigned and any later check runs against the plates "
+                                            "as they were";
                 Perf::mark("driver.assign_end", m_done);
-                enter(m_spec.pick > 0 ? Phase::Pick : (m_spec.scope > 0 ? Phase::Scope : Phase::Board));
+                enter(m_spec.pick > 0 ? Phase::Pick
+                                      : (m_spec.scope > 0 ? Phase::Scope
+                                                          : (m_spec.context > 0 ? Phase::Context : Phase::Board)));
+            } else if (m_done >= m_spec.assigns) {
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ASSIGN phase done - " << m_assigned << " of "
+                                           << m_done << " iteration(s) changed a plate's machine";
+                Perf::mark("driver.assign_end", m_done);
+                enter(m_spec.pick > 0 ? Phase::Pick
+                                      : (m_spec.scope > 0 ? Phase::Scope
+                                                          : (m_spec.context > 0 ? Phase::Context : Phase::Board)));
             } else {
                 const int count = plater->get_partplate_list().get_plate_count();
                 const int plate = count > 0 ? (m_done % count) : 0;
-                //alternate between a named printer and clearing back to the project, so
-                //both write paths get timed rather than only the one
-                const std::string &name = (m_done % 2 == 0) ? m_assign_presets.front() : m_empty;
-                plater->set_plate_printer(plate, name);
+                //A REAL printer, and one this plate does not already have.
+                //
+                //Two earlier versions of this line each timed nothing. The first alternated a named
+                //preset with an empty string on the theory that clearing was the second write path;
+                //there is no such path - a plate names its own machine or it is unresolved - so every
+                //other iteration measured set_plate_printer refusing to write. The second alternated
+                //two real presets by iteration index, and m_assign_presets[0] is the CURRENTLY
+                //SELECTED printer, which is the one the plates were completed to - so with assigns=1
+                //the single iteration assigned a plate the machine it already had, timed nothing, and
+                //left the context check testing a plate that had never been assigned at all.
+                //
+                //What the phase is for is the cost of a CHANGE of machine, so it picks a name that is
+                //a change for this plate, and says out loud when it cannot.
+                const std::string current = plater->get_partplate_list().get_plate(plate) != nullptr
+                                                ? plater->get_partplate_list().get_plate(plate)->get_printer_preset_name()
+                                                : std::string();
+                std::string       name;
+                for (size_t i = 0; i < m_assign_presets.size(); ++i) {
+                    const std::string &candidate = m_assign_presets[(m_done + i) % m_assign_presets.size()];
+                    if (candidate != current) {
+                        name = candidate;
+                        break;
+                    }
+                }
+                if (name.empty()) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ASSIGN SKIPPED - plate " << (plate + 1)
+                                             << " already names '" << current
+                                             << "' and no other printer preset is installed, so this iteration "
+                                                "cannot time a change of machine";
+                } else if (plater->set_plate_printer(plate, name)) {
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ASSIGN plate " << (plate + 1) << " '" << current
+                                               << "' -> '" << name << "'";
+                    ++m_assigned;
+                } else {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ASSIGN SKIPPED - plate " << (plate + 1)
+                                             << " was not reassigned from '" << current << "' to '" << name
+                                             << "'; this iteration timed no assignment";
+                }
                 ++m_done;
                 m_quiet = 20;
             }
@@ -231,6 +291,21 @@ private:
 
         case Phase::Scope:
             scope_step(plater);
+            evt.RequestMore();
+            break;
+
+        case Phase::Context:
+            context_step(plater);
+            evt.RequestMore();
+            break;
+
+        case Phase::Slice:
+            slice_step(plater);
+            evt.RequestMore();
+            break;
+
+        case Phase::SliceWait:
+            slice_wait_step(plater);
             evt.RequestMore();
             break;
 
@@ -276,8 +351,10 @@ private:
         m_tick  = 0;
         m_done  = 0;
         m_quiet = 0;
-        if (p == Phase::Assign)
+        if (p == Phase::Assign) {
+            m_assigned = 0;
             collect_assign_presets();
+        }
     }
 
     //PetkosOrca: the half of correctness a timing run cannot show.
@@ -364,6 +441,249 @@ private:
             BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.save << " (rc=" << written << ")";
         }
 
+        enter(m_spec.context > 0 ? Phase::Context : Phase::Board);
+    }
+
+    //IS THE PROJECT PRINTER REALLY GONE?
+    //
+    //Three questions, in rising strength, all asked of the code slicing itself reads.
+    //
+    //  1. Does every plate carry its own complete context? A plate without one used to be
+    //     legal and meant "use the project's", which is the state being deleted.
+    //  2. Does an EMPTY context refuse to resolve? That refusal is the deletion. While the
+    //     resolver answered an empty context by reading the globally selected preset, every
+    //     plate in the project had that preset standing behind it.
+    //  3. Does moving the global selection change what a plate slices with? This is the one
+    //     that cannot be faked by a well-behaved caller: the cursor is moved underneath the
+    //     plate and the plate must not notice. It is restored afterwards.
+    void context_step(Plater *plater)
+    {
+        PartPlateList &list   = plater->get_partplate_list();
+        PresetBundle * bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK SKIPPED - no preset bundle";
+            enter(Phase::Board);
+            return;
+        }
+
+        bool ok = true;
+
+        // 1. every plate owns a complete context
+        for (int i = 0; i < list.get_plate_count(); ++i) {
+            PartPlate *plate = list.get_plate(i);
+            if (plate == nullptr)
+                continue;
+            const PlateSlicingContext context = plate->get_slicing_context();
+            if (!context.is_complete()) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - plate " << (i + 1)
+                                         << " has no context of its own (printer='" << context.printer_preset_name
+                                         << "', process='" << context.print_preset_name << "', "
+                                         << context.filament_preset_names.size() << " filament(s))";
+                ok = false;
+            }
+        }
+
+        // 1b. and it must not be a PLACEHOLDER. "Complete" is not the same as "right": the
+        //     first attempt at this filled every plate in before the project's own presets
+        //     were installed, so each one came out complete and named "Default Setting" /
+        //     "Default Filament" - which capped the flow rate at 2 and turned a 6h45m plate
+        //     into 21h03m. Every in-app check passed on that build. This is the cheap
+        //     in-app half of the check that would have caught it; the other half is reading
+        //     filament_settings_id and filament_max_volumetric_speed out of the G-code.
+        for (int i = 0; i < list.get_plate_count(); ++i) {
+            PartPlate *plate = list.get_plate(i);
+            if (plate == nullptr)
+                continue;
+            const PlateSlicingContext context = plate->get_slicing_context();
+            auto names_a_default = [bundle](const PresetCollection &collection, const std::string &name) {
+                const Preset *preset = collection.find_preset(name, false);
+                return preset != nullptr && preset->is_default;
+            };
+            if (names_a_default(bundle->prints, context.print_preset_name)) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - plate " << (i + 1)
+                                         << " names the default process '" << context.print_preset_name
+                                         << "', which is a placeholder rather than a choice";
+                ok = false;
+            }
+            for (const std::string &filament : context.filament_preset_names) {
+                if (names_a_default(bundle->filaments, filament)) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - plate " << (i + 1)
+                                             << " names the default filament '" << filament
+                                             << "', which caps the flow rate and is a placeholder rather than a choice";
+                    ok = false;
+                }
+            }
+        }
+
+        // 2. an empty context is an error, not an inheritance
+        {
+            PlateSlicingContext        empty;
+            ResolvedPlateSlicingConfig resolved;
+            std::string                error;
+            if (bundle->resolve_plate_slicing_config(empty, std::nullopt, std::nullopt, resolved, error)) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - an empty context still "
+                                            "resolves, so the project printer is still standing behind it";
+                ok = false;
+            }
+        }
+
+        // 3. the cursor moves, the plate does not
+        PartPlate *subject = list.get_plate(0);
+        if (subject != nullptr) {
+            ResolvedPlateSlicingConfig before;
+            std::string                error;
+            if (!plater->resolve_plate_slicing_config(subject, before, error)) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - plate 1 does not resolve: "
+                                         << error;
+                ok = false;
+            } else {
+                const std::string original = bundle->printers.get_selected_preset_name();
+                std::string       other;
+                for (const Preset &preset : bundle->printers) {
+                    if (preset.is_visible && !preset.is_default && preset.printer_technology() == ptFFF &&
+                        preset.name != original) {
+                        other = preset.name;
+                        break;
+                    }
+                }
+                if (other.empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: only one printer preset is installed, so the "
+                                                  "cursor cannot be moved out from under plate 1; questions 1 and 2 "
+                                                  "still stand";
+                } else {
+                    bundle->printers.select_preset_by_name(other, false);
+                    ResolvedPlateSlicingConfig after;
+                    if (!plater->resolve_plate_slicing_config(subject, after, error)) {
+                        BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - plate 1 stopped "
+                                                    "resolving when the global selection moved: " << error;
+                        ok = false;
+                    } else {
+                        //The NAMES, not the preset pointers. find_preset hands back
+                        //&m_edited_preset for whichever preset is selected, and
+                        //select_preset_by_name overwrites that buffer - so reading
+                        //before.printer_preset->name after the move read the machine the cursor
+                        //had just been pointed at, and this check reported a plate changing
+                        //machine when nothing about the plate had changed. It is the one test
+                        //that moves the cursor on purpose, so it is the one place guaranteed to
+                        //hit it. See ResolvedPlateSlicingConfig.
+                        const std::string &was = before.printer_preset_name;
+                        const std::string &now = after.printer_preset_name;
+                        if (was != now) {
+                            BOOST_LOG_TRIVIAL(error)
+                                << "PETKOS_PERF_SCRIPT: CONTEXT CHECK FAILED - moving the global selection to '"
+                                << other << "' changed what plate 1 slices with, from '" << was << "' to '" << now
+                                << "'";
+                            ok = false;
+                        }
+                    }
+                    bundle->printers.select_preset_by_name(original, false);
+                }
+            }
+        }
+
+        if (ok)
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: context check passed - every plate owns its context, "
+                                          "an empty one is an error, and the global selection reaches no plate";
+
+        enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+    }
+
+    //SLICE IT, AND KEEP WHAT CAME OUT.
+    //
+    //Every check above this one is the app marking its own homework. They all passed on the
+    //build that quoted 21h03m for a 6h45m plate and reported 0.00 g, because a plate pinned
+    //to a placeholder preset is a COMPLETE plate - it is simply pinned to the wrong thing.
+    //The emitted G-code is the only artefact that cannot be wrong about what was used, so
+    //the run produces one and the harness reads it without the app.
+    void slice_step(Plater *plater)
+    {
+        PartPlate *plate = plater->get_partplate_list().get_plate(0);
+        if (plate == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE SKIPPED - there is no plate 1";
+            enter(Phase::Board);
+            return;
+        }
+        plater->select_plate(0);
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: slicing plate 1 on '"
+                                   << plate->get_printer_preset_name() << "' with process '"
+                                   << plate->get_print_preset_name() << "'";
+        plater->reslice();
+        m_slice_started   = std::chrono::steady_clock::now();
+        m_slice_requested = plater->is_background_process_slicing();
+        if (!m_slice_requested)
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: reslice() returned without a running background "
+                                          "process; either the plate was already sliced or the slice never started";
+        m_tick = 0;
+        enter(Phase::SliceWait);
+    }
+
+    void slice_wait_step(Plater *plater)
+    {
+        //BOUNDED ON THE WALL CLOCK, NOT ON IDLE TICKS. Idle events fire as fast as the loop
+        //turns, so a tick count measures how busy the UI thread is rather than how long
+        //slicing has had: the same bound is minutes on an idle app and seconds on a busy
+        //one, and a big model "times out" while still working. A harness that can hang is a
+        //harness that gets killed, and a killed process writes no CSV and no verdict, so
+        //there is still a bound - twenty minutes of real time.
+        static constexpr auto slice_bound = std::chrono::minutes(20);
+        const auto elapsed = std::chrono::steady_clock::now() - m_slice_started;
+        const bool timed_out = elapsed > slice_bound;
+        if (plater->is_background_process_slicing()) {
+            m_slice_requested = true;   //it is running, whatever reslice() reported
+            if (!timed_out)
+                return;
+        }
+        const long long secs = (long long) std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+        PartPlate *plate = plater->get_partplate_list().get_plate(0);
+        //THREE DIFFERENT FAILURES, SAID APART. They used to share one sentence because one
+        //test answered all three, which is the test's convenience rather than the reader's:
+        //a slice that never started, a slice still running when the bound expired, and a
+        //slice that finished and produced nothing valid are three different things to go and
+        //look at.
+        if (plate == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE FAILED - there is no plate 1 to take a result from";
+            enter(Phase::Board);
+            return;
+        }
+        if (timed_out && plater->is_background_process_slicing()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE TIMED OUT - plate 1 was still slicing after "
+                                     << secs << "s (bound is " << slice_bound.count() << " minutes)";
+            enter(Phase::Board);
+            return;
+        }
+        if (!m_slice_requested && !plate->is_slice_result_valid()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE NEVER STARTED - no background slice ran for plate 1 "
+                                        "and it has no result from before; check that the plate resolves and has "
+                                        "printable instances";
+            enter(Phase::Board);
+            return;
+        }
+        if (!plate->is_slice_result_valid()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE COMPLETED WITHOUT A VALID RESULT - plate 1 finished "
+                                        "after " << secs << "s and has nothing that can be exported";
+            enter(Phase::Board);
+            return;
+        }
+
+        //The result lives at a temp path the plate owns. Copying rather than moving, because
+        //the plate still needs it: the retained slice is a per-plate asset in this fork.
+        const std::string src = plate->get_tmp_gcode_path();
+        boost::system::error_code ec;
+        if (src.empty() || !boost::filesystem::exists(src)) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE FAILED - plate 1 reports a valid result but its "
+                                        "G-code is not at '" << src << "'";
+            enter(Phase::Board);
+            return;
+        }
+        boost::filesystem::copy_file(src, boost::filesystem::path(m_spec.gcode),
+                                     boost::filesystem::copy_option::overwrite_if_exists, ec);
+        if (ec)
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE FAILED - could not copy the G-code to "
+                                     << m_spec.gcode << ": " << ec.message();
+        else
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.gcode
+                                       << " - read it with tools/petkos-gcode-check.py";
         enter(Phase::Board);
     }
 
@@ -427,7 +747,7 @@ private:
                 BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: pick check passed - " << m_pick_ok
                                            << " of " << count << " plates picked themselves ("
                                            << m_pick_off << " off screen)";
-            enter(m_spec.scope > 0 ? Phase::Scope : Phase::Board);
+            enter(m_spec.scope > 0 ? Phase::Scope : (m_spec.context > 0 ? Phase::Context : Phase::Board));
             return;
         }
 
@@ -473,6 +793,13 @@ private:
         if (m_spec.plates <= 0)
             return;
         PartPlateList &list = plater->get_partplate_list();
+        //A PLATE IS SEEDED BY WHOEVER ASKED FOR IT, and this driver is asking. create_plate
+        //deliberately seeds nothing, so a run that built 36 plates built 35 that named no
+        //printer - and then measured, and then asserted a context check against them. The
+        //holder is the plate the app opened on, exactly as it is for "add a plate".
+        PlateSlicingContext seed;
+        if (const PartPlate *current = list.get_curr_plate())
+            seed = current->get_slicing_context();
         //Stop when the list stops growing, not when the target is reached. create_plate refuses
         //past MAX_PLATE_COUNT and says so by returning without adding one, so a target above
         //that turns a loop on the count into a hang - which is exactly what a mistyped argument
@@ -482,6 +809,11 @@ private:
             previous = list.get_plate_count();
             list.create_plate(true);
         }
+        if (seed.is_complete())
+            list.complete_plate_contexts(seed);
+        else
+            list.complete_plate_contexts();
+        list.apply_printer_assignments();
         if (list.get_plate_count() < m_spec.plates)
             BOOST_LOG_TRIVIAL(warning)
                 << "PETKOS_PERF_SCRIPT: asked for " << m_spec.plates << " plates, the list caps at "
@@ -509,27 +841,64 @@ private:
         plater->update();
     }
 
+    //Two real printers, because that is what the assign phase writes. The phase alternates
+    //between them, so both write paths are exercised, and neither of them is an empty name -
+    //an empty name is not a value this app accepts, and driving one through set_plate_printer
+    //measured a refusal rather than an assignment.
     void collect_assign_presets()
     {
         m_assign_presets.clear();
-        if (!m_spec.printer.empty()) {
-            m_assign_presets.push_back(m_spec.printer);
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ASSIGN FAILED - no preset bundle";
             return;
         }
-        PresetBundle *bundle = wxGetApp().preset_bundle;
-        if (bundle == nullptr)
-            return;
+
+        //A name given on the command line is checked before anything is built on it. An
+        //unknown one used to be assigned anyway, refused deep inside the write path, and
+        //reported as a fast assign phase.
+        if (!m_spec.printer.empty()) {
+            const Preset *named = bundle->printers.find_preset(m_spec.printer, false);
+            if (named == nullptr || !named->is_visible || named->is_default) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ASSIGN FAILED - no visible printer preset named '"
+                                         << m_spec.printer << "'";
+                return;
+            }
+            m_assign_presets.push_back(named->name);
+        }
+
         const std::string current = bundle->printers.get_selected_preset_name();
+        //The current printer is one of the two, so a single extra installed preset is enough
+        //to alternate between two real machines.
+        if (m_assign_presets.empty() && !current.empty())
+            m_assign_presets.push_back(current);
         for (const Preset &p : bundle->printers) {
-            if (!p.is_visible || p.name == current)
+            if (m_assign_presets.size() >= 2)
+                break;
+            if (!p.is_visible || p.is_default || p.printer_technology() != ptFFF)
+                continue;
+            if (std::find(m_assign_presets.begin(), m_assign_presets.end(), p.name) != m_assign_presets.end())
                 continue;
             m_assign_presets.push_back(p.name);
-            break;
         }
-        if (m_assign_presets.empty())
-            BOOST_LOG_TRIVIAL(warning)
-                << "PETKOS_PERF_SCRIPT: no second printer preset installed; the assign phase "
+        //Say what was collected, always. This function reported only its failures, so the ordinary
+        //case produced no line at all - and "no ASSIGN line in the log" then meant either that it
+        //had worked perfectly or that the phase had done nothing, with no way to tell which.
+        if (m_assign_presets.empty()) {
+            BOOST_LOG_TRIVIAL(error)
+                << "PETKOS_PERF_SCRIPT: ASSIGN FAILED - no visible printer preset to assign; the assign phase "
                    "will be skipped and its row will be missing from the summary";
+            return;
+        }
+        std::string names;
+        for (const std::string &name : m_assign_presets)
+            names += (names.empty() ? "" : ", ") + ("'" + name + "'");
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ASSIGN will alternate between " << names;
+        if (m_assign_presets.size() < 2)
+            BOOST_LOG_TRIVIAL(warning)
+                << "PETKOS_PERF_SCRIPT: fewer than two visible printer presets are installed, so the assign "
+                   "phase can only write one machine; a plate already on it cannot be reassigned at all, and "
+                   "any iteration that lands on one will say ASSIGN SKIPPED";
     }
 
     wxWindow *board(Plater *plater)
@@ -595,8 +964,15 @@ private:
     int                      m_pick_ok = 0;
     int                      m_pick_miss = 0;
     int                      m_pick_off = 0;
+    //How many assign iterations actually changed a plate's machine, as against how many ran. The
+    //two were assumed equal, and a run in which they were 0 and 1 read as a phase that had worked.
+    int                      m_assigned = 0;
     std::vector<std::string> m_assign_presets;
-    const std::string        m_empty;
+    //When the slice this run asked for actually started. The wait below is bounded on the
+    //wall clock rather than on idle ticks, so the bound means the same thing whatever the
+    //UI thread is doing. Unset means no slice was ever started.
+    std::chrono::steady_clock::time_point m_slice_started {};
+    bool                     m_slice_requested = false;
 };
 
 } // namespace
@@ -810,13 +1186,17 @@ private:
             PartPlateList &list = plater->get_partplate_list();
             std::string a_name, b_name, error;
             ResolvedPlateSlicingConfig resolved;
-            if (plater->resolve_plate_slicing_config(list.get_plate(0), resolved, error) && resolved.printer_preset)
-                a_name = resolved.printer_preset->name;
+            //The resolved NAME, not the preset pointer: the pointer is a view onto a buffer that
+            //any preset selection rewrites. See ResolvedPlateSlicingConfig.
+            if (plater->resolve_plate_slicing_config(list.get_plate(0), resolved, error) &&
+                !resolved.printer_preset_name.empty())
+                a_name = resolved.printer_preset_name;
             else
                 fail("assign", "plate 1 does not resolve: " + error);
             if (!m_failed) {
-                if (plater->resolve_plate_slicing_config(list.get_plate(1), resolved, error) && resolved.printer_preset)
-                    b_name = resolved.printer_preset->name;
+                if (plater->resolve_plate_slicing_config(list.get_plate(1), resolved, error) &&
+                    !resolved.printer_preset_name.empty())
+                    b_name = resolved.printer_preset_name;
                 else
                     fail("assign", "plate 2 does not resolve: " + error);
             }
