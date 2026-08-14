@@ -38,8 +38,13 @@ struct Spec
     int         board   = 200;
     int         drags   = 5;
     int         preview = 0;
+    int         pick    = 1;
+    //PetkosOrca: the per-plate settings check. Cheap, so it runs unless switched off.
+    int         scope   = 1;
     bool        quit    = true;
     std::string printer;
+    //Where the run writes the project it built, so persistence can be inspected without the app.
+    std::string save;
 };
 
 Spec parse_spec(const std::string &s)
@@ -61,6 +66,9 @@ Spec parse_spec(const std::string &s)
         else if (key == "assign")  spec.assigns = num();
         else if (key == "board")   spec.board = num();
         else if (key == "drag")    spec.drags = num();
+        else if (key == "pick")    spec.pick = num();
+        else if (key == "scope")   spec.scope = num();
+        else if (key == "save")    spec.save = val;
         else if (key == "preview") spec.preview = num();
         else if (key == "quit")    spec.quit = num() != 0;
         else if (key == "printer") spec.printer = val;
@@ -84,7 +92,7 @@ public:
     }
 
 private:
-    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Board, Drag, Finish, Done };
+    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Board, Drag, Finish, Done };
 
     void on_idle(wxIdleEvent &evt)
     {
@@ -195,7 +203,7 @@ private:
                 --m_quiet;
             } else if (m_done >= m_spec.assigns || m_assign_presets.empty()) {
                 Perf::mark("driver.assign_end", m_done);
-                enter(Phase::Board);
+                enter(m_spec.pick > 0 ? Phase::Pick : (m_spec.scope > 0 ? Phase::Scope : Phase::Board));
             } else {
                 const int count = plater->get_partplate_list().get_plate_count();
                 const int plate = count > 0 ? (m_done % count) : 0;
@@ -206,6 +214,16 @@ private:
                 ++m_done;
                 m_quiet = 20;
             }
+            evt.RequestMore();
+            break;
+
+        case Phase::Pick:
+            pick_step(plater, canvas);
+            evt.RequestMore();
+            break;
+
+        case Phase::Scope:
+            scope_step(plater);
             evt.RequestMore();
             break;
 
@@ -255,6 +273,93 @@ private:
             collect_assign_presets();
     }
 
+    //PetkosOrca: the half of correctness a timing run cannot show.
+    //
+    //A frame can be fast while a plate slices with a different plate's settings, which is
+    //precisely what this fork shipped. The Process panel edits the PROJECT's process preset; a
+    //plate reassigned to another printer has been moved onto that printer's own default process;
+    //so every value typed into the panel reached a preset that plate does not use, and the panel
+    //went on displaying the project's preset name as though it had worked. No latency run can
+    //see that, and the screenshot that finally caught it was a person using the app.
+    //
+    //So this asks the resolver the only question that matters - what would this plate ACTUALLY
+    //slice with - and checks two things a whitelist and a stale copy each used to break: that a
+    //per-plate override reaches the plate it was set on, and that it reaches no other plate.
+    void scope_step(Plater *plater)
+    {
+        PartPlateList &list = plater->get_partplate_list();
+        if (list.get_plate_count() < 2) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SCOPE CHECK SKIPPED - needs two plates, have "
+                                     << list.get_plate_count();
+            enter(Phase::Board);
+            return;
+        }
+
+        PartPlate *subject = list.get_plate(0);
+        PartPlate *control = list.get_plate(1);
+        std::string error;
+
+        //Read the inherited value first. An assertion against a number the preset already carries
+        //proves nothing, so the target is deliberately something no preset here is using.
+        ResolvedPlateSlicingConfig before;
+        if (subject == nullptr || control == nullptr ||
+            !plater->resolve_plate_slicing_config(subject, before, error)) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SCOPE CHECK FAILED - plate 1 does not resolve: " << error;
+            enter(Phase::Board);
+            return;
+        }
+        const ConfigOptionInt *inherited = before.config.option<ConfigOptionInt>("wall_loops");
+        const int              want      = (inherited != nullptr ? inherited->value : 2) + 3;
+
+        //Written straight onto the plate, which is what the Plate scope in the Process panel does
+        //through TabPrintPlate::on_value_change. What is under test is everything downstream of
+        //that write: the resolver applying it, and applying it to one plate only.
+        subject->config()->set_key_value("wall_loops", new ConfigOptionInt(want));
+
+        bool ok = true;
+        ResolvedPlateSlicingConfig after;
+        if (!plater->resolve_plate_slicing_config(subject, after, error)) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SCOPE CHECK FAILED - plate 1 stopped resolving: " << error;
+            ok = false;
+        } else {
+            const ConfigOptionInt *got = after.config.option<ConfigOptionInt>("wall_loops");
+            const int              val = got != nullptr ? got->value : -1;
+            if (val != want) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SCOPE CHECK FAILED - plate 1 override not applied: "
+                                            "set wall_loops=" << want << ", plate would slice with " << val;
+                ok = false;
+            }
+        }
+
+        ResolvedPlateSlicingConfig other;
+        if (!plater->resolve_plate_slicing_config(control, other, error)) {
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: plate 2 does not resolve, cannot check isolation: " << error;
+        } else {
+            const ConfigOptionInt *got = other.config.option<ConfigOptionInt>("wall_loops");
+            const int              val = got != nullptr ? got->value : -1;
+            if (val == want) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SCOPE CHECK FAILED - plate 1's override leaked onto "
+                                            "plate 2, both read wall_loops=" << val;
+                ok = false;
+            }
+        }
+
+        if (ok)
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: scope check passed - plate 1 slices with wall_loops="
+                                       << want << ", plate 2 unaffected";
+
+        //Persistence is the other half, and it is the one a whitelist breaks: an override that
+        //works in this session and vanishes on save is a silent yes. The file is left for the
+        //harness to read, because proving a round-trip from inside the process that wrote it is
+        //the weaker test.
+        if (!m_spec.save.empty()) {
+            const int written = plater->export_3mf(boost::filesystem::path(m_spec.save));
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.save << " (rc=" << written << ")";
+        }
+
+        enter(Phase::Board);
+    }
+
     void orbit_step(Plater *plater, GLCanvas3D *canvas)
     {
         //A real orbit is a drag, which is a stream of small rotations. 0.01 rad a frame is
@@ -262,6 +367,98 @@ private:
         //frame cost is not accidentally measured against a view that culled everything.
         plater->get_camera().rotate_on_sphere(0.012, 0.0, false);
         canvas->set_as_dirty();
+    }
+
+    //Where a world point lands on the canvas, in the pixel space the raycaster reads
+    //mouse positions in. Returns false when the point is off screen, which is a skip
+    //rather than a failure.
+    static bool project_to_canvas(const Vec3d &world, Vec2d &out)
+    {
+        const Camera &camera = wxGetApp().plater()->get_camera();
+        const Vec4d clip = camera.get_projection_matrix().matrix() * camera.get_view_matrix().matrix() *
+                           Vec4d(world.x(), world.y(), world.z(), 1.0);
+        if (clip.w() == 0.0)
+            return false;
+        const Vec3d ndc(clip.x() / clip.w(), clip.y() / clip.w(), clip.z() / clip.w());
+        if (ndc.x() < -1.0 || ndc.x() > 1.0 || ndc.y() < -1.0 || ndc.y() > 1.0)
+            return false;
+        const std::array<int, 4> &vp = camera.get_viewport();
+        out = Vec2d(vp[0] + (ndc.x() * 0.5 + 0.5) * vp[2], vp[1] + (0.5 - ndc.y() * 0.5) * vp[3]);
+        return true;
+    }
+
+    //Point at every plate in turn and check the app picks THAT plate. This is the half of
+    //correctness a screenshot cannot show: a plate draws through its own frame and is
+    //picked through the same frame, and the two can disagree silently - a click would
+    //select the wrong plate and nothing on screen would look wrong. Run after the assign
+    //phase on purpose, because that is what moves plates around.
+    void pick_step(Plater *plater, GLCanvas3D *canvas)
+    {
+        PartPlateList &list  = plater->get_partplate_list();
+        const int      count = list.get_plate_count();
+
+        if (m_tick == 0) {
+            //straight down, so no plate's own cube can stand in front of another plate,
+            //and wide enough that every plate is on screen to be pointed at
+            canvas->select_view("top");
+            canvas->zoom_to_volumes();
+            canvas->set_as_dirty();
+            Perf::mark("pick.begin", count);
+        }
+        //the camera change needs a frame to reach the viewport the projection reads
+        if (++m_tick < 12)
+            return;
+
+        if (m_done >= count) {
+            Perf::mark("pick.ok", m_pick_ok);
+            Perf::mark("pick.miss", m_pick_miss);
+            Perf::mark("pick.offscreen", m_pick_off);
+            if (m_pick_miss > 0)
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICK CHECK FAILED - " << m_pick_miss
+                                         << " of " << count << " plates picked the wrong plate";
+            else
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: pick check passed - " << m_pick_ok
+                                           << " of " << count << " plates picked themselves ("
+                                           << m_pick_off << " off screen)";
+            enter(m_spec.scope > 0 ? Phase::Scope : Phase::Board);
+            return;
+        }
+
+        PartPlate *plate = list.get_plate(m_done);
+        if (plate == nullptr) {
+            ++m_done;
+            return;
+        }
+
+        //a quarter of the bed away from the middle: clear of the cube parked at the centre,
+        //and clear of the icon column and the labels along the edges
+        const BoundingBoxf3 &bb   = plate->get_bounding_box();
+        const Vec3d          size = bb.size();
+        const Vec3d target(bb.center().x() + 0.25 * size.x(), bb.center().y() - 0.25 * size.y(), 0.0);
+
+        Vec2d at;
+        if (!project_to_canvas(target, at)) {
+            ++m_pick_off;
+            ++m_done;
+            return;
+        }
+
+        const SceneRaycaster::HitResult hit = canvas->pick_at(at);
+        const int picked = (hit.is_valid() && hit.type == SceneRaycaster::EType::Bed)
+                               ? hit.raycaster_id / PartPlate::GRABBER_COUNT
+                               : -1;
+        if (picked == m_done) {
+            ++m_pick_ok;
+        } else {
+            ++m_pick_miss;
+            //name both plates: which one was pointed at and which one answered is the whole
+            //diagnosis when a frame and its raycaster have drifted apart
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: pointing at plate " << m_done
+                                     << " picked plate " << picked << " (raycaster id "
+                                     << hit.raycaster_id << ")";
+            Perf::mark("pick.mismatch", m_done * 1000 + (picked + 1));
+        }
+        ++m_done;
     }
 
     void build_plates(Plater *plater)
@@ -388,6 +585,9 @@ private:
     int                      m_done    = 0;
     int                      m_quiet   = 0;
     int                      m_board_y = 0;
+    int                      m_pick_ok = 0;
+    int                      m_pick_miss = 0;
+    int                      m_pick_off = 0;
     std::vector<std::string> m_assign_presets;
     const std::string        m_empty;
 };

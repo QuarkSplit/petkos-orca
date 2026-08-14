@@ -206,6 +206,24 @@ launch has previously run the setup wizard and clobbered the installed Orca's sh
 `LNK1104` if it is not closed first. Copy the rebuilt DLL over `build/OrcaSlicer/OrcaSlicer.dll`
 afterwards, or that staging copy silently goes stale beside a current one.
 
+**A full rebuild must not be a child of the shell that starts it.** A rebuild here is 30-35
+minutes, and a long-running background shell is reliably stopped before then. When it goes the
+top-level `cmake` goes with it, but MSBuild's worker nodes keep compiling for another minute or
+two — so the tree fills with fresh, correct object files and then falls silent, having never
+linked. Nothing reports an error, because the process that would have reported it is the one that
+was killed, and from the outside it is indistinguishable from a finished build. The only tell is
+the timestamp on `build/src/Release/OrcaSlicer.dll`. Use `tools/petkos-build-detached.ps1`, which
+runs it as a one-shot Task Scheduler task and signals completion with a FILE containing the exit
+code — a handle belongs to a session, a file does not. `tools/petkos-dev-build.ps1` is still the
+right thing for a quick incremental build you will sit through.
+
+**A newer `.obj` timestamp is not evidence that its contents are current.** Editing a source file
+while a build is running produces an object stamped with the finish time and compiled from the text
+as it was at the start. The build is green and the change is simply absent. Never edit source
+during a build, and confirm a change reached the binary by looking for a marker string in it:
+`strings -a build/src/Release/OrcaSlicer.dll | grep -c "<some literal you added>"`. Same family as
+the probe attached to the wrong door below.
+
 **You do not have to close the app to link.** Windows refuses to delete or overwrite a mapped
 image but will happily **rename** one within the same volume. Move `orca-slicer.exe` and
 `OrcaSlicer.dll` aside to `*.inuse-<date>.*` and the linker writes fresh files while the running

@@ -39,13 +39,30 @@ if ($Jobs -le 0) {
 }
 
 if (Get-Process -Name 'orca-slicer' -ErrorAction SilentlyContinue) {
-    # Windows will not overwrite a mapped image, but it will happily rename one. PETKOS-ORCA.md
-    # documents this: killing a running slicer to unblock a link risks an unsaved project,
-    # renaming risks nothing.
-    Write-Warning 'orca-slicer is running. Close it, or move the DLL aside first:'
-    Write-Warning '  Move-Item build\src\Release\OrcaSlicer.dll build\src\Release\OrcaSlicer.inuse.dll'
-    throw 'refusing to link over a running app'
+    # Windows will not overwrite a mapped image, but it will happily rename one within the same
+    # volume - the running process keeps its old mapping and the linker writes fresh files.
+    # PETKOS-ORCA.md documents the trick; this used to print it as an instruction and then throw,
+    # which is a script describing work it is able to do. Killing a running slicer to unblock a
+    # link risks a project the user has not saved; renaming risks nothing, so just rename.
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    foreach ($name in @('OrcaSlicer.dll', 'orca-slicer.exe', 'orca-slicer.pdb', 'OrcaSlicer.pdb')) {
+        $path = Join-Path $build "src\$Config\$name"
+        if (-not (Test-Path $path)) { continue }
+        $item = Get-Item $path
+        $aside = Join-Path $item.DirectoryName ("{0}.inuse-{1}{2}" -f $item.BaseName, $stamp, $item.Extension)
+        try {
+            Move-Item -LiteralPath $path -Destination $aside -ErrorAction Stop
+            Write-Host "  moved aside (app is running): $($item.Name)" -ForegroundColor DarkYellow
+        } catch {
+            throw "orca-slicer is running and $name could not be moved aside: $_"
+        }
+    }
 }
+
+# Anything moved aside by an EARLIER run is only deletable once nothing maps it. Sweep them here
+# rather than leaving a build directory that grows a 128 MB DLL per iteration.
+Get-ChildItem -Path (Join-Path $build "src\$Config") -Filter '*.inuse-*' -ErrorAction SilentlyContinue |
+    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -ErrorAction Stop } catch { } }
 
 if ($Configure) {
     Write-Host "cmake configure..." -ForegroundColor Cyan
@@ -55,7 +72,12 @@ if ($Configure) {
     if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 }
 
-$target = if ($Full) { 'ALL_BUILD' } else { 'OrcaSlicer' }
+# orca-slicer.exe is NOT part of the OrcaSlicer target - that one builds OrcaSlicer.dll. The exe
+# is a 300 KB launcher from the separate OrcaSlicer_app_gui target, so building 'OrcaSlicer' alone
+# leaves whatever exe was already on disk. That was invisible until the app was running and the
+# exe had been moved aside, at which point the build produced a fresh DLL and no exe to load it.
+$targets = if ($Full) { @('ALL_BUILD') } else { @('OrcaSlicer', 'OrcaSlicer_app_gui') }
+$target  = $targets -join ', '
 Write-Host "building target $target, config $Config, $Jobs of $([Environment]::ProcessorCount) cores, priority $Priority" -ForegroundColor Cyan
 
 $log = Join-Path $env:TEMP ("petkos-dev-build-{0}.log" -f $Config)
@@ -63,7 +85,7 @@ $sw  = [System.Diagnostics.Stopwatch]::StartNew()
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName  = 'cmake'
-$psi.Arguments = "--build `"$build`" --config $Config --target $target -- -m:$Jobs -clp:ErrorsOnly;Summary"
+$psi.Arguments = "--build `"$build`" --config $Config --target $($targets -join ' ') -- -m:$Jobs -clp:ErrorsOnly;Summary"
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true
@@ -82,6 +104,16 @@ if ($p.ExitCode -ne 0 -or $errors) {
     exit 1
 }
 
-$dll = Join-Path $build 'src\Release\OrcaSlicer.dll'
 Write-Host ("OK in {0}m {1:d2}s" -f [int]$sw.Elapsed.TotalMinutes, $sw.Elapsed.Seconds) -ForegroundColor Green
-if (Test-Path $dll) { Write-Host ("  {0}  {1}" -f (Get-Item $dll).LastWriteTime.ToString('HH:mm:ss'), $dll) }
+$missing = @()
+foreach ($name in @('OrcaSlicer.dll', 'orca-slicer.exe')) {
+    $artifact = Join-Path $build "src\$Config\$name"
+    if (Test-Path $artifact) {
+        Write-Host ("  {0}  {1}" -f (Get-Item $artifact).LastWriteTime.ToString('HH:mm:ss'), $artifact)
+    } else {
+        $missing += $name
+    }
+}
+# A green build that produced no runnable app is the failure this reports. MSBuild is happy to
+# succeed at a target whose output nothing asked for.
+if ($missing) { Write-Host ("  MISSING: {0}" -f ($missing -join ', ')) -ForegroundColor Red; exit 1 }

@@ -242,14 +242,22 @@ if (WIN32)
         foreach (CONF ${CMAKE_CONFIGURATION_TYPES})
             file(TO_NATIVE_PATH "${CMAKE_CURRENT_BINARY_DIR}/${CONF}" WIN_CONF_OUTPUT_DIR)
             file(TO_NATIVE_PATH "${CMAKE_CURRENT_BINARY_DIR}/${CONF}/resources" WIN_RESOURCES_SYMLINK)
+            # PetkosOrca: run this inside its own cmd, which is the whole fix.
+            #
+            # The guarded form runs NO command at all in the normal case - the config directory
+            # is absent, or the junction is already there from a previous build. cmd does not
+            # reset %errorlevel% for a branch it did not take, so the block reports whatever the
+            # previous build step happened to leave behind, and MSBuild wraps every POST_BUILD
+            # command in "if %errorlevel% neq 0 goto :cmEnd". A build that compiled and linked
+            # everything cleanly then failed at the symlink step, blaming a junction that was
+            # already correct, and printed the batch source rather than any error.
+            #
+            # A fresh cmd process starts at errorlevel 0 and exits with the code of the last
+            # command it actually ran - none, here - so it exits 0 by construction. No explicit
+            # "exit /b 0" and no VERBATIM: the inner quotes are for cmd, not for CMake.
             add_custom_command(TARGET OrcaSlicer POST_BUILD
-                COMMAND if exist "${WIN_CONF_OUTPUT_DIR}" "("
-                        if not exist "${WIN_RESOURCES_SYMLINK}" "("
-                            mklink /J "${WIN_RESOURCES_SYMLINK}" "${SLIC3R_RESOURCES_DIR_WIN}"
-                        ")"
-                    ")"
+                COMMAND cmd /C "if exist \"${WIN_CONF_OUTPUT_DIR}\" if not exist \"${WIN_RESOURCES_SYMLINK}\" mklink /J \"${WIN_RESOURCES_SYMLINK}\" \"${SLIC3R_RESOURCES_DIR_WIN}\""
                 COMMENT "Symlinking the resources directory into the build tree"
-                VERBATIM
             )
         endforeach ()
 
