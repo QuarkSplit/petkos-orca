@@ -11061,28 +11061,6 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
 
     if (preset_type == Preset::TYPE_FILAMENT) {
         wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
-
-        //PetkosOrca: and onto the plates in scope, in the same slot.
-        //
-        //A plate carries its own filament list now rather than inheriting the project's, which is
-        //what stops a plate being incomplete - but it also means a pick that only wrote the
-        //project row would reach nothing at all. Populating a field per plate and rewiring its
-        //control are one change, not two: doing the first alone turns a working control into a
-        //silent no-op, which is the exact fault this whole piece of work started from.
-        if (sidebar != nullptr && idx >= 0) {
-            for (int plate_index : sidebar->scoped_plates()) {
-                PartPlate *plate = partplate_list.get_plate(plate_index);
-                if (plate == nullptr)
-                    continue;
-                std::vector<std::string> names = plate->get_filament_preset_names();
-                if (names.empty())
-                    names = wxGetApp().preset_bundle->filament_presets;
-                if (idx < (int) names.size()) {
-                    names[idx] = preset_name;
-                    q->set_plate_filaments(plate_index, names);
-                }
-            }
-        }
         wxGetApp().plater()->update_project_dirty_from_presets();
         wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
         sidebar->update_dynamic_filament_list();
@@ -11163,24 +11141,6 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 }
             }
             std::string old_preset_name = wxGetApp().preset_bundle->printers.get_edited_preset().name;
-
-            //PetkosOrca: this picks a printer FOR THE PLATES IN SCOPE, which is always at least the
-            //plate on screen. There is no second thing it could mean, because a plate no longer
-            //inherits a project printer - it carries its own.
-            //
-            //That is the whole reason this is unambiguous now. While an empty plate context meant
-            //"follow the project", this control had two possible targets and no way to tell them
-            //apart, which is why the panel could name one machine while the highlighted plate row
-            //named another. Deleting the fallback deleted the question.
-            //
-            //select_preset still runs, but for a different job: it moves the EDITING focus, so the
-            //Printer settings tab shows the preset just picked. Selection is which preset you are
-            //editing; the plate's context is what will be sliced. Those were one concept and the
-            //conflation is what made "the project printer" feel load-bearing.
-            if (sidebar != nullptr && !sidebar->scoped_plates().empty()) {
-                for (int plate_index : sidebar->scoped_plates())
-                    q->set_plate_printer(plate_index, preset_name);
-            }
 
             update_objects_position_when_select_preset([this, &preset_type, &preset_name]() {
                 wxWindowUpdateLocker noUpdates2(sidebar->filament_panel());
@@ -20160,15 +20120,6 @@ void Plater::set_plate_process(int plate_index, std::string preset_name)
     if (plate->get_print_preset_name() == preset_name)
         return;
 
-    //The same rule the printer has: a plate names its own process, so an empty name is a mistake
-    //rather than an instruction to go and ask the project.
-    if (preset_name.empty()) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
-            << boost::format(": plate %1%: refusing to clear the process. A plate always names one.")
-               % (plate_index + 1);
-        return;
-    }
-
     take_snapshot(std::string("Assign plate process"));
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
         << boost::format(": plate %1% process -> '%2%'")
@@ -20217,15 +20168,6 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
     if (plate->get_slicing_context().filament_preset_names == preset_names)
         return;
 
-    //Same rule as the printer and the process: a plate names its own materials, so an empty list
-    //is a mistake rather than an instruction to go and ask the project.
-    if (preset_names.empty()) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
-            << boost::format(": plate %1%: refusing to clear the filaments. A plate always names them.")
-               % (plate_index + 1);
-        return;
-    }
-
     take_snapshot(std::string("Assign plate filaments"));
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
         << boost::format(": plate %1% filaments -> %2% slot(s)") % (plate_index + 1) % preset_names.size();
@@ -20270,17 +20212,6 @@ void Plater::set_plate_printer(int plate_index, std::string preset_name)
 
     if (plate->get_printer_preset_name() == preset_name)
         return;
-
-    //PetkosOrca: an empty name used to mean "clear back to the project printer". There is no
-    //project printer to go back to any more - a plate carries its own identity and is never
-    //incomplete - so this is now a mistake rather than an instruction, and clearing the field
-    //would re-create exactly the hole that made a plate "unresolved". Say so and change nothing.
-    if (preset_name.empty()) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
-            << boost::format(": plate %1%: refusing to clear the printer. A plate always names one.")
-               % (plate_index + 1);
-        return;
-    }
 
     //Perf: this is the click that feels worst, so it is timed as a whole and phase by
     //phase. Which phase dominates decides whether the fix is a cache, a narrower

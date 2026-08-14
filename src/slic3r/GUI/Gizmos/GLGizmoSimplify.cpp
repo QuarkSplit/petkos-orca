@@ -108,35 +108,11 @@ void GLGizmoSimplify::add_simplify_suggestion_notification(
                  std::back_inserter(big_ids), is_big_object);
     if (big_ids.empty()) return;
 
-    //PetkosOrca: ONE notification with a count, not one per object.
-    //
-    //This raised a separate card for every heavy object, so a five-part model produced five
-    //identical sentences differing only in a name, and they arrived stacked on top of the
-    //collision warning, the floating-region warning and the config warning. A message in the
-    //corner costs attention, and one that grows with the number of affected objects fails hardest
-    //exactly when the project is big enough for the advice to matter.
-    //
-    //The count leads because it is the fact; the names follow on their own lines, which the
-    //notification already supports through set_simplify_suggestion_multiline. The action opens
-    //the heaviest one, and says so, rather than implying it can simplify all of them at once.
-    size_t heaviest    = big_ids.front();
-    size_t heaviest_tri = 0;
-    std::string names;
     for (size_t object_id : big_ids) {
-        const size_t tri = objects[object_id]->volumes.front()->mesh().its.indices.size();
-        if (tri > heaviest_tri) { heaviest_tri = tri; heaviest = object_id; }
-        names += "\n" + objects[object_id]->name;
-    }
-
-    {
-        const size_t object_id = heaviest;
-        std::string t = big_ids.size() == 1
-            ? GUI::format(_L("Processing '%1%' may be slow: over 1M triangles. Simplifying is recommended."),
-                          objects[heaviest]->name)
-            : GUI::format(_L("%1% models have over 1M triangles each and may be slow to process."),
-                          big_ids.size()) + names;
-        std::string hypertext = big_ids.size() == 1 ? _u8L("Simplify model")
-                                                    : GUI::format(_L("Simplify '%1%'"), objects[heaviest]->name);
+        std::string t = GUI::format(_L(
+            "Processing model '%1%' with more than 1M triangles "
+            "could be slow. It is highly recommended to simplify the model."), objects[object_id]->name);
+        std::string hypertext = _u8L("Simplify model");
 
         std::function<bool(wxEvtHandler *)> open_simplify =
             [object_id](wxEvtHandler *) {
@@ -158,8 +134,6 @@ void GLGizmoSimplify::add_simplify_suggestion_notification(
             };
         manager.push_simplify_suggestion_notification(
             t, objects[object_id]->id(), hypertext, open_simplify);
-        if (big_ids.size() > 1)
-            manager.set_simplify_suggestion_multiline(objects[object_id]->id(), true);
     }
 }
 

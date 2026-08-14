@@ -288,21 +288,6 @@ void Tab::create_preset_tab()
                         m_presets_choice->GetString(selection).ToUTF8().data());
                     preset_name = m_preset_bundle->get_preset_name_by_alias(m_type, selected_label);
                 }
-                //PetkosOrca: a PROCESS pick is for the plates in scope, which is always at least
-                //the plate on screen. Same rule the printer combo follows, and for the same reason:
-                //a plate carries its own process rather than inheriting one, so there is no second
-                //thing this control could mean.
-                //
-                //select_preset still runs underneath, moving the EDITING focus so the settings
-                //below show the preset just chosen. Choosing which preset a plate uses and choosing
-                //which preset you are editing are two different acts; they were one control, and
-                //that is why typing into this panel could reach a preset the plate did not use.
-                if (m_type == Preset::TYPE_PRINT) {
-                    if (Plater *plater = wxGetApp().plater(); plater != nullptr && plater->is_initialized()) {
-                        for (int plate_index : plater->sidebar().scoped_plates())
-                            plater->set_plate_process(plate_index, preset_name);
-                    }
-                }
                 select_preset(preset_name);
             }
         });
