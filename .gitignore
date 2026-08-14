@@ -70,3 +70,6 @@ resources/web/homepage/data/views.js
 resources/web/homepage/data/views/
 log_iotc.txt
 crashdumps/
+
+# Evidence screenshots belong in docs/img; test binaries litter the root with images
+/*.png

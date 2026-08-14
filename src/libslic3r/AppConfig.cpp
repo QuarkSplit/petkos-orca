@@ -819,6 +819,13 @@ std::string AppConfig::load()
                 }
             } else if (it.key() == "orca_presets") {
                 for (auto& j_model : it.value()) {
+                    //An entry without a machine name cannot be stored and must not kill the
+                    //whole config: one such entry (written by an earlier defect) made load()
+                    //throw and the app open factory-fresh beside 70KB of real settings.
+                    if (!j_model.contains("machine") || !j_model["machine"].is_string()) {
+                        BOOST_LOG_TRIVIAL(warning) << "AppConfig: skipping an orca_presets entry with no machine name";
+                        continue;
+                    }
                     m_printer_settings[j_model["machine"].get<std::string>()] = j_model;
                 }
             } else if (it.key() == "local_machines") {
@@ -862,7 +869,9 @@ std::string AppConfig::load()
                 }
             }
         }
-    } catch(std::exception err) {
+    } catch(const std::exception &err) {
+        //By reference, or the exception is sliced to a base whose what() is "Unknown
+        //exception" on MSVC — which is how a one-entry defect spent an evening disguised.
         BOOST_LOG_TRIVIAL(info) << format("parse app config \"%1%\", error: %2%", AppConfig::loading_path(), err.what());
 
         return err.what();
@@ -1745,6 +1754,50 @@ void AppConfig::reset_selections()
     }
 }
 
+//WHERE THE SETTINGS ACTUALLY ARE.
+//
+//The config file is named after SLIC3R_APP_KEY, so renaming the app renames the file, and a
+//user who had settings gets an app that opens factory-fresh next to a file it no longer
+//looks for. That happened once already: "OrcaSlicerWaveOverhangs" -> "PetkosOrca" on
+//2026-07-29 left an orphan, and version.inc still carries the note about it.
+//
+//So a rename adopts what came before. The list is every key this fork has been published
+//under, newest first, and it is a MIGRATION rather than a fallback: the old file is copied
+//to the current name and from then on there is one file again. Nothing is deleted, because
+//the previous name's file is also the way back if this build is abandoned.
+std::string AppConfig::loading_path()
+{
+    if (!m_loading_path.empty())
+        return m_loading_path;
+
+    const std::string current = config_path();
+    if (boost::filesystem::exists(current))
+        return current;
+
+    static const char *previous_keys[] = { "PetkosOrca", "OrcaSlicerWaveOverhangs" };
+    const std::string  extension       = boost::filesystem::path(current).extension().string();
+    for (const char *key : previous_keys) {
+        const boost::filesystem::path candidate =
+            (boost::filesystem::path(Slic3r::data_dir()) / (std::string(key) + extension)).make_preferred();
+        if (!boost::filesystem::exists(candidate))
+            continue;
+        boost::system::error_code ec;
+        boost::filesystem::copy_file(candidate, boost::filesystem::path(current),
+                                     boost::filesystem::copy_option::overwrite_if_exists, ec);
+        if (ec) {
+            //Could not copy it, so read it where it lies rather than pretending there are no
+            //settings. A read-only or locked datadir must not cost the user their config.
+            BOOST_LOG_TRIVIAL(warning) << "AppConfig: could not adopt " << candidate.string()
+                                       << " as " << current << " (" << ec.message() << "); reading it in place";
+            return candidate.string();
+        }
+        BOOST_LOG_TRIVIAL(info) << "AppConfig: adopted the settings written as " << candidate.string()
+                                << " under the app's previous name; they are now " << current;
+        return current;
+    }
+    return current;
+}
+
 std::string AppConfig::config_path()
 {
 #ifdef USE_JSON_CONFIG
@@ -1773,7 +1826,15 @@ std::string AppConfig::profile_update_url() const
 
 bool AppConfig::exists()
 {
-    return boost::filesystem::exists(config_path());
+    //THE SAME QUESTION load() ASKS, ASKED THE SAME WAY. This decides whether the app has
+    //settings at all - GUI_App reads it to choose between "returning user" and "run the
+    //setup wizard". config_path() is only where settings are written under the CURRENT app
+    //name, so on the first run after a rename it says no while a full config sits one name
+    //back, and the wizard runs over it. loading_path() is where the settings actually are,
+    //and asking it here is also what performs the previous-name adoption, so the answer and
+    //the migration happen together instead of the migration waiting for a load that the
+    //wizard has already pre-empted.
+    return boost::filesystem::exists(loading_path());
 }
 
 }; // namespace Slic3r

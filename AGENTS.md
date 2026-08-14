@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> **This file is upstream OrcaSlicer's, kept for reference. `PETKOS-ORCA.md` outranks it.**
+> **This file is upstream OrcaSlicer's, kept for reference. `PODSLICER.md` outranks it.**
 > In particular the cross-platform and backward-compatibility constraints below do **not** bind this
 > fork: it is Windows-only and FDM-only, and only the Windows Release build is verifiable here.
 

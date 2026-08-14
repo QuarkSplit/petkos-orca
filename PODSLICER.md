@@ -1,7 +1,43 @@
-# Petko's Orca — what this fork is for
+# Podslicer — what this fork is for
+
+A pack of orcas is a pod. This fork took OrcaSlicer, which knows one machine, and made it know
+a fleet; on 2026-08-14 it took its own name to say so.
 
 `AGENTS.md` describes upstream OrcaSlicer. This file describes why this fork exists, and it
 outranks upstream convention wherever the two disagree.
+
+## What it is, in three sentences
+
+**Podslicer is OrcaSlicer with the single-printer assumption removed.** A plate carries its own
+printer, process, filament slots and target machine, saved in the project and restored with it,
+so one file can hold an ABS plate for one machine, a PLA plate for another and a TPU plate for a
+third - each drawn at its real bed size, each arranged against its own bed, each keeping its own
+finished slice until something about that plate actually changes.
+
+**Moving a plate to another machine is a translation, not a reset.** Wall count, infill, print
+order and every other choice you made travel to the new printer as that plate's own settings; the
+same material is re-expressed for the new machine; anything the target genuinely cannot do is
+named rather than silently dropped. That is why a project downloaded for a Bambu opens and prints
+on a farm that owns no Bambu.
+
+**There is no project printer to get wrong.** The preset dropdowns are an editing cursor that
+follows whichever plate you are looking at, so no plate can quietly be slicing against a machine
+that was selected an hour ago for something else.
+
+## The demand for this, and what it actually looks like
+
+Upstream closed the canonical request, **#7238**, as *not planned* - by a stale bot, with zero
+reactions and two comments, both of them the bot. No human ever replied.
+
+The demand does not show up as reaction counts. It shows up as **the same request independently
+refiled at least twelve times in three years** - #1277, #1309, #3593, #3942, #7221, #7238, #8420,
+#8596, #10551, #11445, and discussions #6357 and #7506 - at least six of them auto-closed without
+a human reply. Nobody piles onto an issue they never find; they file a new one.
+
+Fifteen of those are closed by what is in this tree. The neighbouring high-reaction issues that
+turn up in the same searches - multi-extruder toolchangers (#2050, 67 reactions), per-feature
+filament (#7106, 37), custom bed surfaces (#836, 36), filament-scope overrides (#12401, 21) - are
+things this fork does NOT do, and nothing here should claim them.
 
 ## The objective, and it is the whole objective
 
@@ -21,9 +57,136 @@ making its consumers plural is not progress; it widens the gap between what the 
 what it does.
 
 There are no fallbacks. A missing or incompatible plate context is unresolved and must be fixed
-at its source; it is never permission to substitute the project printer, another preset, or a
-nearest match. The same rule applies to workarounds: if a long comment is needed to defend one,
-the code is wrong and the real boundary must be repaired.
+at its source; it is never permission to substitute another preset or a nearest match. There is
+no project printer left to substitute either — see below. The same rule applies to workarounds:
+if a long comment is needed to defend one, the code is wrong and the real boundary must be
+repaired.
+
+### The project printer was deleted as a state (2026-08-14)
+
+**A plate owns its context. An empty field is not inheritance; it is an error.**
+
+The singular engine did not live in a missing feature — the data layer had held a per-plate
+printer since `4cf3af2bda`. It lived in what *absence* was defined to mean. While an empty field
+in `PlateSlicingContext` resolved to the globally selected preset, every plate that had not been
+explicitly told otherwise had one machine standing behind it, and the resolver read that machine
+on every slice, every frame and every board rebuild.
+
+The project printer is not a printer. It is the settings tabs' **cursor** — which preset is
+currently being edited — and the application was reading a cursor as a fact about the project.
+
+So the rule now is: a plate names its own printer, its own process and its own materials, or it
+is unresolved. The global selection survives as what it always was, an editing cursor, and it
+**follows the current plate** (`Plater::follow_plate_presets`) instead of standing behind every
+plate. The sidebar's printer, process and filament combos write to the current plate.
+
+`PresetBundle::complete_plate_context` is the ONE remaining read of the global selection on a
+plate's behalf, and it runs once per plate, at the two moments a plate can exist without a
+context: a plate being created, and a project written before per-plate machines being loaded. A
+new plate is seeded from the plates that already exist, which is also what answers "what shape is
+a plate that does not exist yet" for arrange, and "what does an overflow land on".
+
+**WHEN it runs is as load-bearing as what it does, and getting it wrong has already shipped
+once.** `e0039df8bf` completed the plates inside `PartPlateList::load_from_3mf_structure`, which
+runs BEFORE `load_config_model` and `load_project_embedded_presets` put the project's own presets
+into the bundle. So every plate was filled in with whatever was selected before the file was
+opened - `Default Setting`, `Default Filament` - as CONCRETE names, which then permanently
+outranked the real presets the 3MF was carrying. `Default Filament` caps
+`filament_max_volumetric_speed` at 2, so a 6h45m plate became 21h03m and reported 0.00 g. For a
+print farm those are the two numbers that reach a price and a machine booking. Every in-app check
+passed on that build; only reading the emitted G-code caught it, and the commit was reverted in
+`1e6a972028`.
+
+The first repair was a timing rule: refuse to complete while a project is loading. That is a patch,
+and the tell was the size of the comment defending it - a rule enforced by a flag breaks again the
+next time somebody adds a call site. **The real repair is that the seed is an argument.**
+
+`PresetBundle::complete_plate_context(context, seed)` takes the seed by reference and reads no
+global state at all. A caller has to name where the values come from, which is exactly the
+difference between a value somebody chose and whatever happened to be selected when the code ran.
+A signature that cannot reach a global cannot make this mistake, wherever it is called from.
+
+The two callers, and what each names as the holder:
+
+- `complete_plate_contexts()` - a plate in an existing session. Each plate is completed from the
+  last complete one, so a new plate lands on the machine the user is already on. Only when no plate
+  has a context is the bundle's selection used, and there it is a remembered choice rather than a
+  placeholder.
+- `complete_plate_contexts(declared)` - a loaded project. `Plater::priv::load_files` reads
+  `printer_settings_id`, `print_settings_id` and `filament_settings_id` **out of the 3MF's own
+  config**, before that config is moved into the bundle, and passes them in. That is correct
+  whenever it runs and whatever the bundle holds, because it came from the file.
+
+The driver's Context phase also asserts that no plate names a preset that `is_default`, which is
+the cheap in-app half of the check. The other half is reading `filament_settings_id` and
+`filament_max_volumetric_speed` out of the G-code, and it is the half that actually caught it.
+
+The difference between a state and a default is how many times it is read.
+
+Consequences that are load-bearing and easy to undo by accident:
+
+- **Nothing may resolve a plate through `printers.get_edited_preset()`.** An empty context is an
+  error with a message naming what is missing. The Context phase of `PetkosPerfDriver` asserts
+  exactly this, and asserts that moving the global selection does not change what a plate slices
+  with.
+- **Arrange overflow keeps its machine.** An item that will not fit goes onto one of arrange's
+  extra beds of the same shape — the same machine by construction — and the plate `finalize`
+  creates takes the context of the plate it overflowed from. An object must never change machine
+  by failing to fit.
+- **CLI has a second bed source and it is named, not hidden.** There is no wxApp and no preset
+  bundle there; a plate resolves against the project config the 3MF carried.
+  `PartPlateList::plate_beds_come_from_presets()` is where that difference is stated. Do not
+  "unify" it into a fallback.
+
+Every plate-context field has a user-facing write path, and they share one idiom: click the value,
+get a menu of what will actually resolve here, filtered by the same compatibility calls the
+composer makes afterwards. A stored name this installation does not have is always offered back
+verbatim, because opening a picker must never be what discards it. Filament is written one slot
+at a time, from the swatch that shows it.
+
+### A change of machine is a TRANSLATION, never a discard (2026-08-14)
+
+Every FDM printer speaks the same language. A 3MF is always resliced, whatever it was downloaded
+for, so a project authored for a Bambu landing on a farm that owns no Bambu must arrive with
+everything it intended, expressed on whatever machine will actually print it. There is almost
+nothing a Bambu can physically do that an Elegoo cannot.
+
+**So a value that was chosen for another printer is still a value somebody chose.** It is a
+translation problem. It is never a reason to substitute a stock default, and never a reason to
+drop the value on the floor. Wall count, infill pattern and density, wipe, print order, per-machine
+calibration: these are the same decision on any of these machines, and failing to carry them is
+inexcusable rather than merely imperfect.
+
+That is why `PresetBundle::carry_process_intent` exists. Switching a plate to a machine whose
+process it cannot run changes the process NAME to the machine's own default - a name means nothing
+across machines - and carries the chosen VALUES onto the plate as its own overrides. A preset is a
+base plus a deviation: the base is a vendor's tuning for one machine, the deviation is what a
+person decided, and only the deviation crosses. When the source has no parent profile in this
+installation - an embedded preset out of another slicer, the normal case for a download - nothing
+distinguishes tuning from intent, so all of it is treated as chosen and carried, and the result
+says that is what happened.
+
+**Colour information is material information.** A project routinely wants several materials at once
+- PETG for the support interface, PLA everywhere else - and the surface where that is managed is
+the one that today presents itself as filament colour. Per-plate `filament_preset_names` is the
+field; the swatch strip is its control, one slot at a time. Anything that treats a slot as a colour
+rather than as a material is describing half the fact.
+
+**The hard cases, named rather than deferred vaguely.** These are genuine work, not edge cases, and
+none of them may be allowed to trip project import or a printer swap - which is the base, and the
+base has to keep working while they are built:
+
+- **Negative space and modifier geometry.** Blocking a region with negative geometry to make a
+  hole, a magnet pocket or a no-support zone. Bambu Studio and PrusaSlicer express these
+  differently in the process/modifier layer, and there are many slicer-printer pairings a 3MF
+  import has to reconcile. Expect heavy work here.
+- **Print by object.** A by-object project needs toolhead collision resolution translated from one
+  machine's kinematics to another's, not merely copied.
+- **Dual nozzle.** A project authored for an H2D genuinely has to be refactored for a
+  single-nozzle machine; the G-code is a different shape. This is the one case where "translate"
+  is not enough.
+- **Filament and tool swaps are a SLICING step.** Different machines handle a swap differently.
+  That difference belongs at slice time and must not reach import or printer-swap code at all.
 
 The slicing identity and physical device identity are separate plate properties. Multiple
 physical printers may share one slicing preset, and one physical printer may use different nozzle
@@ -79,10 +242,21 @@ Its rules, which are the top-of-file rules applied to a change of identity:
 
 - A dependent preset that still runs on the new printer is kept. It is still what the user chose.
 - A process that cannot run switches to the new printer's own declared `default_print_profile` —
-  the printer's own declaration, never a nearest match. A plate cleared back to "follow the
-  project" re-inherits the Project pairing instead.
-- A filament that cannot run is reported by name and never rewritten: filament is material
-  choice, and substituting one is a silent yes with a real cost.
+  the printer's own declaration, never a nearest match. The VALUES that were chosen come with
+  it as plate overrides; see `carry_process_intent` and the translation rule above.
+- A filament that cannot run is TRANSLATED when the same material exists for the new printer,
+  and reported by name when it does not. **Amended 2026-08-14, and the amendment matters more
+  than the rule it replaces.** "Never rewrite a filament" was written to protect a MATERIAL
+  choice, and it still does: PLA turned into PETG is a different thing coming out of the
+  nozzle and stays refused. But PLA re-expressed as the target machine's PLA is not a
+  substitution at all - a filament preset is a base plus a deviation exactly as a process
+  preset is, the base is one vendor's tuning of one material for one machine, and none of
+  that tuning means anything elsewhere. The discriminator is one string, `filament_type`.
+  Without this, pointing a downloaded Bambu plate at a machine you own left the plate unable
+  to SLICE, because the composer refuses a context with an incompatible filament - 54 clicks
+  of hand repair on a six-plate four-colour project before anything would run. See
+  `PresetBundle::translate_filament_to_printer` for the preference order, every step of which
+  is a declaration rather than a guess.
 - Anything that still cannot resolve stays as it is and is named. Unresolved is unresolved.
 - A printer this build does not have preserves the whole context verbatim — the project may be
   headed to a machine that has it.
@@ -123,6 +297,10 @@ from a different direction:
 | Process, filament, nozzle | not per-plate at any level, only the printer name and bed shape are | `PartPlate.hpp` |
 | Devices | one selected machine, one sync target, so live state can be shown for at most one printer | `get_selected_machine()`, `update_sync_status(const MachineObject*)` |
 | Reassignment | changing a plate's printer invalidates no slice state and re-checks no bed boundary | `Plater.cpp` ~19129 |
+
+Of that table, the Presets, Process/filament/nozzle and Reassignment rows are closed. The Devices
+row is the one still standing: a plate carries a `physical_printer_id` and can be given one from
+the inspector, but the monitor and sync layers still hold one selected machine.
 
 The sidebar showing a project filename where a printer name belongs is a symptom of this, not
 the problem. Fixing the label without fixing the layers underneath makes the lie better dressed.

@@ -2,7 +2,13 @@
 #define _libslic3r_h_
 
 #include "libslic3r_version.h"
-#define SLIC3R_APP_FULL_NAME "OrcaSlicer"
+// PODSLICER. A pack of orcas is a pod, and this fork turned one machine into a fleet:
+// a plate carries its own printer, process and materials, and the project has no printer
+// at all. The name is the fork's, so it belongs on every surface a person reads - the
+// window title, the About box, every dialog caption. It is DISPLAY ONLY, which is why it
+// can change safely: SLIC3R_APP_NAME (version.inc) is the one in the G-code header that
+// firmware parsers sniff, and it stays "OrcaSlicer".
+#define SLIC3R_APP_FULL_NAME "Podslicer"
 #define GCODEVIEWER_APP_NAME "OrcaSlicer G-code Viewer"
 #define GCODEVIEWER_APP_KEY  "OrcaSlicerGcodeViewer"
 #define GCODEVIEWER_BUILD_ID std::string("OrcaSlicer G-code Viewer-") + std::string(SLIC3R_VERSION) + std::string("-RC")

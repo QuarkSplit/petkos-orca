@@ -335,7 +335,10 @@ public:
 	bool 				exists();
 
 	void                set_loading_path(const std::string& path) { m_loading_path = path; }
-	std::string         loading_path() { return (m_loading_path.empty() ? config_path() : m_loading_path); }
+	//The file this run reads its settings from. Normally config_path(), but see the
+	//definition: when the app has been renamed, the config written under the previous name
+	//is adopted rather than left on disk beside an app that looks factory-fresh.
+	std::string         loading_path();
 
     std::vector<std::string> get_recent_projects() const;
     void set_recent_projects(const std::vector<std::string>& recent_projects);

@@ -10,11 +10,15 @@
 set(SLIC3R_APP_NAME "OrcaSlicer")
 # Settings dir key: distinct so config is never shared with stock OrcaSlicer.
 # Also the wx app name (GUI_App::SetAppName) and the 3MF "Application" metadata.
-# Renamed from "OrcaSlicerWaveOverhangs" on 2026-07-29: this is Petko's fork,
-# not the upstream WaveOverhangs fork it merged. NOTE this renames the config
-# file to PetkosOrca.conf -- an existing datadir keeps the old file and will
-# look factory-fresh until it is renamed across.
-set(SLIC3R_APP_KEY "PetkosOrca")
+# Renamed "OrcaSlicerWaveOverhangs" -> "PetkosOrca" on 2026-07-29, and
+# "PetkosOrca" -> "Podslicer" on 2026-08-14 when the fork took its own name.
+#
+# Renaming this renames the config file, so an existing datadir would look
+# factory-fresh: it keeps the old file under the old name and the app looks for
+# the new one. That is the trap the previous rename left behind and this one does
+# NOT, because AppConfig::loading_path now adopts the most recent config written
+# under any name this fork has had. See the list there.
+set(SLIC3R_APP_KEY "Podslicer")
 # gettext catalog domain. Stays "OrcaSlicer" because the .po/.mo files
 # are named OrcaSlicer_<lang>.po / OrcaSlicer.mo (inherited from upstream).
 set(SLIC3R_GETTEXT_DOMAIN "OrcaSlicer")
