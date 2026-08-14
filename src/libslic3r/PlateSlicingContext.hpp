@@ -1,14 +1,47 @@
 #ifndef slic3r_PlateSlicingContext_hpp_
 #define slic3r_PlateSlicingContext_hpp_
 
+#include <set>
 #include <string>
 #include <vector>
 
 namespace Slic3r {
 
-// Empty preset names mean explicit inheritance from the Project row. Once a
-// field is set, resolving it is exact: callers must never substitute another
-// preset when the named preset is unavailable or incompatible.
+// The process settings a PLATE has always owned a control of its own for, and the ONE
+// definition of that set. Two sides read it and they must never disagree:
+//
+//  - PresetBundle::carry_process_intent leaves these out of the candidate set, so a change
+//    of machine never carries one across as "intent".
+//  - PartPlate::process_override_keys / _count / clear_process_overrides leave them out of
+//    the count the inspector shows and out of what "clear" clears.
+//
+// While those were two lists, print_sequence and spiral_mode sat in one and not the other:
+// a machine change carried them onto the plate as overrides that nothing counted and
+// nothing could clear. print-by-object is also not translatable in the first place - a
+// by-object plate needs its toolhead collisions resolved for the new machine's kinematics,
+// and copying the flag is not that.
+inline bool is_plate_owned_process_setting(const std::string &key)
+{
+    static const std::set<std::string> own_controls = {
+        "curr_bed_type", "print_sequence", "first_layer_print_sequence",
+        "other_layers_print_sequence", "other_layers_print_sequence_nums",
+        "spiral_mode", "filament_map_mode", "filament_map", "filament_volume_map",
+    };
+    return own_controls.count(key) > 0;
+}
+
+// A plate's complete slicing identity, owned by the plate and by nothing else.
+//
+// There is no project printer to fall back to. An empty field is NOT inheritance: it is
+// a plate that has not been given one yet, which happens in exactly two places - a plate
+// that has just been created, and a project written before per-plate machines. Both are
+// completed at once by PresetBundle::complete_plate_context, and after that every field
+// is a name that must resolve exactly.
+//
+// The distinction matters because "empty means the project's" was the whole of the
+// singular engine. It let one global selection stand behind every plate that had not
+// been told otherwise, so a project could hold several printers in its data and still
+// slice on one. Deleting the meaning is what deletes the state.
 struct PlateSlicingContext
 {
     std::string              printer_preset_name;
@@ -16,6 +49,16 @@ struct PlateSlicingContext
     std::string              print_preset_name;
     std::vector<std::string> filament_preset_names;
     std::string              physical_printer_id;
+
+    // Everything a slice needs to be named. printer_vendor_id is excluded: it is a
+    // guard recorded against the printer name, not an identity of its own, and an
+    // empty one means "no vendor was recorded", which resolves fine.
+    // physical_printer_id is excluded too - which machine on the network prints this
+    // is a dispatch question, and a plate slices without an answer to it.
+    bool is_complete() const
+    {
+        return !printer_preset_name.empty() && !print_preset_name.empty() && !filament_preset_names.empty();
+    }
 
     bool operator==(const PlateSlicingContext &rhs) const
     {

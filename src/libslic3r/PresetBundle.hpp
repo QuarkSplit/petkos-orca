@@ -36,6 +36,26 @@ namespace Slic3r {
 struct ResolvedPlateSlicingConfig
 {
     DynamicPrintConfig         config;
+    // THESE POINTERS ARE A VIEW, AND THE THING THEY VIEW MOVES.
+    //
+    // PresetCollection::find_preset returns &m_edited_preset - not the stored preset - whenever the
+    // name it was asked for is the one currently selected, and select_preset_by_name OVERWRITES
+    // m_edited_preset with the newly selected preset. So a resolved result that is read after any
+    // preset selection reports whatever the cursor has since moved to, for a plate that never
+    // changed. In a fork whose whole point is that the cursor follows the plate, selections happen
+    // constantly, and this reads as the plate having silently changed machine.
+    //
+    // That is exactly what it did: the context check resolved plate 1 (Prusa CORE One), moved the
+    // cursor to an Anycubic Kobra to prove the plate would not follow it, and then read the name off
+    // the pointer it had taken BEFORE the move - which by then was the Kobra. The plate was right
+    // both times and the report was an artefact of holding a view across a mutation.
+    //
+    // So the names below are the answer, taken by value at resolve time, and they are what anything
+    // outliving one statement should read. The pointers remain for callers that need the whole
+    // preset within a single operation; they are valid only until the next preset selection.
+    std::string                printer_preset_name;
+    std::string                print_preset_name;
+    std::vector<std::string>   filament_preset_names;
     const Preset              *printer_preset { nullptr };
     const Preset              *print_preset { nullptr };
     std::vector<const Preset*> filament_presets;
@@ -216,6 +236,98 @@ public:
                                ResolvedPlatePresets      &presets,
                                std::string               &error) const;
 
+    // THE ONLY PLACE A PLATE'S CONTEXT IS AUTHORED FROM ANYTHING BUT THE USER.
+    //
+    // Deleting the project printer means deleting the rule that an empty field reads as
+    // "whatever is globally selected". That rule ran on every slice, every frame and every
+    // board rebuild, which is what let one global selection stand behind a whole project.
+    // Here it runs once per plate, at the moment the plate comes into being, and writes a
+    // name the plate then owns. The difference between a state and a default is exactly
+    // that: how many times it is read.
+    //
+    // THE SEED IS AN ARGUMENT, AND THAT IS THE WHOLE POINT. This function reads no global
+    // state at all: it copies from the context it is handed, and nothing else. The caller
+    // has to name where the values come from, which is the difference between a value
+    // somebody chose and whatever happened to be selected when the code ran.
+    //
+    // That distinction is not theoretical. The first attempt at this sampled the bundle
+    // from inside the 3MF plate loader, which runs before the project's own presets are
+    // installed, so every plate came out "complete" and named `Default Filament` - whose
+    // filament_max_volumetric_speed of 2 turned a 6h45m plate into 21h03m and reported
+    // 0.00 g. A signature that cannot reach a global cannot make that mistake, wherever it
+    // is called from. Timing rules are a caller's problem; this is the boundary repair.
+    //
+    // A SEED MAY BE HOLDING A PLACEHOLDER, AND A PLACEHOLDER IS NEVER A CHOICE. An
+    // is_default preset is what a collection has selected before any real profile is
+    // installed. Copied onto a plate it makes the plate look complete while pinning it to a
+    // stand-in - and "Default Filament" caps filament_max_volumetric_speed at 2, the whole
+    // of the 6h45m -> 21h03m quote. Where the seed names a real printer, that printer's own
+    // default_print_profile / default_filament_profile replace the placeholder; where no
+    // declaration can, the field is left EMPTY, because a plate that is unresolved can be
+    // reported and a plate pinned to a placeholder cannot.
+    //
+    // Returns true when it wrote anything, so a migration can say how many plates it
+    // completed rather than claiming a file said something it did not.
+    bool complete_plate_context(PlateSlicingContext &context, const PlateSlicingContext &seed) const;
+
+    // WHAT SURVIVES A CHANGE OF MACHINE.
+    // (declared below carry_process_intent's neighbours; see complete_plate_context)
+    //
+    // A preset is a base plus a deviation. The base is tuning a vendor did for one machine;
+    // the deviation is what a person decided. Only the deviation should cross to another
+    // machine - then the target keeps its own tuning and the choice survives, which is the
+    // whole of what "translate this project onto that printer" means for a process.
+    //
+    // Two cases, because there are two things "chosen" can mean here:
+    //  - The source has a parent in this installation. The deviation is knowable exactly:
+    //    the keys where the two differ. Everything else is the old machine's tuning and is
+    //    left behind.
+    //  - It has no parent - an embedded preset out of a 3MF authored in another slicer,
+    //    whose system profile this installation does not have. Then nothing distinguishes
+    //    tuning from intent, and every value in the file was put there by somebody. All of
+    //    it carries, and the result says so, because that is the case where a value tuned
+    //    for the old machine can ride along.
+    //
+    // Settings the PLATE owns a control for never cross as intent - the plate already holds
+    // its own answer, and PartPlate's override count and clear action both skip them, so one
+    // carried here would be an override nothing counts and nothing can clear. The set has one
+    // definition, Slic3r::is_plate_owned_process_setting in PlateSlicingContext.hpp, read by
+    // this function and by PartPlate::process_override_keys.
+    //
+    // Keys the target has no definition for are named in dropped rather than forced.
+    DynamicPrintConfig carry_process_intent(const Preset &from, const Preset &to,
+                                            std::vector<std::string> &dropped) const;
+
+    // WHAT A MATERIAL MEANS ACROSS MACHINES.
+    //
+    // A filament preset has the same structure as a process preset: a base plus a deviation.
+    // The base is one vendor's tuning of one material for one machine - temperatures, flow,
+    // cooling, pressure advance - and none of it means anything on a different machine. What
+    // DOES mean something is the material: filament_type says PLA, and PLA is PLA on any FDM
+    // printer ever made.
+    //
+    // So this is a translation, and the discriminator is one string. PLA re-expressed as that
+    // machine's PLA is the same material with the right tuning. PLA turned into PETG is a
+    // different thing coming out of the nozzle, and it stays refused - that is what "never
+    // substitute a filament" protects, and it is untouched here.
+    //
+    // Without this, pointing a downloaded Bambu plate at a printer you own left the plate
+    // unable to slice AT ALL, because compose_plate_slicing_config refuses a context whose
+    // filament is incompatible. Every slot had to be repaired by hand before anything would
+    // run - 54 clicks on a six-plate four-colour project - which is precisely the "technically
+    // succeeded, left the user obvious manual work" that this fork calls a defect.
+    //
+    // Preference order, and each step is a declaration rather than a guess:
+    //   1. one of the printer's OWN declared default_filament_profile entries of that material
+    //   2. a preset of that material from the same vendor as the original
+    //   3. any preset of that material that runs on this printer and process
+    //   4. the same, for the base material when the type carries a modifier ("PLA High Speed"
+    //      -> "PLA"); dash-separated types like PA-CF are distinct materials, never modifiers
+    // Returns empty when none of those exist, which is a refusal and is reported by name.
+    std::string translate_filament_to_printer(const std::string            &filament_name,
+                                              const PresetWithVendorProfile &printer,
+                                              const PresetWithVendorProfile &process) const;
+
     // THE RE-RESOLUTION MECHANISM. When a plate's printer identity changes, every preset
     // that depends on it is re-resolved against the new printer through this one path.
     // Its absence is what made one missing rule surface as three unrelated faults: a
@@ -223,17 +335,30 @@ public:
     // and a hard refusal from the model combo.
     //
     // The rules, and why each is what it is:
+    //  - A dependent that IS_DEFAULT is not a dependent at all. An is_default preset exists
+    //    so that something is selected before any real profile is installed; it is a
+    //    placeholder, it passes every compatibility test there is, and it therefore survives
+    //    a printer assignment untouched while looking like a choice. That is the whole of the
+    //    self-reinforcing fault: a plate seeded from a degraded config named "Default
+    //    Setting" / "Default Filament", assignment kept both because they were "compatible",
+    //    the selection was exported on exit and the next session seeded worse - and Default
+    //    Filament caps filament_max_volumetric_speed at 2, which is the 6h45m -> 21h03m
+    //    quote. So a placeholder is treated as ABSENT, and the slot is filled from the new
+    //    printer's OWN declaration (default_print_profile, default_filament_profile). Those
+    //    are declarations, not nearest matches, and nothing is carried across from a
+    //    placeholder because nothing in it was ever chosen.
     //  - A dependent that still runs on the new printer is kept exactly as it is. It is
     //    still the thing the user chose.
     //  - A process that cannot run (incompatible, or no longer available) is switched to
-    //    the new printer's own declared default_print_profile. A process is machine
-    //    tuning, its identity means nothing across machines, and the target is the
-    //    printer's own declaration rather than a nearest match. When the plate follows
-    //    the Project printer, the switch clears the slot back to inheritance instead,
-    //    because the Project pairing is what the plate just asked to follow.
-    //  - A filament that cannot run is REPORTED by name and never rewritten. Filament is
-    //    material choice, user intent the machine cannot infer; substituting one is a
-    //    silent yes with a real cost.
+    //    the new printer's own declared default_print_profile, AND the values that were
+    //    chosen come with it. See carry_process_intent: a process preset's NAME means
+    //    nothing across machines, but its values mostly do. Every FDM printer speaks
+    //    G-code; wall count, infill pattern and density, wipe and print order are the same
+    //    decision on any of them, and losing them because the machine changed is not a
+    //    missing feature, it is the app discarding what somebody chose.
+    //  - A filament that cannot run is TRANSLATED when the same material exists for the
+    //    new printer, and reported by name when it does not. See translate_filament_to_printer
+    //    for why re-expressing PLA as PLA is not the substitution this rule forbids.
     //  - Anything that still cannot resolve stays as it is and is named in the result:
     //    unresolved is unresolved, fix it at the source.
     //
@@ -243,15 +368,44 @@ public:
     // re-resolve against. It also re-records printer_vendor_id from the resolved
     // printer, which assignment alone leaves empty.
     //
-    // Scope: plate-local identity changes. A PROJECT printer change flows through
-    // Tab::select_preset / update_compatible, which owns the Project row's own pairing.
+    // Scope: plate-local identity changes, which is now every printer change there is.
     struct PlateContextReresolution
     {
         std::string              process_from;            // effective process before the switch
         std::string              process_to;              // what it now names; empty = no switch
-        bool                     process_now_inherits { false }; // the switch cleared the slot to inheritance
         std::string              process_unresolved;      // why no switch target could be found; empty = none needed or found
-        std::vector<std::string> incompatible_filaments;  // slots that cannot run on the new printer, reported not rewritten
+        //Why the printer's OWN declared default could not be used, when a compatible process was
+        //found some other way. Empty when the declaration was good. A vendor ships this wrong often
+        //enough to matter - tools/petkos-vendor-audit.py counts 212 machines across 28 vendors whose
+        //declared default cannot run on them - and a plate must never be left unresolvable while a
+        //compatible process exists. The switch still happens; this is the second fact the message
+        //has to carry, because "we used Y" without "your machine asked for X and X does not fit" is
+        //the app quietly making a decision the vendor got wrong.
+        std::string              process_declaration_failed;
+        std::vector<std::string> incompatible_filaments;  // slots with no same-material preset here: refused, and named
+        //Slots re-expressed for the new machine: same material, that machine's own tuning.
+        struct FilamentTranslation { size_t slot; std::string from; std::string to; std::string material; };
+        std::vector<FilamentTranslation> translated_filaments;
+        //Slots that named an is_default PLACEHOLDER rather than a material, filled from the
+        //new printer's own declared default_filament_profile. Deliberately not counted as a
+        //translation: nothing was translated, because nothing had been chosen. material is
+        //empty for the same reason.
+        std::vector<FilamentTranslation> filled_filament_placeholders;
+        //True when the process slot named an is_default placeholder, so what replaced it is
+        //the printer's own declared default and carried_process is empty by construction.
+        bool                     process_was_placeholder { false };
+        //The chosen process values, carried across the switch. The caller applies them to
+        //the PLATE's own overrides rather than to a preset: they are this plate's
+        //configuration, and writing them into a shared preset would change every other
+        //plate that names it.
+        DynamicPrintConfig       carried_process;
+        size_t                   carried_process_count { 0 };
+        //True when the source process had no parent in this installation to tell tuning
+        //from intent - an embedded preset from another slicer, typically - so all of it was
+        //treated as chosen. Worth saying out loud, because it is the case where a value
+        //tuned for the old machine can ride along.
+        bool                     carried_whole_process { false };
+        std::vector<std::string> dropped_process_keys;    // the target has no such option
         bool process_switched() const { return !process_to.empty(); }
     };
     bool reresolve_plate_context_for_printer(PlateSlicingContext      &context,
@@ -274,8 +428,8 @@ public:
 
     // TIER 2. Resolve a plate's complete slicing identity and compose its effective config.
     // Calls tier 1 for the identity, then adds compatibility, the filament list and the
-    // composition. Empty context fields inherit the Project row; non-empty names are exact
-    // and never remapped.
+    // composition. Every name is exact and never remapped; an empty field is an error,
+    // because there is no project row behind it to mean anything else.
     bool resolve_plate_slicing_config(const PlateSlicingContext            &context,
                                       std::optional<std::vector<int>>        filament_maps,
                                       std::optional<std::vector<int>>        filament_volume_maps,
@@ -501,9 +655,9 @@ public:
     // Orca: update selected filament and print
     // preserve_project_filaments: keep the currently loaded project's filament count and
     // colors across a printer switch instead of replacing them with the per-printer
-    // remembered ones. Shrinking the filament list or overwriting the colors destroys the
-    // project's multi-material data (painting is truncated irreversibly downstream, see
-    // ModelVolume::update_extruder_count).
+    // remembered ones. The painting survives a shrink now - only an explicit filament
+    // deletion prunes it - but the colours and the slot list are the project's own
+    // material choices, and a printer switch is not the user asking to change them.
     void           update_selections(AppConfig &config, bool preserve_project_filaments = false);
     void set_calibrate_printer(std::string name);
 
@@ -547,6 +701,43 @@ public:
     // and they are being used by slicing core.
     DynamicPrintConfig          project_config;
 
+    // PetkosOrca: the PROJECT layer of the resolution order preset < project < plate < object.
+    //
+    // A setting the user changes at the Global scope of the params panel is a statement about this
+    // project, not about the vendor's preset and not about one plate. Upstream had nowhere to put
+    // such a statement, because one project meant one printer and one process, so a global edit was
+    // stored as dirty state on the selected preset. In this fork the selected preset is the editing
+    // cursor and follows the current plate, which made that storage actively destructive: moving the
+    // cursor to another plate either dropped the edit or dragged it onto whatever preset the next
+    // plate uses, and both of those happened through a modal dialog on every plate click.
+    //
+    // So an edit made at Global scope lands here instead, keyed by option, and every plate composes
+    // it - it is applied after the presets and before the plate's own overrides, in
+    // compose_plate_slicing_config and in full_fff_config. It is not a preset and never becomes one
+    // unless the user saves a preset.
+    //
+    // It persists by composition: full_config() is what a 3MF's project_settings.config is written
+    // from, so these values are in the file, and loading that file decomposes them into the
+    // project's own external presets - which is why load_config_file_config clears this layer.
+    //
+    // project_config above is a different thing with a confusingly similar name: a FIXED list of
+    // per-project options (s_project_options - colours, flush volumes, bed type) that has always
+    // existed and is applied in the middle of the composition. This layer holds any option at all
+    // and is applied last.
+    DynamicPrintConfig          project_overrides;
+
+    // Move a set of options into the project layer. Keys naming a preset's identity rather than its
+    // settings (compatibility, inheritance, ids) are refused: those describe which preset this is,
+    // and a project cannot override them for every plate at once.
+    void                        park_as_project_overrides(const DynamicPrintConfig &src, const std::vector<std::string> &keys);
+    // Apply the project layer to a config, for the keys that config actually has. That makes one
+    // function serve both a composed full config and a single preset's config: a preset only carries
+    // its own options, so passing one applies exactly the overrides that belong to it.
+    void                        apply_project_overrides(DynamicPrintConfig &config) const;
+    // Whether the project layer holds an option, for the panel's "project overrides preset" marker.
+    bool                        has_project_override(const std::string &opt_key) const { return project_overrides.has(opt_key); }
+    void                        clear_project_override(const std::string &opt_key) { project_overrides.erase(opt_key); }
+
     // There will be an entry for each system profile loaded,
     // and the system profiles will point to the VendorProfile instances owned by PresetBundle::vendors.
     VendorMap                   vendors;
@@ -588,6 +779,20 @@ public:
     std::vector<std::vector<std::vector<float>>> get_full_flush_matrix(bool with_multiplier = true) const;
 
     //BBS: add some functions for multiple extruders
+    //
+    // HOW MANY NOZZLES THE EDITED PRINTER HAS, AND WHETHER THAT QUESTION HAS AN ANSWER.
+    //
+    // The int form returns 0 when the printer preset carries no nozzle_diameter at all,
+    // which is not a count - it is "no printer worth the name is being edited". 0 is a
+    // silent sentinel: callers divide by it (get_flush_volumes_matrix), resize vectors to
+    // it (flush_multiplier, and an empty flush_multiplier makes every later
+    // flush_volumes_matrix read divide by zero in turn) and iterate to it. So the checked
+    // form says so, and a caller that cannot proceed without a real count uses it and
+    // refuses out loud instead of computing with a zero.
+    //
+    // The int form stays because most callers only need "how many rows do I draw", where 0
+    // rows is the honest answer and costs nothing.
+    std::optional<int> get_printer_extruder_count_checked() const;
     int get_printer_extruder_count() const;
     bool support_different_extruders() const;
 

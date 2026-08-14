@@ -440,6 +440,41 @@ std::string Preset::remove_suffix_modified(const std::string &name)
         name;
 }
 
+//See the header. A trailing balanced "(...3mf)" group is decoration; anything else is name.
+std::string Preset::strip_project_decoration(const std::string &name)
+{
+    std::string reduced = name;
+    while (reduced.size() >= 2 && reduced.back() == ')') {
+        //Walk back to the '(' that OPENS this trailing group, counting depth. The nearest
+        //'(' is the wrong one whenever the filename inside contains parentheses of its own,
+        //which is routine: "PLA(energy_revolver_(v2).3mf)" would be cut to
+        //"PLA(energy_revolver_" by an unbalanced match, and the plates naming that preset
+        //would all read unresolved.
+        size_t depth = 0;
+        size_t open  = std::string::npos;
+        for (size_t i = reduced.size(); i-- > 0;) {
+            if (reduced[i] == ')') {
+                ++depth;
+            } else if (reduced[i] == '(') {
+                if (--depth == 0) {
+                    open = i;
+                    break;
+                }
+            }
+        }
+        if (open == std::string::npos)
+            break;   //unbalanced: not a group at all, so not decoration
+        const std::string inner = reduced.substr(open + 1, reduced.size() - open - 2);
+        if (inner.size() < 5 || !boost::algorithm::iends_with(inner, ".3mf"))
+            break;   //an ordinary parenthesised name, e.g. "0.20mm Standard (0.4 nozzle)"
+        reduced.erase(open);
+        boost::algorithm::trim_right(reduced);
+    }
+    //It was nothing BUT decoration; there is no name underneath to prefer, so keep what
+    //came in rather than authoring an empty one.
+    return reduced.empty() ? name : reduced;
+}
+
 // Update new extruder fields at the printer profile.
 void Preset::normalize(DynamicPrintConfig &config)
 {
@@ -2705,13 +2740,23 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
                     prefix =  std::to_string(idx);
             }
         } else {
-            std::string reduced_name = original_name;
-            //TODO
-            //boost::regex rx("3mf\(*\)");
-            //boost::iterator_range<std::string::iterator> result = boost::algorithm::find_regex(reduced_name, rx);
-            //if (!result.empty()) {
-            //    reduced_name = std::string(result.begin(), result.end());
-            //}
+            // PetkosOrca: a project preset is named "<preset>(<project file>)", and this is
+            // built from the name the file carried. On reopening a project that was saved
+            // from this app, that name ALREADY carries the suffix, so it was appended again -
+            // every save/reopen round trip added one. A real file on disk here holds
+            //   PolyTerra PLA @BBL A1M(helldiver-colored.3mf)(helldiver-colored.3mf)(helldiver-colored.3mf)
+            // which is three round trips. The TODO that used to sit here was the previous
+            // author meeting this and stopping.
+            //
+            // It is not cosmetic in this fork. A plate stores its filament and process by
+            // NAME, so a name that grows on every round trip eventually names a preset the
+            // bundle does not have, and the plate reads as unresolved for no reason the user
+            // can see.
+            //
+            // Strip trailing "(...3mf)" groups, repeatedly, and only those. The rule and the
+            // balanced-match reason live in Preset::strip_project_decoration, which is the
+            // one definition of what "a project's decoration" means.
+            const std::string reduced_name = Preset::strip_project_decoration(original_name);
 
             if (idx == 0)
                 prefix = reduced_name;

@@ -84,6 +84,68 @@ const char *PresetBundle::ORCA_DEFAULT_FILAMENT = "Generic PLA @System";
 const char *PresetBundle::ORCA_FILAMENT_LIBRARY = "OrcaFilamentLibrary";
 const char *PresetBundle::ORCA_DEFAULT_FILAMENT_PLACEHOLDER = "Default Filament";
 
+// Keys that say WHICH preset this is rather than what it is set to. A project layer that applies to
+// every plate cannot mean anything for them: two plates on two printers need two different answers,
+// which is what the per-plate context is for.
+static const std::set<std::string> s_project_override_refused_keys {
+    "compatible_printers", "compatible_prints", "compatible_printers_condition", "compatible_prints_condition",
+    "inherits", "print_settings_id", "filament_settings_id", "printer_settings_id", "filament_ids",
+    "filament_id", "printer_model", "printer_variant", "printer_technology", "print_compatible_printers",
+    "default_print_profile", "default_filament_profile", "printer_extruder_id", "printer_extruder_variant",
+    "print_extruder_id", "print_extruder_variant", "filament_extruder_variant", "printer_vendor_id"
+};
+
+// See the declaration in PresetBundle.hpp for what this layer is and why it exists.
+void PresetBundle::park_as_project_overrides(const DynamicPrintConfig &src, const std::vector<std::string> &keys)
+{
+    for (const std::string &key : keys) {
+        if (s_project_override_refused_keys.count(key) > 0)
+            continue;
+        const ConfigOption *opt = src.option(key);
+        if (opt == nullptr)
+            continue;
+        this->project_overrides.set_key_value(key, opt->clone());
+    }
+}
+
+void PresetBundle::apply_project_overrides(DynamicPrintConfig &config) const
+{
+    if (this->project_overrides.empty())
+        return;
+    std::vector<std::string> present;
+    for (const std::string &key : this->project_overrides.keys()) {
+        const ConfigOption *stored = this->project_overrides.option(key);
+        const ConfigOption *target = config.option(key);
+        if (stored == nullptr || target == nullptr)
+            continue;
+        //A VECTOR OPTION IS ONLY THE SAME VALUE WHEN IT IS THE SAME LENGTH.
+        //
+        //Per-filament and per-extruder options are vectors whose length is a fact about the machine
+        //and the slot count, not about the setting. The same option is one entry long inside a
+        //filament preset and four entries long in a four-material composed config, so copying one
+        //over the other does not override a value - it changes how many filaments the config says
+        //there are, and filament_colour.size() is what several consumers read as that count. A
+        //length mismatch means the two are not talking about the same thing, so it is refused and
+        //said out loud rather than applied.
+        if (stored->is_vector() && target->is_vector() &&
+            static_cast<const ConfigOptionVectorBase *>(stored)->size() !=
+                static_cast<const ConfigOptionVectorBase *>(target)->size()) {
+            //Debug rather than warning because nothing is lost when it fires: the length only differs
+            //on the composed views that expand per-extruder variants, and the edited preset those are
+            //composed from already carries the value. It is logged so that a case where something IS
+            //lost can be found rather than guessed at.
+            BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+                << boost::format(": project override '%1%' holds %2% value(s) and this config wants %3%; not applied")
+                   % key % static_cast<const ConfigOptionVectorBase *>(stored)->size()
+                   % static_cast<const ConfigOptionVectorBase *>(target)->size();
+            continue;
+        }
+        present.push_back(key);
+    }
+    if (!present.empty())
+        config.apply_only(this->project_overrides, present);
+}
+
 DynamicPrintConfig PresetBundle::construct_full_config(
     Preset& in_printer_preset,
     Preset& in_print_preset,
@@ -298,20 +360,16 @@ bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
     presets = {};
     error.clear();
 
-    const Preset *printer = nullptr;
+    // No inheritance. A plate names its own printer or it names nothing, and nothing is
+    // an error rather than an invitation to read whichever preset is currently being
+    // edited. complete_plate_context is the one place that authors a name, and it runs
+    // when the plate is created or migrated, never on the way to a slice.
     if (context.printer_preset_name.empty()) {
-        // Explicit inheritance from the Project row. An unresolved Project selection is an
-        // error here as much as anywhere else: it is not permission to reach for whichever
-        // preset happens to be left in the edited slot.
-        if (printers.get_selected_idx() == size_t(-1) || printers.get_selected_idx() >= printers.size()) {
-            error = "The Project printer preset selection is unresolved";
-            return false;
-        }
-        printer = &printers.get_edited_preset();
-    } else {
-        // exact name, never a nearest match
-        printer = printers.find_preset(context.printer_preset_name, false);
+        error = "The plate names no printer";
+        return false;
     }
+    // exact name, never a nearest match
+    const Preset *printer = printers.find_preset(context.printer_preset_name, false);
     if (printer == nullptr) {
         error = "Printer preset '" + context.printer_preset_name + "' is not available";
         return false;
@@ -337,16 +395,11 @@ bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
         return false;
     }
 
-    const Preset *print = nullptr;
     if (context.print_preset_name.empty()) {
-        if (prints.get_selected_idx() == size_t(-1) || prints.get_selected_idx() >= prints.size()) {
-            error = "The Project process preset selection is unresolved";
-            return false;
-        }
-        print = &prints.get_edited_preset();
-    } else {
-        print = prints.find_preset(context.print_preset_name, false);
+        error = "The plate names no process";
+        return false;
     }
+    const Preset *print = prints.find_preset(context.print_preset_name, false);
     if (print == nullptr) {
         error = "Process preset '" + context.print_preset_name + "' is not available";
         return false;
@@ -359,6 +412,226 @@ bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
     return true;
 }
 
+//See the header. What survives a change of machine.
+DynamicPrintConfig PresetBundle::carry_process_intent(const Preset &from, const Preset &to,
+                                                      std::vector<std::string> &dropped) const
+{
+    dropped.clear();
+    DynamicPrintConfig carried;
+
+    //Preset BOOKKEEPING, which lives in print_options() alongside the print settings but is
+    //not one. Carrying "compatible_printers" onto a plate would hand it the OLD machine's
+    //compatibility list as an override, so every later check would ask the wrong question;
+    //"inherits" would claim a parent the carried values no longer have. These are facts
+    //about a preset, and what is being carried is not a preset.
+    static const std::set<std::string> bookkeeping = {
+        "compatible_printers", "compatible_printers_condition", "compatible_prints",
+        "compatible_prints_condition", "inherits", "print_settings_id", "printer_settings_id",
+    };
+
+    const Preset *parent = prints.get_preset_parent(from);
+
+    //The candidate keys. With a parent, the deviation. Without one, every process option
+    //the source carries - see the header for why that is the honest reading and not a
+    //bigger hammer.
+    t_config_option_keys keys;
+    if (parent != nullptr) {
+        keys = from.config.diff(parent->config);
+    } else {
+        for (const std::string &key : Preset::print_options())
+            if (from.config.option(key) != nullptr)
+                keys.push_back(key);
+    }
+
+    for (const std::string &key : keys) {
+        if (bookkeeping.count(key) > 0)
+            continue;
+        //Settings the PLATE owns a control for. These are not process intent to be carried:
+        //the plate already has its own answer for each of them, PartPlate's override count
+        //and clear action both skip them, so one carried here would be an override nothing
+        //counts and nothing can clear. print_sequence is also the case the constitution
+        //names as non-translatable - a by-object plate needs its toolhead collisions
+        //resolved for the new machine's kinematics, and copying the flag is not that.
+        //Shared definition, read by both sides: see PlateSlicingContext.hpp.
+        if (is_plate_owned_process_setting(key))
+            continue;
+        const ConfigOption *value = from.config.option(key);
+        if (value == nullptr)
+            continue;
+        //The target must have the option, or there is nothing to set it on. This is the
+        //one honest drop: a machine that has no such setting cannot be given one.
+        if (to.config.option(key) == nullptr) {
+            dropped.push_back(key);
+            continue;
+        }
+        //Already the same on the target: carrying it would be a plate override that
+        //overrides nothing, and a project full of those is a plate that looks edited when
+        //it is not.
+        if (value->operator==(*to.config.option(key)))
+            continue;
+        carried.set_key_value(key, value->clone());
+    }
+
+    return carried;
+}
+
+//See the header. The material crosses; the tuning does not.
+std::string PresetBundle::translate_filament_to_printer(const std::string             &filament_name,
+                                                       const PresetWithVendorProfile &printer,
+                                                       const PresetWithVendorProfile &process) const
+{
+    const Preset *source = filaments.find_preset(filament_name, false);
+    if (source == nullptr)
+        return {};   //we cannot know what material it was, so we cannot claim to have kept it
+
+    const std::string material = source->config.opt_string("filament_type", 0u);
+    if (material.empty())
+        return {};   //a preset that does not say what it is made of translates to nothing
+
+    const std::string source_vendor = source->vendor != nullptr ? source->vendor->id : std::string();
+
+    //Every filament that actually runs here, of a given material. Compatibility is the same
+    //pair of calls the composer will make after the click, so the answer cannot differ.
+    auto candidates_of = [&](const std::string &want) {
+        std::vector<const Preset *> found;
+        for (const Preset &preset : filaments) {
+            if (!preset.is_visible || preset.is_default)
+                continue;
+            if (preset.config.opt_string("filament_type", 0u) != want)
+                continue;
+            const PresetWithVendorProfile profile = filaments.get_preset_with_vendor_profile(preset);
+            if (!is_compatible_with_printer(profile, printer, &project_config))
+                continue;
+            if (!is_compatible_with_print(profile, process, printer))
+                continue;
+            found.push_back(&preset);
+        }
+        return found;
+    };
+
+    auto pick = [&](const std::vector<const Preset *> &found) -> std::string {
+        if (found.empty())
+            return {};
+        //1. the printer's own declaration, exactly as the process rule prefers default_print_profile
+        if (const ConfigOptionStrings *declared = printer.preset.config.option<ConfigOptionStrings>("default_filament_profile")) {
+            for (const std::string &name : declared->values)
+                for (const Preset *candidate : found)
+                    if (candidate->name == name)
+                        return candidate->name;
+        }
+        //2. the same vendor as the original, which is the closest thing to "the same product"
+        if (!source_vendor.empty())
+            for (const Preset *candidate : found)
+                if (candidate->vendor != nullptr && candidate->vendor->id == source_vendor)
+                    return candidate->name;
+        //3. anything of this material that runs here
+        return found.front()->name;
+    };
+
+    if (std::string chosen = pick(candidates_of(material)); !chosen.empty())
+        return chosen;
+
+    //4. the base material. "PLA High Speed" is PLA with a modifier; "PA-CF" is not PA.
+    if (const size_t sep = material.find(' '); sep != std::string::npos)
+        return pick(candidates_of(material.substr(0, sep)));
+
+    return {};
+}
+
+//See the header. Copies from the seed and reads nothing else.
+bool PresetBundle::complete_plate_context(PlateSlicingContext &context, const PlateSlicingContext &seed) const
+{
+    bool wrote = false;
+
+    //THE SEED MAY BE HOLDING A PLACEHOLDER, AND A PLACEHOLDER IS NEVER A CHOICE.
+    //
+    //An is_default preset is what the collections have selected before any real profile is
+    //installed. Copying one onto a new plate makes the plate LOOK complete while pinning it
+    //to a stand-in: Default Filament caps filament_max_volumetric_speed at 2, which turned a
+    //6h45m plate into 21h03m and reported 0.00 g. And because export_selections writes the
+    //selection back out on exit, a session seeded this way seeds the next one worse.
+    //
+    //When the seed names a real printer, that printer's OWN declarations are the answer -
+    //default_print_profile and default_filament_profile, exactly as
+    //reresolve_plate_context_for_printer uses them. They are declarations, not guesses. When
+    //there is no usable declaration the field is left EMPTY, which leaves the plate
+    //unresolved and reported: unresolved is a state this app can say out loud, and a
+    //placeholder is a state it cannot.
+    const Preset *seed_printer = seed.printer_preset_name.empty()
+                                     ? nullptr
+                                     : printers.find_preset(seed.printer_preset_name, false);
+    const ConfigOptionStrings *seed_declared_filaments =
+        seed_printer != nullptr ? seed_printer->config.option<ConfigOptionStrings>("default_filament_profile") : nullptr;
+
+    if (context.printer_preset_name.empty() && !seed.printer_preset_name.empty()) {
+        context.printer_preset_name = seed.printer_preset_name;
+        //Deliberately not copied from the seed. The vendor id is a guard written when a
+        //printer is ASSIGNED, so that a later name collision across vendors reads as a
+        //different machine wearing the same string. Stamping one onto a plate that never
+        //named a vendor would invent evidence.
+        context.printer_vendor_id.clear();
+        wrote = true;
+    }
+
+    if (context.print_preset_name.empty() && !seed.print_preset_name.empty()) {
+        std::string  process     = seed.print_preset_name;
+        const Preset *seeded     = prints.find_preset(process, false);
+        if (seeded != nullptr && seeded->is_default) {
+            const std::string declared = seed_printer != nullptr ? seed_printer->config.opt_string("default_print_profile")
+                                                                 : std::string();
+            if (!declared.empty() && prints.find_preset(declared, false) != nullptr) {
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                    << boost::format(": the seed names the placeholder process '%1%'; completing from printer '%2%' own declared default '%3%'")
+                       % process % seed_printer->name % declared;
+                process = declared;
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                    << boost::format(": the seed names the placeholder process '%1%' and no printer declaration replaces it; the plate is left without a process rather than pinned to a stand-in")
+                       % process;
+                process.clear();
+            }
+        }
+        if (!process.empty()) {
+            context.print_preset_name = process;
+            wrote                     = true;
+        }
+    }
+
+    if (context.filament_preset_names.empty() && !seed.filament_preset_names.empty()) {
+        std::vector<std::string> slots = seed.filament_preset_names;
+        for (size_t slot = 0; slot < slots.size(); ++slot) {
+            const Preset *seeded = filaments.find_preset(slots[slot], false);
+            if (seeded == nullptr || !seeded->is_default)
+                continue;
+            std::string declared;
+            if (seed_declared_filaments != nullptr && !seed_declared_filaments->values.empty())
+                declared = slot < seed_declared_filaments->values.size() ? seed_declared_filaments->values[slot]
+                                                                        : seed_declared_filaments->values.front();
+            if (!declared.empty() && filaments.find_preset(declared, false) != nullptr) {
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                    << boost::format(": the seed names the placeholder filament '%1%' in slot %2%; completing from printer '%3%' own declared default '%4%'")
+                       % slots[slot] % (slot + 1) % seed_printer->name % declared;
+                slots[slot] = declared;
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                    << boost::format(": the seed names the placeholder filament '%1%' in slot %2% and no printer declaration replaces it; the plate is left without filaments rather than pinned to one that caps the flow rate at 2")
+                       % slots[slot] % (slot + 1);
+                slots.clear();
+                break;
+            }
+        }
+        if (!slots.empty()) {
+            context.filament_preset_names = std::move(slots);
+            wrote                         = true;
+        }
+    }
+
+    //physical_printer_id is not completed. Which machine on the network prints this plate
+    //is a dispatch choice with a consequence in the physical world, and a plate slices
+    //perfectly well without one. Nothing here guesses at it.
+    return wrote;
+}
+
 bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      &context,
                                                        PlateContextReresolution &result,
                                                        std::string              &error) const
@@ -369,16 +642,11 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
     // The printer half, by the tier-1 rules. resolve_plate_presets is not reused whole
     // because it also resolves the process slot, and an unresolved process slot is
     // exactly the state this function exists to repair.
-    const Preset *printer = nullptr;
     if (context.printer_preset_name.empty()) {
-        if (printers.get_selected_idx() == size_t(-1) || printers.get_selected_idx() >= printers.size()) {
-            error = "The Project printer preset selection is unresolved";
-            return false;
-        }
-        printer = &printers.get_edited_preset();
-    } else {
-        printer = printers.find_preset(context.printer_preset_name, false);
+        error = "The plate names no printer";
+        return false;
     }
+    const Preset *printer = printers.find_preset(context.printer_preset_name, false);
     if (printer == nullptr) {
         error = "Printer preset '" + context.printer_preset_name + "' is not available";
         return false;
@@ -397,17 +665,20 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
     // Assignment records the name and set_printer_preset_name clears the vendor id.
     // Recording it here is what makes a later name collision across vendors read as a
     // different machine wearing the same string, rather than resolve to it.
-    if (!context.printer_preset_name.empty())
-        context.printer_vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
+    context.printer_vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
 
     // The process slot.
-    const bool    process_inherits = context.print_preset_name.empty();
-    const Preset *process = nullptr;
-    if (process_inherits) {
-        if (prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size())
-            process = &prints.get_edited_preset();
-    } else {
-        process = prints.find_preset(context.print_preset_name, false);
+    const Preset *process = prints.find_preset(context.print_preset_name, false);
+
+    // A PLACEHOLDER IS NOT A CHOICE. An is_default preset is what the app has selected
+    // before any real profile is installed. It is compatible with everything, so it walks
+    // through a printer assignment untouched wearing the shape of a decision, and the next
+    // session's seed is taken from it. Treated as absent: the switch below fills the slot
+    // from the new printer's own declaration, and nothing is carried, because nothing in a
+    // placeholder was ever chosen.
+    if (process != nullptr && process->is_default) {
+        result.process_was_placeholder = true;
+        process                        = nullptr;
     }
 
     bool process_runs = false;
@@ -417,66 +688,152 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
     }
 
     if (!process_runs) {
-        result.process_from = process != nullptr ? process->name
-                            : process_inherits  ? std::string("(unresolved Project process)")
-                                                : context.print_preset_name;
-        if (context.printer_preset_name.empty()) {
-            // The plate follows the Project printer, so a plate-local process that cannot
-            // run there re-resolves to the Project pairing itself — that pairing is what
-            // the plate just asked to follow. Both slots inheriting is not this plate's
-            // state to repair: if the Project row cannot run its own process, that is the
-            // Project row's error and the resolver reports it as such.
-            const bool project_has_process = prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size();
-            if (!process_inherits && project_has_process) {
-                context.print_preset_name.clear();
-                result.process_to           = prints.get_edited_preset().name;
-                result.process_now_inherits = true;
-            } else if (!process_inherits) {
-                result.process_unresolved = "The Project process selection is unresolved, so there is nothing to inherit";
+        result.process_from = process != nullptr ? process->name : context.print_preset_name;
+        //A process is machine tuning: its identity means nothing across machines, so a
+        //process that cannot run on the new printer is replaced by that printer's OWN
+        //declared default. Never a nearest match, and never the project's, because there
+        //is no project printer left for a pairing to be inherited from.
+        const std::string target_name = printer->config.opt_string("default_print_profile");
+        const Preset     *target      = target_name.empty() ? nullptr : prints.find_preset(target_name, false);
+        if (target_name.empty()) {
+            result.process_declaration_failed = "Printer preset '" + printer->name + "' declares no default process profile";
+        } else if (target == nullptr) {
+            result.process_declaration_failed = "The printer's own default process '" + target_name + "' is not available";
+        } else if (const PresetWithVendorProfile target_profile = prints.get_preset_with_vendor_profile(*target);
+                   !is_compatible_with_printer(target_profile, printer_profile, &project_config)) {
+            result.process_declaration_failed = "The printer's own default process '" + target->name + "' is itself incompatible with it";
+            target                            = nullptr;
+        }
+
+        //A DECLARATION THAT IS WRONG IS STILL NOT A REASON TO LEAVE A PLATE UNRESOLVABLE.
+        //
+        //The rule above - the printer's own declaration, never a nearest match - is about not
+        //inventing a pairing nobody stated. It is not about refusing to slice when the vendor's own
+        //data is self-contradictory, which it routinely is: every Flashforge Creator 5 variant
+        //inherited its default_print_profile from an Adventurer 5M Pro and named a process that lists
+        //only Adventurer machines, so choosing a Creator 5 produced a plate that could not resolve at
+        //all. Refusing there is the app enforcing a vendor's typo against its user.
+        //
+        //So when the declaration fails, the machine's own visible system processes are asked instead.
+        //Compatibility is the printer's own statement about what runs on it, which makes every
+        //candidate here a declaration too - just one made by the process rather than by the printer.
+        //Sorted by name so the same machine always lands on the same process; a fallback that is not
+        //deterministic is a fallback that cannot be reasoned about. And it is REPORTED: the result
+        //carries both the failure and the choice, and the message says both.
+        if (target == nullptr && !result.process_declaration_failed.empty()) {
+            const Preset *chosen = nullptr;
+            for (const Preset &candidate : prints.get_presets()) {
+                if (!candidate.is_visible || !candidate.is_system || candidate.is_default)
+                    continue;
+                if (candidate.printer_technology() != ptFFF)
+                    continue;
+                const PresetWithVendorProfile candidate_profile = prints.get_preset_with_vendor_profile(candidate);
+                if (!is_compatible_with_printer(candidate_profile, printer_profile, &project_config))
+                    continue;
+                //get_presets() is already ordered by name, so the first match is the sorted-first
+                //match. Comparing anyway costs nothing and does not depend on that staying true.
+                if (chosen == nullptr || candidate.name < chosen->name)
+                    chosen = &candidate;
             }
+            if (chosen != nullptr)
+                target = chosen;
+        }
+
+        if (target == nullptr) {
+            //Nothing this machine can run at all. Unresolved is unresolved, and it is said.
+            result.process_unresolved = result.process_declaration_failed.empty()
+                                            ? std::string("No process available for printer '" + printer->name + "'")
+                                            : result.process_declaration_failed +
+                                                  ", and no other process is compatible with it";
+            result.process_declaration_failed.clear();
         } else {
-            const std::string target_name = printer->config.opt_string("default_print_profile");
-            if (target_name.empty()) {
-                result.process_unresolved = "Printer preset '" + printer->name + "' declares no default process profile";
-            } else if (const Preset *target = prints.find_preset(target_name, false); target == nullptr) {
-                result.process_unresolved = "The printer's own default process '" + target_name + "' is not available";
-            } else if (const PresetWithVendorProfile target_profile = prints.get_preset_with_vendor_profile(*target);
-                       !is_compatible_with_printer(target_profile, printer_profile, &project_config)) {
-                result.process_unresolved = "The printer's own default process '" + target->name + "' is itself incompatible with it";
-            } else {
-                context.print_preset_name = target->name;
-                result.process_to         = target->name;
+            //The name switches to the machine's own default. The VALUES that were chosen
+            //come with it, as plate overrides - see carry_process_intent. Without this the
+            //app answered "this process does not run here" by discarding wall count,
+            //infill and print order, which are the same decision on any FDM machine.
+            //
+            //There is a process to take values FROM only when one resolved here. A name this
+            //build does not have, and a placeholder, both leave nothing to carry - and this
+            //call used to dereference the null in the first of those cases, which is a crash
+            //on exactly the download-a-foreign-project path the fork exists for.
+            if (process != nullptr) {
+                result.carried_process       = carry_process_intent(*process, *target, result.dropped_process_keys);
+                result.carried_process_count = result.carried_process.keys().size();
+                result.carried_whole_process = prints.get_preset_parent(*process) == nullptr;
             }
+            context.print_preset_name    = target->name;
+            result.process_to            = target->name;
         }
     }
 
-    // Filament slots: reported, never rewritten. The effective list is the plate's own
-    // when it has one and the Project row's otherwise; either way the user should hear
-    // which materials cannot follow the plate onto this machine.
-    const Preset *post_process = nullptr;
-    if (context.print_preset_name.empty()) {
-        if (prints.get_selected_idx() != size_t(-1) && prints.get_selected_idx() < prints.size())
-            post_process = &prints.get_edited_preset();
-    } else {
-        post_process = prints.find_preset(context.print_preset_name, false);
-    }
-    const std::vector<std::string> &filament_names = context.filament_preset_names.empty()
-        ? filament_presets
-        : context.filament_preset_names;
-    for (const std::string &name : filament_names) {
-        const Preset *filament = filaments.find_preset(name, false);
-        if (filament == nullptr) {
-            result.incompatible_filaments.push_back(name + " (not available)");
+    // What this printer declares as its own material for a slot. The list is the printer's
+    // per-slot declaration; where it does not run that deep, its first entry is the answer.
+    // A declaration, never a nearest match - the same rule default_print_profile gets above.
+    const ConfigOptionStrings *declared_filaments = printer->config.option<ConfigOptionStrings>("default_filament_profile");
+    auto declared_filament_for = [&](size_t slot) -> std::string {
+        if (declared_filaments == nullptr || declared_filaments->values.empty())
+            return {};
+        return slot < declared_filaments->values.size() ? declared_filaments->values[slot]
+                                                        : declared_filaments->values.front();
+    };
+
+    // Filament slots: reported, never rewritten. The user should hear which materials
+    // cannot follow the plate onto this machine.
+    const Preset *post_process = prints.find_preset(context.print_preset_name, false);
+    //A copy, because the loop below rewrites the slots it translates.
+    const std::vector<std::string> filament_names = context.filament_preset_names;
+    for (size_t slot = 0; slot < filament_names.size(); ++slot) {
+        const std::string &name     = filament_names[slot];
+        const Preset *     filament = filaments.find_preset(name, false);
+
+        //A PLACEHOLDER IS NOT A MATERIAL. "Default Filament" is what is selected before any
+        //real filament is installed; it is compatible with every printer and every process,
+        //so it survives an assignment looking like a choice, and it caps
+        //filament_max_volumetric_speed at 2 - the difference between a 6h45m plate and a
+        //21h03m one. There is nothing here to translate, because nothing was chosen: the
+        //slot takes this printer's OWN declared filament.
+        if (filament != nullptr && filament->is_default) {
+            const std::string declared = declared_filament_for(slot);
+            if (declared.empty() || filaments.find_preset(declared, false) == nullptr) {
+                result.incompatible_filaments.push_back(
+                    filament->name + " (a placeholder, and '" + printer->name + "' declares no filament to replace it with)");
+                continue;
+            }
+            result.filled_filament_placeholders.push_back({slot, name, declared, std::string()});
+            context.filament_preset_names[slot] = declared;
             continue;
         }
-        const PresetWithVendorProfile filament_profile = filaments.get_preset_with_vendor_profile(*filament);
-        if (!is_compatible_with_printer(filament_profile, printer_profile, &project_config)) {
-            result.incompatible_filaments.push_back(filament->name);
-        } else if (post_process != nullptr) {
-            const PresetWithVendorProfile process_profile = prints.get_preset_with_vendor_profile(*post_process);
-            if (!is_compatible_with_print(filament_profile, process_profile, printer_profile))
-                result.incompatible_filaments.push_back(filament->name);
+
+        //A process that does not resolve cannot answer "does this filament run with it", so
+        //the slot is reported as it always was rather than translated against nothing. The
+        //process slot is repaired above; this one waits for that to be true.
+        if (post_process == nullptr) {
+            if (filament == nullptr)
+                result.incompatible_filaments.push_back(name + " (not available)");
+            continue;
         }
+        const PresetWithVendorProfile process_profile = prints.get_preset_with_vendor_profile(*post_process);
+
+        bool runs = filament != nullptr;
+        if (runs) {
+            const PresetWithVendorProfile filament_profile = filaments.get_preset_with_vendor_profile(*filament);
+            runs = is_compatible_with_printer(filament_profile, printer_profile, &project_config) &&
+                   is_compatible_with_print(filament_profile, process_profile, printer_profile);
+        }
+        if (runs)
+            continue;
+
+        //The same material, expressed for this machine. See translate_filament_to_printer:
+        //this is not the substitution the "never rewrite a filament" rule forbids, because
+        //what comes out of the nozzle is the same stuff.
+        const std::string translated = translate_filament_to_printer(name, printer_profile, process_profile);
+        if (translated.empty()) {
+            result.incompatible_filaments.push_back(filament != nullptr ? filament->name : name + " (not available)");
+            continue;
+        }
+        const std::string material = filament != nullptr ? filament->config.opt_string("filament_type", 0u) : std::string();
+        result.translated_filaments.push_back({slot, name, translated, material});
+        context.filament_preset_names[slot] = translated;
     }
 
     return true;
@@ -587,13 +944,11 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
     const Preset *printer = presets.printer;
     const Preset *print   = presets.print;
 
-    const std::vector<std::string> &filament_names = context.filament_preset_names.empty()
-        ? filament_presets
-        : context.filament_preset_names;
-    if (filament_names.empty()) {
-        error = "The plate has no filament presets";
+    if (context.filament_preset_names.empty()) {
+        error = "The plate names no filaments";
         return false;
     }
+    const std::vector<std::string> &filament_names = context.filament_preset_names;
 
     const PresetWithVendorProfile printer_profile = printers.get_preset_with_vendor_profile(*printer);
     const PresetWithVendorProfile print_profile   = prints.get_preset_with_vendor_profile(*print);
@@ -631,6 +986,7 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
             return false;
         }
         resolved.filament_presets.push_back(filament);
+        resolved.filament_preset_names.push_back(filament->name);
         filament_copies.emplace_back(*filament);
     }
 
@@ -639,12 +995,22 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
         Preset print_copy   = *print;
         resolved.config = construct_full_config(printer_copy, print_copy, project_config, filament_copies,
                                                 false, std::move(filament_maps), std::move(filament_volume_maps));
+        // preset < project < plate < object. The plate's own overrides are applied by the caller
+        // after this returns, so the project layer goes on here, over every preset and under the
+        // plate: a setting the user changed for the project applies to all of its plates, and a
+        // plate that disagrees still wins.
+        apply_project_overrides(resolved.config);
     } catch (const std::exception &ex) {
         error = "Unable to compose plate context: " + std::string(ex.what());
         resolved = {};
         return false;
     }
 
+    // Taken by value here, once, while the presets are certainly the ones just resolved. See the
+    // comment on ResolvedPlateSlicingConfig: the pointers below become a report about the editing
+    // cursor the moment anything selects a preset, and these do not.
+    resolved.printer_preset_name = printer->name;
+    resolved.print_preset_name   = print->name;
     resolved.printer_preset    = printer;
     resolved.print_preset      = print;
     resolved.printer_vendor_id = presets.printer_vendor_id;
@@ -818,6 +1184,7 @@ PresetBundle& PresetBundle::operator=(const PresetBundle &rhs)
 
     filament_presets    = rhs.filament_presets;
     project_config      = rhs.project_config;
+    project_overrides   = rhs.project_overrides;
     vendors             = rhs.vendors;
     obsolete_presets    = rhs.obsolete_presets;
     m_errors    = rhs.m_errors;
@@ -850,6 +1217,8 @@ void PresetBundle::reset(bool delete_files)
     this->obsolete_presets.filaments.clear();
     this->obsolete_presets.sla_materials.clear();
     this->obsolete_presets.printers.clear();
+    // The project layer belongs to a project, and this is the end of one.
+    this->project_overrides.clear();
 }
 
 void PresetBundle::setup_directories()
@@ -4047,23 +4416,30 @@ void PresetBundle::reset_default_nozzle_volume_type()
     this->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type")->values = current_printer.config.option<ConfigOptionEnumsGeneric>("default_nozzle_volume_type")->values;
 }
 
-int PresetBundle::get_printer_extruder_count() const
+//See the header. The answer, or the fact that there is not one.
+std::optional<int> PresetBundle::get_printer_extruder_count_checked() const
 {
     const Preset& printer_preset = this->printers.get_edited_preset();
 
     const auto* nozzle_diameter = printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
     if (nozzle_diameter == nullptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": nozzle_diameter is missing";
-        return 0;
+        return std::nullopt;
     }
     if (nozzle_diameter->values.empty()) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": nozzle_diameter is empty";
-        return 0;
+        return std::nullopt;
     }
 
-    int count = int(nozzle_diameter->values.size());
+    return int(nozzle_diameter->values.size());
+}
 
-    return count;
+int PresetBundle::get_printer_extruder_count() const
+{
+    //0 here means "there is no printer to count nozzles on", not "this printer has none".
+    //Anything that would divide, resize or size an array by the result wants the checked
+    //form above instead.
+    return get_printer_extruder_count_checked().value_or(0);
 }
 
 void PresetBundle::update_filament_count()
@@ -4479,6 +4855,11 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
     out.option<ConfigOptionStrings>("extruder_ams_count", true)->values   = save_extruder_ams_count_to_string(this->extruder_ams_counts);
 
 	out.option<ConfigOptionEnumGeneric>("printer_technology", true)->value = ptFFF;
+    // The same project layer every plate composes, applied here for the cursor's own view of the
+    // world: the sidebar, the preview and the 3MF's project_settings.config all read this config, so
+    // leaving it out would make a project override real at slice time and invisible everywhere else.
+    // It is also what carries these values into a saved project - see the header.
+    apply_project_overrides(out);
     return out;
 }
 
@@ -4926,6 +5307,13 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
 
         // 4) Load the project config values (the per extruder wipe matrix etc).
         this->project_config.apply_only(config, s_project_options);
+
+        // The project layer of the project being replaced does not survive it. Everything the file
+        // carries is already in the presets loaded above - a saved project's project_settings.config
+        // is a composed config, and load_external_preset decomposes it back into this project's own
+        // presets - so keeping the outgoing project's overrides here would apply one project's
+        // decisions to another's plates.
+        this->project_overrides.clear();
 
         break;
     }
@@ -5575,11 +5963,32 @@ void PresetBundle::update_multi_material_filament_presets(size_t to_delete_filam
     if (to_delete_filament_id == -1)
         to_delete_filament_id = num_filaments;
 
+    //A COUNT OF ZERO IS NOT A COUNT. get_printer_extruder_count returns 0 for "no printer
+    //worth the name is being edited", and this function turns that into permanent damage:
+    //flush_multiplier is resized to it, which empties the vector, and old_nozzle_nums is
+    //read straight back off that same vector on the next pass - so every later run divides
+    //old_matrix.size() by zero. Refuse the unanswerable case here instead of propagating it
+    //as a number, and refuse an already-emptied multiplier for the same reason.
+    const std::optional<int> checked_nozzle_nums = get_printer_extruder_count_checked();
+    if (!checked_nozzle_nums.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << ": the edited printer declares no nozzle diameter, so the flush matrix cannot be sized; leaving it as it is";
+        return;
+    }
+    const size_t nozzle_nums = size_t(*checked_nozzle_nums);
+
     // Now verify if flush_volumes_matrix has proper size (it is used to deduce number of extruders in wipe tower generator):
     std::vector<double> old_matrix = this->project_config.option<ConfigOptionFloats>("flush_volumes_matrix")->values;
     size_t old_nozzle_nums = this->project_config.option<ConfigOptionFloats>("flush_multiplier")->values.size();
+    if (old_nozzle_nums == 0) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << ": flush_multiplier is empty, so the existing flush matrix describes no extruder; rebuilding it for "
+            << nozzle_nums << " nozzle(s)";
+        this->project_config.option<ConfigOptionFloats>("flush_multiplier")->values.assign(nozzle_nums, 1.);
+        old_matrix.clear();
+        old_nozzle_nums = nozzle_nums;
+    }
     size_t old_number_of_filaments = size_t(sqrt(old_matrix.size() / old_nozzle_nums) + EPSILON);
-    size_t nozzle_nums = get_printer_extruder_count();
     if (old_nozzle_nums != nozzle_nums) {
         std::vector<double>& f_multiplier = this->project_config.option<ConfigOptionFloats>("flush_multiplier")->values;
         f_multiplier.resize(nozzle_nums, 1.f);

@@ -4215,12 +4215,16 @@ int CLI::run(int argc, char **argv)
         }
 
         partplate_list.reflow_layout();
+        //A project written before per-plate machines names no printer on any plate, and
+        //the project-wide bed translation below is the legacy repair for exactly those.
+        //Once a plate names its own machine its geometry is already exact, so translating
+        //it would move parts off a bed that fits them.
         const bool has_assigned_printer = std::any_of(partplate_list.get_plate_list().begin(), partplate_list.get_plate_list().end(),
             [](const Slic3r::GUI::PartPlate *plate) { return plate != nullptr && plate->has_printer_assignment(); });
         if (!has_assigned_printer)
             translate_models(partplate_list, m_print_config);
         else if (translate_old || shrink_to_new_bed > 0)
-            BOOST_LOG_TRIVIAL(info) << "Project-wide bed translation is not applicable to plates with exact printer assignments; each plate keeps its resolved printer geometry";
+            BOOST_LOG_TRIVIAL(info) << "Project-wide bed translation is not applicable to plates that name their own printer; each plate keeps its resolved printer geometry";
     }
     else {
         plate_print_configs.assign(partplate_list.get_plate_count(), m_print_config);
@@ -5082,20 +5086,38 @@ int CLI::run(int argc, char **argv)
                 : m_print_config; // plate 0 means the explicit Project-row arrangement pool
             int arrange_geometry_plate = plate_to_slice > 0 ? plate_to_slice - 1 : -1;
             std::vector<bool> original_plate_locks;
+            //The pool a global arrange may move is the plates that share the FIRST plate's
+            //machine: they share a bed, which is the property the pool ever really needed.
+            //Read once, BEFORE the loop. Deciding it inside the loop made the pool whatever
+            //the first plate carrying a name happened to be, so a part-converted project -
+            //plate 0 unassigned, plate 3 named, plate 5 unassigned - locked plate 5 out of a
+            //pool that plates 0-2 were in, for no reason the file expressed.
+            std::string pool_printer;
+            if (plate_to_slice == 0 && partplate_list.get_plate_count() > 0) {
+                if (const Slic3r::GUI::PartPlate *first = partplate_list.get_plate(0))
+                    pool_printer = first->get_printer_preset_name();
+            }
             if (plate_to_slice == 0) {
                 original_plate_locks.reserve(partplate_list.get_plate_count());
                 for (int index = 0; index < partplate_list.get_plate_count(); ++index) {
                     Slic3r::GUI::PartPlate *plate = partplate_list.get_plate(index);
                     original_plate_locks.push_back(plate->is_locked());
-                    if (plate->has_slicing_context_assignment())
+                    //Every plate carries its own context now, so "the plates that follow
+                    //the project" is not a set that exists. The pool a global arrange may
+                    //move is the plates that share the FIRST plate's machine: they share a
+                    //bed, which is the property the pool ever really needed. The rest are
+                    //locked, exactly as explicitly configured plates were before.
+                    if (plate->get_printer_preset_name() == pool_printer) {
+                        if (arrange_geometry_plate < 0)
+                            arrange_geometry_plate = index;
+                    } else
                         plate->lock(true);
-                    else if (arrange_geometry_plate < 0)
-                        arrange_geometry_plate = index;
                 }
                 if (arrange_geometry_plate < 0) {
-                    BOOST_LOG_TRIVIAL(info) << "Global arrange has no Project-context plate pool; all explicitly configured plates remain in place";
+                    BOOST_LOG_TRIVIAL(info) << "Global arrange found no plate to arrange against; every plate remains in place";
                     finished_arrange = true;
-                }
+                } else
+                    BOOST_LOG_TRIVIAL(info) << boost::format("Global arrange pool is the plates on '%1%'; plates on other machines are locked in place") % pool_printer;
             }
 
             if (duplicate_count > 0) {

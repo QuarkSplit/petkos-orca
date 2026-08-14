@@ -414,6 +414,26 @@ public:
 	static void                             update_suffix_modified(const std::string& new_suffix_modified);
     static const std::string&               suffix_modified();
     static std::string                      remove_suffix_modified(const std::string& name);
+
+    // THE DECORATION A PROJECT PUTS ON ITS OWN PRESETS, REMOVED.
+    //
+    // A preset loaded out of a 3MF is named "<preset>(<project file>)", per collection. The
+    // name a project carries therefore already has one when the project is reopened, and
+    // without this the decoration was appended again on every round trip - a real file on
+    // disk holds three of them. In this fork that is not cosmetic: a plate stores its
+    // process and its filaments by NAME, so a name that grows names a preset the bundle
+    // does not have and the plate reads unresolved for no reason anyone can see.
+    //
+    // Only a trailing, BALANCED "(...3mf)" group is decoration. The match has to be
+    // balanced because filenames routinely contain parentheses - "energy_revolver_(v2).3mf"
+    // is an ordinary MakerWorld download - and scanning back to the nearest '(' finds the
+    // one inside the filename and cuts the name in half. Ordinary preset names full of
+    // parentheses ("0.20mm Standard (0.4 nozzle)") are left exactly as they are, because
+    // what is inside the group does not end in .3mf.
+    //
+    // Idempotent, and it strips every trailing group rather than one, so a name that had
+    // already grown comes back to what it was.
+    static std::string                      strip_project_decoration(const std::string &name);
     static void                             normalize(DynamicPrintConfig &config);
     // Report configuration fields, which are misplaced into a wrong group, remove them from the config.
     static std::string                      remove_invalid_keys(DynamicPrintConfig &config, const DynamicPrintConfig &default_config);
