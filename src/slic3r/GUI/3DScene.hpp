@@ -186,6 +186,12 @@ public:
     std::pair<size_t, size_t> geometry_id;
     // An ID containing the extruder ID (used to select color).
     int                 	extruder_id;
+    // PetkosOrca: the filament's finish, resolved to the two numbers the shader wants. Stored on
+    // the volume and set beside its colour in update_colors_by_extruder, NOT looked up while
+    // rendering: reading the preset bundle per volume per frame is exactly the fault that made a
+    // frame 86 ms, and a second one would undo that work. 0/0 is Standard and draws as before.
+    float                   metalness { 0.f };
+    float                   gloss     { 0.f };
 
     size_t                  model_object_ID{0};
 

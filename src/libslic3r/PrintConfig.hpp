@@ -517,6 +517,25 @@ enum NozzleVolumeType {
     nvtMaxNozzleVolumeType = nvtTPUHighFlow
 };
 
+// PetkosOrca: how a filament LOOKS, which is not the same question as what colour it is.
+//
+// Orca has only a colour per filament, so silver PLA is stored as #C0C0C0 and painted as flat
+// light grey - a silver-and-yellow part reads as one colour with a dull half. But silver is not a
+// colour: it is grey with a metallic finish, exactly as gold is yellow with one. Making the finish
+// a property of the material rather than a special case in the palette means every filament can be
+// drawn as what it is, and nothing has to know the word "silver".
+//
+// Standard is the default and renders exactly as before, so existing profiles are unaffected.
+// Values are serialised by NAME (see s_keys_map_FilamentFinish), so the order is free to change.
+enum FilamentFinish {
+    ffStandard = 0,
+    ffMatte,
+    ffGlossy,
+    ffSilk,      // silk PLA: a sheen, not a metal - part-tinted reflection
+    ffMetallic,  // metallic/silver/gold filaments and metal-fill
+    ffMaxFilamentFinish = ffMetallic
+};
+
 enum FilamentMapMode {
     fmmAutoForFlush,
     fmmAutoForMatch,

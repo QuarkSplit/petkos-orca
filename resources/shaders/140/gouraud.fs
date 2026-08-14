@@ -29,6 +29,24 @@ struct SlopeDetection
 };
 
 uniform vec4 uniform_color;
+// PetkosOrca: filament FINISH.
+//
+// Orca paints every filament as a flat colour, so silver PLA arrives as light grey and a
+// silver-and-yellow part reads as one colour with a dull half. Silver is not a colour though - it
+// is grey with a metallic finish, exactly as gold is yellow with one. So the property belongs to
+// the material rather than the palette, and every filament becomes renderable as what it is.
+//
+// The shading difference between a metal and a plastic is one fact: a metal has almost no diffuse
+// and TINTS its reflection with its own colour, where a plastic reflects the light source's colour
+// (white) and gets its colour from the diffuse term. That is the whole model, and it is what makes
+// silver look like silver instead of pale grey.
+//
+// Both uniforms default to 0 when nothing sets them, and at 0 every expression below collapses to
+// the original line exactly - mix(white, c, 0) is white, (1 - 0.85*0) is 1, and the gloss branch
+// is not taken. So a build that never uploads a finish is pixel-identical to before.
+uniform float material_metalness;   // 0 = plastic, 1 = metal
+uniform float material_gloss;       // <=1 = leave the highlight alone, >1 tightens it
+
 uniform bool use_color_clip_plane;
 uniform vec4 uniform_color_clip_plane_1;
 uniform vec4 uniform_color_clip_plane_2;
@@ -240,6 +258,12 @@ void main()
     else if (use_environment_tex)
         out_color = vec4((0.45 * texture(environment_tex, normalize(eye_normal).xy * 0.5 + 0.5).xyz + 0.8 * color.rgb * intensity.x) * shade, color.a);
 #endif
-    else
-        out_color = vec4((vec3(intensity.y) + color.rgb * intensity.x) * shade, color.a);
+    else {
+        // See material_metalness above. color, not uniform_color, because this shader has
+        // already resolved clip-plane and slope colouring into a local.
+        float spec = material_gloss > 1.0 ? pow(max(intensity.y, 0.0), material_gloss) : intensity.y;
+        vec3  reflected = mix(vec3(1.0), color.rgb, material_metalness) * spec * (1.0 + 2.0 * material_metalness);
+        vec3  body = color.rgb * intensity.x * (1.0 - 0.85 * material_metalness);
+        out_color = vec4((reflected + body) * shade, color.a);
+    }
 }

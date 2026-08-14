@@ -1190,6 +1190,10 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
 
         if (!volume.first->model.is_initialized())
             shader->set_uniform("uniform_color", volume.first->render_color);
+        // Always set, never conditionally: a GL uniform is program state and persists between
+        // draws, so skipping a plastic volume would paint it with the previous metal's setting.
+        shader->set_uniform("material_metalness", volume.first->metalness);
+        shader->set_uniform("material_gloss", volume.first->gloss);
         shader->set_uniform("z_range", m_z_range);
         shader->set_uniform("clipping_plane", m_clipping_plane);
         shader->set_uniform("use_color_clip_plane", m_use_color_clip_plane);
@@ -1648,6 +1652,22 @@ void GLVolumeCollection::reset_outside_state()
     }
 }
 
+// PetkosOrca: a finish, as the two numbers the shader takes. The only physically meaningful one is
+// metalness: a metal has almost no diffuse and tints its reflection with its own colour, where a
+// plastic reflects white and takes its colour from the diffuse term. Gloss just tightens the
+// highlight. Silk sits between the two on purpose - silk PLA has a sheen without being metal.
+static std::pair<float, float> filament_finish_shading(FilamentFinish finish)
+{
+    switch (finish) {
+    case ffMatte:    return { 0.00f, 0.4f };
+    case ffGlossy:   return { 0.00f, 2.2f };
+    case ffSilk:     return { 0.35f, 3.0f };
+    case ffMetallic: return { 0.90f, 4.0f };
+    case ffStandard:
+    default:         return { 0.00f, 0.0f };   // 0/0 is "leave it alone", bit-identical to before
+    }
+}
+
 void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *config, bool is_update_alpha)
 {
     
@@ -1683,6 +1703,16 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
         }
     }
 
+    // PetkosOrca: the finish per extruder, resolved once here beside the colours rather than per
+    // volume per frame. A missing option means every filament is Standard, which is what an
+    // untouched profile should be.
+    std::vector<std::pair<float, float>> finishes;   // metalness, gloss
+    if (const auto *finish_opt = dynamic_cast<const ConfigOptionEnumsGeneric *>(config->option("filament_finish"))) {
+        finishes.reserve(finish_opt->values.size());
+        for (int value : finish_opt->values)
+            finishes.push_back(filament_finish_shading(static_cast<FilamentFinish>(value)));
+    }
+
     for (GLVolume* volume : volumes) {
         if (volume == nullptr || volume->is_modifier || volume->is_wipe_tower || volume->volume_idx() < 0)
             continue;
@@ -1690,6 +1720,14 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
         int extruder_id = volume->extruder_id - 1;
         if (extruder_id < 0 || (int)colors.size() <= extruder_id)
             extruder_id = 0;
+
+        if (extruder_id < (int) finishes.size()) {
+            volume->metalness = finishes[extruder_id].first;
+            volume->gloss     = finishes[extruder_id].second;
+        } else {
+            volume->metalness = 0.f;
+            volume->gloss     = 0.f;
+        }
 
         const ColorItem& color = colors[extruder_id];
         if (!color.first.empty()) {

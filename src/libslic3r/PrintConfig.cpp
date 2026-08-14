@@ -645,6 +645,15 @@ static const t_config_enum_values s_keys_map_NozzleVolumeType = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NozzleVolumeType)
 
+static const t_config_enum_values s_keys_map_FilamentFinish = {
+    { "standard", ffStandard },
+    { "matte",    ffMatte },
+    { "glossy",   ffGlossy },
+    { "silk",     ffSilk },
+    { "metallic", ffMetallic }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentFinish)
+
 static const t_config_enum_values s_keys_map_FilamentMapMode = {
     { "Auto For Flush", fmmAutoForFlush },
     { "Auto For Match", fmmAutoForMatch },
@@ -6291,6 +6300,26 @@ void PrintConfigDef::init_fff_params()
     def->set_default_value(new ConfigOptionEnumsGeneric{ ExtruderType::etDirectDrive });
 
     //BBS
+    def = this->add("filament_finish", coEnums);
+    def->label = L("Finish");
+    def->tooltip = L("How this filament looks when printed. This changes the preview only - it never "
+                     "reaches the G-code. Metallic tints its reflection with the filament's own colour "
+                     "instead of reflecting white, which is the difference between silver and grey.");
+    def->enum_keys_map = &ConfigOptionEnum<FilamentFinish>::get_enum_values();
+    // Order must match the FilamentFinish enum values.
+    def->enum_values.push_back(L("Standard"));
+    def->enum_values.push_back(L("Matte"));
+    def->enum_values.push_back(L("Glossy"));
+    def->enum_values.push_back(L("Silk"));
+    def->enum_values.push_back(L("Metallic"));
+    def->enum_labels.push_back(L("Standard"));
+    def->enum_labels.push_back(L("Matte"));
+    def->enum_labels.push_back(L("Glossy"));
+    def->enum_labels.push_back(L("Silk"));
+    def->enum_labels.push_back(L("Metallic"));
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionEnumsGeneric{ FilamentFinish::ffStandard });
+
     def = this->add("nozzle_volume_type", coEnums);
     // internal use only, don't need translation
     def->label = "Nozzle Volume Type";
