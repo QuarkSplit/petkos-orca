@@ -897,6 +897,10 @@ public:
     void enable_slope(bool enable) { m_slope.enable(enable); }
     void allow_multisample(bool allow) { m_multisample_allowed = allow; }
 
+    // The hit test _picking_pass performs, from a canvas pixel position, so a scripted
+    // run can ask what a click at a point would select. Same raycaster, same camera; the
+    // clipping plane is omitted because it only ever applies to volumes.
+    SceneRaycaster::HitResult pick_at(const Vec2d& canvas_pos) const;
     void zoom_to_bed();
     void zoom_to_volumes();
     void zoom_to_selection();

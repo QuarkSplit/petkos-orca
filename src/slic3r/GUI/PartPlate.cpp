@@ -631,7 +631,8 @@ void PartPlate::calc_gridlines(const ExPolygon& poly, const BoundingBox& pp_bbox
 
     // calculate and generate grid
     int   step          = Bed_2D::calculate_grid_step(pp_bbox, scale_(1.00));
-    Vec2d scaled_origin = Vec2d(scale_(m_origin.x()),scale_(m_origin.y()));
+    //the grid is anchored at this plate's own origin, which in its own frame is zero
+    Vec2d scaled_origin = Vec2d(0.0, 0.0);
     auto  grid_lines    = Bed_2D::generate_grid(poly, pp_bbox, scaled_origin, scale_(step), SCALED_EPSILON);
 
     Lines lines_thin = to_lines(grid_lines[0]);
@@ -654,10 +655,10 @@ void PartPlate::calc_height_limit() {
     m_height_limit_top.reset();
 
 	Lines3 bottom_h_lines, top_lines, top_h_lines, common_lines;
-	int shape_count = m_shape.size();
+	int shape_count = m_shape_local.size();
 	float first_z = 0.02f;
 	for (int i = 0; i < shape_count; i++) {
-		auto &cur_p = m_shape[i];
+		auto &cur_p = m_shape_local[i];
 		Vec3crd p1(scale_(cur_p.x()), scale_(cur_p.y()), scale_(first_z));
 		Vec3crd p2(scale_(cur_p.x()), scale_(cur_p.y()), scale_(m_height_to_rod));
 		Vec3crd p3(scale_(cur_p.x()), scale_(cur_p.y()), scale_(m_height_to_lid));
@@ -667,11 +668,11 @@ void PartPlate::calc_height_limit() {
 
 		Vec2d next_p;
 		if (i < (shape_count - 1)) {
-			next_p = m_shape[i+1];
+			next_p = m_shape_local[i+1];
 
 		}
 		else {
-			next_p = m_shape[0];
+			next_p = m_shape_local[0];
 		}
 		Vec3crd p4(scale_(cur_p.x()), scale_(cur_p.y()), scale_(m_height_to_rod));
 		Vec3crd p5(scale_(next_p.x()), scale_(next_p.y()), scale_(m_height_to_rod));
@@ -708,7 +709,7 @@ void PartPlate::calc_vertex_for_number(int index, bool one_number, GLModel &buff
 	poly.contour.append({ scale_(p(0) + PARTPLATE_ICON_GAP + PARTPLATE_ICON_SIZE - offset_x), scale_(p(1) - index * (PARTPLATE_ICON_SIZE + PARTPLATE_ICON_GAP)- PARTPLATE_ICON_GAP - PARTPLATE_TEXT_OFFSET_Y)});
 	poly.contour.append({ scale_(p(0) + PARTPLATE_ICON_GAP + offset_x), scale_(p(1) - index * (PARTPLATE_ICON_SIZE + PARTPLATE_ICON_GAP)- PARTPLATE_ICON_GAP - PARTPLATE_TEXT_OFFSET_Y) });
 #else //in the bottom
-    auto bed_ext   = get_extents(m_shape);
+    auto bed_ext   = get_extents(m_shape_local);
     Vec2d p        = bed_ext[1];
     float factor   = bed_ext.size()(1) / 200.0;
     float size     = PARTPLATE_ICON_SIZE     * factor;
@@ -730,7 +731,7 @@ void PartPlate::calc_vertex_for_plate_name_edit_icon(GLTexture *texture, int ind
     model.reset();
 
     ExPolygon poly;
-    auto  bed_ext  = get_extents(m_shape);
+    auto  bed_ext  = get_extents(m_shape_local);
     Vec2d p        = bed_ext[3];
     float factor   = bed_ext.size()(1) / 200.0;
     float icon_sz  = factor * PARTPLATE_EDIT_PLATE_NAME_ICON_SIZE;
@@ -763,7 +764,7 @@ void PartPlate::calc_vertex_for_icons(int index, PickingModel &model)
     model.reset();
 
     ExPolygon poly;
-    auto  bed_ext  = get_extents(m_shape);
+    auto  bed_ext  = get_extents(m_shape_local);
     Vec2d p        = bed_ext[2];
     auto  factor   = bed_ext.size()(1) / 200.0;
     float size     = PARTPLATE_ICON_SIZE     * factor;
@@ -843,7 +844,7 @@ void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffe
 		if (shader != nullptr) {
 			shader->start_using();
             const Camera &camera = wxGetApp().plater()->get_camera();
-            shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+            shader->set_uniform("view_model_matrix", camera.get_view_matrix() * m_model_matrix);
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
 			shader->set_uniform("transparent_background", 0);
 			shader->set_uniform("svg_source", 0);
@@ -986,10 +987,6 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
 			if (part.buffer && part.buffer->is_initialized()
 				//&& part.vbo_id != 0
 				) {
-				if (part.offset.x() != m_origin.x() || part.offset.y() != m_origin.y()) {
-					part.offset = Vec2d(m_origin.x(), m_origin.y());
-					part.update_buffer();
-				}
 				render_logo_texture(*(part.texture),
 									*(part.buffer),
 									bottom);
@@ -1002,10 +999,6 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
 		for (auto& part : m_partplate_list->cali_texture_info.parts) {
 			if (part.texture) {
                 if (part.buffer && part.buffer->is_initialized()) {
-					if (part.offset.x() != m_origin.x() || part.offset.y() != m_origin.y()) {
-						part.offset = Vec2d(m_origin.x(), m_origin.y());
-						part.update_buffer();
-					}
 					render_logo_texture(*(part.texture),
 						*(part.buffer),
 						bottom);
@@ -1021,10 +1014,6 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
         for (auto &part : m_partplate_list->extruder_only_area_info[language_idx].parts) {
             if (part.texture) {
                 if (part.buffer && part.buffer->is_initialized()) {
-                    if (part.offset.x() != m_origin.x() || part.offset.y() != m_origin.y()) {
-                        part.offset = Vec2d(m_origin.x(), m_origin.y());
-                        part.update_buffer();
-                    }
                     render_logo_texture(*(part.texture), *(part.buffer), bottom);
                 }
             }
@@ -1096,7 +1085,7 @@ void PartPlate::render_grid(bool bottom) {
     const Transform3d& view_matrix = camera.get_view_matrix();
     const Transform3d& projection_matrix = camera.get_projection_matrix();
 
-    shader->set_uniform("view_model_matrix", view_matrix);
+    shader->set_uniform("view_model_matrix", view_matrix * m_model_matrix);
     shader->set_uniform("projection_matrix", projection_matrix);
 
 #if !SLIC3R_OPENGL_ES
@@ -1129,7 +1118,7 @@ void PartPlate::render_grid(bool bottom) {
     }
     shader->start_using();
 
-    shader->set_uniform("view_model_matrix", view_matrix);
+    shader->set_uniform("view_model_matrix", view_matrix * m_model_matrix);
     shader->set_uniform("projection_matrix", projection_matrix);
 
 #if !SLIC3R_OPENGL_ES
@@ -1228,7 +1217,7 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
 	if (shader != nullptr) {
 		shader->start_using();
         const Camera &camera = wxGetApp().plater()->get_camera();
-        shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix() * m_model_matrix);
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
 		shader->set_uniform("transparent_background", bottom);
 		//shader->set_uniform("svg_source", boost::algorithm::iends_with(m_partplate_list->m_del_texture.get_source(), ".svg"));
@@ -1343,7 +1332,7 @@ void PartPlate::render_only_numbers(bool bottom)
 	if (shader != nullptr) {
 		shader->start_using();
         const Camera &camera = wxGetApp().plater()->get_camera();
-        shader->set_uniform("view_model_matrix", camera.get_view_matrix());
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix() * m_model_matrix);
         shader->set_uniform("projection_matrix", camera.get_projection_matrix());
 		shader->set_uniform("transparent_background", bottom);
 		//shader->set_uniform("svg_source", boost::algorithm::iends_with(m_partplate_list->m_del_texture.get_source(), ".svg"));
@@ -1588,16 +1577,29 @@ void PartPlate::render_right_arrow(const ColorRGBA render_color, bool use_lighti
 }
 */
 
-static void register_model_for_picking(GLCanvas3D &canvas, PickingModel &model, int id)
+//The picking mesh is the plate's own local geometry; the plate's frame is what puts it
+//where the user is clicking. Handing the transform over rather than baking it in is what
+//lets a move re-aim the pick instead of rebuilding its AABB tree.
+void PartPlate::register_model_for_picking(GLCanvas3D &canvas, PickingModel &model, int id)
 {
 	if (model.mesh_raycaster == nullptr)
 		return;
 
-    canvas.add_raycaster_for_picking(SceneRaycaster::EType::Bed, id, model.mesh_raycaster, Transform3d::Identity());
+	//the plate-name icon re-registers on its own whenever its texture is rebuilt, so drop
+	//the handles the canvas has already let go of rather than accumulating dead ones
+	m_picking_items.erase(std::remove_if(m_picking_items.begin(), m_picking_items.end(),
+		[](const std::weak_ptr<SceneRaycasterItem>& item) { return item.expired(); }),
+		m_picking_items.end());
+
+	m_picking_items.emplace_back(canvas.add_raycaster_for_picking(SceneRaycaster::EType::Bed, id, model.mesh_raycaster, m_model_matrix));
 }
 
 void PartPlate::register_raycasters_for_picking(GLCanvas3D &canvas)
 {
+	//the canvas drops every bed raycaster before it re-registers, so the handles we were
+	//holding are all expired by now
+	m_picking_items.clear();
+
     register_model_for_picking(canvas, m_triangles, picking_id_component(0));
     register_model_for_picking(canvas, m_del_icon, picking_id_component(1));
     register_model_for_picking(canvas, m_orient_icon, picking_id_component(2));
@@ -2557,6 +2559,12 @@ void PartPlate::set_pos_and_size(Vec3d& origin, int width, int depth, int height
 	m_depth = depth;
 	m_height = height;
 
+	//Origin and outline are one fact. Keeping them in step at the only place the origin
+	//is written is what lets every caller treat a move as a move: before this, a plate
+	//could sit at one place and draw at another until someone re-stamped its shape.
+	if (pos_changed)
+		apply_placement();
+
 	if (with_instance_move && m_plater)
 		m_plater->mark_plate_toolbar_image_dirty();
 
@@ -2603,7 +2611,7 @@ void PartPlate::generate_plate_name_texture()
 	}
 
     ExPolygon poly;
-    auto  bed_ext  = get_extents(m_shape);
+    auto  bed_ext  = get_extents(m_shape_local);
     Vec2d p        = bed_ext[3];
     float factor   = bed_ext.size()(1) / 200.0;
     float icon_sz  = factor * PARTPLATE_EDIT_PLATE_NAME_ICON_SIZE;
@@ -3269,7 +3277,7 @@ void PartPlate::move_instances_to(PartPlate& left_plate, PartPlate& right_plate,
 
 void PartPlate::generate_logo_polygon(ExPolygon &logo_polygon)
 {
-	if (m_shape.size() == 4)
+	if (m_shape_local.size() == 4)
 	{
         ResolvedPlateSlicingConfig resolved;
         if (m_plater == nullptr || !resolve_plate_context(this, resolved))
@@ -3279,7 +3287,7 @@ void PartPlate::generate_logo_polygon(ExPolygon &logo_polygon)
         //rectangle case
 		for (int i = 0; i < 4; i++)
 		{
-			const Vec2d& p = m_shape[i];
+			const Vec2d& p = m_shape_local[i];
 			if ((i  == 0) || (i  == 1)) {
                 logo_polygon.contour.append({scale_(p(0)), scale_(is_bbl_vendor ? p(1) - 12.f : p(1))});
             }
@@ -3289,7 +3297,7 @@ void PartPlate::generate_logo_polygon(ExPolygon &logo_polygon)
 		}
 	}
 	else {
-		for (const Vec2d& p : m_shape) {
+		for (const Vec2d& p : m_shape_local) {
 			logo_polygon.contour.append({ scale_(p(0)), scale_(p(1)) });
 		}
 	}
@@ -3310,7 +3318,7 @@ void PartPlate::generate_print_polygon(ExPolygon &print_polygon)
 		}
 	};
 
-	for (const Vec2d& p : m_shape) {
+	for (const Vec2d& p : m_shape_local) {
 			print_polygon.contour.append({scale_(p(0)), scale_(p(1))});
 		}
 }
@@ -3331,12 +3339,12 @@ void PartPlate::generate_exclude_polygon(ExPolygon &exclude_polygon)
 	};
 
 	int points_count = 8;
-	if (m_exclude_area.size() == 4)
+	if (m_exclude_area_local.size() == 4)
 	{
 		//rectangle case
 		for (int i = 0; i < 4; i++)
 		{
-			const Vec2d& p = m_exclude_area[i];
+			const Vec2d& p = m_exclude_area_local[i];
 			Vec2d center;
 			double start_angle, stop_angle, radius;
 			radius = 1.f; // ORCA use equal rounding for all corners
@@ -3373,7 +3381,7 @@ void PartPlate::generate_exclude_polygon(ExPolygon &exclude_polygon)
 		}
 	}
 	else {
-		for (const Vec2d& p : m_exclude_area) {
+		for (const Vec2d& p : m_exclude_area_local) {
 			exclude_polygon.contour.append({ scale_(p(0)), scale_(p(1)) });
 		}
 	}
@@ -3381,103 +3389,132 @@ void PartPlate::generate_exclude_polygon(ExPolygon &exclude_polygon)
 	exclude_polygon.contour.make_counter_clockwise();
 }
 
+//A plate is a rigid body: the bed profile is what it IS, its origin is only where it
+//sits. Those were one thing while every buffer carried world coordinates, so moving a
+//plate re-derived its outline, grid, icons and picking meshes. They are two things now,
+//and only the first of them costs anything to change.
 bool PartPlate::set_shape(const Pointfs& shape, const Pointfs& exclude_areas, const std::vector<Pointfs>& extruder_areas, const std::vector<double>& extruder_heights, Vec2d position, float height_to_lid, float height_to_rod)
 {
-	Pointfs new_shape, new_exclude_areas;
-	m_extruder_heights = extruder_heights;
+	const bool profile_changed = (m_shape_local != shape)
+		|| (m_exclude_area_local != exclude_areas)
+		|| (m_extruder_areas_local != extruder_areas)
+		|| (m_extruder_heights != extruder_heights)
+		|| (m_height_to_lid != height_to_lid)
+		|| (m_height_to_rod != height_to_rod);
+	const bool moved = (m_origin.x() != position.x()) || (m_origin.y() != position.y());
 
-	//keep the untranslated profile geometry so this plate can be moved or resized
-	//on its own later without the caller re-supplying it
-	m_shape_local = shape;
-	m_exclude_area_local = exclude_areas;
-	m_extruder_areas_local = extruder_areas;
-
-	for (const Vec2d& p : shape) {
-		new_shape.push_back(Vec2d(p.x() + position.x(), p.y() + position.y()));
-	}
-
-	for (const Vec2d& p : exclude_areas) {
-		new_exclude_areas.push_back(Vec2d(p.x() + position.x(), p.y() + position.y()));
-	}
-
-	std::vector<Pointfs> new_extruder_areas;
-	for (const Pointfs& shape : extruder_areas) {
-		Pointfs new_extruder_area;
-		for (const Vec2d& p : shape) {
-			Vec2d point(p(0) + position.x(), p(1) + position.y());
-			new_extruder_area.push_back(point);
-		}
-		new_extruder_areas.push_back(new_extruder_area);
-	}
-	m_extruder_areas = std::move(new_extruder_areas);
-
-	if ((m_shape == new_shape)&&(m_exclude_area == new_exclude_areas)
-		&&(m_height_to_lid == height_to_lid)&&(m_height_to_rod == height_to_rod)) {
+	if (!profile_changed && !moved) {
 		BOOST_LOG_TRIVIAL(info) << "PartPlate same shape, skip directly";
 		return false;
 	}
 
-	m_height_to_lid =  height_to_lid;
-	m_height_to_rod =  height_to_rod;
+	m_shape_local = shape;
+	m_exclude_area_local = exclude_areas;
+	m_extruder_areas_local = extruder_areas;
+	m_extruder_heights = extruder_heights;
+	m_height_to_lid = height_to_lid;
+	m_height_to_rod = height_to_rod;
 
-	if ((m_shape != new_shape) || (m_exclude_area != new_exclude_areas))
-	{
-		/*m_shape.clear();
-		for (const Vec2d& p : shape) {
-			m_shape.push_back(Vec2d(p.x() + position.x(), p.y() + position.y()));
-		}
+	if (profile_changed)
+		rebuild_geometry();
 
-		m_exclude_area.clear();
-		for (const Vec2d& p : exclude_areas) {
-			m_exclude_area.push_back(Vec2d(p.x() + position.x(), p.y() + position.y()));
-		}*/
-		m_shape = std::move(new_shape);
-		m_exclude_area = std::move(new_exclude_areas);
-
-		calc_bounding_boxes();
-
-		if (m_plater != nullptr) { // render data, skip in CLI mode where m_plater is null
-			ExPolygon logo_poly;
-			generate_logo_polygon(logo_poly);
-			m_logo_triangles.reset();
-			if (!init_model_from_poly(m_logo_triangles, logo_poly, GROUND_Z + 0.02f))
-				BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":Unable to create logo triangles\n";
-
-			ExPolygon poly;
-			generate_print_polygon(poly);
-			calc_triangles(poly);
-
-			// reset m_wrapping_detection_triangles when change printer
-			m_print_polygon = poly;
-			m_wrapping_detection_triangles.reset();
-			init_raycaster_from_model(m_triangles);
-
-			ExPolygon exclude_poly;
-			generate_exclude_polygon(exclude_poly);
-			calc_exclude_triangles(exclude_poly);
-
-			const BoundingBox& pp_bbox = poly.contour.bounding_box();
-			calc_gridlines(poly, pp_bbox);
-
-			calc_vertex_for_icons(0, m_del_icon);
-			calc_vertex_for_icons(1, m_orient_icon);
-			calc_vertex_for_icons(2, m_arrange_icon);
-			calc_vertex_for_icons(3, m_lock_icon);
-			calc_vertex_for_icons(4, m_plate_settings_icon);
-			// ORCA also change bed_icon_count number in calc_vertex_for_icons() after adding or removing icons for circular shaped beds that uses vertical alingment for icons
-			const bool dual_bbl = plate_uses_dual_bbl(this);
-			calc_vertex_for_icons(dual_bbl ? 5 : 6, m_plate_filament_map_icon);
-			calc_vertex_for_icons(dual_bbl ? 6 : 5, m_move_front_icon);
-
-			calc_vertex_for_number(0, false, m_plate_idx_icon);
-			// calc vertex for plate name
-			invalidate_plate_name_texture();
-		}
+	if (moved) {
+		//An origin is written in exactly one place, so that the Print's copy of it and
+		//the plate's own can never disagree. No instances move: that is a caller's
+		//decision, and this one is only being told where its bed sits.
+		Vec3d origin(position.x(), position.y(), m_origin.z());
+		set_pos_and_size(origin, m_width, m_depth, m_height, false, false);
 	}
+	else
+		apply_placement();
 
+	return profile_changed;
+}
+
+//Rebuild every buffer from the local profile, all of it at the plate's own origin.
+//Only a change of bed or of the height rods reaches here; a change of position never does.
+void PartPlate::rebuild_geometry()
+{
+	PETKOS_PERF_SCOPE(Perf::Probe::PlateSetShapeGeom);
+
+	//the rod/lid outlines follow the profile, and are wanted headless too
 	calc_height_limit();
 
-	return true;
+	if (m_plater == nullptr) // render data, skip in CLI mode where m_plater is null
+		return;
+
+	ExPolygon logo_poly;
+	generate_logo_polygon(logo_poly);
+	m_logo_triangles.reset();
+	if (!init_model_from_poly(m_logo_triangles, logo_poly, GROUND_Z + 0.02f))
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":Unable to create logo triangles\n";
+
+	ExPolygon poly;
+	generate_print_polygon(poly);
+	calc_triangles(poly);
+
+	// reset m_wrapping_detection_triangles when change printer
+	m_print_polygon = poly;
+	m_wrapping_detection_triangles.reset();
+	init_raycaster_from_model(m_triangles);
+
+	ExPolygon exclude_poly;
+	generate_exclude_polygon(exclude_poly);
+	calc_exclude_triangles(exclude_poly);
+
+	const BoundingBox& pp_bbox = poly.contour.bounding_box();
+	calc_gridlines(poly, pp_bbox);
+
+	calc_vertex_for_icons(0, m_del_icon);
+	calc_vertex_for_icons(1, m_orient_icon);
+	calc_vertex_for_icons(2, m_arrange_icon);
+	calc_vertex_for_icons(3, m_lock_icon);
+	calc_vertex_for_icons(4, m_plate_settings_icon);
+	// ORCA also change bed_icon_count number in calc_vertex_for_icons() after adding or removing icons for circular shaped beds that uses vertical alingment for icons
+	const bool dual_bbl = plate_uses_dual_bbl(this);
+	calc_vertex_for_icons(dual_bbl ? 5 : 6, m_plate_filament_map_icon);
+	calc_vertex_for_icons(dual_bbl ? 6 : 5, m_move_front_icon);
+
+	calc_vertex_for_number(0, false, m_plate_idx_icon);
+	// calc vertex for plate name
+	invalidate_plate_name_texture();
+}
+
+//Put the fixed geometry at m_origin. Everything here is proportional to the number of
+//points in the bed outline; no buffer is rebuilt and no AABB tree is retraversed.
+void PartPlate::apply_placement()
+{
+	//A plate with no bed profile has nothing to place. The unprintable plate is the one
+	//such plate: it is a parking slot, not a machine.
+	if (m_shape_local.empty())
+		return;
+
+	const Vec2d position(m_origin.x(), m_origin.y());
+
+	//the world-space profile, which is what the rest of the app asks a plate for
+	m_shape = m_shape_local;
+	for (Vec2d& p : m_shape)
+		p += position;
+
+	m_exclude_area = m_exclude_area_local;
+	for (Vec2d& p : m_exclude_area)
+		p += position;
+
+	m_extruder_areas = m_extruder_areas_local;
+	for (Pointfs& area : m_extruder_areas)
+		for (Vec2d& p : area)
+			p += position;
+
+	m_model_matrix = Geometry::translation_transform(Vec3d(position.x(), position.y(), 0.0));
+
+	calc_bounding_boxes();
+
+	//A registered raycaster is aimed by its transform, so picking follows the plate
+	//without the mesh it was built from being touched.
+	for (const std::weak_ptr<SceneRaycasterItem>& weak : m_picking_items) {
+		if (std::shared_ptr<SceneRaycasterItem> item = weak.lock())
+			item->set_transform(m_model_matrix);
+	}
 }
 
 //footprint of this plate's own bed, independent of any neighbour
@@ -3487,18 +3524,6 @@ Vec2d PartPlate::get_local_size() const
 		return Vec2d(0.0, 0.0);
 
 	return get_extents(m_shape_local).size();
-}
-
-//re-apply our own geometry at a new origin
-bool PartPlate::reposition(const Vec2d& position)
-{
-	//copy first: set_shape writes to the very members we are reading from
-	const Pointfs shape = m_shape_local;
-	const Pointfs exclude_areas = m_exclude_area_local;
-	const std::vector<Pointfs> extruder_areas = m_extruder_areas_local;
-	const std::vector<double> extruder_heights = m_extruder_heights;
-
-	return set_shape(shape, exclude_areas, extruder_areas, extruder_heights, position, m_height_to_lid, m_height_to_rod);
 }
 
 const BoundingBox PartPlate::get_bounding_box_crd()
@@ -3574,7 +3599,8 @@ void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projec
         glsafe(::glEnable(GL_BLEND));
         glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
 
-        shader->set_uniform("view_model_matrix", view_matrix);
+        //every buffer below is authored at this plate's origin; the frame puts it in the scene
+        shader->set_uniform("view_model_matrix", view_matrix * m_model_matrix);
         shader->set_uniform("projection_matrix", projection_matrix);
 
         if (!bottom) {
@@ -3584,7 +3610,9 @@ void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projec
             render_exclude_area(force_background_color);
             if(m_selected && wxGetApp().plater()->get_enable_wrapping_detection()){
                 if(!m_wrapping_detection_triangles.is_initialized()){
-                    auto points = get_plate_wrapping_detection_area();
+                    //both sides local: the frame places the result, so a plate that moves
+                    //no longer throws this away and re-intersects it
+                    const std::vector<Vec2d>& points = m_wrapping_exclude_area_local;
                     if (points.size() > 0) {//wrapping_detection_area
                         ExPolygon temp_poly;
                         for (const Vec2d &p : points) {
@@ -4474,8 +4502,10 @@ void PartPlateList::reflow_layout()
 
 		plate->set_index((int)i);
 		Vec3d origin(pos.x(), pos.y(), 0.0);
+		//one call: it moves the plate's instances and re-places the plate itself. The
+		//separate geometry re-stamp that used to follow is what made a reflow cost
+		//O(plates) rebuilds of outlines, grids, icons and picking meshes.
 		plate->set_pos_and_size(origin, (int)size.x(), (int)size.y(), m_plate_height, true);
-		plate->reposition(pos);
 
 		x += size.x() * (1. + LOGICAL_PART_PLATE_GAP);
 	}
@@ -4629,12 +4659,10 @@ bool PartPlateList::set_plate_shape(int                         index,
 	//stamp the new bed on at the plate's current origin; reflow_layout then shuffles
 	//the neighbours around whatever footprint it turned out to be
 	const Vec2d current_origin = get_plate_origin_2d(index);
-	bool changed = false;
-	{
-		PETKOS_PERF_SCOPE(Perf::Probe::PlateSetShapeGeom);
-		changed = plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights,
-		                          current_origin, height_to_lid, height_to_rod);
-	}
+	//PlateSetShapeGeom now sits inside PartPlate::rebuild_geometry, which is the only
+	//thing here that costs anything and the only thing every caller reaches.
+	const bool changed = plate->set_shape(shape, exclude_areas, extruder_areas, extruder_heights,
+	                                      current_origin, height_to_lid, height_to_rod);
 	if (!changed) {
 		//The outline did not move, but two printers can share an outline and differ
 		//in height (P1P vs X1E). set_pos_and_size applies the height override, and
@@ -7203,13 +7231,10 @@ void PartPlateList::BedTextureInfo::TexturePart::update_buffer()
 	rectangle.push_back(Vec2d(x, y+h));
 	ExPolygon poly;
 
-	for (int i = 0; i < 4; i++) {
-		const Vec2d & p = rectangle[i];
-		for (auto& p : rectangle) {
-			Vec2d pp = Vec2d(p.x() + offset.x(), p.y() + offset.y());
-			poly.contour.append({ scale_(pp(0)), scale_(pp(1)) });
-		}
-	}
+	//one point per corner. The nested loop this replaces appended all four corners four
+	//times over, so the quad was a contour that crossed itself three times.
+	for (const Vec2d& p : rectangle)
+		poly.contour.append({ scale_(p(0)), scale_(p(1)) });
 
 	if (!buffer)
         buffer = new GLModel();

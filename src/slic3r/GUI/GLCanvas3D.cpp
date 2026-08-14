@@ -1908,6 +1908,11 @@ void GLCanvas3D::enable_separator_toolbar(bool enable)
     m_separator_toolbar.set_enabled(enable);
 }
 
+SceneRaycaster::HitResult GLCanvas3D::pick_at(const Vec2d& canvas_pos) const
+{
+    return m_scene_raycaster.hit(canvas_pos, wxGetApp().plater()->get_camera(), nullptr);
+}
+
 void GLCanvas3D::zoom_to_bed()
 {
     BoundingBoxf3 box = m_bed.build_volume().bounding_volume();

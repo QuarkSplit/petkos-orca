@@ -172,6 +172,17 @@ private:
     GLModel m_plate_idx_icon;
     GLTexture m_texture;
 
+    // Every GL buffer above is authored in this plate's own frame, with its bed origin
+    // at (0,0), and drawn through this matrix. Position is where a plate IS, not part
+    // of what it is shaped like: baking the origin into the vertices made every move a
+    // re-derivation of the outline, grid, icons and raycasters. A move now writes one
+    // matrix.
+    Transform3d m_model_matrix{ Transform3d::Identity() };
+    // The bed raycasters handed to the canvas, so a move can re-aim them instead of
+    // rebuilding their AABB trees. Weak because the canvas owns them and drops the lot
+    // on a scene reset.
+    std::vector<std::weak_ptr<SceneRaycasterItem>> m_picking_items;
+
     float m_scale_factor{ 1.0f };
     GLUquadricObject* m_quadric;
     int m_hover_id;
@@ -212,6 +223,13 @@ private:
     void generate_exclude_polygon(ExPolygon &exclude_polygon);
     void generate_logo_polygon(ExPolygon &logo_polygon);
     void calc_bounding_boxes() const;
+    // Put this plate's fixed geometry at m_origin: the world-space point lists the rest
+    // of the app reads, the bounding boxes derived from them, the render matrix and the
+    // registered raycasters. All O(shape points); no buffer is rebuilt.
+    void apply_placement();
+    // Rebuild every GL buffer from the local profile. Only a change of bed shape or of
+    // the height rods needs this; a change of position never does.
+    void rebuild_geometry();
     void calc_triangles(const ExPolygon& poly);
     void calc_exclude_triangles(const ExPolygon& poly);
     void calc_triangles_from_polygon(const ExPolygon &poly, GLModel& render_model);
@@ -242,6 +260,7 @@ private:
     void render_plate_name_texture();
     void invalidate_plate_name_texture();
     void register_raycasters_for_picking(GLCanvas3D& canvas);
+    void register_model_for_picking(GLCanvas3D& canvas, PickingModel& model, int id);
     int picking_id_component(int idx) const;
 
     void on_filament_map_mode_change();
@@ -516,10 +535,9 @@ public:
     const std::vector<Pointfs>& get_local_extruder_areas() const { return m_extruder_areas_local; }
     // Footprint of this plate's own bed, independent of any neighbour.
     Vec2d get_local_size() const;
-    // Re-apply this plate's own geometry at a new origin. Cheaper and safer than
-    // set_shape when only the position moved, and it cannot pick up a neighbour's
-    // bed by accident.
-    bool reposition(const Vec2d& position);
+    // This plate's own frame in world space. Every buffer it owns is built at the
+    // origin and drawn through this.
+    const Transform3d& get_model_matrix() const { return m_model_matrix; }
     const std::vector<Pointfs>& get_extruder_areas() const { return m_extruder_areas; }
     const std::vector<double>& get_extruder_heights() const { return m_extruder_heights; }
     bool contains(const Vec3d& point) const;
@@ -794,7 +812,6 @@ public:
             float h;
             std::string filename;
             GLTexture* texture { nullptr };
-            Vec2d offset;
             GLModel* buffer { nullptr };
             TexturePart(float xx, float yy, float ww, float hh, std::string file){
                 x = xx; y = yy;
@@ -802,7 +819,6 @@ public:
                 filename = file;
                 texture = nullptr;
                 buffer = nullptr;
-                offset = Vec2d(0, 0);
             }
 
             TexturePart(const TexturePart& part) {
@@ -810,7 +826,6 @@ public:
                 this->y = part.y;
                 this->w = part.w;
                 this->h = part.h;
-                this->offset = part.offset;
                 this->buffer    = part.buffer;
                 this->filename  = part.filename;
                 this->texture   = part.texture;
@@ -828,6 +843,8 @@ public:
             void update_buffer();
             void reset();
         };
+        // x/y/w/h are bed-local millimetres. Each plate draws these shared buffers
+        // through its own frame, so no copy of them carries a plate's position.
         std::vector<TexturePart> parts;
         void                     reset();
     };
