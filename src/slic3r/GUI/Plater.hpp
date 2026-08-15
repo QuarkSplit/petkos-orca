@@ -537,7 +537,10 @@ public:
 
     // BBS: segment model with CGAL
     void segment(size_t obj_idx, size_t instance_idx, double smoothing_alpha=0.5, int segment_number=5);
-    void apply_cut_object_to_model(size_t init_obj_idx, const ModelObjectPtrs& cut_objects);
+    //distribute_to_plates packs the resulting parts into the current plate's free space
+    //instead of leaving them standing in the source object's footprint. Off by default, so
+    //every existing caller keeps the behaviour it had.
+    void apply_cut_object_to_model(size_t init_obj_idx, const ModelObjectPtrs& cut_objects, bool distribute_to_plates = false);
     void merge(size_t obj_idx, std::vector<int> &vol_indeces);
 
     void send_to_printer(bool isall = false);

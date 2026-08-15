@@ -17,6 +17,11 @@
 #include "imgui/imgui_internal.h"
 #include "slic3r/GUI/Field.hpp"
 #include "slic3r/GUI/MsgDialog.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
+#include "slic3r/GUI/OpenGLManager.hpp"
+#include "slic3r/GUI/Jobs/ArrangeJob.hpp"
+#include "slic3r/GUI/Jobs/Job.hpp"
+#include "slic3r/GUI/Jobs/Worker.hpp"
 #include "FixModelByCgal.hpp"
 
 namespace Slic3r {
@@ -279,6 +284,22 @@ bool GLGizmoCut3D::on_mouse(const wxMouseEvent &mouse_event)
 {
     Vec2i32 mouse_coord(mouse_event.GetX(), mouse_event.GetY());
     Vec2d mouse_pos = mouse_coord.cast<double>();
+
+    //Drawing the cut region owns the mouse outright while it is armed. It is taken before
+    //the grabbers so that a stroke started over the plane grabber draws instead of dragging
+    //the plane, which is the one collision the two interactions have.
+    if (m_bounds_drawing && !m_connectors_editing) {
+        if (mouse_event.LeftDown())
+            return bounds_event(SLAGizmoEventType::LeftDown, mouse_pos);
+        if (mouse_event.Dragging())
+            return bounds_event(SLAGizmoEventType::Dragging, mouse_pos);
+        if (mouse_event.LeftUp())
+            return bounds_event(SLAGizmoEventType::LeftUp, mouse_pos);
+        if (mouse_event.RightDown())
+            return bounds_event(SLAGizmoEventType::RightDown, mouse_pos);
+        if (mouse_event.Moving())
+            return false;
+    }
 
     if (mouse_event.ShiftDown() && mouse_event.LeftDown())
         return gizmo_event(SLAGizmoEventType::LeftDown, mouse_pos, mouse_event.ShiftDown(), mouse_event.AltDown(), mouse_event.CmdDown());
@@ -1331,6 +1352,13 @@ bool GLGizmoCut3D::on_init()
         {ctrl + "A",                        _L("Select all connectors")},
     };
 
+    //Order matches CutBounds::Shape, so the combo index IS the shape and nothing has to map
+    //between them.
+    m_bounds_shapes = {_u8L("Whole plane"), _u8L("Rectangle"), _u8L("Disc"), _u8L("Lasso")};
+
+    if (AppConfig* cfg = wxGetApp().app_config)
+        m_distribute_to_plates = cfg->get_bool("cut_distribute_to_plates");
+
     return true;
 }
 
@@ -1420,6 +1448,10 @@ void GLGizmoCut3D::on_set_state()
         }
         m_selected.clear();
         m_parent.set_use_color_clip_plane(false);
+        //The region belongs to the plane that is going away with the gizmo. Leaving it set
+        //would silently bound the next object's cut with a shape drawn for a different one.
+        reset_bounds();
+        m_bounds_outline.reset();
         //m_c->selection_info()->set_use_shift(false);
 
         // Make sure that the part selection data are released when the gizmo is closed.
@@ -2303,6 +2335,10 @@ void GLGizmoCut3D::on_render()
         render_cut_plane_grabbers();
     }
 
+    //Drawn after the plane so the region reads as sitting on it, and outside the
+    //hide-cut-plane branch so a hidden plane still shows where the cut will stop.
+    render_bounds_region();
+
     render_cut_line();
 
     m_selection_rectangle.render(m_parent);
@@ -2488,6 +2524,9 @@ void GLGizmoCut3D::reset_cut_plane()
     set_center(m_bb_center);
     m_start_dragging_m = m_rotation_m = Transform3d::Identity();
     m_ar_plane_center  = m_plane_center;
+
+    //The region was drawn on the plane that has just been thrown away, so it goes with it.
+    reset_bounds();
 
     reset_cut_by_contours();
     m_parent.request_extra_frame();
@@ -2879,6 +2918,12 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
         if (mode == CutMode::cutPlanar) {
             ImGui::Separator();
 
+            //The bound is on the PLANE, so it belongs beside the plane's own controls and
+            //above everything that describes what happens to the parts afterwards.
+            render_bounds_input_window();
+
+            ImGui::Separator();
+
             m_imgui->disabled_begin(!m_keep_upper || !m_keep_lower || m_keep_as_parts || (m_part_selection.valid() && m_part_selection.is_one_object()));
                 if (m_imgui->button(has_connectors ? _L("Edit connectors") : _L("Add connectors")))
                     set_connectors_editing(true);
@@ -2965,6 +3010,14 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
                 m_rotate_upper = m_rotate_lower = false;
             }
         m_imgui->disabled_end();
+
+        //A cut leaves its parts standing exactly where the source object stood - overlapping,
+        //and for the halves of anything worth cutting, off the bed. Packing them into the
+        //plate's free space is the work the app can obviously do, so it offers to do it.
+        if (m_imgui->bbl_checkbox(_L("Distribute parts to plates"), m_distribute_to_plates)) {
+            if (AppConfig* cfg = wxGetApp().app_config)
+                cfg->set_bool("cut_distribute_to_plates", m_distribute_to_plates);
+        }
     }
 
     ImGui::Separator();
@@ -3126,6 +3179,13 @@ void GLGizmoCut3D::render_input_window_warning() const
         m_imgui->warning_text(/*wxString(ImGui::WarningMarkerSmall)*/ _L("Warning") + ": " + _L("Cut plane is placed out of object"));
     else if (invalid_groove_warning)
         m_imgui->warning_text(/*wxString(ImGui::WarningMarkerSmall)*/ _L("Warning") + ": " + _L("Cut plane with groove is invalid"));
+
+    //Whatever the last attempt actually refused to do, in its own words. A disabled button
+    //with no reason beside it is the failure this line exists to prevent.
+    if (!m_cut_report.empty()) {
+        ImGui::Separator();
+        m_imgui->warning_text(_L("Warning") + ": " + from_u8(m_cut_report));
+    }
 }
 
 void GLGizmoCut3D::on_render_input_window(float x, float y, float bottom_limit)
@@ -3258,7 +3318,14 @@ void GLGizmoCut3D::check_and_update_connectors_state()
      for (size_t i = 0; i < connectors.size(); ++i) {
         const CutConnector& connector = connectors[i];
         Vec3d pos = connector.pos + instance_offset + sla_shift * Vec3d::UnitZ(); // recalculate connector position to world position
-        if (is_conflict_for_connector(i, connectors, pos))
+        //A connector placed while the plane was unbounded, or before the region was moved,
+        //can end up where there is no cut face. It counts as out of the cut contour, which
+        //is the same fault in the user's terms and already has a message.
+        const bool conflict       = is_conflict_for_connector(i, connectors, pos);
+        const bool outside_region = !conflict && is_outside_of_bounds(pos);
+        if (outside_region)
+            m_info_stats.outside_cut_contour++;
+        if (conflict || outside_region)
             m_invalid_connectors_idxs.emplace_back(i);
      }
 }
@@ -3365,6 +3432,11 @@ bool GLGizmoCut3D::can_perform_cut() const
     if (! m_invalid_connectors_idxs.empty() || (!m_keep_upper && !m_keep_lower) || m_connectors_editing)
         return false;
 
+    //A shape was chosen and no region has been drawn yet. Cutting now would have to mean
+    //either the infinite plane or nothing, and both are answers the user did not give.
+    if (m_bounds_shape_id != int(CutBounds::Shape::Unbounded) && !m_bounds.bounded())
+        return false;
+
     if (CutMode(m_mode) == CutMode::cutTongueAndGroove)
         return has_valid_groove();
 
@@ -3415,6 +3487,265 @@ bool GLGizmoCut3D::has_valid_contour() const
 {
     const auto clipper = m_c->object_clipper();
     return clipper && clipper->has_valid_contour();
+}
+
+// ------------------------------------------------------------------------------------------
+// Bounded planar cut: the plane that stops somewhere
+// ------------------------------------------------------------------------------------------
+
+//A stroke shorter than this was a click. Committing it would produce a region with no area,
+//which reads as "bounded" structurally and cuts nothing at all.
+static const double BOUNDS_MIN_EXTENT = 0.2; // mm
+
+//Drawn ON the cut plane, so it has to read against the pale plane in light mode and against
+//the model behind it in dark. Two colours, one rule.
+static ColorRGBA bounds_outline_color(bool dark)
+{
+    return dark ? ColorRGBA(0.42f, 0.80f, 1.00f, 1.0f) : ColorRGBA(0.04f, 0.36f, 0.82f, 1.0f);
+}
+
+//The region as it currently reads, whether it is still being dragged or already committed.
+//One function, so the preview cannot disagree with what gets executed.
+static CutBounds bounds_from_stroke(CutBounds::Shape shape, const Vec2d &anchor, const std::vector<Vec2d> &stroke)
+{
+    if (stroke.empty())
+        return CutBounds();
+    const Vec2d last = stroke.back();
+    switch (shape) {
+    case CutBounds::Shape::Rectangle: return CutBounds::make_rectangle(anchor, last);
+    case CutBounds::Shape::Disc:      return CutBounds::make_disc(anchor, (last - anchor).norm());
+    case CutBounds::Shape::Lasso:     return stroke.size() >= 3 ? CutBounds::make_lasso(stroke) : CutBounds();
+    default:                          return CutBounds();
+    }
+}
+
+static bool bounds_big_enough(const CutBounds &b)
+{
+    if (!b.bounded())
+        return false;
+    Vec2d lo = b.contour.front(), hi = b.contour.front();
+    for (const Vec2d &p : b.contour) {
+        lo = lo.cwiseMin(p);
+        hi = hi.cwiseMax(p);
+    }
+    const Vec2d sz = hi - lo;
+    return sz.x() > BOUNDS_MIN_EXTENT && sz.y() > BOUNDS_MIN_EXTENT;
+}
+
+//A mouse position becomes a point of the cut plane in the plane's OWN frame - the frame Cut
+//executes in - so what is drawn and what is cut are the same numbers. Deliberately not
+//routed through unproject_on_cut_plane(), which refuses points outside the object's cut
+//contour: the region is allowed to be drawn around the model, and usually has to be.
+bool GLGizmoCut3D::plane_local_from_mouse(const Vec2d &mouse_position, Vec2d &local)
+{
+    const Camera &camera = wxGetApp().plater()->get_camera();
+    Vec3d point, direction;
+    MeshRaycaster::line_from_mouse_pos(mouse_position, Transform3d::Identity(), camera, point, direction);
+
+    const Vec3d  normal = m_rotation_m.linear() * Vec3d::UnitZ();
+    const double den    = normal.dot(direction);
+    if (std::abs(den) < EPSILON)
+        return false;
+
+    const Vec3d hit      = point + (normal.dot(m_plane_center - point) / den) * direction;
+    const Vec3d in_plane = m_rotation_m.linear().inverse() * (hit - m_plane_center);
+    local = Vec2d(in_plane.x(), in_plane.y());
+    return true;
+}
+
+void GLGizmoCut3D::set_bounds_shape(int shape_id)
+{
+    m_bounds_shape_id      = shape_id;
+    m_bounds_dragging      = false;
+    m_bounds_stroke.clear();
+    m_bounds.clear();
+    m_bounds_outline_valid = false;
+    m_cut_report.clear();
+    //Choosing a shape arms the next stroke. A shape without a region cuts nothing, which is
+    //the honest state to be in between choosing and drawing - never "everything".
+    m_bounds_drawing = shape_id != int(CutBounds::Shape::Unbounded);
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoCut3D::reset_bounds()
+{
+    m_bounds.clear();
+    m_bounds_shape_id      = int(CutBounds::Shape::Unbounded);
+    m_bounds_drawing       = false;
+    m_bounds_dragging      = false;
+    m_bounds_stroke.clear();
+    m_bounds_outline_valid = false;
+    m_cut_report.clear();
+}
+
+bool GLGizmoCut3D::bounds_event(SLAGizmoEventType action, const Vec2d &mouse_position)
+{
+    if (!m_bounds_drawing || m_connectors_editing)
+        return false;
+
+    const CutBounds::Shape shape = CutBounds::Shape(m_bounds_shape_id);
+    if (shape == CutBounds::Shape::Unbounded)
+        return false;
+
+    if (action == SLAGizmoEventType::RightDown) {
+        // Abandon the stroke in progress; whatever was committed before it survives.
+        m_bounds_dragging      = false;
+        m_bounds_stroke.clear();
+        m_bounds_outline_valid = false;
+        m_parent.set_as_dirty();
+        return true;
+    }
+
+    Vec2d local;
+    if (!plane_local_from_mouse(mouse_position, local))
+        return false;
+
+    if (action == SLAGizmoEventType::LeftDown) {
+        m_bounds_dragging      = true;
+        m_bounds_anchor        = local;
+        m_bounds_stroke.assign(1, local);
+        m_bounds_outline_valid = false;
+        m_parent.set_as_dirty();
+        return true;
+    }
+
+    if (!m_bounds_dragging)
+        return false;
+
+    if (action == SLAGizmoEventType::Dragging) {
+        if (shape == CutBounds::Shape::Lasso) {
+            //Pixel-resolution sampling is what makes a lasso a lasso; 0.1 mm between kept
+            //points is below what any downstream stage can resolve, so nothing is lost and
+            //the contour never needs simplifying afterwards.
+            if (m_bounds_stroke.empty() || (m_bounds_stroke.back() - local).norm() > 0.1)
+                m_bounds_stroke.push_back(local);
+        }
+        else
+            m_bounds_stroke = {m_bounds_anchor, local};
+        m_bounds_outline_valid = false;
+        m_parent.set_as_dirty();
+        return true;
+    }
+
+    if (action == SLAGizmoEventType::LeftUp) {
+        m_bounds_dragging = false;
+        const CutBounds drawn = bounds_from_stroke(shape, m_bounds_anchor, m_bounds_stroke);
+        if (bounds_big_enough(drawn)) {
+            m_bounds         = drawn;
+            m_bounds_drawing = false;
+            m_cut_report.clear();
+        }
+        else {
+            //Nothing was drawn, so nothing is claimed. Staying armed is the state that
+            //matches what happened; silently reverting to the infinite plane is not.
+            m_bounds.clear();
+            m_cut_report = _u8L("The region was too small to cut with. Drag out a region on the cut plane.");
+        }
+        m_bounds_stroke.clear();
+        m_bounds_outline_valid = false;
+        m_parent.set_as_dirty();
+        return true;
+    }
+
+    return false;
+}
+
+void GLGizmoCut3D::update_bounds_outline()
+{
+    m_bounds_outline.reset();
+    m_bounds_outline_valid = true;
+
+    const CutBounds preview = m_bounds_dragging ? bounds_from_stroke(CutBounds::Shape(m_bounds_shape_id), m_bounds_anchor, m_bounds_stroke)
+                                                : m_bounds;
+    if (!preview.bounded())
+        return;
+
+    GLModel::Geometry init_data;
+    init_data.format = {GLModel::Geometry::EPrimitiveType::LineLoop, GLModel::Geometry::EVertexLayout::P3};
+    init_data.reserve_vertices(preview.contour.size());
+    init_data.reserve_indices(preview.contour.size());
+    for (size_t i = 0; i < preview.contour.size(); ++i) {
+        init_data.add_vertex(Vec3f(float(preview.contour[i].x()), float(preview.contour[i].y()), 0.0f));
+        init_data.add_index((unsigned int) i);
+    }
+    m_bounds_outline.init_from(std::move(init_data));
+}
+
+void GLGizmoCut3D::render_bounds_region()
+{
+    if (m_connectors_editing && !m_bounds.bounded())
+        return;
+    if (!m_bounds_outline_valid)
+        update_bounds_outline();
+    if (!m_bounds_outline.is_initialized())
+        return;
+
+    //A line drawn ON a plane fights the plane it is drawn on. mm_contour's depth offset is
+    //the fix already in this tree - the paint gizmo draws its own contours with it.
+    GLShaderProgram *curr_shader = wxGetApp().get_current_shader();
+    if (curr_shader != nullptr)
+        curr_shader->stop_using();
+
+    if (GLShaderProgram *shader = wxGetApp().get_shader("mm_contour")) {
+        shader->start_using();
+        shader->set_uniform("offset", OpenGLManager::get_gl_info().is_mesa() ? 0.0005 : 0.00001);
+        const Camera &camera = wxGetApp().plater()->get_camera();
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix() * translation_transform(m_plane_center) * m_rotation_m);
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+
+        m_bounds_outline.set_color(bounds_outline_color(m_is_dark_mode));
+        glsafe(::glLineWidth(m_bounds_dragging ? 3.0f : 2.0f));
+        m_bounds_outline.render();
+        glsafe(::glLineWidth(1.0f));
+
+        shader->stop_using();
+    }
+
+    if (curr_shader != nullptr)
+        curr_shader->start_using();
+}
+
+bool GLGizmoCut3D::is_outside_of_bounds(const Vec3d &pos_world) const
+{
+    if (!m_bounds.bounded())
+        return false;
+    const Vec3d in_plane = m_rotation_m.linear().inverse() * (pos_world - m_plane_center);
+    return !m_bounds.contains(Vec2d(in_plane.x(), in_plane.y()));
+}
+
+bool GLGizmoCut3D::render_bounds_shape_combo()
+{
+    ImGui::AlignTextToFramePadding();
+    ImGuiWrapper::push_combo_style(m_parent.get_scale());
+    int selection = m_bounds_shape_id;
+    const bool changed = m_imgui->combo(_u8L("Cut region"), m_bounds_shapes, selection, 0, m_label_width, m_control_width);
+    ImGuiWrapper::pop_combo_style();
+
+    if (changed && selection != m_bounds_shape_id) {
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Change cut region"), UndoRedo::SnapshotType::GizmoAction);
+        set_bounds_shape(selection);
+        return true;
+    }
+    return false;
+}
+
+void GLGizmoCut3D::render_bounds_input_window()
+{
+    render_bounds_shape_combo();
+
+    if (m_bounds_shape_id != int(CutBounds::Shape::Unbounded)) {
+        ImGui::SameLine();
+        m_imgui->disabled_begin(!m_bounds.bounded() && !m_bounds_drawing);
+        if (m_imgui->button(_L("Redraw")))
+            set_bounds_shape(m_bounds_shape_id);
+        m_imgui->disabled_end();
+
+        if (m_bounds_drawing)
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT,
+                                  m_bounds_shape_id == int(CutBounds::Shape::Lasso)
+                                      ? _L("Draw a closed shape on the cut plane. Right-click abandons the stroke.")
+                                      : _L("Drag out the region on the cut plane. Right-click abandons the stroke."));
+    }
 }
 
 void GLGizmoCut3D::apply_connectors_in_model(ModelObject* mo, int &dowels_count)
@@ -3513,6 +3844,118 @@ void synchronize_model_after_cut(Model& model, const CutObjectBase& cut_id)
             obj->cut_id.copy(cut_id);
 }
 
+//The bounded cut's booleans, off the UI thread. Meshes are snapshotted as shared_ptr on the
+//UI thread - free, because a ModelVolume's mesh is immutable - the geometry runs in
+//process() polling was_canceled, and nothing touches a Model or a ModelConfig until
+//finalize() is back on the UI thread. The 103 MB revolver is seconds of boolean; on the UI
+//thread that is a window that has stopped responding, which is the whole reason this exists.
+class BoundedCutJob : public Job
+{
+public:
+    struct Request
+    {
+        Transform3d                  cut_matrix{Transform3d::Identity()};
+        CutBounds                    bounds;
+        std::vector<CutBoundedInput> volumes;
+    };
+    using Apply = std::function<void(bool canceled, CutBoundedSplits splits, const std::string &failure)>;
+
+    BoundedCutJob(Request req, Apply apply) : m_req(std::move(req)), m_apply(std::move(apply)) {}
+
+    void process(Ctl &ctl) override
+    {
+        ctl.update_status(0, _u8L("Cutting the model"));
+        if (!compute_bounded_splits(m_req.volumes, m_req.cut_matrix, m_req.bounds, m_splits, m_failure,
+                                    [&ctl] { return ctl.was_canceled(); }))
+            m_splits.clear();
+        ctl.update_status(100, "");
+    }
+
+    void finalize(bool canceled, std::exception_ptr &eptr) override
+    {
+        //Reported here rather than rethrown into the worker: a boolean that threw is a
+        //refusal the user has to see, not a crash.
+        if (eptr) {
+            try { std::rethrow_exception(eptr); }
+            catch (const std::exception &ex) { m_failure = ex.what(); }
+            catch (...)                      { m_failure = "unknown failure in the cut worker"; }
+            eptr = nullptr;
+            m_splits.clear();
+        }
+        if (m_apply)
+            m_apply(canceled, std::move(m_splits), m_failure);
+    }
+
+private:
+    Request          m_req;
+    Apply            m_apply;
+    CutBoundedSplits m_splits;
+    std::string      m_failure;
+};
+
+void GLGizmoCut3D::report_cut_failure(const std::string &why)
+{
+    m_cut_report = why;
+    BOOST_LOG_TRIVIAL(error) << "GLGizmoCut3D: the cut was not performed: " << why;
+    wxGetApp().plater()->get_notification_manager()->push_notification(
+        NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+        _u8L("The cut was not performed") + ": " + why);
+}
+
+//The tail of every cut: the parts exist, and the model has to be told. Shared by the
+//synchronous path and by the worker's finalize, because what happens to a set of parts does
+//not depend on which thread computed them.
+void GLGizmoCut3D::apply_cut_objects(int object_idx, const CutObjectBase &cut_id, const ModelObjectPtrs &new_objects, bool distribute)
+{
+    Plater *plater = wxGetApp().plater();
+
+    // fix_non_manifold_edges
+    {
+        bool is_showed_dialog = false;
+        bool user_fix_model   = false;
+        const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
+        for (size_t i = 0; i < new_objects.size(); i++) {
+            for (size_t j = 0; j < new_objects[i]->volumes.size(); j++) {
+                if (its_num_open_edges(new_objects[i]->volumes[j]->mesh().its) > 0) {
+                    if (!is_showed_dialog) {
+                        is_showed_dialog = true;
+                        MessageDialog dlg(nullptr, _L("Non-manifold edges be caused by cut tool: do you want to fix now\?"), "", wxYES | wxCANCEL);
+                        if (dlg.ShowModal() == wxID_YES)
+                            user_fix_model = true;
+                    }
+                    if (!user_fix_model)
+                        break;
+                    std::vector<std::string>                         succes_models;
+                    std::vector<std::pair<std::string, std::string>> failed_models;
+                    auto fix_and_update_progress = [plater, keep_painting](ModelObject *model_object, const int vol_idx, const string &model_name,
+                                                                           ProgressDialog &progress_dlg,
+                                                                           std::vector<std::string> &succes_models,
+                                                                           std::vector<std::pair<std::string, std::string>> &failed_models) {
+                        wxString msg = _L("Repairing model object");
+                        msg += ": " + from_u8(model_name) + "\n";
+                        std::string res;
+                        if (!fix_model_with_cgal_gui(*model_object, vol_idx, progress_dlg, msg, res, keep_painting)) return false;
+                        return true;
+                    };
+                    ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater),
+                                                wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+
+                    auto model_name = new_objects[i]->name;
+                    if (!fix_and_update_progress(new_objects[i], j, model_name, progress_dlg, succes_models, failed_models)) {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "run fix_and_update_progress error";
+                    };
+                };
+            }
+        }
+    }
+    check_objects_after_cut(new_objects);
+
+    // update cut results on plater and in the model
+    plater->apply_cut_object_to_model(object_idx, new_objects, distribute);
+
+    synchronize_model_after_cut(plater->model(), cut_id);
+}
+
 void GLGizmoCut3D::perform_cut(const Selection& selection)
 {
     if (!can_perform_cut())
@@ -3526,6 +3969,11 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
     ModelObject* mo = plater->model().objects[object_idx];
     if (!mo)
         return;
+
+    //Closing the gizmo resets the gizmo's own state, including the region, so everything the
+    //cut depends on is read out before that happens rather than after.
+    const CutBounds bounds     = m_bounds;
+    const bool      distribute = m_distribute_to_plates;
 
     // deactivate CutGizmo and than perform a cut
     m_parent.reset_all_gizmos();
@@ -3568,62 +4016,104 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
         // update cut_id for the cut object in respect to the attributes
         update_object_cut_id(cut_mo->cut_id, attributes, dowels_count);
 
-        Cut cut(cut_mo, instance_idx, get_cut_matrix(selection), attributes);
+        const Transform3d cut_matrix = get_cut_matrix(selection);
+        // save cut_id to post update synchronization
+        const CutObjectBase cut_id = cut_mo->cut_id;
+
+        //The bounded cut is the only one whose geometry is a mesh boolean, and the only one
+        //that can take long enough to matter. It goes to a worker; every other cut is the
+        //code it always was, on the thread it always ran on.
+        const bool bounded = bounds.bounded() && !cut_with_groove && !cut_by_contour;
+        if (bounded) {
+            BoundedCutJob::Request req;
+            req.cut_matrix = cut_matrix;
+            req.bounds     = bounds;
+            req.volumes    = collect_bounded_cut_inputs(*cut_mo, instance_idx);
+            if (req.volumes.empty()) {
+                report_cut_failure(_u8L("There is no solid geometry to cut."));
+                return;
+            }
+
+            //The object is identified by its ObjectID rather than its index, because the
+            //model can be edited while the worker runs and an index would then name someone
+            //else's object.
+            const ObjectID src_id = mo->id();
+            replace_job(wxGetApp().plater()->get_ui_job_worker(),
+                        std::make_unique<BoundedCutJob>(
+                            std::move(req),
+                            [this, src_id, instance_idx, cut_matrix, attributes, bounds, distribute, cut_id]
+                            (bool canceled, CutBoundedSplits splits, const std::string &failure) {
+                                finish_bounded_cut(canceled, src_id, instance_idx, cut_matrix, attributes, bounds,
+                                                   distribute, cut_id, std::move(splits), failure);
+                            }));
+            return;
+        }
+
+        Cut cut(cut_mo, instance_idx, cut_matrix, attributes);
         const ModelObjectPtrs& new_objects = cut_by_contour    ? cut.perform_by_contour(mo, m_part_selection.get_cut_parts(), dowels_count):
                                              cut_with_groove   ? cut.perform_with_groove(m_groove, m_rotation_m, m_groove_count, m_groove_gap, m_radius) :
                                                                  cut.perform_with_plane();
 
-        // fix_non_manifold_edges
-        {
-            bool is_showed_dialog = false;
-            bool user_fix_model   = false;
-            for (size_t i = 0; i < new_objects.size(); i++) {
-                for (size_t j = 0; j < new_objects[i]->volumes.size(); j++) {
-                    if (its_num_open_edges(new_objects[i]->volumes[j]->mesh().its) > 0) {
-                        if (!is_showed_dialog) {
-                            is_showed_dialog = true;
-                            MessageDialog dlg(nullptr, _L("Non-manifold edges be caused by cut tool: do you want to fix now\?"), "", wxYES | wxCANCEL);
-                            int           ret = dlg.ShowModal();
-                            if (ret == wxID_YES) {
-                                user_fix_model = true;
-                            }
-                        }
-                        if (!user_fix_model) {
-                            break;
-                        }
-                        // model_name
-                        std::vector<std::string> succes_models;
-                        // model_name     failing reason
-                        std::vector<std::pair<std::string, std::string>> failed_models;
-                        auto                                             plater = wxGetApp().plater();
-                        auto fix_and_update_progress = [this, plater, keep_painting](ModelObject *model_object, const int vol_idx, const string &model_name, ProgressDialog &progress_dlg,
-                                                                      std::vector<std::string> &succes_models, std::vector<std::pair<std::string, std::string>> &failed_models) {
-                            wxString msg = _L("Repairing model object");
-                            msg += ": " + from_u8(model_name) + "\n";
-                            std::string res;
-                            if (!fix_model_with_cgal_gui(*model_object, vol_idx, progress_dlg, msg, res, keep_painting)) return false;
-                            return true;
-                        };
-                        ProgressDialog progress_dlg(_L("Repairing model object"), "", 100, find_toplevel_parent(plater), wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
-
-                        auto model_name = new_objects[i]->name;
-                        if (!fix_and_update_progress(new_objects[i], j, model_name, progress_dlg, succes_models, failed_models)) {
-                            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "run fix_and_update_progress error";
-                        };
-                    };
-                }
-            }
+        //A cut that could not be executed leaves the model alone and says why. Applying an
+        //empty result here would delete the source object and put nothing in its place.
+        if (!cut.failure().empty() || new_objects.empty()) {
+            report_cut_failure(cut.failure().empty() ? _u8L("The cut produced no parts.") : cut.failure());
+            return;
         }
-        check_objects_after_cut(new_objects);
+        m_cut_report.clear();
 
-        // save cut_id to post update synchronization
-        const CutObjectBase cut_id = cut_mo->cut_id;
-
-        // update cut results on plater and in the model 
-        plater->apply_cut_object_to_model(object_idx, new_objects);
-
-        synchronize_model_after_cut(plater->model(), cut_id);
+        apply_cut_objects(object_idx, cut_id, new_objects, distribute);
     }
+}
+
+//Back on the UI thread with the booleans already done. Everything from here touches the
+//Model and the ModelConfig, which is exactly why none of it ran on the worker.
+void GLGizmoCut3D::finish_bounded_cut(bool canceled, ObjectID src_id, int instance_idx, const Transform3d &cut_matrix,
+                                      ModelObjectCutAttributes attributes, const CutBounds &bounds, bool distribute,
+                                      const CutObjectBase &cut_id, CutBoundedSplits splits, const std::string &failure)
+{
+    if (canceled) {
+        BOOST_LOG_TRIVIAL(info) << "GLGizmoCut3D: the bounded cut was cancelled";
+        return;
+    }
+    if (!failure.empty() || splits.empty()) {
+        report_cut_failure(failure.empty() ? _u8L("The cut produced no parts.") : failure);
+        return;
+    }
+
+    //The model may have been edited while the worker ran, so the object is found by identity
+    //rather than by the index it had when the cut started.
+    Plater *plater    = wxGetApp().plater();
+    int     object_idx = -1;
+    for (size_t i = 0; i < plater->model().objects.size(); ++i)
+        if (plater->model().objects[i]->id() == src_id) {
+            object_idx = int(i);
+            break;
+        }
+    if (object_idx < 0) {
+        report_cut_failure(_u8L("The object was removed while the cut was being computed."));
+        return;
+    }
+
+    ModelObject *mo = plater->model().objects[object_idx];
+    Cut cut(mo, instance_idx, cut_matrix, attributes);
+    cut.set_precomputed_splits(std::move(splits));
+    const ModelObjectPtrs &new_objects = cut.perform_with_bounded_plane(bounds);
+
+    if (!cut.failure().empty() || new_objects.empty()) {
+        report_cut_failure(cut.failure().empty() ? _u8L("The cut produced no parts.") : cut.failure());
+        return;
+    }
+    //One part out of a bounded cut means the region never crossed the model. Replacing the
+    //object with a copy of itself is not a cut, and saying nothing about it is how a user
+    //concludes the tool is broken rather than that the region was in the wrong place.
+    if (new_objects.size() < 2 && !attributes.has(ModelObjectCutAttribute::KeepAsParts)) {
+        report_cut_failure(_u8L("The region did not cross the model, so nothing was cut."));
+        return;
+    }
+    m_cut_report.clear();
+
+    apply_cut_objects(object_idx, cut_id, new_objects, distribute);
 }
 
 // Unprojects the mouse position on the mesh and saves hit point and normal of the facet into pos_and_normal
@@ -3822,6 +4312,18 @@ bool GLGizmoCut3D::add_connector(CutConnectors& connectors, const Vec2d& mouse_p
     Vec3d pos;
     Vec3d pos_world;
     if (unproject_on_cut_plane(mouse_position.cast<double>(), pos, pos_world)) {
+        //A connector joins two parts across the cut face. Outside the bounded region there
+        //is no cut face and nothing to join, so the connector is refused with the reason
+        //rather than placed where it would mean nothing - or, worse, dropped in silence.
+        if (is_outside_of_bounds(pos_world)) {
+            m_cut_report = _u8L("Connectors go on the cut region. This point is outside it, so nothing was added.");
+            wxGetApp().plater()->get_notification_manager()->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                m_cut_report);
+            return false;
+        }
+        m_cut_report.clear();
+
         Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Add connector"), UndoRedo::SnapshotType::GizmoAction);
         unselect_all_connectors();
 

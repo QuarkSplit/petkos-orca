@@ -165,6 +165,29 @@ class GLGizmoCut3D : public GLGizmoBase
     // Vertices of the groove used to detection if groove is valid
     std::vector<Vec3d> m_groove_vertices;
 
+    // ---- Bounded planar cut ------------------------------------------------------------
+    // The plane stops at a region drawn ON it, so only what that region sweeps is cut and
+    // the rest of the model stays attached. The region lives in the plane's own frame
+    // (z = 0, millimetres), which is the same frame Cut uses, so no conversion is needed
+    // between what is drawn and what is executed. Unbounded is the default and takes the
+    // historical cut_mesh path unchanged.
+    CutBounds                m_bounds;
+    std::vector<std::string> m_bounds_shapes;
+    int                      m_bounds_shape_id{0};      // 0 = whole plane
+    bool                     m_bounds_drawing{false};   // armed for the next stroke
+    bool                     m_bounds_dragging{false};
+    Vec2d                    m_bounds_anchor{Vec2d::Zero()};
+    std::vector<Vec2d>       m_bounds_stroke;           // plane-local, while the stroke is live
+    GLModel                  m_bounds_outline;
+    bool                     m_bounds_outline_valid{false};
+    // What the last attempted cut refused to do, in the user's terms. Empty when there is
+    // nothing to say; a cut that cannot be executed says so rather than substituting one
+    // that can.
+    std::string              m_cut_report;
+    // Land the resulting parts in the current plate's free space instead of leaving them
+    // stacked where the source object stood. Persisted in the app config.
+    bool                     m_distribute_to_plates{false};
+
     class PartSelection {
     public:
         PartSelection() = default;
@@ -359,6 +382,26 @@ private:
     bool can_perform_cut() const;
     bool has_valid_groove() const;
     bool has_valid_contour() const;
+
+    // The tail of every cut: the parts exist and the model has to be told. UI thread only.
+    void apply_cut_objects(int object_idx, const CutObjectBase& cut_id, const ModelObjectPtrs& new_objects, bool distribute);
+    // The worker's finalize for a bounded cut, back on the UI thread with the booleans done.
+    void finish_bounded_cut(bool canceled, ObjectID src_id, int instance_idx, const Transform3d& cut_matrix,
+                            ModelObjectCutAttributes attributes, const CutBounds& bounds, bool distribute,
+                            const CutObjectBase& cut_id, CutBoundedSplits splits, const std::string& failure);
+    void report_cut_failure(const std::string& why);
+
+    // ---- Bounded planar cut ------------------------------------------------------------
+    bool plane_local_from_mouse(const Vec2d& mouse_position, Vec2d& local);
+    bool bounds_event(SLAGizmoEventType action, const Vec2d& mouse_position);
+    void update_bounds_outline();
+    void render_bounds_region();
+    void reset_bounds();
+    void set_bounds_shape(int shape_id);
+    bool render_bounds_shape_combo();
+    void render_bounds_input_window();
+    // A connector only means something where the cut actually happens.
+    bool is_outside_of_bounds(const Vec3d& pos_world) const;
     void apply_connectors_in_model(ModelObject* mo, int &dowels_count);
     bool cut_line_processing() const;
     void discard_cut_line_processing();

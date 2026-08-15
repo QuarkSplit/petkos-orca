@@ -1,17 +1,176 @@
 
 #include "CutUtils.hpp"
+#include "ClipperUtils.hpp"
+#include "ExPolygon.hpp"
 #include "Geometry.hpp"
 #include "libslic3r.h"
+#include "MeshBoolean.hpp"
 #include "Model.hpp"
+#include "Tesselate.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "ObjectID.hpp"
+
+#include <cmath>
+#include <map>
+#include <tuple>
 
 #include <boost/log/trivial.hpp>
 
 namespace Slic3r {
 
 using namespace Geometry;
+
+// ----------------------------------------------------------------------------------------
+// The bounded region
+// ----------------------------------------------------------------------------------------
+
+static Polygon cut_bounds_to_polygon(const std::vector<Vec2d> &contour)
+{
+    Points pts;
+    pts.reserve(contour.size());
+    for (const Vec2d &p : contour)
+        pts.emplace_back(scaled(p.x()), scaled(p.y()));
+    return Polygon(std::move(pts));
+}
+
+//A lasso is drawn by hand, so it crosses itself; a rectangle dragged backwards comes out
+//clockwise. Both are answered by the same union: it returns simple, correctly wound
+//ExPolygons with holes where the stroke wrapped twice, which is what a tessellator and a
+//point-in-region test both need. Doing this once, here, is why neither of them has a
+//special case for the shape that produced the region.
+static ExPolygons cut_bounds_regions(const CutBounds &bounds)
+{
+    if (!bounds.bounded())
+        return {};
+    Polygon poly = cut_bounds_to_polygon(bounds.contour);
+    if (poly.points.size() < 3)
+        return {};
+    return union_ex(Polygons{std::move(poly)});
+}
+
+bool CutBounds::contains(const Vec2d &pt) const
+{
+    if (!bounded())
+        return true;
+    const Point p(scaled(pt.x()), scaled(pt.y()));
+    for (const ExPolygon &ep : cut_bounds_regions(*this))
+        if (ep.contains(p))
+            return true;
+    return false;
+}
+
+CutBounds CutBounds::make_rectangle(const Vec2d &corner_a, const Vec2d &corner_b)
+{
+    CutBounds b;
+    const double x0 = std::min(corner_a.x(), corner_b.x());
+    const double x1 = std::max(corner_a.x(), corner_b.x());
+    const double y0 = std::min(corner_a.y(), corner_b.y());
+    const double y1 = std::max(corner_a.y(), corner_b.y());
+    b.shape   = Shape::Rectangle;
+    b.contour = {Vec2d(x0, y0), Vec2d(x1, y0), Vec2d(x1, y1), Vec2d(x0, y1)};
+    return b;
+}
+
+CutBounds CutBounds::make_disc(const Vec2d &center, double radius, int segments)
+{
+    CutBounds b;
+    segments = std::max(segments, 8);
+    b.shape  = Shape::Disc;
+    b.contour.reserve(size_t(segments));
+    for (int i = 0; i < segments; ++i) {
+        const double a = 2.0 * PI * double(i) / double(segments);
+        b.contour.emplace_back(center.x() + radius * std::cos(a), center.y() + radius * std::sin(a));
+    }
+    return b;
+}
+
+CutBounds CutBounds::make_lasso(std::vector<Vec2d> points)
+{
+    CutBounds b;
+    b.shape   = Shape::Lasso;
+    b.contour = std::move(points);
+    return b;
+}
+
+//Welded by construction, because a triangle soup is not a manifold and every boolean backend
+//in the ladder refuses one. A cap tessellated by GLU and a wall built from the same contour
+//meet only if they agree on a vertex twice over: the same millimetre value, and the same
+//quantisation of it. Both are arranged below, and both had to be.
+indexed_triangle_set its_make_cut_prism(const CutBounds &bounds, double z_top)
+{
+    indexed_triangle_set out;
+    const ExPolygons regions = cut_bounds_regions(bounds);
+    if (regions.empty() || z_top <= EPSILON)
+        return out;
+
+    //The weld key is ONE rounding of the millimetre coordinate, applied identically to the cap
+    //and to the wall. It used to be the scaled integer, recovered from the tessellator's output
+    //by scaling back up - and unscale()/scale() do not round-trip, because 1e-6 is not exact in
+    //binary and the inverse truncates. A rectangle survived that (whole millimetres round-trip
+    //fine) and a 72-segment disc did not: 64 of its 72 wall edges found no cap edge to meet, so
+    //the cutter was a mesh that renders perfectly and that every boolean backend refuses.
+    auto key_of = [](double x, double y, int level) {
+        return std::make_tuple(std::llround(x / SCALING_FACTOR), std::llround(y / SCALING_FACTOR), level);
+    };
+    std::map<std::tuple<long long, long long, int>, int> index_of;
+    auto vertex = [&out, &index_of, &key_of](double x, double y, int level, double z) {
+        const auto key = key_of(x, y, level);
+        auto it = index_of.find(key);
+        if (it != index_of.end())
+            return it->second;
+        const int id = int(out.vertices.size());
+        out.vertices.emplace_back(float(x), float(y), float(z));
+        index_of.emplace(key, id);
+        return id;
+    };
+    auto vertex_at = [&vertex](const Vec3d &p, int level) { return vertex(p.x(), p.y(), level, p.z()); };
+
+    //A cap triangle's winding is not something to take from the tessellator. GLU answers in
+    //fans and strips, and a cap whose triangles disagree with the walls about which way is out
+    //leaves the solid open along every edge the two share - which is a mesh that renders
+    //perfectly and that every boolean backend refuses. Signed area decides it here, so the
+    //orientation is a property of the geometry rather than of whoever produced the triangles.
+    auto add_cap = [&out, &vertex_at](const std::vector<Vec3d> &tris, int level, bool upward) {
+        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+            const Vec3d &a = tris[i], &b = tris[i + 1], &c = tris[i + 2];
+            const double area2 = (b.x() - a.x()) * (c.y() - a.y()) - (c.x() - a.x()) * (b.y() - a.y());
+            if (std::abs(area2) < 1e-12)
+                continue; // a zero-area triangle is not a face, and welding turns it into a seam
+            const int ia = vertex_at(a, level), ib = vertex_at(b, level), ic = vertex_at(c, level);
+            if ((area2 > 0.0) == upward)
+                out.indices.emplace_back(ia, ib, ic);
+            else
+                out.indices.emplace_back(ia, ic, ib);
+        }
+    };
+
+    for (const ExPolygon &ep : regions) {
+        // Caps: bottom sits ON the cut plane and faces away from the solid, top closes it.
+        add_cap(triangulate_expolygon_3d(ep, 0.0,   NORMALS_UP), 0, false);
+        add_cap(triangulate_expolygon_3d(ep, z_top, NORMALS_UP), 1, true);
+
+        // Walls. union_ex() leaves the contour counter-clockwise and every hole clockwise,
+        // so one winding rule covers both and the solid comes out consistently oriented.
+        //unscale<double>() is the SAME conversion Tesselate.cpp feeds GLU, so a wall vertex and
+        //the cap vertex it must meet are the same number before they are the same key.
+        auto add_wall = [&out, &vertex, z_top](const Points &pts) {
+            const size_t n = pts.size();
+            for (size_t i = 0; i < n; ++i) {
+                const double ax = unscaled<double>(pts[i].x()),           ay = unscaled<double>(pts[i].y());
+                const double bx = unscaled<double>(pts[(i + 1) % n].x()), by = unscaled<double>(pts[(i + 1) % n].y());
+                const int a0 = vertex(ax, ay, 0, 0.0),   b0 = vertex(bx, by, 0, 0.0);
+                const int a1 = vertex(ax, ay, 1, z_top), b1 = vertex(bx, by, 1, z_top);
+                out.indices.emplace_back(a0, b0, b1);
+                out.indices.emplace_back(a0, b1, a1);
+            }
+        };
+        add_wall(ep.contour.points);
+        for (const Polygon &hole : ep.holes)
+            add_wall(hole.points);
+    }
+    return out;
+}
 
 static void apply_tolerance(ModelVolume* vol)
 {
@@ -63,21 +222,157 @@ static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelV
     vol->cut_info = src_volume->cut_info;
 }
 
+//The bounded split, in cut space: the plane is z = 0 and the region is drawn on it. The
+//cutter is that region swept upwards until it has left the mesh, so what is above the plane
+//AND inside the region is one part and everything else is the other. Both come out of the
+//same solid, which is why they agree on the cut face and why their volumes add up to the
+//source's.
+//
+//A wall of the cutter that runs through air cuts nothing, which is what makes the arm
+//separable from the torso; a wall run through material cuts there too, and that is the
+//instruction rather than a defect. Nothing here decides which the user meant.
+static bool bounded_volume_split(const indexed_triangle_set &src, const CutBounds &bounds,
+                                 indexed_triangle_set &upper_its, indexed_triangle_set &lower_its,
+                                 std::string &failure)
+{
+    upper_its = indexed_triangle_set();
+    lower_its = indexed_triangle_set();
+
+    const BoundingBoxf3 bb = bounding_box(src);
+    if (!bb.defined) {
+        failure = "the volume has no geometry to cut";
+        return false;
+    }
+    //Nothing of this volume reaches above the plane, so there is nothing for the region to
+    //take. That is an answer, not a failure, and it matches what the unbounded cut does.
+    if (bb.max.z() <= EPSILON) {
+        lower_its = src;
+        return true;
+    }
+
+    const double z_top  = bb.max.z() + std::max(1.0, 0.01 * bb.size().norm());
+    indexed_triangle_set cutter = its_make_cut_prism(bounds, z_top);
+    if (cutter.empty()) {
+        failure = "the bounded region is degenerate";
+        return false;
+    }
+
+    upper_its = src;
+    MeshBoolean::LadderResult up = MeshBoolean::execute(MeshBoolean::Op::Intersection, upper_its, cutter);
+    if (!up.ok) {
+        failure = "the bounded region could not be intersected with the model (" + up.reason + ")";
+        upper_its = indexed_triangle_set();
+        return false;
+    }
+
+    lower_its = src;
+    MeshBoolean::LadderResult down = MeshBoolean::execute(MeshBoolean::Op::Difference, lower_its, cutter);
+    if (!down.ok) {
+        failure = "the bounded region could not be subtracted from the model (" + down.reason + ")";
+        upper_its = indexed_triangle_set();
+        lower_its = indexed_triangle_set();
+        return false;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "bounded cut: intersection via " << up.backend << ", difference via " << down.backend;
+    return true;
+}
+
+//The one place a mesh is put into cut space, shared by the cut itself, by the worker that
+//precomputes for it and by anything checking it, so none of them can drift apart about what
+//"the cut plane" means.
+Transform3d cut_space_transform(const Transform3d &cut_matrix)
+{
+    const Transformation cut_transformation = Transformation(cut_matrix);
+    return cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1 * cut_transformation.get_offset());
+}
+
+std::vector<CutBoundedInput> collect_bounded_cut_inputs(const ModelObject &object, int instance)
+{
+    std::vector<CutBoundedInput> out;
+    if (instance < 0 || instance >= int(object.instances.size()))
+        return out;
+    const Transform3d instance_matrix = object.instances[instance]->get_transformation().get_matrix_no_offset();
+    for (size_t i = 0; i < object.volumes.size(); ++i) {
+        const ModelVolume *v = object.volumes[i];
+        if (v == nullptr || !v->is_model_part() || v->mesh().empty())
+            continue;
+        CutBoundedInput in;
+        in.volume_idx = i;
+        //shared_ptr, not a copy: the mesh is immutable in the model and this is what makes
+        //snapshotting a 100 MB object on the UI thread free.
+        in.mesh   = v->get_mesh_shared_ptr();
+        in.matrix = instance_matrix * v->get_matrix();
+        out.push_back(std::move(in));
+    }
+    return out;
+}
+
+bool compute_bounded_splits(const std::vector<CutBoundedInput> &inputs, const Transform3d &cut_matrix,
+                            const CutBounds &bounds, CutBoundedSplits &out, std::string &failure,
+                            const std::function<bool()> &canceled)
+{
+    out.clear();
+    failure.clear();
+    if (!bounds.bounded()) {
+        failure = "the cut region is unbounded, so there is nothing to precompute";
+        return false;
+    }
+
+    const Transform3d invert_cut_matrix = cut_space_transform(cut_matrix);
+    for (const CutBoundedInput &in : inputs) {
+        if (canceled && canceled())
+            return false;
+        if (!in.mesh)
+            continue;
+
+        TriangleMesh mesh(*in.mesh);
+        mesh.transform(invert_cut_matrix * in.matrix, true);
+
+        CutBoundedSplit split;
+        if (!bounded_volume_split(mesh.its, bounds, split.upper, split.lower, failure))
+            return false;
+        out.emplace(in.volume_idx, std::move(split));
+    }
+    return true;
+}
+
 static void process_volume_cut( const ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
-                                ModelObjectCutAttributes attributes, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh)
+                                ModelObjectCutAttributes attributes, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh,
+                                const CutBounds& bounds = CutBounds(), std::string* failure = nullptr,
+                                const CutBoundedSplit* precomputed = nullptr)
 {
     const auto volume_matrix = volume->get_matrix();
 
-    const Transformation cut_transformation = Transformation(cut_matrix);
-    const Transform3d invert_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1 * cut_transformation.get_offset());
-
-    // Transform the mesh by the combined transformation matrix.
-    // Flip the triangles in case the composite transformation is left handed.
-    TriangleMesh mesh(volume->mesh());
-    mesh.transform(invert_cut_matrix * instance_matrix * volume_matrix, true);
-
     indexed_triangle_set upper_its, lower_its;
-    cut_mesh(mesh.its, 0.0f, &upper_its, &lower_its);
+    if (bounds.bounded() && precomputed != nullptr) {
+        //Already computed off the UI thread against the same matrices; recomputing it here
+        //would be the whole cost of the cut, done twice.
+        upper_its = precomputed->upper;
+        lower_its = precomputed->lower;
+    }
+    else {
+        // Transform the mesh by the combined transformation matrix.
+        // Flip the triangles in case the composite transformation is left handed.
+        TriangleMesh mesh(volume->mesh());
+        mesh.transform(cut_space_transform(cut_matrix) * instance_matrix * volume_matrix, true);
+
+        if (bounds.bounded()) {
+            std::string why;
+            if (!bounded_volume_split(mesh.its, bounds, upper_its, lower_its, why)) {
+                //A bounded cut that cannot be executed is reported and abandoned. Falling
+                //back to the infinite plane would cut the geometry the user drew a boundary
+                //around to protect.
+                BOOST_LOG_TRIVIAL(error) << "bounded cut refused on volume '" << volume->name << "': " << why;
+                if (failure && failure->empty())
+                    *failure = why;
+                return;
+            }
+        }
+        else
+            cut_mesh(mesh.its, 0.0f, &upper_its, &lower_its);
+    }
+
     if (attributes.has(ModelObjectCutAttribute::KeepUpper))
         upper_mesh = TriangleMesh(upper_its);
     if (attributes.has(ModelObjectCutAttribute::KeepLower))
@@ -179,11 +474,13 @@ static void process_modifier_cut(ModelVolume* volume, const Transform3d& instanc
 }
 
 static void process_solid_part_cut(const ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
-                            ModelObjectCutAttributes attributes, ModelObject* upper, ModelObject* lower)
+                            ModelObjectCutAttributes attributes, ModelObject* upper, ModelObject* lower,
+                            const CutBounds& bounds = CutBounds(), std::string* failure = nullptr,
+                            const CutBoundedSplit* precomputed = nullptr)
 {
     // Perform cut
     TriangleMesh upper_mesh, lower_mesh;
-    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh);
+    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh, bounds, failure, precomputed);
 
     // Add required cut parts to the objects
 
@@ -302,6 +599,15 @@ void Cut::finalize(const ModelObjectPtrs& objects, const std::vector<std::option
 }
 
 
+const ModelObjectPtrs& Cut::perform_with_bounded_plane(const CutBounds& bounds)
+{
+    //An unbounded region is not a degenerate bounded cut; it is the historical cut, and it
+    //runs the historical code path so that turning bounds off leaves nothing changed.
+    m_bounds = bounds;
+    m_failure.clear();
+    return perform_with_plane();
+}
+
 const ModelObjectPtrs& Cut::perform_with_plane()
 {
     if (!m_attributes.has(ModelObjectCutAttribute::KeepUpper) && !m_attributes.has(ModelObjectCutAttribute::KeepLower)) {
@@ -334,6 +640,7 @@ const ModelObjectPtrs& Cut::perform_with_plane()
     const Transform3d       inverse_cut_matrix = cut_transformation.get_rotation_matrix().inverse() * translation_transform(-1. * cut_transformation.get_offset());
 
     std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paintings;
+    size_t volume_idx = 0;
     for (ModelVolume* volume : mo->volumes) {
         // Save painting data before reset_extra_facets() discards it.
         if (m_attributes.has(ModelObjectCutAttribute::KeepPaint)) {
@@ -352,8 +659,27 @@ const ModelObjectPtrs& Cut::perform_with_plane()
             else
                 process_connector_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, dowels);
         }
-        else if (!volume->mesh().empty())
-            process_solid_part_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower);
+        else if (!volume->mesh().empty()) {
+            //The index is into this object's volume list, which is the same list
+            //collect_bounded_cut_inputs() walked, so a precomputed split lands on the volume
+            //it was computed from.
+            const auto it = m_splits.find(volume_idx);
+            process_solid_part_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, m_bounds, &m_failure,
+                                   it == m_splits.end() ? nullptr : &it->second);
+        }
+        ++volume_idx;
+    }
+
+    //A bounded cut that could not be executed produces no parts and says why. Returning the
+    //objects built so far would hand the caller a model that is missing the geometry the
+    //boolean refused, which is the one outcome worse than refusing.
+    if (!m_failure.empty()) {
+        if (upper) m_model.objects.push_back(upper);
+        if (lower) m_model.objects.push_back(lower);
+        for (ModelObject* dowel : dowels)
+            m_model.objects.push_back(dowel);
+        m_model.clear_objects();
+        return m_model.objects;
     }
 
     // Post-process cut parts

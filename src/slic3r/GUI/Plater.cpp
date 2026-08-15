@@ -16725,13 +16725,40 @@ void Plater::convert_unit(ConversionType conv_type)
     }
 }
 
-void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& new_objects)
+void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& new_objects, bool distribute_to_plates)
 {
     model().delete_object(obj_idx);
     sidebar().obj_list()->delete_object_from_list(obj_idx);
 
     // suppress to call selection update for Object List to avoid call of early Gizmos on/off update
     p->load_model_objects(new_objects, false, false);
+
+    //Cut-and-distribute. Without it the parts stand exactly where the source object stood,
+    //interpenetrating, and for anything worth cutting at least one half is off the bed - a
+    //fault the app can obviously repair, which makes leaving it a defect rather than a
+    //missing luxury. place_instances_on_plate packs into THIS plate's free space against
+    //THIS plate's own bed, moves nothing that was already there, and lays anything that
+    //will not fit in a visible row in front of the plate with the reason named. Bare
+    //add_to_plate() centres and stacks, which is the behaviour being replaced, so it is
+    //never the mechanism here.
+    if (distribute_to_plates && !new_objects.empty() && p->model.objects.size() >= new_objects.size()) {
+        const size_t first = p->model.objects.size() - new_objects.size();
+        std::vector<std::pair<int, int>> instances;
+        for (size_t oid = first; oid < p->model.objects.size(); ++oid)
+            for (size_t iid = 0; iid < p->model.objects[oid]->instances.size(); ++iid)
+                instances.emplace_back((int) oid, (int) iid);
+
+        const int             plate_idx = p->partplate_list.get_curr_plate_index();
+        const PlacementResult result    = place_instances_on_plate(this, plate_idx, instances);
+        BOOST_LOG_TRIVIAL(info) << boost::format("cut-and-distribute: %1% part instance(s) placed on plate %2%, %3% laid out in front of it")
+                                       % result.placed % (plate_idx + 1) % result.unplaced;
+
+        //The assemble view should start from where the parts actually ended up, the same
+        //rule paste follows after its own placement.
+        for (size_t oid = first; oid < p->model.objects.size(); ++oid)
+            for (ModelInstance *inst : p->model.objects[oid]->instances)
+                inst->set_assemble_transformation(inst->get_transformation());
+    }
 
     // now process all updates of the 3d scene
     update();
@@ -16744,10 +16771,6 @@ void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& ne
     size_t last_id = p->model.objects.size() - 1;
     for (size_t i = 0; i < new_objects.size(); ++i)
         selection.add_object((unsigned int)(last_id - i), i == 0);
-
-    // UIThreadWorker w;
-    // arrange(w, true);
-    // w.wait_for_idle();
 }
 
 void Plater::export_gcode(bool prefer_removable)
