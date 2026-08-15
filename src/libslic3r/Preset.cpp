@@ -913,7 +913,9 @@ void Preset::set_visible_from_appconfig(const AppConfig &app_config)
 	    }
     }
     //BBS: add config related log
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": name %1%, is_visible set to %2%")%name % is_visible;
+    //Petko's Orca: trace, not info - one line per preset, 2,319 per boot, and the sink flushes
+    //every record. At info this was 20% of the startup log's bytes for zero diagnostic value.
+    BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << boost::format(": name %1%, is_visible set to %2%")%name % is_visible;
 }
 
 std::string Preset::get_filament_type(std::string &display_filament_type)
@@ -3975,7 +3977,11 @@ void PresetCollection::set_printer_hold_alias(const std::string &alias, Preset &
                 }
             }
         }
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " " << " preset name : " << preset.name << " remove action: " << remove << " insert success: "
+        //Petko's Orca: trace, not info - this sits inside the per-compatible-printer loop, so at
+        //info it emitted 5,573 lines per boot (one per preset x printer) through a sink that
+        //flushes every record, from six vendor-load threads at once. 96% of the startup log was
+        //this line and its sibling in set_visible_from_appconfig.
+        BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << " " << " preset name : " << preset.name << " remove action: " << remove << " insert success: "
                                 << insert_success << " remove success: " << remove_success << " alias: " << alias;
     }
 }
