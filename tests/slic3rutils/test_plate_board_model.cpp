@@ -223,7 +223,8 @@ TEST_CASE("PlateBoardModel rows report each plate's own machine", "[PlateBoard][
     build_bundle(bundle);
 
     SyntheticPlates list(3);
-    // plate 0 keeps no assignment: it follows the Project row
+    // plate 0 names no printer at all - since the project printer's deletion (2026-08-14)
+    // there is nothing standing behind it, and the row must say so rather than borrow
     list.at(1).set_printer_preset_name(SMALL_PRINTER);
     list.at(2).set_printer_preset_name(GHOST_PRINTER);
 
@@ -231,21 +232,16 @@ TEST_CASE("PlateBoardModel rows report each plate's own machine", "[PlateBoard][
     model.rebuild(list.plates, bundle, PlateBoardGrouping::PlateOrder);
     REQUIRE(model.rows().size() == 3);
 
-    SECTION("an unassigned plate shows the project printer and its bed")
+    SECTION("a plate naming no printer reads as exactly that, never as some other machine")
     {
         const PlateBoardRow &row = model.rows()[0];
-        CHECK_FALSE(row.assigned);
-        CHECK_FALSE(row.preset_missing);
-        CHECK(row.printer_name == PROJECT_PRINTER);
-        CHECK_THAT(row.bed_w, Catch::Matchers::WithinAbs(220., 1e-9));
-        CHECK_THAT(row.bed_d, Catch::Matchers::WithinAbs(220., 1e-9));
-        CHECK_THAT(row.nozzle_diameter, Catch::Matchers::WithinAbs(0.4, 1e-9));
+        CHECK(row.printer_name.empty());
+        CHECK(row.preset_missing);
     }
 
     SECTION("an assigned plate shows its own machine's bed, not the project's")
     {
         const PlateBoardRow &row = model.rows()[1];
-        CHECK(row.assigned);
         CHECK_FALSE(row.preset_missing);
         CHECK(row.printer_name == SMALL_PRINTER);
         CHECK_THAT(row.bed_w, Catch::Matchers::WithinAbs(200., 1e-9));
@@ -257,7 +253,6 @@ TEST_CASE("PlateBoardModel rows report each plate's own machine", "[PlateBoard][
     SECTION("an assignment this installation cannot resolve is preserved, not repaired")
     {
         const PlateBoardRow &row = model.rows()[2];
-        CHECK(row.assigned);
         CHECK(row.preset_missing);
         // the stored name comes back verbatim: not cleared, not remapped to a nearest match,
         // and not rendered as though the plate were following the project printer
@@ -434,9 +429,8 @@ TEST_CASE("PlateBoardModel names the project printer while every plate still fol
     // here would be a panel describing a fleet that does not exist.
     CHECK(model.summary_text() == PROJECT_PRINTER);
     CHECK(model.rollup().machines == 1);
-    CHECK(model.project_row().printer_name == PROJECT_PRINTER);
-    CHECK(model.project_row().plate_index == PLATE_BOARD_PROJECT_ROW);
-    CHECK_THAT(model.project_row().bed_w, Catch::Matchers::WithinAbs(220., 1e-9));
+    // project_row() is gone with the project printer itself (2026-08-14): the board holds
+    // only real plates, each owning its context; there is no synthetic Project row to assert.
 
     REQUIRE(model.groups().size() == 1);
     CHECK(model.groups().front().key == "m:");
