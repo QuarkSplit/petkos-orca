@@ -14,6 +14,7 @@
 #include "MainFrame.hpp"
 #include "WebViewDialog.hpp"
 #include "PartPlate.hpp"
+#include "Widgets/PodBanner.hpp"
 
 #include <boost/log/trivial.hpp>
 
@@ -49,6 +50,9 @@ CenteredTitle::CenteredTitle(wxWindow* parent)
         wxBufferedPaintDC dc(this);
         dc.SetBackground(wxBrush(wxColour(38, 46, 48)));
         dc.Clear();
+        //phase-aligned to this control's place in the topbar, so the PEI grain runs
+        //continuously across the title instead of restarting at its left edge
+        PodBanner::draw(dc, GetClientRect(), true, GetPosition().x);
 
         dc.SetTextForeground(*wxWHITE);
 
@@ -103,6 +107,9 @@ public:
 
 void BBLTopbarArt::DrawBackground(wxDC& dc, wxWindow* wnd, const wxRect& rect)
 {
+    //the topbar is dark in both colour modes, so the gunmetal ground is unconditional
+    if (PodBanner::draw(dc, rect, true))
+        return;
     dc.SetBrush(wxBrush(wxColour(38, 46, 48)));
     wxRect clipRect = rect;
     clipRect.y -= 8;
@@ -165,19 +172,19 @@ void BBLTopbarArt::DrawButton(wxDC& dc, wxWindow* wnd, const wxAuiToolBarItem& i
     {
         if (item.GetState() & wxAUI_BUTTON_STATE_PRESSED)
         {
-            dc.SetPen(wxPen(StateColor::darkModeColorFor("#009688"))); // ORCA
-            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#009688"))); // ORCA
+            dc.SetPen(wxPen(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
+            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
             dc.DrawRectangle(rect);
         }
         else if ((item.GetState() & wxAUI_BUTTON_STATE_HOVER) || item.IsSticky())
         {
-            dc.SetPen(wxPen(StateColor::darkModeColorFor("#009688"))); // ORCA
-            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#009688"))); // ORCA
+            dc.SetPen(wxPen(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
+            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
 
             // draw an even lighter background for checked item hovers (since
             // the hover background is the same color as the check background)
             if (item.GetState() & wxAUI_BUTTON_STATE_CHECKED)
-                dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#009688"))); // ORCA
+                dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
 
             dc.DrawRectangle(rect);
         }
@@ -185,8 +192,8 @@ void BBLTopbarArt::DrawButton(wxDC& dc, wxWindow* wnd, const wxAuiToolBarItem& i
         {
             // it's important to put this code in an else statement after the
             // hover, otherwise hovers won't draw properly for checked items
-            dc.SetPen(wxPen(StateColor::darkModeColorFor("#009688"))); // ORCA
-            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#009688"))); // ORCA
+            dc.SetPen(wxPen(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
+            dc.SetBrush(wxBrush(StateColor::darkModeColorFor("#4F87A5"))); // ORCA
             dc.DrawRectangle(rect);
         }
     }

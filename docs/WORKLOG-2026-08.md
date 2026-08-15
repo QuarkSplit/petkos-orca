@@ -2200,3 +2200,57 @@ a boolean that actually loses material.
 - Manifold vendoring, as above.
 - Stages 2-5 of the design - paint-the-seam, the waist cut, assembly-informed decomposition and
   Chopper-for-the-farm - are untouched. Stage 1 was designed to ship alone and it does.
+
+## Work log - 2026-08-15 daylight, second half (the camera, and the fork wearing its own colours)
+
+Three asks from Petko's daylight scope call, beside the cutting work above.
+
+### A bed swap stops moving the camera
+
+Selecting a plate that carries a different printer changes the bed, and
+`GLCanvas3D::bed_shape_changed()` answered every bed change by setting
+`requires_zoom_to_bed` - so a plate click re-aimed the viewport the user had just framed.
+The flag-set is gone: a bed change refreshes the camera's scene box and nothing else. Every
+path that legitimately wants a re-frame (startup at Plater.cpp:13947, project load at
+14060, the Downloader, the view cube) already requests one explicitly, so nothing was lost.
+The capture run confirms it: after the driver's plate-switch phase across printer-changing
+plates, the view still frames all six plates. The selected plate's grey-to-dark bed render
+is the selection feedback, whole and sufficient.
+
+### Dark by default, and the identity that comes with it
+
+`dark_color_mode` defaults to "1" (AppConfig.cpp); a fresh config boots dark, proven by
+stripping the key from a clone's conf and capturing the boot (perf-runs/theme-dark-default.png).
+Light mode stays one Preferences toggle away.
+
+**The accent is muted arctic blue, and `tools/accent-sweep.ps1` is the authority on the
+mapping.** Base #4F87A5, hover #6B9DB8, dark #3D6B85, pressed #8FD0EA, plus the pale wash
+family (#C0D4E2 selection, #E5EEF5 focus) and the dark-side washes in StateColor's map,
+recomputed as accent-over-dark-ground blends. The sweep replaced 2,300+ literals across
+~530 files - hex strings, wxColour triples, 0xRRGGBB ints, ColorRGBA::ORCA(), the ImGui
+constants, 400+ SVG icons, the web pages - and it is idempotent, so an upstream rebase that
+reintroduces teal is answered by re-running one script rather than a hand-merge. Two
+tell-tales found on the way: the tree held two drifted typos of the accent (#009687,
+#009789), which is what happens to a colour that lives as scattered literals; and
+libslic3r's teal literals are DEFAULT FILAMENT COLOURS - material data that reaches
+G-code - so the sweep deliberately never touches libslic3r.
+
+**Banners wear gunmetal PEI.** `tools/gen_gunmetal.py` generates the texture
+deterministically (dark blue-grey ground, two-grain powder-coat speckle, brushed
+anisotropy, arctic-tinted glints, baked specular sheen); `Widgets/PodBanner` tiles it
+across any rect, cropping rather than scaling - scaling would average the grain away -
+and phase-aligns a child control's tiling to its parent so the grain runs continuously
+across the title. Wired into the topbar art, the centered title, and the plate board's
+group headers (light mode keeps its flat head; the topbar is dark in both modes and is
+textured in both). The main tab strip stays flat deliberately: its buttons would need a
+transparent-idle mode on the shared Button widget, and a texture on every surface is
+uniform emphasis, which is its own kind of slop. Specular stays baked rather than
+cursor-tracked: a mouse-move repaint tax on the window whose frame time was fought for
+all week would be decoration charging rent.
+
+Evidence: perf-runs/theme-dark-default.png (dark boot, gunmetal topbar, arctic selection,
+six plates still framed after the switch phase), perf-runs/theme-board-headers.png (the
+21-plate mixed fixture under Machine grouping, textured group headers, pinned inspector).
+Both gates re-ran VERIFIED on the shipping binary after the sweep, and `pod cut` passed
+on it (volume conserved 290534 = 290534 mm3, bounded region 122675 vs the plane's
+181012 mm3).

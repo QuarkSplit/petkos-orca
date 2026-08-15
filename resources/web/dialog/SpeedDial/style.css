@@ -54,7 +54,7 @@ body {
   background: var(--speed-tile-bg, #f0f0f0);
   border: 1px solid var(--speed-tile-border, #d8d8d8);
 }
-.fav-tile.sel { outline: 2px solid var(--main-color, var(--orca-accent, #009688)); outline-offset: 2px; }
+.fav-tile.sel { outline: 2px solid var(--main-color, var(--orca-accent, #4F87A5)); outline-offset: 2px; }
 .ctx-menu {
   position: fixed;
   z-index: 10;
@@ -93,7 +93,7 @@ body {
   border-radius: 7px;
 }
 .plugin-search:focus-within {
-  border-color: var(--main-color, var(--orca-accent, #009688));
+  border-color: var(--main-color, var(--orca-accent, #4F87A5));
   box-shadow: 0 0 0 2px rgba(0,150,136,.25);
 }
 .plugin-search-icon { display: inline-flex; color: var(--muted, var(--orca-muted, #6b7280)); }
@@ -212,7 +212,7 @@ kbd {
 .star svg { display: block; }
 .row:hover .star:not(.on),
 .row.sel .star:not(.on) { opacity: .5; }
-.star.on { opacity: 1; color: var(--main-color, var(--orca-accent, #009688)); }
+.star.on { opacity: 1; color: var(--main-color, var(--orca-accent, #4F87A5)); }
 .star:hover { background: rgba(127,127,127,.18); }
 .dial-empty {
   min-height: 64px;

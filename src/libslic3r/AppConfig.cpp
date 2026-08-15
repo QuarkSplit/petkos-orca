@@ -335,8 +335,9 @@ void AppConfig::set_defaults()
 //#endif
 
 #ifdef SUPPORT_DARK_MODE
+    //Podslicer is dark by default; light mode stays one Preferences toggle away.
     if (get("dark_color_mode").empty())
-        set("dark_color_mode", "0");
+        set("dark_color_mode", "1");
 #endif
 
 //#ifdef SUPPORT_SYS_MENU

@@ -1,5 +1,6 @@
 #include "PlateBoard.hpp"
 #include "PetkosPerf.hpp"
+#include "Widgets/PodBanner.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -555,10 +556,10 @@ wxColour board_soft(bool dark)   { return theme(dark, "#323A3D"); } //softer tex
 wxColour board_dim(bool dark)    { return theme(dark, "#6B6A6A"); } //dimmed text
 wxColour board_line(bool dark)   { return theme(dark, "#EEEEEE"); } //separator / title line
 wxColour board_head(bool dark)   { return theme(dark, "#F8F8F8"); } //sidebar titlebar band
-wxColour board_sel(bool dark)    { return theme(dark, "#BFE1DE"); } //checked item background
+wxColour board_sel(bool dark)    { return theme(dark, "#C0D4E2"); } //checked item background
 wxColour board_scope(bool dark)  { return theme(dark, "#EBF9F0"); } //in the scope set, not current
-wxColour board_hover(bool dark)  { return theme(dark, "#E5F0EE"); } //focused item background
-wxColour board_accent(bool dark) { return theme(dark, "#009688"); } //ORCA colour
+wxColour board_hover(bool dark)  { return theme(dark, "#E5EEF5"); } //focused item background
+wxColour board_accent(bool dark) { return theme(dark, "#4F87A5"); } //ORCA colour
 //GROUNDS, kept apart from the inks above because nothing in the type system keeps them
 //apart: a wxColour is a wxColour, so a fill can take a text colour and did. board_soft
 //(#323A3D) was the brush for both empty tiles, which painted a near-black square as the
@@ -2663,9 +2664,12 @@ void PlateBoard::draw_group_header(wxDC &                 dc,
                                    const PlateBoardGroup &group,
                                    bool                   collapsed)
 {
-    dc.SetBrush(wxBrush(board_head(dark)));
-    dc.SetPen(*wxTRANSPARENT_PEN);
-    dc.DrawRectangle(0, y, width, height);
+    //dark mode grounds the header on gunmetal PEI; light mode keeps the flat head
+    if (!PodBanner::draw(dc, wxRect(0, y, width, height), dark)) {
+        dc.SetBrush(wxBrush(board_head(dark)));
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.DrawRectangle(0, y, width, height);
+    }
 
     dc.SetPen(wxPen(board_line(dark)));
     dc.DrawLine(0, y + height - 1, width, y + height - 1);
@@ -2855,7 +2859,7 @@ void PlateBoard::draw_plate_tile(wxDC &dc, const wxRect &cell, int row_index, bo
                 cell.y + (cell.GetHeight() - extent.GetHeight()) / 2);
 
     //THE CORNER MARK IS THE SLICE STATE, and it is a mark rather than a fill because the
-    //fills that could carry it - #BFE1DE, #EBF9F0, #F4F6F6 - are one pale grey-green at this
+    //fills that could carry it - #C0D4E2, #EBF9F0, #F4F6F6 - are one pale grey-green at this
     //size, and board_scope already means "in the scope set" on this same tile. Three
     //saturated colours in one small shape are three facts; three pale grounds are one.
     wxColour mark;
