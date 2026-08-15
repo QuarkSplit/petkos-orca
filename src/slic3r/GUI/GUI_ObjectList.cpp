@@ -3130,8 +3130,13 @@ void ObjectList::merge(bool to_multipart_object)
             for (auto& opt_key : opt_keys) {
                 if (find(new_opt_keys.begin(), new_opt_keys.end(), opt_key) == new_opt_keys.end()) {
                     const ConfigOption* option = from_config.option(opt_key);
-                    if (!option)
-                        throw RuntimeError("Object configuration key '" + opt_key + "' has no value");
+                    //A key its own config cannot produce a value for is skipped and named,
+                    //not a reason to abandon the merge.
+                    if (!option) {
+                        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": object configuration key '" << opt_key
+                                                   << "' has no value; leaving it out of the merged settings";
+                        continue;
+                    }
                     config.set_key_value(opt_key, option->clone());
                 }
             }

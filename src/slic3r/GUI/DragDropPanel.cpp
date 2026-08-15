@@ -5,20 +5,29 @@
 #include "Widgets/Label.hpp"
 #include "Widgets/StateColor.hpp"
 #include <slic3r/GUI/wxExtensions.hpp>
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r { namespace GUI {
 
 wxDEFINE_EVENT(wxEVT_DRAG_DROP_COMPLETED, wxCommandEvent);
 
+//A query reports; it does not throw. Every caller size-checks this list, so the honest answer
+//for an unresolvable plate is the empty one: no nozzle volume types to speak of.
 static std::vector<int> current_plate_nozzle_volume_types()
 {
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error))
-        throw Slic3r::RuntimeError("Unable to resolve the current plate for filament mapping: " + error);
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the current plate does not resolve - " << error
+                                   << "; answering with no nozzle volume types";
+        return {};
+    }
     const auto *option = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-    if (option == nullptr)
-        throw Slic3r::RuntimeError("The current plate slicing context has no nozzle volume types");
+    if (option == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate slicing context has no nozzle volume types;"
+                                      " answering with none";
+        return {};
+    }
     return option->values;
 }
 

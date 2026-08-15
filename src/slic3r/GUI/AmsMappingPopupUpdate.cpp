@@ -514,8 +514,13 @@ size_t AmsMapingPopup::source_nozzle_count(MachineObject *obj) const
 void AmsMapingPopup::set_source_plate_config(const std::string &printer_model_id, const DynamicPrintConfig &config)
 {
     const ConfigOptionFloats *nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
-    if (nozzles == nullptr || nozzles->values.empty())
-        throw Slic3r::RuntimeError("The source plate has no exact nozzle configuration");
+    //A query reports; without an exact nozzle configuration the popup declines the plate count
+    //and source_nozzle_count() falls back to the machine's own extruder count, by design.
+    if (nozzles == nullptr || nozzles->values.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the source plate has no exact nozzle configuration;"
+                                      " leaving the nozzle count to the machine's own answer";
+        return;
+    }
 
     m_source_printer_model_id = printer_model_id;
     m_source_plate_nozzle_count = nozzles->values.size();

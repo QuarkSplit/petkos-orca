@@ -266,6 +266,21 @@ bool is_flush_config_modified()
 
 void open_flushing_dialog(wxEvtHandler *parent, const wxEvent &event)
 {
+    //The front door refuses with a message instead of letting the dialog's own plate reads
+    //throw behind it. A button that does nothing silently is always a bug; this one speaks.
+    {
+        Plater    *plater = wxGetApp().plater();
+        PartPlate *plate  = plater != nullptr ? plater->get_partplate_list().get_curr_plate() : nullptr;
+        ResolvedPlateSlicingConfig resolved;
+        std::string error;
+        if (plate == nullptr || !plater->resolve_plate_slicing_config(plate, resolved, error)) {
+            if (plate != nullptr)
+                plate->update_apply_result_invalid(true);
+            show_error(plater, plate == nullptr ? _L("Flushing volumes need a selected plate.")
+                                                : format_wxstr(_L("Flushing volumes cannot be edited: %1%"), error));
+            return;
+        }
+    }
     WipingDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe));
     dlg.ShowModal();
     if (dlg.GetSubmitFlag()) {

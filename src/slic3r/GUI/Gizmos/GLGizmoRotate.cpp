@@ -9,6 +9,7 @@
 
 #include "libslic3r/PresetBundle.hpp"
 
+#include <boost/log/trivial.hpp>
 #include <glad/gl.h>
 
 namespace Slic3r {
@@ -600,16 +601,21 @@ void GLGizmoRotate3D::data_changed(bool is_serializing) {
 
     bool is_wipe_tower = selection.is_wipe_tower();
     if (is_wipe_tower) {
+        //A query reports; if the plate cannot say what the wipe tower's angle is, the gizmo
+        //keeps the rotation it already shows rather than inventing one.
         ResolvedPlateSlicingConfig resolved;
         std::string error;
-        if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error))
-            throw RuntimeError(error);
-        const DynamicPrintConfig& config = resolved.config;
-        float wipe_tower_rotation_angle =
-            dynamic_cast<const ConfigOptionFloat *>(
-                config.option("wipe_tower_rotation_angle"))
-                ->value;
-        set_rotation(Vec3d(0., 0., (M_PI / 180.) * wipe_tower_rotation_angle));
+        if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate does not resolve - " << error
+                                       << "; keeping the current wipe-tower rotation";
+        } else {
+            const DynamicPrintConfig& config = resolved.config;
+            float wipe_tower_rotation_angle =
+                dynamic_cast<const ConfigOptionFloat *>(
+                    config.option("wipe_tower_rotation_angle"))
+                    ->value;
+            set_rotation(Vec3d(0., 0., (M_PI / 180.) * wipe_tower_rotation_angle));
+        }
         m_gizmos[0].disable_grabber();
         m_gizmos[1].disable_grabber();
     } else {

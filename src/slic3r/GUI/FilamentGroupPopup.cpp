@@ -47,8 +47,13 @@ static FilamentMapMode get_prefered_map_mode()
     auto                                   &app_config    = wxGetApp().app_config;
     std::string                             mode_str      = app_config->get("prefered_filament_map_mode");
     auto                                    iter          = enum_keys_map.find(mode_str);
-    if (iter == enum_keys_map.end())
-        throw RuntimeError("Invalid prefered_filament_map_mode value: " + mode_str);
+    //An unrecognised string in the conf is data gone stale, not a reason to throw: answer with
+    //the mode AppConfig itself seeds (fmmAutoForFlush) and say so.
+    if (iter == enum_keys_map.end()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": unrecognised prefered_filament_map_mode '" << mode_str
+                                   << "'; answering with the default flush mode";
+        return FilamentMapMode::fmmAutoForFlush;
+    }
     return FilamentMapMode(iter->second);
 }
 
@@ -59,8 +64,13 @@ static void set_prefered_map_mode(FilamentMapMode mode)
     std::string                           mode_str;
     if (mode < enum_values.size()) mode_str = enum_values[mode];
 
-    if (mode_str.empty())
-        throw RuntimeError("Invalid filament map mode");
+    //A mode outside the enum cannot be stored honestly; declining the write keeps the conf's
+    //last valid value instead of poisoning it.
+    if (mode_str.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": filament map mode " << int(mode)
+                                   << " has no name; leaving the stored preference unchanged";
+        return;
+    }
     app_config->set("prefered_filament_map_mode", mode_str);
 }
 

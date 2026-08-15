@@ -7,7 +7,9 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/PrintConfig.hpp"
 #include "GLGizmoUtils.hpp"
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r { namespace GUI {
 
@@ -645,6 +647,9 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
     PresetBundle *bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
     std::string error;
+    //A render-path query reports; throwing mid-frame is the crash class this fork retired.
+    //An unresolvable plate draws the gizmo against the option defaults - the honest absence
+    //of a preset, not a substituted one.
     if (plate == nullptr || !bundle->resolve_plate_slicing_config(
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
@@ -652,9 +657,15 @@ void GLGizmoBrimEars::on_render_input_window(float x, float y, float bottom_limi
             resolved, error)) {
         if (plate != nullptr)
             plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for brim editing" : error);
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no plate config for brim editing - "
+                                   << (plate == nullptr ? std::string("no plate is current")
+                                                        : (error.empty() ? std::string("the plate does not resolve") : error))
+                                   << "; drawing against the option defaults";
+        resolved.config = DynamicPrintConfig();
+        resolved.config.apply(FullPrintConfig::defaults());
     }
-    resolved.config.apply(*plate->config(), true);
+    if (plate != nullptr)
+        resolved.config.apply(*plate->config(), true);
     const DynamicPrintConfig& plate_cfg = resolved.config;
     const float win_h = ImGui::GetWindowHeight();
     y                 = std::min(y, bottom_limit - win_h);
@@ -1175,6 +1186,8 @@ float GLGizmoBrimEars::get_brim_default_radius() const
     PresetBundle *bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
     std::string error;
+    //A query reports; the default radius degrades to the option defaults' 0.4 nozzle rather
+    //than refusing to size a brim ear.
     if (plate == nullptr || !bundle->resolve_plate_slicing_config(
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
@@ -1182,12 +1195,21 @@ float GLGizmoBrimEars::get_brim_default_radius() const
             resolved, error)) {
         if (plate != nullptr)
             plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for brim editing" : error);
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no plate config for the brim radius - "
+                                   << (plate == nullptr ? std::string("no plate is current")
+                                                        : (error.empty() ? std::string("the plate does not resolve") : error))
+                                   << "; sizing against the option defaults";
+        resolved.config = DynamicPrintConfig();
+        resolved.config.apply(FullPrintConfig::defaults());
     }
-    resolved.config.apply(*plate->config(), true);
+    if (plate != nullptr)
+        resolved.config.apply(*plate->config(), true);
     const ConfigOptionFloats *nozzles = resolved.config.option<ConfigOptionFloats>("nozzle_diameter");
-    if (nozzles == nullptr || nozzles->values.empty())
-        throw RuntimeError("The plate's printer has no nozzle definition");
+    if (nozzles == nullptr || nozzles->values.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate's printer has no nozzle definition;"
+                                      " sizing against a 0.4 nozzle";
+        return resolved.config.get_abs_value("initial_layer_line_width", 0.4) * 16.0f;
+    }
     return resolved.config.get_abs_value("initial_layer_line_width", nozzles->get_at(0)) * 16.0f;
 }
 

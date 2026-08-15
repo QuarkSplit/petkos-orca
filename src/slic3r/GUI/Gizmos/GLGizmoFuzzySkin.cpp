@@ -11,6 +11,8 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "GLGizmoUtils.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include <boost/log/trivial.hpp>
 
 #include <glad/gl.h>
 #include <algorithm>
@@ -328,6 +330,8 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
     PresetBundle *bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
     std::string error;
+    //A render-path query reports; throwing mid-frame is the crash class this fork retired.
+    //An unresolvable plate draws the gizmo against the option defaults.
     if (plate == nullptr || !bundle->resolve_plate_slicing_config(
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
@@ -335,9 +339,15 @@ void GLGizmoFuzzySkin::on_render_input_window(float x, float y, float bottom_lim
             resolved, error)) {
         if (plate != nullptr)
             plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for fuzzy-skin editing" : error);
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no plate config for fuzzy-skin editing - "
+                                   << (plate == nullptr ? std::string("no plate is current")
+                                                        : (error.empty() ? std::string("the plate does not resolve") : error))
+                                   << "; drawing against the option defaults";
+        resolved.config = DynamicPrintConfig();
+        resolved.config.apply(FullPrintConfig::defaults());
     }
-    resolved.config.apply(*plate->config(), true);
+    if (plate != nullptr)
+        resolved.config.apply(*plate->config(), true);
     const DynamicPrintConfig &plate_cfg                  = resolved.config;
     const bool                has_object_fuzzy_override  = obj_cfg.option("fuzzy_skin");
     const FuzzySkinType       effective_fuzzy_skin_state = has_object_fuzzy_override ? obj_cfg.opt_enum<FuzzySkinType>("fuzzy_skin")

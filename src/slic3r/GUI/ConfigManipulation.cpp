@@ -15,6 +15,7 @@
 #include <sstream>
 #include <wx/msgdlg.h>
 #include <algorithm>
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r {
 namespace GUI {
@@ -231,8 +232,12 @@ void ConfigManipulation::check_filament_max_volumetric_speed(DynamicPrintConfig 
 
 void ConfigManipulation::check_chamber_temperature(DynamicPrintConfig* config)
 {
-    if (printer_config == nullptr)
-        throw RuntimeError("ConfigManipulation has no printer context");
+    //A validation is a query too: with no printer context there is nothing to validate against,
+    //and "no check performed" is the honest answer, never a throw.
+    if (printer_config == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no printer context; skipping chamber-temperature validation";
+        return;
+    }
     bool support_chamber_temp_control = printer_config->opt_bool("support_chamber_temp_control");
     if (support_chamber_temp_control&&config->has("chamber_temperature")) {
         std::string filament_type = config->option<ConfigOptionStrings>("filament_type")->get_at(0);
@@ -287,8 +292,12 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
 
     // layer_height shouldn't be equal to zero
     auto layer_height = config->opt_float("layer_height");
-    if (printer_config == nullptr)
-        throw RuntimeError("ConfigManipulation has no printer context");
+    //A validation is a query: no printer context means no printer to validate against, which is
+    //an answer, not an error. The fields keep their values; nothing is reset behind the user.
+    if (printer_config == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no printer context; skipping print-config validation";
+        return;
+    }
     if (layer_height < EPSILON)
     {
         const wxString msg_text = _(L("Layer height too small\nIt has been reset to 0.2"));
@@ -655,8 +664,12 @@ void ConfigManipulation::apply_null_fff_config(DynamicPrintConfig *config, std::
 
 void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, int variant_index, const bool is_global_config)
 {
-    if (printer_config == nullptr)
-        throw RuntimeError("ConfigManipulation has no printer context");
+    //Toggles are a query about the printer; with no printer context the fields keep their last
+    //enabled state, which is the honest absence of an answer rather than a substituted one.
+    if (printer_config == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no printer context; leaving field toggles as they are";
+        return;
+    }
     const GCodeFlavor gcflavor = printer_config->option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value;
 
     // Orca: use booleans to avoid repeated comparisons with enum values
@@ -1249,11 +1262,15 @@ void ConfigManipulation::toggle_print_sla_options(DynamicPrintConfig* config)
 int ConfigManipulation::show_spiral_mode_settings_dialog(bool is_object_config)
 {
     wxString msg_text = _(L("Spiral mode only works when wall loops is 1, support is disabled, clumping detection by probing is disabled, top shell layers is 0, sparse infill density is 0 and timelapse type is traditional."));
-    if (printer_config == nullptr)
-        throw RuntimeError("ConfigManipulation has no printer context");
-    auto printer_structure_opt = printer_config->option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
-    if (printer_structure_opt && printer_structure_opt->value == PrinterStructure::psI3) {
-        msg_text += _(L(" But machines with I3 structure will not generate timelapse videos."));
+    //The dialog is the user's question and must keep working; only the printer-specific I3 note
+    //depends on the printer context, so an absent context costs the note, not the dialog.
+    if (printer_config == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no printer context; omitting the printer-structure note";
+    } else {
+        auto printer_structure_opt = printer_config->option<ConfigOptionEnum<PrinterStructure>>("printer_structure");
+        if (printer_structure_opt && printer_structure_opt->value == PrinterStructure::psI3) {
+            msg_text += _(L(" But machines with I3 structure will not generate timelapse videos."));
+        }
     }
     if (!is_object_config)
         msg_text += "\n\n" + _(L("Change these settings automatically\?\nYes - Change these settings and enable spiral/vase mode automatically\nNo  - Cancel enabling spiral mode"));

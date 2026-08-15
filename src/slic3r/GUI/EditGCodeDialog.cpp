@@ -22,6 +22,8 @@
 #include "Widgets/DialogButtons.hpp"
 
 #include "libslic3r/Preset.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include <boost/log/trivial.hpp>
 
 #define BTN_GAP  FromDIP(20)
 #define BTN_SIZE wxSize(FromDIP(58), FromDIP(24))
@@ -29,6 +31,9 @@
 namespace Slic3r {
 namespace GUI {
 
+//A query reports; it does not throw. The dialog lists placeholder names, and the option defaults
+//carry the full placeholder vocabulary, so an unresolvable plate costs the plate's own values,
+//never the dialog: log, mark, and list against the defaults.
 static DynamicPrintConfig current_plate_gcode_config()
 {
     PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
@@ -42,7 +47,15 @@ static DynamicPrintConfig current_plate_gcode_config()
             resolved, error)) {
         if (plate != nullptr)
             plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for custom G-code editing" : error);
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no plate config for custom G-code editing - "
+                                   << (plate == nullptr ? std::string("no plate is current")
+                                                        : (error.empty() ? std::string("the plate does not resolve") : error))
+                                   << "; listing placeholders against the option defaults";
+        DynamicPrintConfig defaults;
+        defaults.apply(FullPrintConfig::defaults());
+        if (plate != nullptr)
+            defaults.apply(*plate->config(), true);
+        return defaults;
     }
     resolved.config.apply(*plate->config(), true);
     return std::move(resolved.config);

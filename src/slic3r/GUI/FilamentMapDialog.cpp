@@ -7,6 +7,7 @@
 #include "GUI_App.hpp"
 #include "CapsuleButton.hpp"
 #include "MsgDialog.hpp"
+#include <boost/log/trivial.hpp>
 
 namespace Slic3r { namespace GUI {
 
@@ -91,8 +92,12 @@ public:
 private:
     void on_smart_filament_checkbox(wxCommandEvent &event)
     {
-        if (m_plate == nullptr)
-            throw Slic3r::RuntimeError("The smart-filament control has no plate");
+        //A control without a plate has nothing to write to; the honest response is to decline
+        //the click, not to end the dialog.
+        if (m_plate == nullptr) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the smart-filament control has no plate; ignoring the click";
+            return;
+        }
         m_plate->config()->set_key_value("enable_filament_dynamic_map",
             new ConfigOptionBool(m_smart_filament_checkbox->GetValue()));
         m_plate->update_apply_result_invalid(true);
@@ -289,14 +294,20 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
             plate->config()->option<ConfigOptionBool>("enable_filament_dynamic_map") : nullptr;
         bool dynamic_map_enabled = dynamic_map != nullptr ? dynamic_map->value : false;
         if (plate != nullptr && dynamic_map == nullptr) {
+            //A query reports; an unresolvable plate answers "smart filament off", which is the
+            //feature's own default, not a substituted preset.
             ResolvedPlateSlicingConfig resolved;
             std::string error;
-            if (!wxGetApp().plater()->resolve_plate_slicing_config(plate, resolved, error))
-                throw Slic3r::RuntimeError("Unable to resolve smart-filament state: " + error);
-            const auto *resolved_dynamic_map = resolved.config.option<ConfigOptionBool>("enable_filament_dynamic_map");
-            if (resolved_dynamic_map == nullptr)
-                throw Slic3r::RuntimeError("The plate slicing context has no smart-filament setting");
-            dynamic_map_enabled = resolved_dynamic_map->value;
+            if (!wxGetApp().plater()->resolve_plate_slicing_config(plate, resolved, error)) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate does not resolve - " << error
+                                           << "; treating smart filament as off";
+            } else if (const auto *resolved_dynamic_map = resolved.config.option<ConfigOptionBool>("enable_filament_dynamic_map");
+                       resolved_dynamic_map == nullptr) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate slicing context has no smart-filament"
+                                              " setting; treating it as off";
+            } else {
+                dynamic_map_enabled = resolved_dynamic_map->value;
+            }
         }
         m_smart_filament = new SmartFilamentPanel(this, plate, dynamic_map_enabled);
         m_smart_filament->Show(get_mode() == fmmAutoForFlush);

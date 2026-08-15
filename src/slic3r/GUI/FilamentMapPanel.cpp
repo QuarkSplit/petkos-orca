@@ -211,8 +211,12 @@ std::vector<int> FilamentMapManualPanel::GetFilamentVolumeMaps() const
     if (!resolve_current_plate_config(resolved))
         return {};
     const auto *nozzle_volume_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-    if (nozzle_volume_opt == nullptr)
-        throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
+    //A query reports; a missing option gets the same empty answer an unresolvable plate does.
+    if (nozzle_volume_opt == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate slicing context has no nozzle volume types;"
+                                      " answering with no volume map";
+        return {};
+    }
     const auto &nozzle_volume_values = nozzle_volume_opt->values;
 
     for (int i = 0; i < (int) volume_map.size(); ++i) {
@@ -421,8 +425,12 @@ void FilamentMapManualPanel::UpdateNozzleVolumeType()
         if (!resolve_current_plate_config(resolved))
             return false;
         const auto *nozzle_volume_opt = resolved.config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
-        if (nozzle_volume_opt == nullptr)
-            throw Slic3r::RuntimeError("The plate slicing context has no nozzle volume types");
+        //A query reports; no volume types means no separation, same as an unresolvable plate.
+        if (nozzle_volume_opt == nullptr) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate slicing context has no nozzle volume"
+                                          " types; answering no separation";
+            return false;
+        }
         const auto &nozzle_volume_values = nozzle_volume_opt->values;
         if (nozzle_volume_values.size() <= 1)
             return false;
@@ -455,12 +463,22 @@ void FilamentMapManualPanel::UpdateNozzleCountDisplay()
     // Format the count suffix separately so a translation containing '%' cannot
     // corrupt the wxString::Format output.
     const auto *stats_opt = resolved.config.option<ConfigOptionStrings>("extruder_nozzle_stats");
-    if (stats_opt == nullptr)
-        throw Slic3r::RuntimeError("The plate slicing context has no nozzle-count statistics");
+    //A query reports; without statistics the zone titles keep their plain labels.
+    if (stats_opt == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the plate slicing context has no nozzle-count"
+                                      " statistics; keeping the plain nozzle labels";
+        m_left_panel->UpdateLabel(_L("Left Nozzle"));
+        m_right_panel->UpdateLabel(_L("Right Nozzle"));
+        return;
+    }
     const auto stats = get_extruder_nozzle_stats(stats_opt->values);
     auto count = [&stats](int extruder_id, std::optional<NozzleVolumeType> type) {
-        if (extruder_id < 0 || size_t(extruder_id) >= stats.size())
-            throw Slic3r::RuntimeError("The plate nozzle-count statistics do not match its extruders");
+        //A count that cannot be known is zero, and the mismatch is logged rather than fatal.
+        if (extruder_id < 0 || size_t(extruder_id) >= stats.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "UpdateNozzleCountDisplay: the nozzle-count statistics do not cover"
+                                          " extruder " << extruder_id << "; counting zero";
+            return 0;
+        }
         if (type) {
             const auto it = stats[size_t(extruder_id)].find(*type);
             return it == stats[size_t(extruder_id)].end() ? 0 : it->second;
