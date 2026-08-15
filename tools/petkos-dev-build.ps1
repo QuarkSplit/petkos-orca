@@ -107,8 +107,16 @@ $psi.RedirectStandardError  = $true
 
 $p = [System.Diagnostics.Process]::Start($psi)
 try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::$Priority } catch { }
-$out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
+# BOTH pipes have to be drained AT ONCE. Reading stdout to the end and only then reading stderr
+# deadlocks the moment the child writes more to stderr than the pipe buffer holds: the child
+# blocks writing, this script blocks reading the other stream, and neither ever moves. It looks
+# exactly like a slow build - a live cmake.exe with no compilers under it and no output - and the
+# case that triggers it is the common one, because a changed CMakeLists makes MSBuild re-run the
+# whole configure and that is thousands of lines. Async on both, then wait.
+$outTask = $p.StandardOutput.ReadToEndAsync()
+$errTask = $p.StandardError.ReadToEndAsync()
 $p.WaitForExit()
+$out = $outTask.Result + $errTask.Result
 $sw.Stop()
 $out | Out-File -FilePath $log -Encoding utf8
 

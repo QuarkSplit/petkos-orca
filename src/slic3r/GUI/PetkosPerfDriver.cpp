@@ -18,6 +18,8 @@
 #include <wx/event.h>
 #include <wx/timer.h>
 
+#include "libslic3r/CutUtils.hpp"
+#include "libslic3r/Format/STL.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
@@ -61,6 +63,16 @@ struct Spec
     std::string printer;
     //Where the run writes the project it built, so persistence can be inspected without the app.
     std::string save;
+    //PetkosOrca stage 1: a real bounded cut, on whatever the run loaded. Off by default because
+    //it is a mesh boolean on the whole object and nothing else in a timing run wants that.
+    int         cut     = 0;
+    //Where the plane sits, as a fraction of the object's height, and how much of its footprint
+    //in X the region covers. Both are fractions so the same spec works on any fixture.
+    double      cutz    = 0.5;
+    double      cutspan = 0.5;
+    int         cutdist = 1;
+    //Where the resulting parts are written as STL. Evidence, not the check.
+    std::string cutout;
 };
 
 Spec parse_spec(const std::string &s)
@@ -90,6 +102,11 @@ Spec parse_spec(const std::string &s)
         else if (key == "preview") spec.preview = num();
         else if (key == "quit")    spec.quit = num() != 0;
         else if (key == "printer") spec.printer = val;
+        else if (key == "cut")     spec.cut = num();
+        else if (key == "cutz")    spec.cutz = std::atof(val.c_str());
+        else if (key == "cutspan") spec.cutspan = std::atof(val.c_str());
+        else if (key == "cutdist") spec.cutdist = num();
+        else if (key == "cutout")  spec.cutout = val;
     }
     return spec;
 }
@@ -110,7 +127,7 @@ public:
     }
 
 private:
-    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Slice, SliceWait, Board, Drag, Finish, Done };
+    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Cut, Slice, SliceWait, Board, Drag, Finish, Done };
 
     void on_idle(wxIdleEvent &evt)
     {
@@ -229,14 +246,14 @@ private:
                 Perf::mark("driver.assign_end", m_done);
                 enter(m_spec.pick > 0 ? Phase::Pick
                                       : (m_spec.scope > 0 ? Phase::Scope
-                                                          : (m_spec.context > 0 ? Phase::Context : Phase::Board)));
+                                                          : (m_spec.context > 0 ? Phase::Context : next_after_context())));
             } else if (m_done >= m_spec.assigns) {
                 BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ASSIGN phase done - " << m_assigned << " of "
                                            << m_done << " iteration(s) changed a plate's machine";
                 Perf::mark("driver.assign_end", m_done);
                 enter(m_spec.pick > 0 ? Phase::Pick
                                       : (m_spec.scope > 0 ? Phase::Scope
-                                                          : (m_spec.context > 0 ? Phase::Context : Phase::Board)));
+                                                          : (m_spec.context > 0 ? Phase::Context : next_after_context())));
             } else {
                 const int count = plater->get_partplate_list().get_plate_count();
                 const int plate = count > 0 ? (m_done % count) : 0;
@@ -296,6 +313,11 @@ private:
 
         case Phase::Context:
             context_step(plater);
+            evt.RequestMore();
+            break;
+
+        case Phase::Cut:
+            cut_step(plater);
             evt.RequestMore();
             break;
 
@@ -454,7 +476,7 @@ private:
             BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.save << " (rc=" << written << ")";
         }
 
-        enter(m_spec.context > 0 ? Phase::Context : Phase::Board);
+        enter(m_spec.context > 0 ? Phase::Context : next_after_context());
     }
 
     //IS THE PROJECT PRINTER REALLY GONE?
@@ -597,6 +619,232 @@ private:
         if (ok)
             BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: context check passed - every plate owns its context, "
                                           "an empty one is an error, and the global selection reaches no plate";
+
+        enter(next_after_context());
+    }
+
+    //its_volume() accumulates in FLOAT. Two million signed tetrahedra, each of magnitude ~1e6,
+    //summing to ~3e5 lose their low digits to cancellation: on the revolver that is ~250 mm3 of
+    //pure measurement error - 0.09%, which is more than a boolean would have to lose before
+    //this check could see it. A check whose noise floor is above the fault it is looking for is
+    //not a check, so the sum is done in double and the tolerance can then mean something.
+    static double mesh_volume(const indexed_triangle_set &its)
+    {
+        double v = 0.0;
+        for (const Vec3i32 &f : its.indices) {
+            const Vec3d a = its.vertices[f[0]].cast<double>();
+            const Vec3d b = its.vertices[f[1]].cast<double>();
+            const Vec3d c = its.vertices[f[2]].cast<double>();
+            v += a.dot(b.cross(c));
+        }
+        return v / 6.0;
+    }
+
+    Phase next_after_context() const
+    {
+        if (m_spec.cut > 0)
+            return Phase::Cut;
+        return m_spec.gcode.empty() ? Phase::Board : Phase::Slice;
+    }
+
+    //PETKOSORCA STAGE 1: A REAL BOUNDED CUT, CHECKED THE ONLY WAY THAT CANNOT BE WRONG.
+    //
+    //Two halves that look right on screen prove nothing - the failure mode of a boolean is a
+    //part with a hole in it, and a hole does not show from outside. So the verdict is
+    //arithmetic: both parts closed (its_num_open_edges == 0) and their volumes adding up to
+    //the source's. Both are computed off the meshes the app is holding, after the cut has
+    //actually gone through Cut and Plater::apply_cut_object_to_model, so what is measured is
+    //the production path rather than a copy of it.
+    //
+    //The booleans run inline here rather than through BoundedCutJob, deliberately: this phase
+    //is checking geometry, and a driver that hands work to a worker and returns to idle has to
+    //re-enter to find out what happened. What the Job is for - a UI that keeps painting - is
+    //not what a headless run can observe.
+    void cut_step(Plater *plater)
+    {
+        Model &model = plater->model();
+        if (model.objects.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - there is no object to cut";
+            enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+            return;
+        }
+
+        ModelObject *mo = model.objects.front();
+        if (mo->instances.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - '" << mo->name << "' has no instance";
+            enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+            return;
+        }
+
+        const int           instance_idx = 0;
+        const BoundingBoxf3 wbb          = mo->instance_bounding_box(instance_idx);
+        const Vec3d         inst_offset  = mo->instances[instance_idx]->get_offset();
+        if (!wbb.defined || wbb.size().z() <= EPSILON) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - '" << mo->name << "' has no height to cut";
+            enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+            return;
+        }
+
+        //The plane, expressed the way the gizmo expresses it: a centre in the instance's own
+        //space, no rotation. The region is then plane-local by construction.
+        const Vec3d plane_centre(wbb.center().x(), wbb.center().y(), wbb.min.z() + m_spec.cutz * wbb.size().z());
+        const Transform3d cut_matrix = Geometry::translation_transform(plane_centre - inst_offset);
+
+        //A rectangle covering the middle `cutspan` of the footprint in X and the whole of it in
+        //Y, with margin. The point of the fixture is that the walls in X pass through material
+        //and the walls in Y pass through air, so the result is testable in one number: the part
+        //that comes off is smaller than the whole slab above the plane.
+        const double half_x = 0.5 * m_spec.cutspan * wbb.size().x();
+        const double half_y = 0.5 * wbb.size().y() + 10.0;
+        const CutBounds bounds = CutBounds::make_rectangle(Vec2d(-half_x, -half_y), Vec2d(half_x, half_y));
+
+        const std::vector<CutBoundedInput> inputs = collect_bounded_cut_inputs(*mo, instance_idx);
+        if (inputs.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - '" << mo->name
+                                     << "' has no solid volume to cut";
+            enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+            return;
+        }
+
+        //The source volume, measured in the same space the split is measured in, so the
+        //conservation check is a comparison rather than a coincidence.
+        //The source's OWN open edges are reported with its volume, because a downloaded mesh is
+        //routinely not closed and the volume of a mesh that is not closed is not a number - it
+        //is a divergence sum over a surface with holes in it. Without this line a conservation
+        //check that drifts reads as a boolean losing material, when what actually happened is
+        //that corefinement returned a closed solid for an input that never had one volume.
+        double source_volume = 0.0;
+        size_t source_faces  = 0;
+        size_t source_open   = 0;
+        for (const CutBoundedInput &in : inputs) {
+            if (!in.mesh)
+                continue;
+            TriangleMesh m(*in.mesh);
+            m.transform(in.matrix, true);
+            source_volume += mesh_volume(m.its);
+            source_faces  += m.its.indices.size();
+            source_open   += its_num_open_edges(m.its);
+        }
+
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: cutting '" << mo->name << "' - " << inputs.size()
+                                   << " volume(s), " << source_faces << " faces, " << source_volume
+                                   << " mm3, " << source_open << " open edge(s) in the SOURCE; plane at z="
+                                   << plane_centre.z() << ", region " << (2.0 * half_x) << " x " << (2.0 * half_y)
+                                   << " mm";
+
+        CutBoundedSplits splits;
+        std::string      failure;
+        const auto       t0 = std::chrono::steady_clock::now();
+        const bool       ok = compute_bounded_splits(inputs, cut_matrix, bounds, splits, failure);
+        const double     boolean_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+        if (!ok) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - the boolean refused after "
+                                     << boolean_ms << " ms: " << failure;
+            enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
+            return;
+        }
+
+        //THE NUMBER THAT SAYS THE BOUND DID ANYTHING. Watertight parts that add up prove the
+        //boolean is sound; they say nothing about whether the region mattered. So the same
+        //plane is run unbounded, through the code path the unbounded cut actually uses, and
+        //the two upper volumes are compared. If they are equal the bound is decoration.
+        double unbounded_upper = 0.0;
+        {
+            const Transform3d to_cut = cut_space_transform(cut_matrix);
+            for (const CutBoundedInput &in : inputs) {
+                if (!in.mesh)
+                    continue;
+                TriangleMesh m(*in.mesh);
+                m.transform(to_cut * in.matrix, true);
+                indexed_triangle_set up, lo;
+                cut_mesh(m.its, 0.0f, &up, &lo);
+                unbounded_upper += mesh_volume(up);
+            }
+        }
+
+        bool   check_ok    = true;
+        double parts_volume = 0.0;
+        for (const auto &kv : splits) {
+            const size_t open_up = its_num_open_edges(kv.second.upper);
+            const size_t open_lo = its_num_open_edges(kv.second.lower);
+            if (open_up != 0 || open_lo != 0) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - volume " << kv.first
+                                         << " came out open: " << open_up << " open edge(s) above, " << open_lo
+                                         << " below";
+                check_ok = false;
+            }
+            parts_volume += mesh_volume(kv.second.upper) + mesh_volume(kv.second.lower);
+        }
+
+        //One part in a thousand. Tessellation moves a volume by far less than that; a boolean
+        //that lost a piece moves it by percent.
+        //One part in a hundred thousand. Double summation puts the noise floor far below that,
+        //so anything this catches is geometry rather than arithmetic.
+        const double tolerance = std::max(1e-5 * std::abs(source_volume), 1e-6);
+        if (std::abs(parts_volume - source_volume) > tolerance) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - volume not conserved: source "
+                                     << source_volume << " mm3, parts " << parts_volume << " mm3 (difference "
+                                     << (parts_volume - source_volume) << ")";
+            check_ok = false;
+        }
+
+        //Now the cut for real, through the same Cut the gizmo drives, with the geometry it has
+        //just been handed. A check that stops at the meshes would never touch clone_for_cut,
+        //the config copy, the paint restore or the plate placement.
+        const int object_idx = 0;
+        ModelObjectCutAttributes attributes = ModelObjectCutAttribute::KeepUpper |
+                                              ModelObjectCutAttribute::KeepLower |
+                                              ModelObjectCutAttribute::KeepPaint;
+        Cut cut(mo, instance_idx, cut_matrix, attributes);
+        cut.set_precomputed_splits(splits);
+        const ModelObjectPtrs &new_objects = cut.perform_with_bounded_plane(bounds);
+
+        if (!cut.failure().empty() || new_objects.size() < 2) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - the cut produced "
+                                     << new_objects.size() << " object(s)"
+                                     << (cut.failure().empty() ? "" : (": " + cut.failure()));
+            check_ok = false;
+        }
+        else {
+            if (!m_spec.cutout.empty()) {
+                boost::system::error_code ec;
+                boost::filesystem::create_directories(boost::filesystem::path(m_spec.cutout), ec);
+                for (size_t i = 0; i < new_objects.size(); ++i) {
+                    TriangleMesh part = new_objects[i]->mesh();
+                    const std::string path =
+                        (boost::filesystem::path(m_spec.cutout) / ("cut-part-" + std::to_string(i + 1) + ".stl")).string();
+                    if (store_stl(path.c_str(), &part, true))
+                        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << path << " ("
+                                                   << part.its.indices.size() << " faces)";
+                    else
+                        BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: could not write " << path;
+                }
+            }
+            const size_t parts = new_objects.size();
+            plater->apply_cut_object_to_model(object_idx, new_objects, m_spec.cutdist != 0);
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: applied " << parts << " part(s) to the model"
+                                       << (m_spec.cutdist != 0 ? ", distributed to the plate" : "");
+        }
+
+        double bounded_upper = 0.0;
+        for (const auto &kv : splits)
+            bounded_upper += mesh_volume(kv.second.upper);
+        if (bounded_upper >= unbounded_upper - std::max(1e-5 * std::abs(unbounded_upper), 1e-6)) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: CUT CHECK FAILED - the region took "
+                                     << bounded_upper << " mm3 and the infinite plane at the same height would "
+                                        "have taken " << unbounded_upper << " mm3; the bound did nothing";
+            check_ok = false;
+        }
+
+        if (check_ok)
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: cut check passed - both parts watertight, volume "
+                                          "conserved (source " << source_volume << " mm3, parts " << parts_volume
+                                       << " mm3), the region took " << bounded_upper << " mm3 where the infinite "
+                                          "plane would have taken " << unbounded_upper << " mm3, boolean "
+                                       << boolean_ms << " ms";
+        Perf::mark("driver.cut_ms", int(boolean_ms));
 
         enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
     }
@@ -760,7 +1008,7 @@ private:
                 BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: pick check passed - " << m_pick_ok
                                            << " of " << count << " plates picked themselves ("
                                            << m_pick_off << " off screen)";
-            enter(m_spec.scope > 0 ? Phase::Scope : (m_spec.context > 0 ? Phase::Context : Phase::Board));
+            enter(m_spec.scope > 0 ? Phase::Scope : (m_spec.context > 0 ? Phase::Context : next_after_context()));
             return;
         }
 

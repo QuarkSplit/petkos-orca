@@ -8,6 +8,7 @@ re-derived from the shell by the next session:
     pod inspect  <3mf>               what does this project DECLARE (plates, contexts, key values)
     pod run      [flags]             drive the real app through the perf driver and report honestly
     pod slice    <3mf> --printer P   open, retarget, slice, keep the G-code (the proven write path)
+    pod cut      [--project 3mf]     drive a real bounded cut; watertight + volume checked, STLs kept
     pod check    <gcode> [flags]     what did a slice ACTUALLY use (petkos-gcode-check)
     pod verify                       the in-app suite   (tools/petkos-verify.ps1)
     pod import-check                 the five-number cross-printer suite
@@ -40,8 +41,17 @@ def newest(pattern, exclude=None, logdir=None):
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 def app_running():
+    """(a slicer is running, a build is running).
+
+    MSBuild is NOT the tell. Node reuse leaves a worker per core alive for ~15 minutes after
+    every build, so `msbuild in tasklist` reports ACTIVE for a quarter of an hour during which
+    nothing is compiling - and a warning that is wrong most of the time is a warning nobody
+    reads, which is the one failure this line exists to prevent. A build is a live driver
+    (cmake --build) or a live compiler; the idle workers under them are not.
+    """
     out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower()
-    return "orca-slicer" in out, "msbuild" in out
+    building = any(name in out for name in ("cmake.exe", "cl.exe", "link.exe"))
+    return "orca-slicer" in out, building
 
 def running_slicer_datadirs():
     """(pid, datadir-from-command-line) for every running slicer. Empty datadir = unknown."""
@@ -254,6 +264,30 @@ def drive(spec, project=None, timeout=900, keep_env=False):
 def cmd_run(a):
     sys.exit(drive(a.spec, a.project, a.timeout, keep_env=a.keep_env))
 
+#The revolver is the fixture the cutting work is checked against because it is 103 MB of a real
+#download rather than a clean cube: a boolean that only works on primitives is not a feature.
+CUT_FIXTURE = (r"E:\3D-Printing\Projects\Comic Con 2026\01-source"
+               r"\1607565-las-58-talon-v2-helldivers-2\energy_revolver_-_part_1.3mf")
+
+def cmd_cut(a):
+    """Drive a real bounded cut and keep what came out.
+
+    The verdict is not a screenshot: the driver checks that both parts are closed
+    (its_num_open_edges == 0) and that their volumes add up to the source's, and says
+    CHECK FAILED when they do not. The STLs it keeps are evidence, not the test.
+    """
+    project = a.project or CUT_FIXTURE
+    out = Path(a.out or (PERFDIR / "cut")).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    spec = (f"plates=0,warmup=25,orbit=0,switch=0,assign=0,board=0,drag=0,pick=0,scope=0,context=0,"
+            f"cut=1,cutz={a.z},cutspan={a.span},cutdist={1 if a.distribute else 0},cutout={out},quit=1")
+    rc = drive(spec, project, a.timeout)
+    kept = sorted(out.glob("*.stl"))
+    print(f"   kept {len(kept)} part STL(s) in {out}")
+    for p in kept:
+        print(f"     {p.name}  {p.stat().st_size // 1024} KB")
+    sys.exit(rc)
+
 def cmd_slice(a):
     gcode = Path(a.out or (PERFDIR / (Path(a.project).stem + ".gcode"))).resolve()
     spec = (f"plates=0,warmup=25,orbit=0,switch=0,assign=1,printer={a.printer},"
@@ -272,8 +306,19 @@ def pwsh(script, *args):
     return subprocess.run(["pwsh", "-Command",
                            f"& '{TOOLS / script}' " + " ".join(args)]).returncode
 
-def cmd_verify(a):       sys.exit(pwsh("petkos-verify.ps1"))
-def cmd_import_check(a): sys.exit(pwsh("petkos-import-check.ps1", "-TimeoutSec 1500"))
+#A VERIFICATION RUN STARTS FROM A KNOWN STATE. The clone is shared by every driven run and the
+#app writes its conf on exit, so whatever the last run left selected - a project's own embedded
+#presets, a different printer - decides what the next one starts from. A `pod cut` on a
+#Bambu-authored download left the clone remembering that project's presets, and the verify after
+#it assigned plate 1 to a machine whose bed the driver's cube did not fit, so the slice never
+#started and four green checks were followed by a G-code gate that failed for no reason in the
+#code. A latency run may reuse the clone; a run whose whole point is a verdict may not.
+def cmd_verify(a):
+    ensure_clone(fresh=True)
+    sys.exit(pwsh("petkos-verify.ps1"))
+def cmd_import_check(a):
+    ensure_clone(fresh=True)
+    sys.exit(pwsh("petkos-import-check.ps1", "-TimeoutSec 1500"))
 def cmd_check(a):
     extra = sum([["--expect-printer", a.expect_printer] if a.expect_printer else [],
                  ["--expect-filament", a.expect_filament] if a.expect_filament else [],
@@ -357,6 +402,7 @@ def main():
     p = sub.add_parser("inspect"); p.add_argument("project"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_inspect)
     p = sub.add_parser("run"); p.add_argument("spec"); p.add_argument("--project"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--keep-env", action="store_true", help="honour PETKOS_ACCEPT/PETKOS_TEST_ASSIGN already in the environment"); p.set_defaults(f=cmd_run)
     p = sub.add_parser("slice"); p.add_argument("project"); p.add_argument("--printer", required=True); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1500); p.set_defaults(f=cmd_slice)
+    p = sub.add_parser("cut"); p.add_argument("--project", help=f"default: {CUT_FIXTURE}"); p.add_argument("--z", type=float, default=0.5, help="plane height as a fraction of the object"); p.add_argument("--span", type=float, default=0.5, help="the region's share of the footprint in X"); p.add_argument("--distribute", action="store_true", help="land the parts on the plate"); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1800); p.set_defaults(f=cmd_cut)
     p = sub.add_parser("check"); p.add_argument("gcode"); p.add_argument("--expect-printer"); p.add_argument("--expect-filament"); p.add_argument("--min-flow", type=float); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_check)
     sub.add_parser("verify").set_defaults(f=cmd_verify)
     sub.add_parser("import-check").set_defaults(f=cmd_import_check)
