@@ -188,6 +188,11 @@ protected:
 	// just be used for edit filament dialog
     bool m_just_edit{false};
 
+    //PetkosOrca: depth of the PlateWriteSuspend scopes currently open. Static because the printer
+    //tab's selection reaches into the process and filament collections, so suspending "this tab"
+    //would leave the tabs it drags along still writing the plate.
+    static int s_plate_write_suspend_depth;
+
 	ScalableButton*			m_undo_btn;
 	ScalableButton*			m_undo_to_sys_btn;
 	//ScalableButton*			m_question_btn;
@@ -357,6 +362,38 @@ public:
     //answers - discard loses the edit, transfer drags it onto the next plate's preset. Unsaved edits
     //are PARKED instead; see Tab::park_dirty_edits.
     bool select_preset(std::string preset_name = "", bool delete_current = false, const std::string &last_selected_ph_printer_name = "", bool force_select = false, bool force_no_transfer = false, bool from_plate_cursor = false);
+
+    //PetkosOrca: THE TAB'S PRESET COMBO IS A PLATE CONTROL, because everything it picks is a plate
+    //property. It used to write only the global selection, which made it a second preset picker that
+    //looked identical to the sidebar's and did nothing: pick a printer at the top of the Printer
+    //Settings page, watch the tabs and the bed update, click another plate and back, and
+    //follow_plate_presets re-reads the plate - which still names the old printer - and snaps it all
+    //back. The change was silently discarded, which this fork calls the worst case there is.
+    //
+    //Writing through the Plater paths keeps every consequence in one place: the undo snapshot, the
+    //bed, the bounds re-check, the re-resolution of dependents. And it is idempotent against
+    //follow_plate_presets, which moves the cursor the other way and does nothing once the plate
+    //already agrees - which, after this, it does.
+    void write_selection_to_current_plate();
+
+    //PetkosOrca: THE RULE IS "a preset selection writes the plate only when it is the user choosing
+    //what THIS PLATE uses". Three things wear the costume of a selection without being that choice,
+    //and each is refused by its own name rather than by one flag doing three jobs:
+    //  - the editing cursor following the plate the user clicked  -> select_preset's from_plate_cursor
+    //  - opening a preset in order to EDIT it                     -> m_just_edit
+    //  - internal bookkeeping that happens to move the selection  -> this suspend scope
+    //A COUNTER, not a bool: select_preset can open a nested modal event loop, so a nested scope's
+    //exit must restore what the outer scope set rather than clear it outright.
+    class PlateWriteSuspend
+    {
+    public:
+        PlateWriteSuspend();
+        ~PlateWriteSuspend();
+        PlateWriteSuspend(const PlateWriteSuspend &) = delete;
+        PlateWriteSuspend &operator=(const PlateWriteSuspend &) = delete;
+    };
+    static bool plate_write_suspended() { return s_plate_write_suspend_depth > 0; }
+
 	bool		may_discard_current_dirty_preset(PresetCollection* presets = nullptr, const std::string& new_printer_name = "", bool no_transfer = false, bool no_transfer_variant = false);
 
     //Move this tab's unsaved edits out of the preset, so a selection that is not the user's choice of

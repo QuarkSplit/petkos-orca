@@ -7234,9 +7234,63 @@ bool Tab::select_preset(
 
     if (technology_changed)
         wxGetApp().mainframe->technology_changed();
+
+    //See the header. A preset the user picked here is a choice about the plate they are looking
+    //at, so it is written to that plate. The three exclusions are the three ways a selection can
+    //happen without being that choice:
+    //  from_plate_cursor - the cursor is FOLLOWING the plate, so the plate is the source of this
+    //                      value and writing it back is a loop with no new information in it;
+    //  m_just_edit       - the edit-filament dialog selected a preset in order to show its page.
+    //                      Picking a filament to EDIT is not choosing it for the plate;
+    //  the suspend scope - internal bookkeeping (deleting a filament, opening a tab on a slot)
+    //                      that moves the selection as a side effect of something else.
+    if (!canceled && !from_plate_cursor && !m_just_edit && !plate_write_suspended())
+        write_selection_to_current_plate();
+
     BOOST_LOG_TRIVIAL(info) << boost::format("select preset, exit");
 
     return !canceled;
+}
+
+int Tab::s_plate_write_suspend_depth = 0;
+
+Tab::PlateWriteSuspend::PlateWriteSuspend() { ++Tab::s_plate_write_suspend_depth; }
+
+Tab::PlateWriteSuspend::~PlateWriteSuspend()
+{
+    //Restore, never clear: select_preset can pump a nested modal event loop, and a nested scope
+    //that reset the depth to zero on the way out would re-arm the write-back underneath a scope
+    //that is still open.
+    if (Tab::s_plate_write_suspend_depth > 0)
+        --Tab::s_plate_write_suspend_depth;
+}
+
+//See select_preset. The tab picked a preset; the plate the user is looking at now uses it.
+void Tab::write_selection_to_current_plate()
+{
+    Plater *plater = wxGetApp().plater();
+    if (plater == nullptr || !plater->is_initialized() || plater->is_loading_project())
+        return;
+    PartPlateList &plates = plater->get_partplate_list();
+    const int      index  = plates.get_curr_plate_index();
+    if (plates.get_plate(index) == nullptr)
+        return;
+
+    switch (m_type) {
+    case Preset::TYPE_PRINTER:
+        plater->set_plate_printer(index, m_preset_bundle->printers.get_selected_preset_name());
+        break;
+    case Preset::TYPE_PRINT:
+        plater->set_plate_process(index, m_preset_bundle->prints.get_selected_preset_name());
+        break;
+    case Preset::TYPE_FILAMENT:
+        //The whole slot list, because that is the field. One call, one snapshot, and no
+        //chance of a slot count drifting out of step with the library.
+        plater->set_plate_filaments(index, m_preset_bundle->filament_presets);
+        break;
+    default:
+        break;
+    }
 }
 
 // If the current preset is dirty, the user is asked whether the changes may be discarded.
@@ -7507,6 +7561,23 @@ bool Tab::tree_sel_change_delayed(wxCommandEvent& event)
 
     if (!m_parent->is_active_and_shown_tab((wxPanel*)this))
     {
+        //THIS IS THE TAB STEAL, and it is right here. Reaching this branch means "a page in a
+        //background tab became selected", and the only thing that used to mean was that the
+        //user clicked it - so the tab promotes itself to the front. But a preset selection
+        //reloads its tab and rebuilds its page list, which moves that list's selection with
+        //nobody having clicked anything. When the selection is the editing cursor following the
+        //plate, the result is the Printer page arriving in front of a user who clicked a plate
+        //while editing process settings, once per plate click, to show a highlight the board row
+        //is already showing.
+        //
+        //So while the panel is pinned this is treated exactly as the background-selection case
+        //immediately above: remember where this tab's list now points and change nothing on
+        //screen. See ParamsPanel::ActiveTabPin, held across Plater::follow_plate_presets.
+        if (m_parent->is_active_tab_pinned()) {
+            m_last_select_item = sel_item;
+            return false;
+        }
+
         Tab* current_tab = dynamic_cast<Tab*>(m_parent->get_current_tab());
 
         m_page_view->Freeze();

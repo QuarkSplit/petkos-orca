@@ -184,6 +184,36 @@ class ParamsPanel : public wxPanel
         wxScrolledWindow* get_paged_view() { return m_page_view;}
         wxPanel*    get_current_tab() { return m_current_tab; }
 
+        //PetkosOrca: THE ACTIVE SETTINGS PAGE BELONGS TO THE USER, NOT TO THE PRESET SYSTEM.
+        //
+        //Selecting a preset reloads its tab, which rebuilds that tab's page list, which moves
+        //that list's selection, which - through Tab::tree_sel_change_delayed - promotes the tab
+        //to the shown one. That chain is correct when the user clicked a page. It is wrong when
+        //the selection moved because the editing cursor followed the plate: the user clicked a
+        //PLATE, was editing process settings, and the Printer page arrives in front of them.
+        //Every plate click then costs a click back, and the only thing gained is a highlight the
+        //board row already shows.
+        //
+        //So a cursor move pins the panel: whatever it reloads, the page on screen stays where
+        //the user put it. Explicitly choosing a printer is not a cursor move and still brings
+        //its page forward. Held as a COUNTER for the same reason Tab::PlateWriteSuspend is - a
+        //preset selection can pump a nested modal loop, and a nested scope's exit must restore
+        //rather than clear.
+        class ActiveTabPin
+        {
+        public:
+            ActiveTabPin();
+            ~ActiveTabPin();
+            ActiveTabPin(const ActiveTabPin &) = delete;
+            ActiveTabPin &operator=(const ActiveTabPin &) = delete;
+        };
+        //True only while pinned AND there is already a page on screen to keep. With no current
+        //tab there is nothing to protect and the first promotion has to be allowed through, or
+        //the panel would open empty.
+        bool is_active_tab_pinned() const { return s_active_tab_pin_depth > 0 && m_current_tab != nullptr; }
+
+    private:
+        static int s_active_tab_pin_depth;
 };
 
 } // GUI

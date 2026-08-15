@@ -648,6 +648,17 @@ void ParamsPanel::set_active_tab(wxPanel* tab)
     }
 }
 
+//See the header. A cursor move must not move the user's page.
+int ParamsPanel::s_active_tab_pin_depth = 0;
+
+ParamsPanel::ActiveTabPin::ActiveTabPin() { ++ParamsPanel::s_active_tab_pin_depth; }
+
+ParamsPanel::ActiveTabPin::~ActiveTabPin()
+{
+    if (ParamsPanel::s_active_tab_pin_depth > 0)
+        --ParamsPanel::s_active_tab_pin_depth;
+}
+
 bool ParamsPanel::is_active_and_shown_tab(wxPanel* tab)
 {
     if (m_current_tab == tab)

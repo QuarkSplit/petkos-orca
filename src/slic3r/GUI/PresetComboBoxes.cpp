@@ -1007,6 +1007,11 @@ bool PlaterPresetComboBox::switch_to_tab()
         if (!boost::algorithm::starts_with(selected_preset, Preset::suffix_modified()))
         {
             const std::string& preset_name = wxGetApp().preset_bundle->filaments.get_preset_name_by_alias(selected_preset);
+            //Opening the Filament page on the slot the user clicked. The selection is how the tab
+            //is pointed at that slot, not a choice of material for the plate - the plate already
+            //names this filament, and the slot index is only set AFTER the call, so what the tab
+            //selects here can land on the wrong slot. See Tab::PlateWriteSuspend.
+            Tab::PlateWriteSuspend no_plate_write;
             if (wxGetApp().get_tab(m_type)->select_preset(preset_name))
                 wxGetApp().get_tab(m_type)->get_combo_box()->set_filament_idx(m_filament_idx);
             else {
