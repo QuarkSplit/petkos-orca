@@ -4,6 +4,8 @@
 #include <vector>
 #include <set>
 #include <array>
+#include <map>
+#include <memory>
 #include <thread>
 #include <mutex>
 
@@ -87,6 +89,7 @@ struct PlateBed
     std::vector<double>  extruder_heights;
     double               printable_height { 0.0 };
     std::string          bed_model;   //may be empty; Bed3D then draws a plain bed
+    std::string          bed_texture; //may be empty; the plate then draws a plain surface
 };
 
 class PartPlate : public ObjectBase
@@ -125,6 +128,12 @@ private:
     GCodeProcessorResult *m_gcode_result;
     std::vector<FilamentInfo> slice_filaments_info;
     int m_print_index;
+
+    //this plate's own bed texture (from its printer), and the one it last actually drew -
+    //the latter bridges the frames where a newly wanted texture is still compressing, so a
+    //printer change never shows an empty black bed
+    std::string m_logo_texture_file;
+    std::string m_logo_texture_shown;
 
     std::string m_tmp_gcode_path;       //use a temp path to store the gcode
     std::string m_temp_config_3mf_path; //use a temp path to store the config 3mf
@@ -246,8 +255,13 @@ private:
     void calc_vertex_for_icons(int index, PickingModel &model);
     // void calc_vertex_for_icons_background(int icon_count, GLModel &buffer);
     void render_background(bool force_default_color = false);
-    void render_logo(bool bottom, bool render_cali = true);
-    void render_logo_texture(GLTexture &logo_texture, GLModel &logo_buffer, bool bottom);
+    void render_logo(bool bottom, bool render_cali = true, bool pale = false);
+    void render_logo_texture(GLTexture &logo_texture, GLModel &logo_buffer, bool bottom, float opacity = 1.0f);
+
+    //This plate's own bed texture, resolved from its printer alongside the bed shape. Empty
+    //falls back to the list-wide filename, which is the pre-per-plate behaviour.
+    void set_logo_texture_file(const std::string &filename) { m_logo_texture_file = filename; }
+    const std::string &get_logo_texture_file() const { return m_logo_texture_file; }
     void render_exclude_area(bool force_default_color);
     //void render_background_for_picking(const ColorRGBA render_color) const;
     void render_grid(bool bottom);
@@ -778,6 +792,11 @@ class PartPlateList : public ObjectBase
     bool m_intialized;
     std::string m_logo_texture_filename;
     GLTexture m_logo_texture;
+    //One texture per bed-texture file, kept for the life of the list. A plate switching
+    //printers looks its texture up here, so switching BACK is free, and a texture is never
+    //destroyed to make room for its replacement - which is what used to draw a black bed
+    //while the replacement compressed.
+    std::map<std::string, std::unique_ptr<GLTexture>> m_logo_texture_cache;
     GLTexture m_del_texture;
     GLTexture m_del_hovered_texture;
     GLTexture m_move_front_hovered_texture;
@@ -1149,6 +1168,10 @@ public:
     bool contains(const BoundingBoxf3 &bb);
 
     const std::string &get_logo_texture_filename() { return m_logo_texture_filename; }
+    //Find-or-load the texture for one bed-texture file. Starts an asynchronous load on first
+    //sight, returns nullptr until the texture is fully on the GPU, and never evicts - so the
+    //caller can keep drawing whatever it drew last while a new texture arrives.
+    GLTexture *logo_texture_for(const std::string &filename);
     void               update_logo_texture_filename(const std::string &texture_filename);
     /*slice related functions*/
     //update current slice context into backgroud slicing process

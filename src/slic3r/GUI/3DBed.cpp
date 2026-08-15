@@ -558,6 +558,7 @@ void Bed3D::render_system(GLCanvas3D& canvas, const Transform3d& view_matrix, co
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
             shader->set_uniform("transparent_background", bottom);
             shader->set_uniform("svg_source", boost::algorithm::iends_with(m_texture.get_source(), ".svg"));
+            shader->set_uniform("opacity", 1.0f);
 
             unsigned int* vbo_id = const_cast<unsigned int*>(&m_vbo_id);
 

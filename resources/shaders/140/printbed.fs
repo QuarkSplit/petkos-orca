@@ -6,6 +6,8 @@ const vec3 back_color_light = vec3(0.365, 0.365, 0.365);
 uniform sampler2D in_texture;
 uniform bool transparent_background;
 uniform bool svg_source;
+// Petko's Orca: every plate renders its texture; unselected plates render it pale.
+uniform float opacity;
 
 in vec2 tex_coord;
 out vec4 frag_color;
@@ -32,4 +34,5 @@ vec4 non_svg_color()
 void main()
 {
     frag_color = svg_source ? svg_color() : non_svg_color();
+    frag_color.a *= opacity;
 }

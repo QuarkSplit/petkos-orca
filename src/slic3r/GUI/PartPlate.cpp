@@ -831,7 +831,40 @@ void PartPlate::render_background(bool force_default_color)
 	glsafe(::glDepthMask(GL_TRUE));
 }
 
-void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffer, bool bottom)
+GLTexture *PartPlateList::logo_texture_for(const std::string &filename)
+{
+	auto it = m_logo_texture_cache.find(filename);
+	if (it == m_logo_texture_cache.end()) {
+		auto tex = std::make_unique<GLTexture>();
+		bool ok = false;
+		if (boost::algorithm::iends_with(filename, ".svg")) {
+			GLint max_tex_size  = OpenGLManager::get_gl_info().get_max_tex_size();
+			GLint logo_tex_size = (max_tex_size < 2048) ? max_tex_size : 2048;
+			ok = tex->load_from_svg_file(filename, true, true, true, logo_tex_size);
+		} else if (boost::algorithm::iends_with(filename, ".png")) {
+			ok = tex->load_from_file(filename, true, GLTexture::MultiThreaded, true);
+		} else {
+			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": unsupported bed texture format %1%") % filename;
+		}
+		if (!ok) {
+			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": loading bed texture %1% failed") % filename;
+			tex.reset(); //a null entry remembers the failure so it is not retried every frame
+		}
+		it = m_logo_texture_cache.emplace(filename, std::move(tex)).first;
+	}
+	GLTexture *tex = it->second.get();
+	if (tex == nullptr || tex->get_id() == 0)
+		return nullptr;
+	if (tex->unsent_compressed_data_available())
+		tex->send_compressed_data_to_gpu();
+	//Not ready is an answer: the caller keeps drawing its previous texture instead of a
+	//half-arrived one, which is what used to read as a black bed.
+	if (!tex->all_compressed_data_sent_to_gpu())
+		return nullptr;
+	return tex;
+}
+
+void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffer, bool bottom, float opacity)
 {
 	//check valid
 	if (logo_texture.unsent_compressed_data_available()) {
@@ -848,6 +881,7 @@ void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffe
             shader->set_uniform("projection_matrix", camera.get_projection_matrix());
 			shader->set_uniform("transparent_background", 0);
 			shader->set_uniform("svg_source", 0);
+			shader->set_uniform("opacity", opacity);
 
 			//glsafe(::glEnable(GL_DEPTH_TEST));
 			glsafe(::glDepthMask(GL_FALSE));
@@ -877,74 +911,32 @@ void PartPlate::render_logo_texture(GLTexture &logo_texture, GLModel& logo_buffe
 	}
 }
 
-void PartPlate::render_logo(bool bottom, bool render_cali)
+void PartPlate::render_logo(bool bottom, bool render_cali, bool pale)
 {
+	const float opacity = pale ? 0.35f : 1.0f;
 	if (!m_partplate_list->render_bedtype_logo) {
 		// render third-party printer texture logo
-		if (m_partplate_list->m_logo_texture_filename.empty()) {
-			m_partplate_list->m_logo_texture.reset();
+		//Per-plate first: this plate's own printer decided its texture when its bed was
+		//resolved; the list-wide filename is the fallback for plates without one. Textures
+		//live in the list's cache and are never destroyed to make room for a replacement -
+		//destroying-then-async-reloading is what used to draw a black bed for the frames
+		//the replacement spent compressing. Until the wanted texture is fully on the GPU,
+		//the plate keeps drawing the one it drew last.
+		if (!m_logo_triangles.is_initialized())
 			return;
-		}
-
-		//GLTexture* temp_texture = const_cast<GLTexture*>(&m_temp_texture);
-
-		if (m_partplate_list->m_logo_texture.get_id() == 0 || m_partplate_list->m_logo_texture.get_source() != m_partplate_list->m_logo_texture_filename) {
-			m_partplate_list->m_logo_texture.reset();
-
-			if (boost::algorithm::iends_with(m_partplate_list->m_logo_texture_filename, ".svg")) {
-				/*// use higher resolution images if graphic card and opengl version allow
-				GLint max_tex_size = OpenGLManager::get_gl_info().get_max_tex_size();
-				if (temp_texture->get_id() == 0 || temp_texture->get_source() != m_texture_filename) {
-					// generate a temporary lower resolution texture to show while no main texture levels have been compressed
-					if (!temp_texture->load_from_svg_file(m_texture_filename, false, false, false, max_tex_size / 8)) {
-						render_default(bottom, false);
-						return;
-					}
-					canvas.request_extra_frame();
-				}*/
-
-				// starts generating the main texture, compression will run asynchronously
-				GLint max_tex_size = OpenGLManager::get_gl_info().get_max_tex_size();
-				GLint logo_tex_size = (max_tex_size < 2048) ? max_tex_size : 2048;
-				if (!m_partplate_list->m_logo_texture.load_from_svg_file(m_partplate_list->m_logo_texture_filename, true, true, true, logo_tex_size)) {
-					BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": load logo texture from %1% failed!") % m_partplate_list->m_logo_texture_filename;
-					return;
-				}
-			}
-			else if (boost::algorithm::iends_with(m_partplate_list->m_logo_texture_filename, ".png")) {
-				// generate a temporary lower resolution texture to show while no main texture levels have been compressed
-				/* if (temp_texture->get_id() == 0 || temp_texture->get_source() != m_logo_texture_filename) {
-					if (!temp_texture->load_from_file(m_logo_texture_filename, false, GLTexture::None, false)) {
-						render_default(bottom, false);
-						return;
-					}
-					canvas.request_extra_frame();
-				}*/
-
-				// starts generating the main texture, compression will run asynchronously
-				if (!m_partplate_list->m_logo_texture.load_from_file(m_partplate_list->m_logo_texture_filename, true, GLTexture::MultiThreaded, true)) {
-					BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": load logo texture from %1% failed!") % m_partplate_list->m_logo_texture_filename;
-					return;
-				}
-			}
-			else {
-				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": can not load logo texture from %1%, unsupported format") % m_partplate_list->m_logo_texture_filename;
+		const std::string &wanted = !m_logo_texture_file.empty() ? m_logo_texture_file
+		                                                         : m_partplate_list->m_logo_texture_filename;
+		if (!wanted.empty()) {
+			if (GLTexture *tex = m_partplate_list->logo_texture_for(wanted)) {
+				m_logo_texture_shown = wanted;
+				render_logo_texture(*tex, m_logo_triangles, bottom, opacity);
 				return;
 			}
 		}
-		else if (m_partplate_list->m_logo_texture.unsent_compressed_data_available()) {
-			// sends to gpu the already available compressed levels of the main texture
-			m_partplate_list->m_logo_texture.send_compressed_data_to_gpu();
-
-			// the temporary texture is not needed anymore, reset it
-			//if (temp_texture->get_id() != 0)
-			//    temp_texture->reset();
-
-			//canvas.request_extra_frame();
+		if (!m_logo_texture_shown.empty()) {
+			if (GLTexture *tex = m_partplate_list->logo_texture_for(m_logo_texture_shown))
+				render_logo_texture(*tex, m_logo_triangles, bottom, opacity);
 		}
-
-		if (m_logo_triangles.is_initialized())
-			render_logo_texture(m_partplate_list->m_logo_texture, m_logo_triangles, bottom);
 		return;
 	}
 
@@ -989,7 +981,7 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
 				) {
 				render_logo_texture(*(part.texture),
 									*(part.buffer),
-									bottom);
+									bottom, opacity);
 			}
 		}
 	}
@@ -1001,7 +993,7 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
                 if (part.buffer && part.buffer->is_initialized()) {
 					render_logo_texture(*(part.texture),
 						*(part.buffer),
-						bottom);
+						bottom, opacity);
 				}
 			}
 		}
@@ -1014,7 +1006,7 @@ void PartPlate::render_logo(bool bottom, bool render_cali)
         for (auto &part : m_partplate_list->extruder_only_area_info[language_idx].parts) {
             if (part.texture) {
                 if (part.buffer && part.buffer->is_initialized()) {
-                    render_logo_texture(*(part.texture), *(part.buffer), bottom);
+                    render_logo_texture(*(part.texture), *(part.buffer), bottom, opacity);
                 }
             }
         }
@@ -1222,6 +1214,7 @@ void PartPlate::render_icons(bool bottom, bool only_name, int hover_id)
 		shader->set_uniform("transparent_background", bottom);
 		//shader->set_uniform("svg_source", boost::algorithm::iends_with(m_partplate_list->m_del_texture.get_source(), ".svg"));
 		shader->set_uniform("svg_source", 0);
+		shader->set_uniform("opacity", 1.0f);
 
         //if (bottom)
         //    glsafe(::glFrontFace(GL_CW));
@@ -1337,6 +1330,7 @@ void PartPlate::render_only_numbers(bool bottom)
 		shader->set_uniform("transparent_background", bottom);
 		//shader->set_uniform("svg_source", boost::algorithm::iends_with(m_partplate_list->m_del_texture.get_source(), ".svg"));
 		shader->set_uniform("svg_source", 0);
+		shader->set_uniform("opacity", 1.0f);
 
         //if (bottom)
         //    glsafe(::glFrontFace(GL_CW));
@@ -3653,11 +3647,14 @@ void PartPlate::render(const Transform3d& view_matrix, const Transform3d& projec
     if (wxGetApp().show_plate_gridlines() && show_grid)
         render_grid(bottom);
 
-    if (!bottom && m_selected && !force_background_color) {
+    //Every plate renders its texture - the selected one at full strength, the rest pale.
+    //An unselected plate that drew nothing was half the "flashes black" report; the other
+    //half was the texture swap, handled in render_logo.
+    if (!bottom && !force_background_color) {
         if (m_partplate_list)
-            render_logo(bottom, m_partplate_list->render_cali_logo && render_cali);
+            render_logo(bottom, m_partplate_list->render_cali_logo && render_cali && m_selected, !m_selected);
         else
-            render_logo(bottom);
+            render_logo(bottom, m_selected, !m_selected);
     }
 
     render_icons(bottom, only_body, hover_id);
@@ -4595,6 +4592,21 @@ bool PartPlateList::resolve_printer_bed(const std::string &preset_name, PlateBed
 			break;
 	}
 
+	//The bed texture is the model's twin and may resolve at a different ancestor, so it
+	//gets its own walk.
+	bed.bed_texture.clear();
+	for (const Preset* curr = preset; curr != nullptr; curr = bundle->printers.get_preset_parent(*curr)) {
+		if (curr->is_system) {
+			bed.bed_texture = PresetUtils::system_printer_bed_texture(*curr);
+		} else {
+			const ConfigOptionString* printer_model = curr->config.opt<ConfigOptionString>("printer_model");
+			if (printer_model != nullptr && !printer_model->value.empty())
+				bed.bed_texture = bundle->get_texture_for_printer_model(printer_model->value);
+		}
+		if (!bed.bed_texture.empty())
+			break;
+	}
+
 	return true;
 }
 
@@ -4760,6 +4772,7 @@ bool PartPlateList::apply_printer_to_plate(int index, bool reflow)
 	//record the height before reshaping so set_pos_and_size inside set_plate_shape
 	//already applies it
 	plate->set_printable_height(bed.printable_height);
+	plate->set_logo_texture_file(bed.bed_texture);
 
 	//set_plate_shape reports whether the bed actually moved, which is a different
 	//question from whether we honoured the assignment. Callers care about the latter.
@@ -6777,6 +6790,9 @@ bool PartPlateList::set_shapes(const Pointfs              &shape,
 			plate_bed.extruder_heights = extruder_heights;
 		}
 		plate->set_printable_height(own_bed ? plate_bed.printable_height : 0.0);
+		//a plate with its own bed knows its own texture; without one it falls back to the
+		//list-wide filename at render time
+		plate->set_logo_texture_file(own_bed ? plate_bed.bed_texture : std::string());
 
 		plate->set_shape(plate_bed.shape, plate_bed.exclude_areas, plate_bed.extruder_areas, plate_bed.extruder_heights,
 		                 get_plate_origin_2d((int)i), height_to_lid, height_to_rod);
@@ -7719,6 +7735,7 @@ void PartPlateList::load_bedtype_textures()
 {
 	if (PartPlateList::is_load_bedtype_textures) return;
 
+	PETKOS_PERF_SCOPE(Perf::Probe::LoadBedtypeTextures);
 	init_bed_type_info();
 	GLint max_tex_size = OpenGLManager::get_gl_info().get_max_tex_size();
 	GLint logo_tex_size = (max_tex_size < 2048) ? max_tex_size : 2048;
