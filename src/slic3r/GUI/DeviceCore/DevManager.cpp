@@ -640,8 +640,10 @@ namespace Slic3r
 
     void DeviceManager::subscribe_device_list(std::vector<std::string> dev_list)
     {
+        //collect what to unsubscribe from the OLD cache before clearing it - clearing first
+        //iterated an empty list, so del_subscribe never fired and stale subscriptions
+        //accumulated for every machine ever selected
         std::vector<std::string> unsub_list;
-        subscribe_list_cache.clear();
         for (auto& it : subscribe_list_cache)
         {
             if (it != selected_machine)
@@ -650,6 +652,7 @@ namespace Slic3r
                 BOOST_LOG_TRIVIAL(trace) << "subscribe_device_list: unsub dev id = " << it;
             }
         }
+        subscribe_list_cache.clear();
         BOOST_LOG_TRIVIAL(trace) << "subscribe_device_list: unsub_list size = " << unsub_list.size();
 
         if (!selected_machine.empty())
@@ -928,15 +931,19 @@ namespace Slic3r
         // reset to active
         Slic3r::GUI::wxGetApp().reset_to_active();
 
+        //The refresher keeps the whole fleet's status flowing. check_pushing and
+        //refresh_connection below are account-level, not properties of a "selected" machine -
+        //a board full of plates naming machines has no selection at all, and returning here
+        //starved the device layer for every machine. Only the certificate install is
+        //per-machine, so only it needs obj.
         MachineObject* obj = m_manager->get_selected_machine();
-        if (!obj) { return; }
 
         // check valid machine
         if (obj && m_manager->get_my_machine(obj->get_dev_id()) == nullptr)
         {
             m_manager->set_selected_machine("");
             agent->set_user_selected_machine("");
-            return;
+            obj = nullptr;
         }
 
         // do some refresh
@@ -963,13 +970,15 @@ namespace Slic3r
         }
 
         // certificate
-        try {
-            agent->install_device_cert(obj->get_dev_id(), obj->is_lan_mode_printer());
-        } catch (const std::exception& e) {
-            BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert exception="
-                                     << e.what();
-        } catch (...) {
-            BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert unknown exception";
+        if (obj != nullptr) {
+            try {
+                agent->install_device_cert(obj->get_dev_id(), obj->is_lan_mode_printer());
+            } catch (const std::exception& e) {
+                BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert exception="
+                                         << e.what();
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert unknown exception";
+            }
         }
     }
 }

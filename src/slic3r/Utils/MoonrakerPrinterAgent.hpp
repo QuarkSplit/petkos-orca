@@ -52,6 +52,13 @@ public:
     std::string get_user_selected_machine() override;
     int set_user_selected_machine(std::string dev_id) override;
 
+    // Subscription. A Moonraker agent streams status for the ONE printer its websocket is
+    // connected to; the base class's do-nothing SUCCESS told DeviceManager a whole list of
+    // machines was being watched when none of them were. The honest answer: the connected
+    // device is already subscribed by construction, any other device is a refusal the
+    // caller can see.
+    int add_subscribe(std::vector<std::string> dev_list) override;
+
     // Print Job Operations
     int start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn) override;
     int start_local_print_with_record(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn) override;

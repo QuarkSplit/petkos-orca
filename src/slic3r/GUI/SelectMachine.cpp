@@ -2582,7 +2582,9 @@ static bool resolve_plate_slicing_context(PartPlate *plate, ResolvedPlateSlicing
                                               resolved, error))
         return false;
     resolved.config.apply(*plate->config(), true);
-    return false;
+    //this returned false on success too, which made every caller read a resolved plate as a
+    //resolution failure - the whole Bambu send path was dead by one keyword
+    return true;
 }
 
 bool SelectMachineDialog::is_blocking_printing(MachineObject* obj_)

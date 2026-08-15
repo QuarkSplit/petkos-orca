@@ -283,6 +283,27 @@ int MoonrakerPrinterAgent::set_user_selected_machine(std::string dev_id)
     return BAMBU_NETWORK_SUCCESS;
 }
 
+int MoonrakerPrinterAgent::add_subscribe(std::vector<std::string> dev_list)
+{
+    //See the header: the websocket subscribes exactly one printer, at connect time. Claiming
+    //success for any other device is how a fleet board ends up trusting status that will
+    //never arrive.
+    std::string connected;
+    {
+        std::lock_guard<std::recursive_mutex> lock(connect_mutex);
+        connected = device_info.dev_id;
+    }
+    for (const auto &dev_id : dev_list) {
+        if (dev_id != connected) {
+            BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::add_subscribe: '" << dev_id
+                                       << "' is not the connected printer ('" << connected
+                                       << "'); a Moonraker agent cannot watch it";
+            return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+        }
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
 int MoonrakerPrinterAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
     (void) params;
