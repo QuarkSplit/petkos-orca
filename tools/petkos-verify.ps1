@@ -69,17 +69,13 @@ if (-not (Test-Path $exe)) { throw "No build at $exe - run tools/petkos-dev-buil
 # a correctness check must never require closing a session that may hold an unsaved project.
 $busy = [bool](Get-Process -Name 'orca-slicer' -ErrorAction SilentlyContinue)
 if ($busy) {
-    $datadir = Join-Path $repo 'datadir-verify'
     Write-Host '== a slicer is open, so this runs on its own datadir copy' -ForegroundColor Cyan
-    if ($Fresh -and (Test-Path $datadir)) { Remove-Item $datadir -Recurse -Force }
-    if (-not (Test-Path $datadir)) {
-        if (-not (Test-Path $live)) { throw "No datadir at $live to seed the verification copy from" }
-        New-Item -ItemType Directory -Force -Path $datadir | Out-Null
-        # Everything except the 143 MB of network plugins and the previous runs' logs. system/ and
-        # user/ are what make presets resolve; without them the app opens the setup wizard.
-        Get-ChildItem $live -Force | Where-Object { $_.Name -notin @('plugins', 'log') } |
-            Copy-Item -Destination $datadir -Recurse -Force
-    }
+    # pod clone is the ONE clone implementation: copy minus plugins/log, plus the conf edit
+    # that stops it CLAIMING networking is installed - that claim beside an empty plugins
+    # dir is a modal download dialog in post_init, which hangs an unattended run.
+    $cloneArgs = @('clone'); if ($Fresh) { $cloneArgs += '--fresh' }
+    $datadir = (& python (Join-Path $PSScriptRoot 'pod.py') @cloneArgs | Select-Object -Last 1).Trim()
+    if (-not (Test-Path $datadir)) { throw "pod clone did not produce a datadir (got '$datadir')" }
 } else {
     $datadir = $live
 }

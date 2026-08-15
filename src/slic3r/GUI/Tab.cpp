@@ -52,6 +52,7 @@
 #include "Widgets/TabCtrl.hpp"
 #include "Widgets/ComboBox.hpp"
 #include "MarkdownTip.hpp"
+#include "PetkosPerf.hpp"
 #include "Search.hpp"
 #include "BedShapeDialog.hpp"
 #include "libslic3r/GCode/Thumbnails.hpp"
@@ -1610,6 +1611,7 @@ void Tab::update_mode()
 
 void Tab::update_visibility()
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::TabUpdateVisibility);
     Freeze(); // There is needed Freeze/Thaw to avoid a flashing after Show/Layout
 
     for (auto page : m_pages)
@@ -6670,6 +6672,7 @@ void Tab::reactive_preset_combo_box()
 // Initialize the UI from the current preset
 void Tab::load_current_preset()
 {
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::TabLoadCurrentPreset, (int32_t) m_type);
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(": enter, m_type %1%")%Preset::get_type_string(m_type);
     const Preset& preset = m_presets->get_edited_preset();
     std::vector<std::string> prev_variant_list;
@@ -6925,6 +6928,7 @@ void Tab::update_preset_choice()
 bool Tab::select_preset(
     std::string preset_name, bool delete_current /*=false*/, const std::string &last_selected_ph_printer_name /* =""*/, bool force_select, bool force_no_transfer, bool from_plate_cursor)
 {
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::TabSelectPreset, (int32_t) m_type);
     BOOST_LOG_TRIVIAL(info) << boost::format("select preset, name %1%, delete_current %2%, from_plate_cursor %3%")
         %preset_name %delete_current %from_plate_cursor;
     //See the header. The cursor following the plate is not a decision about presets, so it asks

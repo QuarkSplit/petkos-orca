@@ -35,13 +35,76 @@ CONF    = DATADIR / "Podslicer.conf"
 PERFDIR = REPO / "perf-runs"
 TOOLS   = REPO / "tools"
 
-def newest(pattern, exclude=None):
-    files = [p for p in LOGDIR.glob(pattern) if not (exclude and exclude in p.name)]
+def newest(pattern, exclude=None, logdir=None):
+    files = [p for p in (logdir or LOGDIR).glob(pattern) if not (exclude and exclude in p.name)]
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 def app_running():
     out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower()
     return "orca-slicer" in out, "msbuild" in out
+
+def running_slicer_datadirs():
+    """(pid, datadir-from-command-line) for every running slicer. Empty datadir = unknown."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='orca-slicer.exe'\" | "
+          "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+    out = subprocess.run(["pwsh", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout
+    hits = []
+    for line in out.splitlines():
+        pid, _, cmd = line.partition("\t")
+        m = re.search(r'--datadir"?\s+"?([^"]+?)"?(?:\s+-|\s*$)', cmd)
+        hits.append((pid.strip(), m.group(1).strip() if m else ""))
+    return hits
+
+def ensure_clone(fresh=False):
+    """Create (or reuse) the datadir-verify clone and return its path.
+
+    The ONE clone implementation - the ps1 harnesses call `pod clone` rather than keeping
+    their own copies of these rules. Copies everything except plugins/ (143 MB) and log/,
+    then makes the conf STOP CLAIMING networking is installed: a conf that says
+    installed_networking=true beside an empty plugins dir walks on_init_network into
+    m_networking_need_update, and post_init answers that with a MODAL download dialog -
+    which is how an unattended suite run hangs for its whole timeout with a healthy event
+    loop and no driver. Falsifying the claim honestly (this datadir really has no plugin)
+    makes the app treat it as a clean no-networking install and boot straight through.
+    The MD5 trailer is recomputed because the app treats a mismatch as a torn write.
+    """
+    clone = REPO / "datadir-verify"
+    if fresh and clone.exists():
+        shutil.rmtree(clone)
+    if not clone.exists():
+        clone.mkdir(parents=True)
+        for entry in DATADIR.iterdir():
+            if entry.name in ("plugins", "log"):
+                continue
+            if entry.is_dir():
+                shutil.copytree(entry, clone / entry.name)
+            else:
+                shutil.copy2(entry, clone / entry.name)
+        conf_path = clone / CONF.name
+        if conf_path.exists():
+            raw = conf_path.read_bytes()
+            m = re.search(rb"# MD5 checksum \w+", raw)
+            body = raw[: m.start()] if m else raw
+            cfg = json.loads(body.decode("utf-8"))
+            cfg.setdefault("app", {})["installed_networking"] = False
+            body = json.dumps(cfg, indent=4, ensure_ascii=False).encode("utf-8") + b"\n"
+            conf_path.write_bytes(body + b"# MD5 checksum " + hashlib.md5(body).hexdigest().upper().encode() + b"\n")
+    (clone / "log").mkdir(exist_ok=True)
+    return clone
+
+def run_datadir():
+    """The datadir a driven run should use: the live one, or the clone when a slicer is open.
+
+    The live one is preferred because it is the config that actually resolves - real presets,
+    a parsed conf. The clone is used only when a slicer IS running, because the app holds one
+    datadir per instance and a check must never require closing a session that may hold an
+    unsaved project.
+    """
+    running, _ = app_running()
+    if not running:
+        return DATADIR, LOGDIR, False
+    clone = ensure_clone()
+    return clone, clone / "log", True
 
 #Modal dialogs from crash handlers, CRT leak reports and the hard-error host do not belong to
 #the app's window tree, block everything, and wait for a human. A run that hangs on one looks
@@ -91,7 +154,13 @@ def cmd_status(a):
         if sdll.exists():
             drift = built - sdll.stat().st_mtime
             print(f"staging  : {'CURRENT' if abs(drift) < 2 else f'STALE by {int(drift)}s - run: pod stage'}")
-    print(f"app      : {'RUNNING (datadir busy)' if running else 'not running'}")
+    if running:
+        for pid, dd in running_slicer_datadirs():
+            whose = "holds the LIVE datadir" if dd and Path(dd) == DATADIR else \
+                    (f"on {dd}" if dd else "datadir unknown")
+            print(f"app      : RUNNING (pid {pid}, {whose}); driven runs will use a datadir clone")
+    else:
+        print("app      : not running")
     print(f"build    : {'MSBUILD ACTIVE - do not edit sources' if building else 'idle'}")
     ok, why = conf_valid()
     print(f"conf     : {'valid' if ok else 'BROKEN - ' + why + '  (pod conf --repair)'}")
@@ -134,15 +203,15 @@ def cmd_inspect(a):
 # ---------------------------------------------------------------- run / slice
 def drive(spec, project=None, timeout=900, keep_env=False):
     """Launch the app under the perf driver, wait, and report from its own log."""
-    running, building = app_running()
-    if running:
-        sys.exit("REFUSED: a slicer is already running; its datadir cannot be shared.")
+    datadir, logdir, cloned = run_datadir()
+    if cloned:
+        print("== a slicer is open, so this runs on its own datadir copy")
     for env in ("PETKOS_ACCEPT", "PETKOS_TEST_ASSIGN"):
         os.environ.pop(env, None)
-    before = {p.name for p in LOGDIR.glob("debug_*.log*") if "network" not in p.name}
+    before = {p.name for p in logdir.glob("debug_*.log*") if "network" not in p.name}
     env = dict(os.environ, PETKOS_PERF="1", PETKOS_PERF_OUT=str(PERFDIR / "pod"),
                PETKOS_PERF_SCRIPT=spec)
-    args = [str(EXE), "--datadir", str(DATADIR)] + ([str(project)] if project else [])
+    args = [str(EXE), "--datadir", str(datadir)] + ([str(project)] if project else [])
     print(f"== running: {spec}")
     t0 = time.time()
     proc = subprocess.Popen(args, env=env)
@@ -160,7 +229,7 @@ def drive(spec, project=None, timeout=900, keep_env=False):
             proc.kill()
             print(f"KILLED after {timeout}s - the driver never quit; that is a result, not a detail")
     print(f"   app exited after {int(time.time() - t0)}s (rc={proc.returncode})")
-    new = [p for p in LOGDIR.glob("debug_*.log*")
+    new = [p for p in logdir.glob("debug_*.log*")
            if "network" not in p.name and p.name not in before]
     verdicts = []
     for p in new:
@@ -169,7 +238,7 @@ def drive(spec, project=None, timeout=900, keep_env=False):
             r"PETKOS_PERF_SCRIPT: [^\n]*(?:CHECK|ASSIGN|SLICE|passed|FAILED)[^\n]*", text)
     for v in verdicts:
         print("   " + v.strip())
-    crash = newest("crash_*.log")
+    crash = newest("crash_*.log", logdir=logdir)
     if crash and crash.stat().st_mtime > t0:
         print(f"CRASHED - {crash.name}; top frames:")
         for line in crash.read_text(errors="replace").splitlines():
@@ -293,6 +362,7 @@ def main():
     p = sub.add_parser("logs"); p.add_argument("--crash", action="store_true"); p.add_argument("--errors", action="store_true"); p.add_argument("--grep"); p.add_argument("--tail", type=int, default=25); p.set_defaults(f=cmd_logs)
     p = sub.add_parser("conf"); p.add_argument("--repair", action="store_true"); p.set_defaults(f=cmd_conf)
     sub.add_parser("audit-vendors").set_defaults(f=cmd_audit_vendors)
+    p = sub.add_parser("clone"); p.add_argument("--fresh", action="store_true"); p.set_defaults(f=lambda a: print(ensure_clone(a.fresh)))
     p = sub.add_parser("dialogs"); p.add_argument("--close", action="store_true"); p.set_defaults(f=lambda a: sweep_dialogs(a.close) or print("no modal dialogs found"))
     a = ap.parse_args()
     a.f(a)

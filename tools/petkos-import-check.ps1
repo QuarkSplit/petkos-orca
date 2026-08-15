@@ -81,14 +81,12 @@ Write-Host "== retargeting to '$Printer'" -ForegroundColor Cyan
 # correctness check must never require closing a session holding an unsaved project.
 $busy = [bool](Get-Process -Name 'orca-slicer' -ErrorAction SilentlyContinue)
 if ($busy) {
-    $datadir = Join-Path $repo 'datadir-verify'
     Write-Host '== a slicer is open, so this runs on its own datadir copy' -ForegroundColor Cyan
-    if ($Fresh -and (Test-Path $datadir)) { Remove-Item $datadir -Recurse -Force }
-    if (-not (Test-Path $datadir)) {
-        New-Item -ItemType Directory -Force -Path $datadir | Out-Null
-        Get-ChildItem $live -Force | Where-Object { $_.Name -notin @('plugins', 'log') } |
-            Copy-Item -Destination $datadir -Recurse -Force
-    }
+    # pod clone is the ONE clone implementation - see petkos-verify.ps1 for why the conf edit
+    # it performs is load-bearing.
+    $cloneArgs = @('clone'); if ($Fresh) { $cloneArgs += '--fresh' }
+    $datadir = (& python (Join-Path $PSScriptRoot 'pod.py') @cloneArgs | Select-Object -Last 1).Trim()
+    if (-not (Test-Path $datadir)) { throw "pod clone did not produce a datadir (got '$datadir')" }
 } else {
     $datadir = $live
 }

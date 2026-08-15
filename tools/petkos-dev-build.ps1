@@ -57,12 +57,27 @@ if (Get-Process -Name 'orca-slicer' -ErrorAction SilentlyContinue) {
             throw "orca-slicer is running and $name could not be moved aside: $_"
         }
     }
+    # The post-build event does `cmake -E rm -rf src\<Config>\python` and re-copies it. The app
+    # maps python312.dll from that directory, so the rm fails, the post-build exits 1, and the
+    # exe never links - after a clean compile, which reads as a build error that isn't one.
+    # A mapped file cannot be deleted but CAN be renamed on the same volume, so the whole
+    # directory moves aside and the sweep above reclaims it once nothing maps it.
+    $pydir = Join-Path $build "src\$Config\python"
+    if (Test-Path $pydir) {
+        $pyaside = Join-Path $build ("src\$Config\python.inuse-$stamp")
+        try {
+            Move-Item -LiteralPath $pydir -Destination $pyaside -ErrorAction Stop
+            Write-Host "  moved aside (app is running): python\" -ForegroundColor DarkYellow
+        } catch {
+            throw "orca-slicer is running and python\ could not be moved aside: $_"
+        }
+    }
 }
 
 # Anything moved aside by an EARLIER run is only deletable once nothing maps it. Sweep them here
 # rather than leaving a build directory that grows a 128 MB DLL per iteration.
 Get-ChildItem -Path (Join-Path $build "src\$Config") -Filter '*.inuse-*' -ErrorAction SilentlyContinue |
-    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -ErrorAction Stop } catch { } }
+    ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { } }
 
 if ($Configure) {
     Write-Host "cmake configure..." -ForegroundColor Cyan

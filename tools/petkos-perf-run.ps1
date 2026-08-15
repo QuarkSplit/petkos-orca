@@ -34,8 +34,15 @@ $datadir = Join-Path $repo 'datadir'
 $outRoot = Join-Path $repo 'perf-runs'
 
 if (-not (Test-Path $exe)) { throw "No build at $exe - run build_release_vs2022.bat slicer first" }
+# Same datadir rule as petkos-verify.ps1: a running slicer must never have to be closed for a
+# measurement, so the run switches to its own copy. The idling instance costs a caveat, not the
+# run: only within-run ratios are valid measurements anyway (see PODSLICER.md).
 if (Get-Process -Name 'orca-slicer' -ErrorAction SilentlyContinue) {
-    throw 'orca-slicer is already running; close it first (one datadir, one instance)'
+    Write-Warning 'a slicer is open: running on the datadir-verify clone; treat cross-run comparisons with extra suspicion'
+    # pod clone is the ONE clone implementation - see petkos-verify.ps1 for why the conf edit
+    # it performs is load-bearing.
+    $datadir = (& python (Join-Path $PSScriptRoot 'pod.py') clone | Select-Object -Last 1).Trim()
+    if (-not (Test-Path $datadir)) { throw "pod clone did not produce a datadir (got '$datadir')" }
 }
 New-Item -ItemType Directory -Force -Path $outRoot | Out-Null
 

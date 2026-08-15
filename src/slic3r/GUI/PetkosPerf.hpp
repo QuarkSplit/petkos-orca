@@ -76,6 +76,13 @@ enum class Probe : uint8_t {
     OvNavigator,           //_render_3d_navigator
     OvCanvasToolbar,       //_render_canvas_toolbar
     OvAssemble,            //_render_assemble_control + info + separators
+    TabSelectPreset,       //Tab::select_preset, aux = preset type - the cursor-follow cost
+    TabLoadCurrentPreset,  //Tab::load_current_preset, aux = preset type
+    TabUpdateVisibility,   //Tab::update_visibility - the page-tree teardown/rebuild
+    PlaterSetBedShape,     //Plater::set_bed_shape - texture + shape derivation on the follow path
+    BundleFullConfig,      //PresetBundle::full_config composed on the follow path
+    LoadBedtypeTextures,   //PartPlateList::load_bedtype_textures - sync SVG rasterise in render
+    FollowPlatePresets,    //Plater::follow_plate_presets whole - the plate-switch settle body
     Count
 };
 

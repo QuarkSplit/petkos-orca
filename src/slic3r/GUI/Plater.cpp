@@ -8476,11 +8476,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     q->schedule_background_process(true);
     q->mark_plate_toolbar_image_dirty();
 
-    //Dev hook: PETKOS_TEST_ASSIGN="<plate>:<printer preset name>" (1-based plate) drives the
-    //one plate-printer write path after a project load finishes. The plate board is
-    //custom-painted, so no UI-automation tool can reach its rows; this makes the
-    //assignment flow scriptable through the same production path the picker commits
-    //through, which is what turns a crash-on-assignment report into a repeatable test.
+    //Dev hook: PETKOS_TEST_ASSIGN="<plate>:<printer preset name>[:delay_ms][;<plate>:<preset>...]"
+    //(1-based plates) drives the one plate-printer write path after a project load finishes. The
+    //plate board is custom-painted, so no UI-automation tool can reach its rows; this makes the
+    //assignment flow scriptable through the same production path the picker commits through,
+    //which is what turns a crash-on-assignment report into a repeatable test. Multiple ';'
+    //-separated specs fire in order on the event loop - a mixed-printer fixture is a list of
+    //assignments, and eight app relaunches to make one is the tool failing the task.
     //Fires once per process; inert unless the variable is set at launch.
     static bool petkos_test_assign_fired = false;
     if (!petkos_test_assign_fired) {
@@ -8492,16 +8494,25 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                    << (has_env ? "present, value '" + into_u8(spec) + "'" : "absent");
         if (has_env && !spec.IsEmpty()) {
             petkos_test_assign_fired = true;
-            const std::string s     = into_u8(spec);
-            const size_t      colon = s.find(':');
-            if (colon == std::string::npos) {
-                BOOST_LOG_TRIVIAL(error) << "PETKOS_TEST_ASSIGN: no ':' in spec, expected <plate>:<preset name>[:delay_ms]";
-            } else {
+            std::vector<std::pair<int, std::string>> assignments;
+            long delay_ms = 0;
+            std::string rest = into_u8(spec);
+            while (!rest.empty()) {
+                const size_t semi = rest.find(';');
+                std::string  s    = rest.substr(0, semi);
+                rest = (semi == std::string::npos) ? std::string() : rest.substr(semi + 1);
+                if (s.empty())
+                    continue;
+                const size_t colon = s.find(':');
+                if (colon == std::string::npos) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_TEST_ASSIGN: no ':' in spec '" << s
+                                             << "', expected <plate>:<preset name>[:delay_ms]";
+                    continue;
+                }
                 const int   plate_idx = std::atoi(s.substr(0, colon).c_str()) - 1;
                 std::string preset    = s.substr(colon + 1);
                 //optional trailing :delay_ms gives a debugger time to attach after startup,
                 //which matters because the network plugin refuses to LOAD under one
-                long delay_ms = 0;
                 if (const size_t colon2 = preset.rfind(':'); colon2 != std::string::npos) {
                     char *end = nullptr;
                     const long parsed = std::strtol(preset.c_str() + colon2 + 1, &end, 10);
@@ -8510,11 +8521,16 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         preset.erase(colon2);
                     }
                 }
+                assignments.emplace_back(plate_idx, preset);
+            }
+            if (!assignments.empty()) {
                 Plater *plater = q;
-                auto fire = [plater, plate_idx, preset]() {
-                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN: assigning plate "
-                                               << (plate_idx + 1) << " to '" << preset << "'";
-                    plater->set_plate_printer(plate_idx, preset);
+                auto fire = [plater, assignments]() {
+                    for (const auto &[plate_idx, preset] : assignments) {
+                        BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN: assigning plate "
+                                                   << (plate_idx + 1) << " to '" << preset << "'";
+                        plater->set_plate_printer(plate_idx, preset);
+                    }
                 };
                 if (delay_ms > 0) {
                     BOOST_LOG_TRIVIAL(warning) << "PETKOS_TEST_ASSIGN: will assign in " << delay_ms << " ms";
@@ -18810,6 +18826,7 @@ void Plater::update_flush_volume_matrix(size_t old_nozzle_size, size_t new_nozzl
 
 void Plater::set_bed_shape() const
 {
+    PETKOS_PERF_SCOPE(Perf::Probe::PlaterSetBedShape);
     std::string texture_filename;
     auto bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
@@ -20570,6 +20587,10 @@ void Plater::follow_plate_presets(int plate_index)
     Slic3r::ScopeGuard restore([]() { following = false; });
     following = true;
 
+    //past every early-out, so this span measures only clicks that actually move the cursor -
+    //the 433-670 ms class, not the 20 ms same-printer ones
+    PETKOS_PERF_SCOPE_AUX(Perf::Probe::FollowPlatePresets, (int32_t) plate_index);
+
     //THE PAGE THE USER IS ON IS NOT A CONSEQUENCE OF WHICH PLATE THEY CLICKED. Everything below
     //reloads settings tabs, and a reloaded tab rebuilds its page list, which moves that list's
     //selection, which promotes that tab to the front - so switching plates while editing process
@@ -20634,7 +20655,12 @@ void Plater::follow_plate_presets(int plate_index)
                 into_u8(wxString::Format(_L("The %s tab is still showing \"%s\". Plate %d uses \"%s\"."),
                                          failed_field, failed_showing, plate_index + 1, failed_wanted)));
     } else {
-        on_config_change(bundle->full_config());
+        DynamicPrintConfig full;
+        {
+            PETKOS_PERF_SCOPE(Perf::Probe::BundleFullConfig);
+            full = bundle->full_config();
+        }
+        on_config_change(full);
     }
 }
 
