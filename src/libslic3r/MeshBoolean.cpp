@@ -271,16 +271,21 @@ static bool _cgal_intersection(CGALMesh &A, CGALMesh &B, CGALMesh &R)
     return CGALProc::corefine_and_compute_intersection(A.m, B.m, R.m, p, p);
 }
 
+//A failed boolean must leave its caller holding the mesh it handed over. The result was
+//moved into A before success was ever checked, so every failure that did not throw - a
+//corefinement that reports a non-manifold result by returning false, and a SIGSEGV caught
+//by try_catch_signal - replaced the input with the empty partial result and then threw.
+//The next rung of the ladder, and every undo path, then received nothing to work with.
+//The move is the last statement now, reached only when the operation actually succeeded.
 template<class Op> void _cgal_do(Op &&op, CGALMesh &A, CGALMesh &B)
 {
     bool success = false;
     bool hw_fail = false;
+    CGALMesh result;
     try {
-        CGALMesh result;
         try_catch_signal({SIGSEGV, SIGFPE}, [&success, &A, &B, &result, &op] {
             success = op(A, B, result);
         }, [&] { hw_fail = true; });
-        A = std::move(result);      // In-place operation does not work
     } catch (...) {
         success = false;
     }
@@ -290,6 +295,8 @@ template<class Op> void _cgal_do(Op &&op, CGALMesh &A, CGALMesh &B)
 
     if (! success)
         throw Slic3r::RuntimeError("CGAL mesh boolean operation failed.");
+
+    A = std::move(result);      // In-place operation does not work
 }
 
 void minus(CGALMesh &A, CGALMesh &B) { _cgal_do(_cgal_diff, A, B); }
@@ -706,7 +713,45 @@ MCAPI_ATTR void MCAPI_CALL mcDebugOutput(McDebugSource source,
 }
 
 
-bool do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts)
+const char *to_string(Status s)
+{
+    switch (s) {
+    case Status::Success:        return "computed";
+    case Status::DisjointUnion:  return "inputs do not overlap, so the union is their concatenation";
+    case Status::EmptyInput:     return "one input was empty";
+    case Status::UnsupportedOp:  return "the operation is not one this backend has";
+    case Status::DispatchFailed: return "MCUT refused the input";
+    case Status::NoFragments:    return "MCUT produced no fragments and the inputs may overlap";
+    }
+    return "unknown";
+}
+
+//A bounding box that does not overlap is a proof of disjointness, which is the only
+//circumstance under which concatenating two meshes IS their union. Everything else that
+//used to reach merge_mcut_meshes() was a guess wearing a result's clothes.
+static BoundingBoxf3 mcut_bounding_box(const McutMesh &m)
+{
+    BoundingBoxf3 bb;
+    for (size_t i = 0; i + 2 < m.vertexCoordsArray.size(); i += 3)
+        bb.merge(Vec3d(m.vertexCoordsArray[i], m.vertexCoordsArray[i + 1], m.vertexCoordsArray[i + 2]));
+    return bb;
+}
+
+static bool provably_disjoint(const McutMesh &a, const McutMesh &b)
+{
+    const BoundingBoxf3 bba = mcut_bounding_box(a);
+    const BoundingBoxf3 bbb = mcut_bounding_box(b);
+    if (!bba.defined || !bbb.defined)
+        return true;
+    //Separation on ANY axis proves it. BoundingBoxBase::overlap() only tests x and y, which
+    //for two solids stacked in Z would answer "may overlap" about a pair that cannot.
+    for (int ax = 0; ax < 3; ++ax)
+        if (bba.max[ax] < bbb.min[ax] || bba.min[ax] > bbb.max[ax])
+            return true;
+    return false;
+}
+
+Status do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts)
 {
     // create context
     McContext context = MC_NULL_HANDLE;
@@ -731,13 +776,20 @@ bool do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::st
         {"INTERSECTION", MC_DISPATCH_FILTER_FRAGMENT_SEALING_INSIDE | MC_DISPATCH_FILTER_FRAGMENT_LOCATION_BELOW},
     };
 
-    std::map<std::string, McFlags>::const_iterator it          = booleanOpts.find(boolean_opts);
-    McFlags                                        boolOpFlags = it->second;
+    //An op string this table does not hold used to be dereferenced past end(): undefined
+    //behaviour deciding which boolean the user gets. It is a refusal now, and a named one.
+    std::map<std::string, McFlags>::const_iterator it = booleanOpts.find(boolean_opts);
+    if (it == booleanOpts.end()) {
+        BOOST_LOG_TRIVIAL(error) << "MCUT: no such boolean operation '" << boolean_opts << "'";
+        mcReleaseContext(context);
+        return Status::UnsupportedOp;
+    }
+    McFlags boolOpFlags = it->second;
 
     if (srcMesh.vertexCoordsArray.empty() && (boolean_opts == "UNION" || boolean_opts == "B_NOT_A")) {
         srcMesh = cutMesh;
         mcReleaseContext(context);
-        return true;
+        return Status::EmptyInput;
     }
 
     err = mcDispatch(context,
@@ -750,27 +802,35 @@ bool do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::st
                      // cut mesh
                      reinterpret_cast<const void *>(cutMesh.vertexCoordsArray.data()), cutMesh.faceIndicesArray.data(), cutMesh.faceSizesArray.data(),
                      static_cast<uint32_t>(cutMesh.vertexCoordsArray.size() / 3), static_cast<uint32_t>(cutMesh.faceSizesArray.size()));
+    //A refused dispatch says nothing about the two solids, so a UNION cannot be answered by
+    //standing the meshes next to each other and calling it done. That degradation returned
+    //true, so every caller took a concatenation - two shells, interpenetrating, unprintable -
+    //for a union and had no way to find out. A refusal is a refusal.
     if (err != MC_NO_ERROR) {
-        BOOST_LOG_TRIVIAL(debug) << "MCUT mcDispatch fails! err=" << err;
+        BOOST_LOG_TRIVIAL(error) << "MCUT mcDispatch failed (err=" << err << ") for " << boolean_opts;
         mcReleaseContext(context);
-        if (boolean_opts == "UNION") {
-            merge_mcut_meshes(srcMesh, cutMesh);
-            return true;
-        }
-        return false;
+        return Status::DispatchFailed;
     }
 
     // query the number of available connected component
     uint32_t numConnComps;
     err = mcGetConnectedComponents(context, MC_CONNECTED_COMPONENT_TYPE_FRAGMENT, 0, NULL, &numConnComps);
     if (err != MC_NO_ERROR || numConnComps==0) {
-        BOOST_LOG_TRIVIAL(debug) << "MCUT mcGetConnectedComponents fails! err=" << err << ", numConnComps" << numConnComps;
+        BOOST_LOG_TRIVIAL(debug) << "MCUT mcGetConnectedComponents: err=" << err << ", numConnComps=" << numConnComps;
         mcReleaseContext(context);
-        if (numConnComps == 0 && boolean_opts == "UNION") {
-            merge_mcut_meshes(srcMesh, cutMesh);
-            return true;
+        //Zero fragments after a dispatch that itself succeeded means MCUT found no cut. For
+        //a union that is only an answer when the two solids genuinely do not meet, and the
+        //bounding boxes are what prove it. Overlapping boxes leave containment and
+        //disjointness indistinguishable from here, so the ladder is told, not lied to.
+        if (err == MC_NO_ERROR && numConnComps == 0 && boolean_opts == "UNION") {
+            if (provably_disjoint(srcMesh, cutMesh)) {
+                merge_mcut_meshes(srcMesh, cutMesh);
+                return Status::DisjointUnion;
+            }
+            BOOST_LOG_TRIVIAL(error) << "MCUT UNION produced no fragments while the inputs overlap; refusing to concatenate";
+            return Status::NoFragments;
         }
-        return false;
+        return err == MC_NO_ERROR ? Status::NoFragments : Status::DispatchFailed;
     }
 
     std::vector<McConnectedComponent> connectedComponents(numConnComps, MC_NULL_HANDLE);
@@ -842,11 +902,30 @@ bool do_boolean_single(McutMesh &srcMesh, const McutMesh &cutMesh, const std::st
 
     srcMesh = outMesh;
 
-    return true;
+    return Status::Success;
 }
 
-void do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts)
+//The worst status any component pair reported is the status of the whole operation: one
+//piece that could not be computed makes the assembled mesh not the boolean that was asked
+//for, and a caller that is told "success" has no way left to discover it.
+static Status worse_of(Status a, Status b)
 {
+    if (!succeeded(a)) return a;
+    if (!succeeded(b)) return b;
+    return a == Status::Success ? b : a;
+}
+
+Status do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts)
+{
+    //An operation this backend does not have is unknown whatever the input is, so it is
+    //answered before anything is measured - otherwise an empty operand renames the fault and
+    //the caller is told the wrong thing about why it failed.
+    if (boolean_opts != "UNION" && boolean_opts != "A_NOT_B" && boolean_opts != "INTERSECTION" &&
+        boolean_opts != "B_NOT_A") {
+        BOOST_LOG_TRIVIAL(error) << "MCUT: no such boolean operation '" << boolean_opts << "'";
+        return Status::UnsupportedOp;
+    }
+
     TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
     std::vector<indexed_triangle_set> src_parts = its_split(tri_src.its);
 
@@ -855,20 +934,22 @@ void do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& b
 
     if (src_parts.empty() && boolean_opts == "UNION") {
         srcMesh = cutMesh;
-        return;
+        return Status::EmptyInput;
     }
-    if(cut_parts.empty()) return;
+    if (cut_parts.empty())
+        return Status::EmptyInput;
 
     // when src mesh has multiple connected components, mcut refuses to work.
     // But we can force it to work by spliting the src mesh into disconnected components,
     // and do booleans seperately, then merge all the results.
     indexed_triangle_set all_its;
+    Status               status = Status::Success;
     if (boolean_opts == "UNION" || boolean_opts == "A_NOT_B") {
         for (size_t i = 0; i < src_parts.size(); i++) {
             auto src_part = triangle_mesh_to_mcut(src_parts[i]);
             for (size_t j = 0; j < cut_parts.size(); j++) {
                 auto cut_part = triangle_mesh_to_mcut(cut_parts[j]);
-                do_boolean_single(*src_part, *cut_part, boolean_opts);
+                status = worse_of(status, do_boolean_single(*src_part, *cut_part, boolean_opts));
             }
             TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
             its_merge(all_its, tri_part.its);
@@ -879,30 +960,102 @@ void do_boolean(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& b
             for (size_t j = 0; j < cut_parts.size(); j++) {
                 auto src_part = triangle_mesh_to_mcut(src_parts[i]);
                 auto cut_part = triangle_mesh_to_mcut(cut_parts[j]);
-                bool success = do_boolean_single(*src_part, *cut_part, boolean_opts);
-                if (success) {
+                const Status one = do_boolean_single(*src_part, *cut_part, boolean_opts);
+                //An intersection that MCUT could not compute contributes nothing, which is
+                //also what an empty intersection contributes: the status is what tells the
+                //two apart, so it is carried out rather than dropped here.
+                if (succeeded(one)) {
                     TriangleMesh tri_part = mcut_to_triangle_mesh(*src_part);
                     its_merge(all_its, tri_part.its);
                 }
+                status = worse_of(status, one);
             }
         }
     }
+    //srcMesh is only replaced when the whole operation is the operation that was asked for.
+    if (!succeeded(status))
+        return status;
     srcMesh = *triangle_mesh_to_mcut(all_its);
+    return status;
 }
 
-void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts)
+Status make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts)
 {
     McutMesh srcMesh, cutMesh;
     triangle_mesh_to_mcut(src_mesh, srcMesh);
     triangle_mesh_to_mcut(cut_mesh, cutMesh);
-    //dst_mesh = make_boolean(srcMesh, cutMesh, boolean_opts);
-    do_boolean(srcMesh, cutMesh, boolean_opts);
+    const Status status = do_boolean(srcMesh, cutMesh, boolean_opts);
+    if (!succeeded(status)) {
+        BOOST_LOG_TRIVIAL(error) << "MCUT " << boolean_opts << " failed: " << to_string(status);
+        return status;
+    }
     TriangleMesh tri_src = mcut_to_triangle_mesh(srcMesh);
     if (!tri_src.empty())
         dst_mesh.push_back(std::move(tri_src));
+    return status;
 }
 
 } // namespace mcut
+
+//The ladder itself. CGAL is tried first because where it succeeds it is exact; it throws
+//on failure and, since the input-destruction fix above, throwing leaves A untouched, which
+//is what makes a second rung possible at all. MCUT is tried next because it tolerates
+//input CGAL refuses. Neither is asked to guess: the caller gets a result or a reason.
+static const char *op_name(Op op)
+{
+    switch (op) {
+    case Op::Difference:   return "difference";
+    case Op::Union:        return "union";
+    case Op::Intersection: return "intersection";
+    }
+    return "unknown";
+}
+
+LadderResult execute(Op op, indexed_triangle_set &A, const indexed_triangle_set &B)
+{
+    LadderResult res;
+    if (A.empty() || B.empty()) {
+        res.reason = std::string("nothing to ") + op_name(op) + ": an input mesh is empty";
+        return res;
+    }
+
+    //A CGAL call that returns without throwing is authoritative, empty answer included: an
+    //intersection genuinely can be nothing, and treating that as a failure would send a
+    //correct result down the ladder to be recomputed by a less exact backend.
+    indexed_triangle_set work = A;
+    try {
+        switch (op) {
+        case Op::Difference:   cgal::minus(work, B);     break;
+        case Op::Union:        cgal::plus(work, B);      break;
+        case Op::Intersection: cgal::intersect(work, B); break;
+        }
+        res.empty_result = work.empty();
+        A                = std::move(work);
+        res.ok           = true;
+        res.backend      = "cgal";
+        return res;
+    } catch (const std::exception &ex) {
+        res.reason = std::string("cgal: ") + ex.what();
+    } catch (...) {
+        res.reason = "cgal: unknown failure";
+    }
+
+    const std::string mcut_op = op == Op::Difference ? "A_NOT_B" : (op == Op::Union ? "UNION" : "INTERSECTION");
+    std::vector<TriangleMesh> out;
+    const mcut::Status status = mcut::make_boolean(TriangleMesh(A), TriangleMesh(B), out, mcut_op);
+    if (mcut::succeeded(status)) {
+        //make_boolean() pushes nothing when the answer is nothing, which is a result and
+        //not an absence of one; the status is what says which this is.
+        A                = out.empty() ? indexed_triangle_set() : out.front().its;
+        res.empty_result = A.empty();
+        res.ok           = true;
+        res.backend      = "mcut";
+        return res;
+    }
+    res.reason += std::string("; mcut: ") + mcut::to_string(status);
+    BOOST_LOG_TRIVIAL(error) << "MeshBoolean::execute(" << op_name(op) << ") exhausted the ladder: " << res.reason;
+    return res;
+}
 
 
 } // namespace MeshBoolean

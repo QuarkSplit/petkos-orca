@@ -1239,7 +1239,15 @@ bool ModelObject::make_boolean(ModelObject *cut_object, const std::string &boole
     std::vector<TriangleMesh> new_meshes;
 
     const TriangleMesh &cut_mesh = cut_object->mesh();
-    MeshBoolean::mcut::make_boolean(this->mesh(), cut_mesh, new_meshes, boolean_opts);
+    const MeshBoolean::mcut::Status status = MeshBoolean::mcut::make_boolean(this->mesh(), cut_mesh, new_meshes, boolean_opts);
+    //A boolean that did not happen must not cost the object its geometry. The volumes were
+    //cleared before the result was ever inspected, so a refused MCUT dispatch emptied the
+    //object and reported success.
+    if (!MeshBoolean::mcut::succeeded(status) || new_meshes.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "ModelObject::make_boolean(" << boolean_opts
+                                 << ") left the object untouched: " << MeshBoolean::mcut::to_string(status);
+        return false;
+    }
 
     this->clear_volumes();
     int i = 1;

@@ -87,17 +87,54 @@ bool empty(const McutMesh &mesh);
 McutMeshPtr  triangle_mesh_to_mcut(const indexed_triangle_set &M);
 TriangleMesh mcut_to_triangle_mesh(const McutMesh &mcutmesh);
 
-// do boolean and save result to srcMesh
-// return true if sucessful
-bool do_boolean_single(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts);
+//What one MCUT dispatch actually did. A backend that cannot compute the operation it was
+//asked for must say so: answering with a mesh that is not that operation is the failure
+//mode this type exists to end, because the caller cannot tell it from a result.
+//DisjointUnion is the one degradation that is a theorem rather than a guess - two solids
+//whose bounding boxes do not overlap cannot intersect, so their union IS the two meshes
+//side by side, and concatenating them is exact.
+enum class Status : int {
+    Success,        // MCUT computed the requested operation
+    DisjointUnion,  // the inputs provably do not overlap, so the union is their concatenation
+    EmptyInput,     // one side was empty; the identity is the answer and srcMesh holds it
+    UnsupportedOp,  // boolean_opts names no operation this backend has
+    DispatchFailed, // MCUT refused the input
+    NoFragments,    // MCUT produced nothing and the inputs may overlap, so nothing is known
+};
+const char *to_string(Status s);
+inline bool succeeded(Status s)
+{
+    return s == Status::Success || s == Status::DisjointUnion || s == Status::EmptyInput;
+}
+
+// do boolean and save result to srcMesh. srcMesh is left untouched unless the status succeeded.
+Status do_boolean_single(McutMesh& srcMesh, const McutMesh& cutMesh, const std::string& boolean_opts);
 // do boolean of mesh with multiple volumes and save result to srcMesh
 // Both srcMesh and cutMesh may have multiple volumes.
-void do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts);
+Status do_boolean(McutMesh &srcMesh, const McutMesh &cutMesh, const std::string &boolean_opts);
 
 
 // do boolean and convert result to TriangleMesh
-void make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
+Status make_boolean(const TriangleMesh &src_mesh, const TriangleMesh &cut_mesh, std::vector<TriangleMesh> &dst_mesh, const std::string &boolean_opts);
 } // namespace mcut
+
+//The robustness ladder. Dirty downloaded meshes are the substrate, not the edge case, so
+//one boolean is several backends and a named outcome rather than one backend and a throw.
+//Rung 1 is CGAL (exact where it works, and it now leaves its input intact when it does
+//not); rung 2 is MCUT, which tolerates input CGAL refuses. A caller gets either a result
+//or a reason, never a mesh that is not the operation it asked for.
+enum class Op : int { Difference, Union, Intersection };
+
+struct LadderResult
+{
+    bool        ok{false};
+    bool        empty_result{false}; // the operation succeeded and its answer is the empty set
+    const char *backend{"none"};     // the rung that answered
+    std::string reason;              // why the rungs before it did not
+};
+
+//A is replaced by the result on success and left exactly as it was handed over on failure.
+LadderResult execute(Op op, indexed_triangle_set &A, const indexed_triangle_set &B);
 
 } // namespace MeshBoolean
 } // namespace Slic3r
