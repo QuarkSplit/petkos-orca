@@ -703,24 +703,27 @@ TEST_CASE("Tier-1 plate preset resolution follows the inheritance rule exactly",
                    Catch::Matchers::WithinAbs(0.6, 1e-9));
     }
 
-    SECTION("empty fields are explicit inheritance from the Project row")
+    SECTION("an empty context is a refusal, not an inheritance")
     {
+        // The project printer was deleted as a state (2026-08-14). An all-empty context
+        // used to resolve to whatever was being edited; now it names nothing and that is
+        // an error - the edited preset is right there and deliberately not reached for.
         const PlateSlicingContext inherited; // every field empty
-        REQUIRE(bundle.resolve_plate_presets(inherited, presets, error));
-        CHECK(error.empty());
-        CHECK(presets.printer == &bundle.printers.get_edited_preset());
-        CHECK(presets.print == &bundle.prints.get_edited_preset());
-        CHECK_THAT(presets.printer->config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0),
-                   Catch::Matchers::WithinAbs(0.25, 1e-9));
+        CHECK_FALSE(bundle.resolve_plate_presets(inherited, presets, error));
+        CHECK(error == "The plate names no printer");
+        CHECK(presets.printer == nullptr);
+        CHECK(presets.print == nullptr);
     }
 
-    SECTION("one empty field inherits while the others still resolve exactly")
+    SECTION("a named printer with an empty process slot is still unresolved")
     {
         PlateSlicingContext printer_only = named;
         printer_only.print_preset_name.clear();
-        REQUIRE(bundle.resolve_plate_presets(printer_only, presets, error));
-        CHECK(presets.printer->name == "Plate Printer");
-        CHECK(presets.print == &bundle.prints.get_edited_preset());
+        CHECK_FALSE(bundle.resolve_plate_presets(printer_only, presets, error));
+        CHECK(error == "The plate names no process");
+        // a refusal hands back nothing, not a half-resolved pair
+        CHECK(presets.printer == nullptr);
+        CHECK(presets.print == nullptr);
     }
 
     SECTION("a named preset that is not installed is unresolved, never a nearest match")
@@ -740,15 +743,16 @@ TEST_CASE("Tier-1 plate preset resolution follows the inheritance rule exactly",
         CHECK(presets.print == nullptr);
     }
 
-    SECTION("an unresolved Project printer selection is an error, not permission to use the edited preset")
+    SECTION("a broken Project printer selection cannot leak into plate resolution")
     {
+        // Stronger than the section it replaces: nothing reads the Project selection on a
+        // plate's behalf any more, so its state cannot matter. An empty context refuses for
+        // its own reason, and a plate that names its machine resolves regardless.
         deselect_via_project_embedded(bundle.printers, "Embedded Project Printer");
 
         const PlateSlicingContext inherited;
         CHECK_FALSE(bundle.resolve_plate_presets(inherited, presets, error));
-        CHECK(error == "The Project printer preset selection is unresolved");
-        // The stale edited preset is right there - deselect_via_project_embedded asserts it is -
-        // and is deliberately not reached for. That is the whole point of this case.
+        CHECK(error == "The plate names no printer");
         CHECK(presets.printer == nullptr);
 
         // a plate that names its own machine is untouched by the Project row being broken
@@ -763,7 +767,7 @@ TEST_CASE("Tier-1 plate preset resolution follows the inheritance rule exactly",
         PlateSlicingContext printer_only = named;
         printer_only.print_preset_name.clear();
         CHECK_FALSE(bundle.resolve_plate_presets(printer_only, presets, error));
-        CHECK(error == "The Project process preset selection is unresolved");
+        CHECK(error == "The plate names no process");
         CHECK(presets.print == nullptr);
 
         // the plate's own named process is unaffected

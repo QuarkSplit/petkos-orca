@@ -4529,6 +4529,17 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                             reason = "option '" + option_key + "' is not known to this build";
                         else if (!option->deserialize(value))
                             reason = "option '" + option_key + "' could not be read back";
+                        else if (option_key == "filament_volume_map") {
+                            //Two channels carry this key - this generic record and the legacy
+                            //named attribute below - and they must apply the same rule or the
+                            //unvalidated one always wins. The rule is the legacy channel's:
+                            //per-filament ids above HighFlow clamp to Standard. (Whether that
+                            //rule should spare TPU High Flow is a question for the channel
+                            //owners, not for the channel that merely has to agree.)
+                            for (int &v : static_cast<ConfigOptionInts *>(option)->values)
+                                if (v > 1)
+                                    v = 0;
+                        }
                     } catch (const std::exception &ex) {
                         reason = std::string("option '") + option_key + "': " + ex.what();
                     }

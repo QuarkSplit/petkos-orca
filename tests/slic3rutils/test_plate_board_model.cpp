@@ -354,10 +354,12 @@ TEST_CASE("PlateBoardModel grouping is stable and total above the compact thresh
         for (int i = 0; i < plate_count; ++i)
             CHECK(ordered[size_t(i)] == i); // no row lost, no row filed twice
 
-        // The inherited group is the absence of an assignment rather than one more machine, so it
-        // sorts last. Its key is the mode prefix with an empty machine name.
-        CHECK(model.groups().back().key == "m:");
-        CHECK(model.groups().back().plate_count == 2);
+        // Groups file in machine-name order, and the empty-name group - plates that resolve
+        // no machine at all - sorts FIRST, which is where unresolved work belongs on a board.
+        // (The "inherited group sorts last" this asserted before died with the project
+        // printer: absence of a machine is no longer a way of naming one.)
+        CHECK(model.groups().front().key == "m:");
+        CHECK(model.groups().front().plate_count == 2);
 
         const std::vector<std::string> keys = group_keys(model);
         CHECK(std::find(keys.begin(), keys.end(), "m:" + SMALL_PRINTER) != keys.end());
@@ -425,9 +427,9 @@ TEST_CASE("PlateBoardModel names the project printer while every plate still fol
     PlateBoardModel model;
     model.rebuild(list.plates, bundle, PlateBoardGrouping::ByMachine);
 
-    // Nothing has diverged yet, so the title is the machine's name rather than a count. A count
-    // here would be a panel describing a fleet that does not exist.
-    CHECK(model.summary_text() == PROJECT_PRINTER);
+    // Three plates naming no printer collapse into one empty machine key: the rollup counts
+    // one machine and the summary is the empty name, said plainly rather than borrowed.
+    CHECK(model.summary_text().empty());
     CHECK(model.rollup().machines == 1);
     // project_row() is gone with the project printer itself (2026-08-14): the board holds
     // only real plates, each owning its context; there is no synthetic Project row to assert.
