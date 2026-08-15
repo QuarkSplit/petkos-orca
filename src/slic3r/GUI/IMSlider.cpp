@@ -13,20 +13,45 @@ namespace Slic3r {
 
 namespace GUI {
 
+//A QUERY REPORTS. IT DOES NOT THROW, AND IT CERTAINLY DOES NOT END THE APPLICATION.
+//
+//This is the layer slider asking three questions about the current plate - the pause and template
+//G-code, and whether spiral mode is on - and it used to answer "this plate does not resolve" by
+//throwing. The preview refreshes on the startup path, so a project whose plate could not be composed
+//took the exception all the way to wxApp's main loop and the app exited before anything was on
+//screen. The plate in that case named a printer and a filament that had never gone together: the
+//conf remembered 'Creality K2 Pro' beside 'Anycubic PLA @Kobra S1', completion copied the pair onto
+//plate 1, and every composition of it failed from then on.
+//
+//Completion normalises that pairing now (PartPlateList::complete_plate_contexts), so this instance
+//is gone - but the escape hatch is the real defect and it is here. It is the same rule the load path
+//already learned when Plater::set_bed_shape threw and cost a project of 49 objects: an unresolved
+//plate is a thing to REPORT, never a reason to take something away from the user. So the reason is
+//logged, the plate is marked, and the slider draws against the option defaults - which is not a
+//substituted preset but the honest absence of one, and it makes the three answers "no custom
+//G-code" and "not spiral", which is what a slider with nothing to describe should show.
 static DynamicPrintConfig current_plate_slider_config()
 {
     PartPlate *plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
     PresetBundle *bundle = wxGetApp().preset_bundle;
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (plate == nullptr || !bundle->resolve_plate_slicing_config(
+    if (plate == nullptr || bundle == nullptr || !bundle->resolve_plate_slicing_config(
             plate->get_slicing_context(),
             plate->get_real_filament_maps(bundle->project_config),
             plate->get_real_filament_volume_maps(bundle->project_config),
             resolved, error)) {
         if (plate != nullptr)
             plate->update_apply_result_invalid(true);
-        throw RuntimeError(error.empty() ? "No plate is selected for custom G-code editing" : error);
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the layer slider has no plate config to read - "
+                                   << (plate == nullptr ? std::string("no plate is current")
+                                                        : (error.empty() ? std::string("the plate does not resolve") : error))
+                                   << "; drawing against the option defaults";
+        DynamicPrintConfig defaults;
+        defaults.apply(FullPrintConfig::defaults());
+        if (plate != nullptr)
+            defaults.apply(*plate->config(), true);
+        return defaults;
     }
     resolved.config.apply(*plate->config(), true);
     return std::move(resolved.config);

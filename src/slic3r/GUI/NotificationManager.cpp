@@ -597,6 +597,14 @@ void NotificationManager::PopNotification::init()
 	if (is_finished())
 		return;
 
+	//A push can arrive before ImGui can measure text - startup code paths notify too. The
+	//context is created early but the FONT only exists after the first NewFrame, and
+	//CalcTextSize on a null font is a crash, so both are checked. Defer: leaving the state
+	//as it is makes the first real render pass call init() again (render checks
+	//EState::Unknown). Crashing the app to lay out a notification is the wrong trade.
+	if (ImGui::GetCurrentContext() == nullptr || ImGui::GetFont() == nullptr)
+		return;
+
 	count_spaces();
 	count_lines();
 

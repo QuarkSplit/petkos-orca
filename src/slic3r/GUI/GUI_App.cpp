@@ -339,18 +339,37 @@ public:
         if (m_logo_bmp.IsOk())
             dc.DrawBitmap(m_logo_bmp, 0, 0, true);
 
-        wxRect rc = wxRect(0, 0, c_sz.GetWidth(), 0);
         dc.SetTextForeground(m_fg_color);
 
-        dc.SetFont(m_font_version);
-        rc.y      = c_sz.GetHeight() * 0.72;
-        rc.height = dc.GetTextExtent(m_text_version).GetHeight();
-        dc.DrawLabel(m_text_version, rc, wxALIGN_CENTER);
+        //TEXT IS FITTED TO ITS RECT RATHER THAN ASSUMED TO FIT IT. Every line here used to be
+        //drawn into a rect the full width of the bitmap, with no margin and no measurement of
+        //the string against it - so the version line, which is drawn at 1.65x and is the longest
+        //string on the splash, was clipped at both ends with nothing to say it had been. A
+        //release build makes it longer than a dev build, so the first person to see the whole
+        //thing broken is a user. The width is what is known; the point size is what gives.
+        const int margin = FromDIP(24);
+        const int max_width = std::max(c_sz.GetWidth() - 2 * margin, FromDIP(80));
+        auto draw_fitted = [&dc, margin, max_width](const wxString &text, wxFont font, int y) {
+            if (text.IsEmpty())
+                return 0;
+            dc.SetFont(font);
+            while (font.GetPointSize() > 6 && dc.GetTextExtent(text).GetWidth() > max_width) {
+                font.SetPointSize(font.GetPointSize() - 1);
+                dc.SetFont(font);
+            }
+            const int height = dc.GetTextExtent(text).GetHeight();
+            dc.DrawLabel(text, wxRect(margin, y, max_width, height), wxALIGN_CENTER);
+            return height;
+        };
 
-        dc.SetFont(m_font_action);
-        rc.y      = c_sz.GetHeight() * 0.85;
-        rc.height = dc.GetTextExtent(m_text_action).GetHeight();
-        dc.DrawLabel(m_text_action, rc, wxALIGN_CENTER);
+        //Two lines, because they answer two questions: what this application is, and what it is
+        //built on. One line saying both was where the length came from.
+        int y = c_sz.GetHeight() * 0.70;
+        y += draw_fitted(m_text_version, m_font_version, y);
+        y += FromDIP(2);
+        draw_fitted(m_text_base, m_font_base, y);
+
+        draw_fitted(m_text_action, m_font_action, c_sz.GetHeight() * 0.85);
 
         const wxRect progress_rc(0, c_sz.GetHeight() - m_progress_h, c_sz.GetWidth(), m_progress_h);
                 
@@ -415,12 +434,21 @@ private:
     wxColour m_progress_bg_color;
     wxColour m_progress_fg_color;
 
-    wxString m_text_version = GUI_App::format_display_version();
+    //THE SPLASH SAYS THIS APPLICATION'S NAME. It used to render format_display_version(), which
+    //led with "WaveOverhangs" - a name this fork stopped having on 2026-08-14 - and put
+    //OrcaSlicer where the app's own name belongs. SLIC3R_APP_FULL_NAME is the single place that
+    //answers "what is this called", which is why it is read here rather than spelled out.
+    wxString m_text_version = wxString::FromUTF8(SLIC3R_APP_FULL_NAME " ") + wxString::FromUTF8(WAVE_OVERHANGS_VERSION);
+    //Said, not hidden: this is OrcaSlicer underneath, and the base version is what a bug report
+    //needs. It is a second, smaller line rather than a parenthesis on the first, because that
+    //parenthesis is what made the one line too long to draw.
+    wxString m_text_base    = wxString::Format(_L("based on OrcaSlicer %s"), wxString::FromUTF8(SoftFever_VERSION));
     wxString m_text_action  = _L("Loading configuration") + dots;
     int      m_progress     = 0;
     int      m_progress_h   = 6;
 
     wxFont m_font_version = Label::Body_16;
+    wxFont m_font_base    = Label::Body_12;
     wxFont m_font_action  = Label::Body_16;
 };
 
@@ -6382,7 +6410,12 @@ std::string GUI_App::format_display_version()
 {
     if (!version_display.empty()) return version_display;
 
-    version_display = "WaveOverhangs v" + std::string(WAVE_OVERHANGS_VERSION)
+    //THE APPLICATION'S OWN NAME, read from the one place that holds it. This said
+    //"WaveOverhangs", which the fork stopped being called on 2026-08-14, and it is copied to the
+    //clipboard from the About box - so a bug report carried a name nothing else in the build,
+    //the installer or the datadir agrees with. The OrcaSlicer base version stays, because that
+    //is the other half of what a bug report needs.
+    version_display = std::string(SLIC3R_APP_FULL_NAME) + " v" + std::string(WAVE_OVERHANGS_VERSION)
                     + " (OrcaSlicer " + std::string(SoftFever_VERSION) + ")";
     return version_display;
 }
@@ -9026,8 +9059,41 @@ wxString GUI_App::filter_string(wxString str)
     return wxString::FromUTF8(result);
 }
 
+//AN UNRESOLVED PLATE IS NOT A REASON TO END THE SESSION.
+//
+//Returning false here tells wx to leave the main loop, which closes the application. That is the
+//right answer for a corrupted process and the wrong one for the app's own named refusals: a dozen
+//queries across the GUI answer "this plate does not resolve" by throwing Slic3r::RuntimeError, and
+//any one of them reaching this point took the whole app down. One did, during startup, before
+//anything had been drawn - the user's session ended because a remembered printer and a remembered
+//filament in the conf had never belonged together.
+//
+//The queries themselves are being taught to report instead of throw, one boundary at a time, and
+//that is the real fix. This is the floor under it: a RuntimeError is a message the app composed
+//about its own state, so it is logged, shown, and the loop CONTINUES. Everything else - bad_alloc,
+//a localization fault, an exception this code never named - keeps the old behaviour exactly,
+//because those say the process is no longer trustworthy and continuing would hide that.
 bool GUI_App::OnExceptionInMainLoop()
 {
+    try {
+        throw;
+    } catch (const Slic3r::RuntimeError &ex) {
+        BOOST_LOG_TRIVIAL(error) << boost::format("Recovered from an unhandled RuntimeError in the main loop: %1%") % ex.what();
+        flush_logs();
+        //The recovery path is not allowed to be the thing that fails. The log line above is the
+        //record; the notification is a courtesy on top of it, and a courtesy that can throw would
+        //put this handler back where it started.
+        try {
+            if (plater() != nullptr)
+                if (NotificationManager *notifications = plater()->get_notification_manager())
+                    notifications->push_notification(
+                        NotificationType::CustomNotification, NotificationManager::NotificationLevel::ErrorNotificationLevel,
+                        into_u8(format_wxstr(_L("Something could not be worked out: %1%"), ex.what())));
+        } catch (...) {
+        }
+        return true;
+    } catch (...) {
+    }
     generic_exception_handle();
     return false;
 }
