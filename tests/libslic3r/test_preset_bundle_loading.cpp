@@ -1012,7 +1012,8 @@ TEST_CASE("Reresolving a plate context after a printer change", "[Preset][PlateC
         CHECK(result.process_switched());
         CHECK(result.process_from == "Plate Process");
         CHECK(result.process_to == "Other Process");
-        CHECK_FALSE(result.process_now_inherits);
+        // process_to being a CONCRETE name is the whole assertion: inheritance is not a
+        // state this architecture has any more
         CHECK(context.print_preset_name == "Other Process");
         // the vendor id is the identity's second half, and it followed the printer
         CHECK(context.printer_vendor_id == "TEST");
@@ -1065,16 +1066,19 @@ TEST_CASE("Reresolving a plate context after a printer change", "[Preset][PlateC
         CHECK(context.print_preset_name == "Plate Process"); // unresolved is unresolved, not rewritten
     }
 
-    SECTION("clearing the printer back to the Project row re-inherits an incompatible plate process")
+    SECTION("an empty printer name is a refusal, not an inheritance")
     {
+        // The project printer was deleted as a state (2026-08-14): a plate names its own
+        // printer or it is unresolved. This section used to assert the opposite - that
+        // clearing the name meant "follow the project again" - which is the exact belief
+        // the architecture removed.
         PlateSlicingContext context = fixture.named_context();
-        context.printer_preset_name.clear(); // follow the project printer again
+        context.printer_preset_name.clear();
         context.printer_vendor_id.clear();
 
-        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
-        CHECK(result.process_switched());
-        CHECK(result.process_now_inherits);
-        CHECK(context.print_preset_name.empty()); // inheritance, not a copied name
+        REQUIRE_FALSE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(error == "The plate names no printer");
+        CHECK(context.print_preset_name == "Plate Process"); // a refusal repairs nothing and discards nothing
     }
 
     SECTION("filaments are reported, never rewritten")

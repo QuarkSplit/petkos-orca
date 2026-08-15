@@ -206,8 +206,11 @@ def drive(spec, project=None, timeout=900, keep_env=False):
     datadir, logdir, cloned = run_datadir()
     if cloned:
         print("== a slicer is open, so this runs on its own datadir copy")
-    for env in ("PETKOS_ACCEPT", "PETKOS_TEST_ASSIGN"):
-        os.environ.pop(env, None)
+    #hygiene by default: these hijack a run when left set. keep_env is for the run that MEANS
+    #them - the fixture builder sets PETKOS_TEST_ASSIGN deliberately.
+    if not keep_env:
+        for env in ("PETKOS_ACCEPT", "PETKOS_TEST_ASSIGN"):
+            os.environ.pop(env, None)
     before = {p.name for p in logdir.glob("debug_*.log*") if "network" not in p.name}
     env = dict(os.environ, PETKOS_PERF="1", PETKOS_PERF_OUT=str(PERFDIR / "pod"),
                PETKOS_PERF_SCRIPT=spec)
@@ -249,7 +252,7 @@ def drive(spec, project=None, timeout=900, keep_env=False):
     return 1 if failed else 0
 
 def cmd_run(a):
-    sys.exit(drive(a.spec, a.project, a.timeout))
+    sys.exit(drive(a.spec, a.project, a.timeout, keep_env=a.keep_env))
 
 def cmd_slice(a):
     gcode = Path(a.out or (PERFDIR / (Path(a.project).stem + ".gcode"))).resolve()
@@ -352,7 +355,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").set_defaults(f=cmd_status)
     p = sub.add_parser("inspect"); p.add_argument("project"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_inspect)
-    p = sub.add_parser("run"); p.add_argument("spec"); p.add_argument("--project"); p.add_argument("--timeout", type=int, default=900); p.set_defaults(f=cmd_run)
+    p = sub.add_parser("run"); p.add_argument("spec"); p.add_argument("--project"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--keep-env", action="store_true", help="honour PETKOS_ACCEPT/PETKOS_TEST_ASSIGN already in the environment"); p.set_defaults(f=cmd_run)
     p = sub.add_parser("slice"); p.add_argument("project"); p.add_argument("--printer", required=True); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1500); p.set_defaults(f=cmd_slice)
     p = sub.add_parser("check"); p.add_argument("gcode"); p.add_argument("--expect-printer"); p.add_argument("--expect-filament"); p.add_argument("--min-flow", type=float); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_check)
     sub.add_parser("verify").set_defaults(f=cmd_verify)

@@ -330,6 +330,18 @@ private:
             break;
 
         case Phase::Finish: {
+            //save= is an OUTPUT, not a property of the scope test. The scope phase saves
+            //mid-test to prove override persistence; every other run that asked for a save
+            //gets it here, whatever phases were on - a fixture builder with scope=0 used to
+            //quit having saved nothing, silently.
+            if (!m_spec.save.empty() && !m_saved) {
+                Plater *plater = wxGetApp().plater();
+                if (plater != nullptr) {
+                    const int written = plater->export_3mf(boost::filesystem::path(m_spec.save));
+                    m_saved = true;
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.save << " (rc=" << written << ")";
+                }
+            }
             Perf::mark("driver.end", 0);
             Perf::flush();
             BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: run complete, wrote "
@@ -438,6 +450,7 @@ private:
         //the weaker test.
         if (!m_spec.save.empty()) {
             const int written = plater->export_3mf(boost::filesystem::path(m_spec.save));
+            m_saved = true;
             BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: wrote " << m_spec.save << " (rc=" << written << ")";
         }
 
@@ -957,6 +970,7 @@ private:
 
     Spec                     m_spec;
     Phase                    m_phase   = Phase::Settle0;
+    bool                     m_saved   = false;
     int                      m_tick    = 0;
     int                      m_done    = 0;
     int                      m_quiet   = 0;
