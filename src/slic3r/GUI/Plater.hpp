@@ -628,6 +628,16 @@ public:
     //refusal from a no-op reassignment to the same printer.
     bool set_plate_printer(int plate_index, std::string preset_name);
 
+    //Normalise one plate's context against the printer it names, and report what changed. The GUI
+    //half of PresetBundle::reresolve_plate_context_for_printer, shared by every path that gives a
+    //plate a printer so none of them can drift: single assignment, batch assignment, and
+    //PartPlateList::complete_plate_contexts. Completing a plate from a seed is an assignment of a
+    //context and gets the same normalisation - a seed is only as coherent as its source, and an
+    //incoherent one copied verbatim is a plate that cannot be composed at all. Safe on any plate:
+    //it reports and rewrites, it never throws, and a context it cannot resolve is left alone and
+    //named.
+    void reresolve_plate_context(PartPlate *plate);
+
     // PetkosOrca: the other two halves of a plate's slicing identity, which the app could write
     // and the user could not.
     //
@@ -644,6 +654,25 @@ public:
     //Drop the process settings this plate carries of its own. One snapshot, one refresh,
     //and never called on the user's behalf: see PartPlate::process_override_count.
     void clear_plate_process_overrides(int plate_index);
+
+    // TURN WHAT A PLATE CHANGED INTO A PRESET FOR ITS MACHINE.
+    //
+    // After a plate moves to another printer it names that machine's stock process and carries
+    // the chosen values as its own overrides (see PresetBundle::carry_process_intent). That is
+    // correct, and it is also a dead end: the settings live on one plate and cannot be reused,
+    // so the next project starts the retyping again.
+    //
+    // This makes them a real process preset, compatible with that printer, and points the plate
+    // at it - which empties the override set, because the values are now IN the thing the plate
+    // names rather than piled on top of it.
+    //
+    // The plate slices the same SHAPE before and after, but it does reslice: print_settings_id
+    // is part of the configuration a retained slice is judged against, and it necessarily
+    // changes. That is stated to the user rather than hidden, and it is the whole price.
+    //
+    // This is what upstream #7880, #8216, #10209 and #12943 are actually asking for. None of
+    // them wants preset inheritance; they want not to retype their settings on a new machine.
+    void save_plate_process_as_preset(int plate_index);
     void set_plate_filaments(int plate_index, std::vector<std::string> preset_names);
     //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
     //had. The board's inline editor and any MCP surface should both land here.
@@ -721,6 +750,27 @@ public:
 
     wxString get_project_filename(const wxString& extension = wxEmptyString) const;
     wxString get_export_gcode_filename(const wxString& extension = wxEmptyString, bool only_filename = false, bool export_all = false) const;
+    // HAND THE FARM ITS FILES.
+    //
+    // One action, one folder, one .gcode per plate, each named for the machine that prints it.
+    // Upstream has "export all plate sliced file", which writes a single Bambu-flavoured
+    // .gcode.3mf - useless to an Elegoo, an Anycubic, a Creality or a Raise3D, which each want
+    // a plain G-code file. Doing it by hand is select plate, wait, export, dialog, invent a
+    // filename that says which machine it is for, save - times the number of plates.
+    //
+    // It is cheap HERE and nowhere else: upstream cannot do it without reslicing, because
+    // slicing plate N discards plate N-1's result. In this fork every plate keeps its own
+    // finished slice with an exact snapshot of the context that produced it, so this is a
+    // copy loop over files that already exist.
+    //
+    // ENABLED WHEN ANY PLATE IS READY, not when all are. See MainFrame::can_export_any_plate_gcode:
+    // the reason this action exists is a project whose plates are on different machines, which is
+    // exactly the project where one plate is usually mid-edit. Gating on all of them disables the
+    // feature in its own use case, with no message, which is a silent gate.
+    //
+    // Requested upstream as #10982 (reopened) and #9040.
+    void export_all_plate_gcode();
+
     wxString get_export_gcode_filename_for_plate(int plate_index, const wxString& extension = wxEmptyString,
                                                   bool only_filename = false) const;
     void set_project_filename(const wxString& filename);

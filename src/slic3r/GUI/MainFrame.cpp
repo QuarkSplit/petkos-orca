@@ -1743,6 +1743,32 @@ bool MainFrame::can_export_all_gcode() const
     return part_plate_list.is_all_slice_results_ready_for_print();
 }
 
+//ANY plate, not all of them. can_export_all_gcode above gates on every plate being ready, which
+//is right for a single combined file and wrong for one file per plate: the project this action
+//exists for is a multi-machine one, and in a multi-machine project there is nearly always a plate
+//being edited. Gating on all of them greys the item out in exactly its own use case, and a greyed
+//item with no message is the silent gate this fork calls the worst outcome. Enabled when there is
+//something to write; Plater::export_all_plate_gcode names what it skipped and why.
+bool MainFrame::can_export_any_plate_gcode() const
+{
+    if (m_plater == nullptr)
+        return false;
+
+    if (m_plater->model().objects.empty())
+        return false;
+
+    if (m_plater->is_export_gcode_scheduled())
+        return false;
+
+    PartPlateList &part_plate_list = m_plater->get_partplate_list();
+    for (int i = 0; i < part_plate_list.get_plate_count(); ++i) {
+        PartPlate *plate = part_plate_list.get_plate(i);
+        if (plate != nullptr && !plate->empty() && plate->is_slice_result_ready_for_print())
+            return true;
+    }
+    return false;
+}
+
 bool MainFrame::can_print_3mf() const
 {
     if (m_plater && !m_plater->model().objects.empty()) {
@@ -2823,6 +2849,14 @@ void MainFrame::init_menubar_as_editor()
         append_menu_item(export_menu, wxID_ANY, _L("Export G-code") + dots/* + "\t" + ctrl + "G"*/, _L("Export current plate as G-code"),
             [this](wxCommandEvent&) { if (m_plater) m_plater->export_gcode(false); }, "menu_export_gcode", nullptr,
             [this]() {return can_export_gcode(); }, this);
+
+        //One G-code per plate, named for its machine. See Plater::export_all_plate_gcode:
+        //cheap here because every plate keeps its own finished slice. Enabled when ANY plate is
+        //ready - see can_export_any_plate_gcode - and it names the plates it left behind.
+        append_menu_item(export_menu, wxID_ANY, _L("Export every plate's G-code") + dots,
+            _L("One G-code file per plate, named for the machine that prints it"),
+            [this](wxCommandEvent&) { if (m_plater) m_plater->export_all_plate_gcode(); }, "menu_export_gcode", nullptr,
+            [this]() {return can_export_any_plate_gcode(); }, this);
 
         append_menu_item(export_menu, wxID_ANY, _L("Export toolpaths as OBJ") + dots, _L("Export toolpaths as OBJ"),
             [this](wxCommandEvent&) { if (m_plater != nullptr) m_plater->export_toolpaths_to_obj(); }, "menu_export_toolpaths", nullptr,

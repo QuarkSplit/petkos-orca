@@ -4709,6 +4709,27 @@ int PartPlateList::complete_plate_contexts(const PlateSlicingContext &declared)
 				<< boost::format(": plate %1% completed to printer '%2%', process '%3%', %4% filament(s)")
 				   % (plate->get_index() + 1) % context.printer_preset_name % context.print_preset_name
 				   % context.filament_preset_names.size();
+			//A COMPLETED CONTEXT IS AN ASSIGNED CONTEXT, SO IT IS NORMALISED LIKE ONE.
+			//
+			//A seed is a set of names collected from somewhere - a sibling plate, a 3MF's own
+			//config, or the remembered selection in the conf - and nothing guarantees the parts
+			//of it belong together. The conf carried printer 'Creality K2 Pro' beside filament
+			//'Anycubic PLA @Kobra S1', which is a legitimate pair for neither machine; completion
+			//copied it onto plate 1 exactly as recorded, and from then on every composition of
+			//that plate raised "filament is incompatible with printer" - during startup, before
+			//anything could be clicked.
+			//
+			//Assignment has always had the answer to this: the filament is translated to the same
+			//material for the machine that is actually there, the process falls back to the
+			//printer's declared default or the first compatible one, and what genuinely cannot be
+			//resolved is left as it is and NAMED. Completion was the one path that skipped it, so
+			//it is the one path that could produce a plate nobody had ever assigned and nothing
+			//could slice.
+			//
+			//Only plates this call actually wrote to. A plate that arrived complete was not
+			//assigned anything here, and re-resolving it would rewrite choices no one just made.
+			m_plater->reresolve_plate_context(plate);
+			context = plate->get_slicing_context();
 		}
 		if (context.is_complete())
 			seed = context;

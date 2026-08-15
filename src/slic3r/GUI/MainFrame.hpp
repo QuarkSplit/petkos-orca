@@ -131,6 +131,9 @@ class MainFrame : public DPIFrame
     bool can_export_supports() const;
     bool can_export_gcode() const;
     bool can_export_all_gcode() const;
+    //Enabled when ANY plate has a finished slice. See the definition and
+    //Plater::export_all_plate_gcode.
+    bool can_export_any_plate_gcode() const;
     bool can_print_3mf() const;
     bool can_send_gcode() const;
     //bool can_export_gcode_sd() const;

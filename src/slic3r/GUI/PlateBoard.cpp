@@ -569,20 +569,30 @@ wxColour board_tile_line(bool dark) { return theme(dark, "#DCE2E2"); } //its edg
 wxColour board_warn(bool dark)   { return theme(dark, "#FF6F00"); } //secondary / attention
 wxColour board_err(bool dark)    { return theme(dark, "#D01B1B"); } //error
 
-//The bed glyph is the board's only geometric signal, and the whole point of it is that a
-//smaller machine draws a visibly smaller rectangle. Sizes are given in millimetres and
-//scaled against the project's largest bed, so the biggest machine fills the cell; see the
-//note where glyph_reference_mm is computed.
-wxSize bed_glyph_size(const wxWindow *win, double bed_w, double bed_d, double reference_mm, int cell_dip)
+//THE BED IN PLAN, drawn the same way wherever a bed is drawn, and the board's only geometric
+//signal: a smaller machine draws a visibly smaller rectangle. Sizes are in millimetres and
+//scaled against the project's largest bed, so the biggest machine fills its cell.
+//
+//This is the body of what PlateBoard::draw_bed_plan was, lifted out so the printer picker can
+//draw the same thing. The picker was filling a solid slab from its own scaling helper instead,
+//and a filled dark block of nearly the same size as the one above it is an indistinct square -
+//which is exactly what this glyph exists NOT to be. Two surfaces answering "how big is this
+//bed" with two different pictures is the same fault as two preset combos that do different
+//things, and it was worst at the moment of choosing between machines.
+void draw_bed_plan_in(wxDC &dc, const wxWindow *win, const wxRect &cell, double bed_w, double bed_d,
+                      double reference_mm, const wxColour &colour, int inset_dip)
 {
-    if (reference_mm <= 0.)
-        reference_mm = 250.;
+    if (bed_w <= 0. || bed_d <= 0.)
+        return;
+    const double reference = std::max(1., reference_mm);
+    const int    inset     = win->FromDIP(inset_dip);
+    const int    room      = std::max(1, std::min(cell.GetWidth(), cell.GetHeight()) - 2 * inset);
+    const int    w         = std::max(2, (int) std::lround(room * std::min(1., bed_w / reference)));
+    const int    d         = std::max(2, (int) std::lround(room * std::min(1., bed_d / reference)));
 
-    const int    cell  = win->FromDIP(cell_dip);
-    const double scale = (double) cell / reference_mm;
-    const int    w     = std::max(win->FromDIP(6), (int) (bed_w * scale + 0.5));
-    const int    h     = std::max(win->FromDIP(5), (int) (bed_d * scale + 0.5));
-    return wxSize(std::min(w, cell), std::min(h, cell));
+    dc.SetBrush(*wxTRANSPARENT_BRUSH);
+    dc.SetPen(wxPen(colour, 1));
+    dc.DrawRectangle(cell.x + (cell.GetWidth() - w) / 2, cell.y + (cell.GetHeight() - d) / 2, w, d);
 }
 
 //A collapse chevron drawn as geometry rather than as a text glyph. The character forms
@@ -828,10 +838,11 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
     //how many plates already sit on each machine, so the picker can say so, and which
     //plates share this plate's machine, which is the only set the bulk footer may touch:
     //"the others that are where this one is" is a set the user can see on the board.
-    std::map<std::string, int> plate_counts;
+    std::map<std::string, int> &plate_counts = m_plate_counts;
     const PartPlateList &      plates  = m_plater->get_partplate_list();
     const PartPlate *          subject = plates.get_plate(m_plate_index);
     const std::string          current_machine = subject != nullptr ? subject->get_printer_preset_name() : std::string();
+    m_current_machine = current_machine;
     for (int i = 0; i < plates.get_plate_count(); ++i) {
         const PartPlate *plate = plates.get_plate(i);
         if (plate == nullptr)
@@ -909,15 +920,15 @@ void PlatePrinterPopup::build_items(const std::string &current_name)
 
         for (const std::string &key : model_order) {
             Item &item = models[key];
-            int   plates_here = 0;
+            //Counted per MACHINE, so every nozzle variant of one printer contributes to the one
+            //row that represents it - which is the same grouping the list itself uses.
             for (const std::string &preset_name : item.variant_presets) {
                 const auto used = plate_counts.find(preset_name);
                 if (used != plate_counts.end())
-                    plates_here += used->second;
+                    item.plates_here += used->second;
+                if (preset_name == current_machine)
+                    item.is_current_machine = true;
             }
-            if (plates_here > 0)
-                item.detail += wxString::Format("   %d %s", plates_here,
-                                                plates_here == 1 ? _L("plate") : _L("plates"));
             m_items.push_back(std::move(item));
         }
     }
@@ -977,6 +988,12 @@ void PlatePrinterPopup::build_variant_items(const Item &model_item)
         item.bed_w       = model.bed_w;
         item.bed_d       = model.bed_d;
         item.smaller_bed = model.smaller_bed;
+        //Per VARIANT here, not per machine: at this step the question has narrowed to which
+        //nozzle, and "three plates are already on the 0.4" is the answer to it. Read from the
+        //counts taken when the popup opened, so navigating between the steps costs nothing.
+        if (const auto used = m_plate_counts.find(item.name); used != m_plate_counts.end())
+            item.plates_here = used->second;
+        item.is_current_machine = !m_current_machine.empty() && item.name == m_current_machine;
         m_items.push_back(item);
     }
 
@@ -1124,8 +1141,12 @@ void PlatePrinterPopup::on_paint(wxPaintEvent &evt)
 
     const int width     = GetClientSize().GetWidth();
     const int glyph_x   = FromDIP(8);
-    const int glyph_col = FromDIP(18);
-    const int text_x    = glyph_x + glyph_col + FromDIP(8);
+    const int glyph_col = FromDIP(20);
+    //A fixed column for the "already used" badge, reserved whether or not a row has one, so the
+    //names stay on one left edge and the badges read as a column rather than as ragged noise.
+    const int badge_x   = glyph_x + glyph_col + FromDIP(6);
+    const int badge_col = FromDIP(18);
+    const int text_x    = badge_x + badge_col + FromDIP(6);
     int       y         = FromDIP(2) - m_scroll;
 
     for (size_t i = 0; i < m_items.size(); ++i, y += m_row_height) {
@@ -1173,15 +1194,32 @@ void PlatePrinterPopup::on_paint(wxPaintEvent &evt)
             continue;
         }
 
-        //mini bed glyph, on the same scale as every other glyph in this popup, so the
-        //machines in the list are visibly different sizes before one is picked
-        if (item.bed_w > 0. && item.bed_d > 0.) {
-            const wxSize glyph = bed_glyph_size(this, item.bed_w, item.bed_d, m_glyph_reference_mm, 16);
-            dc.SetBrush(wxBrush(board_line(dark)));
-            dc.SetPen(wxPen(board_dim(dark)));
-            dc.DrawRectangle(glyph_x + (glyph_col - glyph.GetWidth()) / 2,
-                             y + (m_row_height - glyph.GetHeight()) / 2,
-                             glyph.GetWidth(), glyph.GetHeight());
+        //THE BED IN PLAN, the same drawing the board makes. This was a FILLED rectangle in the
+        //board's line colour: at 16 px a solid slab reads as one indistinct square whatever its
+        //dimensions are, so the one signal the glyph exists to give - this machine is bigger or
+        //smaller than that one - was not being given at the moment of choosing. An outline in
+        //proportion is what the board draws for the same fact, and now it is literally the same
+        //call. Scaled against the largest bed in the list, so the biggest machine fills the cell.
+        draw_bed_plan_in(dc, this, wxRect(glyph_x, y, glyph_col, m_row_height),
+                         item.bed_w, item.bed_d, m_glyph_reference_mm,
+                         item.is_current_machine ? board_accent(dark) : board_dim(dark), 2);
+
+        //WHERE THE REST OF THE PROJECT ALREADY IS. A filled pill in the accent means "this
+        //plate's machine"; an outlined one means "other plates of this project are here". Both
+        //carry the count, so same-or-different and how-many are one look.
+        if (item.plates_here > 0 && !item.is_back) {
+            const int    pill_h = FromDIP(14);
+            const wxRect pill(badge_x, y + (m_row_height - pill_h) / 2, badge_col, pill_h);
+            dc.SetBrush(item.is_current_machine ? wxBrush(board_accent(dark)) : *wxTRANSPARENT_BRUSH);
+            dc.SetPen(wxPen(item.is_current_machine ? board_accent(dark) : board_dim(dark)));
+            dc.DrawRoundedRectangle(pill, pill_h / 2);
+
+            dc.SetFont(Label::Body_9);
+            dc.SetTextForeground(item.is_current_machine ? board_bg(dark) : board_dim(dark));
+            const wxString count  = wxString::Format("%d", item.plates_here);
+            const wxSize   extent = dc.GetTextExtent(count);
+            dc.DrawText(count, pill.x + (pill.GetWidth() - extent.GetWidth()) / 2,
+                        pill.y + (pill.GetHeight() - extent.GetHeight()) / 2);
         }
 
         dc.SetFont(Label::Body_12);
@@ -2762,19 +2800,12 @@ void PlateBoard::draw_state_icon(wxDC &dc, const PlateBoardRow &row, int x, int 
 //
 //This is also what the glyph animation was always for. It has been interpolating bed
 //dimensions that no draw call read since the row became pictures.
+//
+//The drawing itself is draw_bed_plan_in, shared with the printer picker so the two surfaces
+//cannot drift into two different pictures of the same bed. They already had.
 void PlateBoard::draw_bed_plan(wxDC &dc, const wxRect &cell, double bed_w, double bed_d, bool dark) const
 {
-    if (bed_w <= 0. || bed_d <= 0.)
-        return;
-    const double reference = std::max(1., m_model.glyph_reference_mm());
-    const int    inset     = FromDIP(5);
-    const int    room      = std::max(1, std::min(cell.GetWidth(), cell.GetHeight()) - 2 * inset);
-    const int    w         = std::max(2, (int) std::lround(room * std::min(1., bed_w / reference)));
-    const int    d         = std::max(2, (int) std::lround(room * std::min(1., bed_d / reference)));
-
-    dc.SetBrush(*wxTRANSPARENT_BRUSH);
-    dc.SetPen(wxPen(board_dim(dark), 1));
-    dc.DrawRectangle(cell.x + (cell.GetWidth() - w) / 2, cell.y + (cell.GetHeight() - d) / 2, w, d);
+    draw_bed_plan_in(dc, this, cell, bed_w, bed_d, m_model.glyph_reference_mm(), board_dim(dark), 5);
 }
 
 //One plate at 34 px. See PLATE_BOARD_TILE_ABOVE for why a large machine group draws these.
@@ -3831,19 +3862,23 @@ void PlateInspector::on_process_click()
         if (preset->name == current)
             item->Check(true);
     }
-    if (names.empty()) {
-        menu.Append(base_id + 9000, wxString::Format(_L("No process in this installation runs on \"%s\""),
-                                                     from_u8(printer->name)))->Enable(false);
-        PopupMenu(&menu);
-        return;
-    }
-
-    //What this plate changed about whichever process it names, and the way to drop it.
-    //Offered rather than done: a carried set is still values somebody chose, and clearing
-    //them is a decision with a physical consequence.
+    //What this plate changed about whichever process it names, and the two things to do with
+    //it. They are opposites - make the settings permanent and reusable, or drop them - and
+    //both are the user's: a carried set is still values somebody chose, and either decision
+    //has a physical consequence.
+    //
+    //ABOVE the "no process runs here" exit below, deliberately. That exit fires when this
+    //installation has nothing compatible to offer, which is precisely the state a plate is in
+    //after landing on a machine whose processes are not installed - carrying its overrides and
+    //with nowhere to put them. Leaving these items after the return made the feature disappear
+    //in the one case it was built for.
     const size_t overrides = plate->process_override_count();
     if (overrides > 0) {
-        menu.AppendSeparator();
+        if (menu.GetMenuItemCount() > 0)
+            menu.AppendSeparator();
+        menu.Append(base_id + 9002,
+                    wxString::Format(_L("Save the %d changed setting(s) as a preset for this machine..."),
+                                     (int) overrides));
         menu.Append(base_id + 9001,
                     wxString::Format(_L("Clear the %d setting(s) this plate changed"), (int) overrides));
     }
@@ -3855,10 +3890,23 @@ void PlateInspector::on_process_click()
             plater->clear_plate_process_overrides(plate_index);
             return;
         }
+        if (evt.GetId() == base_id + 9002) {
+            plater->save_plate_process_as_preset(plate_index);
+            return;
+        }
         const size_t i = (size_t) (evt.GetId() - base_id);
         if (i < names.size())
             plater->set_plate_process(plate_index, names[i]);
     });
+
+    if (names.empty()) {
+        //Said as a disabled line rather than as an empty menu, and it is no longer the whole
+        //menu: the override items above are still reachable.
+        menu.Prepend(base_id + 9000, wxString::Format(_L("No process in this installation runs on \"%s\""),
+                                                      from_u8(printer->name)))->Enable(false);
+        if (overrides > 0)
+            menu.InsertSeparator(1);
+    }
     PopupMenu(&menu);
 }
 

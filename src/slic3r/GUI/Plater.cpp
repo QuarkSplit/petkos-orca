@@ -46,6 +46,7 @@
 #include <wx/string.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
+#include <wx/textdlg.h>     // Plater::save_plate_process_as_preset asks for the preset's name
 #include <wx/choicdlg.h>
 #include <wx/debug.h>
 #include <wx/busyinfo.h>
@@ -137,6 +138,9 @@
 #include "NotificationManager.hpp"
 #include "PresetComboBoxes.hpp"
 #include "MsgDialog.hpp"
+//Plater::export_all_plate_gcode runs a plate's post-processing scripts itself, because the
+//retained G-code is post-processed in place only for BBL machines.
+#include "PostProcessor.hpp"
 #include "Widgets/MultiNozzleSync.hpp"           // NozzleOption, tryPopUpMultiNozzleDialog, setExtruderNozzleCount
 #include "DeviceCore/DevNozzleSystem.h"          // DevNozzle, GetExtNozzles / GetRackNozzles
 #include "ProjectDirtyStateManager.hpp"
@@ -4260,6 +4264,12 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     wxGetApp().plater()->take_snapshot(std::string("Delete filament"));
 
     if (wxGetApp().preset_bundle->is_the_only_edited_filament(filament_id) || (filament_id == 0)) {
+        //This selection is bookkeeping, not a choice: the slot being deleted has to stop being the
+        //edited one before it can go. Writing it to the plate here would store a slot list that
+        //still contains the filament about to be removed - on_filament_deleted renumbers the plate's
+        //maps but not its filament_preset_names - so the plate would name a material that no longer
+        //exists. See Tab::PlateWriteSuspend.
+        Tab::PlateWriteSuspend no_plate_write;
         wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(wxGetApp().preset_bundle->filament_presets[0], false, "", true);
     }
 
@@ -18821,6 +18831,11 @@ void Plater::set_bed_shape() const
         // already drawn, and say what could not be resolved instead of dying.
         const std::string reason = error.empty() ? std::string("the current plate has no resolved printer") : error;
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": leaving the bed unchanged: " << reason;
+        //During startup this branch runs on transient preset churn that resolves before the
+        //user could act on it; the log line is the record. A notification about a state the
+        //user never saw is noise, and pushing one from on_init_inner predates ImGui entirely.
+        if (!is_initialized())
+            return;
         if (NotificationManager *ntf = const_cast<Plater *>(this)->get_notification_manager(); ntf != nullptr)
             ntf->push_notification(NotificationType::CustomNotification,
                                    NotificationManager::NotificationLevel::WarningNotificationLevel,
@@ -19068,6 +19083,186 @@ wxString Plater::get_project_filename(const wxString& extension) const
 wxString Plater::get_export_gcode_filename(const wxString & extension, bool only_filename, bool export_all) const
 {
     return p->get_export_gcode_filename(extension, only_filename, export_all);
+}
+
+//See the header.
+void Plater::export_all_plate_gcode()
+{
+    PartPlateList &plates = p->partplate_list;
+    PresetBundle  *bundle = wxGetApp().preset_bundle;
+
+    //What each plate can contribute, decided once. A plate with nothing on it is not a failure
+    //and is not reported as one - there is no G-code for an empty bed and the user knows it.
+    //A plate that has objects but no finished slice IS reported, by number, because an action
+    //that writes four files when you have six plates and says nothing is the silent gate.
+    struct Skipped { int index; wxString reason; };
+    std::vector<int>     ready;
+    std::vector<Skipped> skipped;
+    int                  empty_plates = 0;
+    for (int i = 0; i < plates.get_plate_count(); ++i) {
+        PartPlate *plate = plates.get_plate(i);
+        if (plate == nullptr)
+            continue;
+        if (plate->empty()) {
+            ++empty_plates;
+            continue;
+        }
+        const std::string path = plate->get_tmp_gcode_path();
+        if (!plate->is_slice_result_valid() || path.empty() || !boost::filesystem::exists(path)) {
+            skipped.push_back({i, _L("no finished slice")});
+            continue;
+        }
+        if (!plate->is_slice_result_ready_for_print()) {
+            //The same bar the single-plate Export G-code is held to, and named rather than
+            //silently dropped: the slice exists but the engine flagged it.
+            skipped.push_back({i, _L("the slice has errors")});
+            continue;
+        }
+        ready.push_back(i);
+    }
+
+    if (ready.empty()) {
+        //Nothing to write, and saying which plates and why beats an empty folder.
+        wxString detail = skipped.empty() ?
+            _L("There is nothing on these plates to export.") :
+            _L("None of these plates has a finished slice to export. Slice them first.");
+        MessageDialog dlg(this, detail, _L("Export every plate's G-code"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+
+    //The project's own folder is the natural default; get_project_filename is the public face
+    //of the private m_project_folder and is empty when the project has never been saved.
+    const wxString project_file = get_project_filename();
+    const wxString default_dir  = project_file.empty() ? wxString() : from_path(into_path(project_file).parent_path());
+    wxDirDialog dialog(this, _L("Choose a folder for one G-code file per plate"),
+                       default_dir, wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK)
+        return;
+    const boost::filesystem::path folder = into_path(dialog.GetPath());
+
+    std::vector<std::string> written;
+    std::vector<std::string> failed;
+    for (int i : ready) {
+        PartPlate *plate = plates.get_plate(i);
+
+        //THIS PLATE'S OWN CONFIG, not the cursor's. Everything below - which vendor's machine
+        //this is, and what post-processing it asked for - is a per-plate question in this fork,
+        //and reading it off the selected preset would answer it for whichever plate happens to
+        //be on screen.
+        ResolvedPlateSlicingConfig resolved;
+        std::string                resolve_error;
+        if (!resolve_plate_slicing_config(plate, resolved, resolve_error)) {
+            failed.push_back((boost::format("plate %1%: %2%") % (i + 1) % resolve_error).str());
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate " << (i + 1) << " does not resolve: " << resolve_error;
+            continue;
+        }
+
+        //The machine goes in the NAME. On a farm the filename is what tells one file from
+        //another at the printer, and "project_plate_2.gcode" says nothing about where it
+        //goes. The model rather than the preset name: short, human, and what the machine is
+        //actually called. Falls back to the preset name when the preset declares no model.
+        std::string machine = resolved.printer_preset_name;
+        if (const ConfigOptionString *model = resolved.config.opt<ConfigOptionString>("printer_model");
+            model != nullptr && !model->value.empty())
+            machine = model->value;
+        //A filename cannot carry a separator, and a preset name can.
+        for (char &c : machine)
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+                c = '-';
+
+        wxString stem = p->get_export_gcode_filename_for_plate(i, wxEmptyString, true);
+        if (stem.IsEmpty())
+            stem = wxString::Format("plate_%d", i + 1);
+        if (!machine.empty())
+            stem += "_" + from_u8(machine);
+
+        boost::filesystem::path target = folder / (into_u8(stem) + ".gcode");
+
+        //POST-PROCESSING IS PART OF THE FILE, so a copy that skips it is not the G-code the
+        //user's printer expects. The retained file is post-processed in place only for BBL
+        //machines (BackgroundSlicingProcess::process_fff runs the scripts on the tmp path for
+        //those and no others); every other vendor has its scripts run by finalize_gcode, at
+        //export time, on a .pp working copy. A plain copy therefore silently drops them for
+        //exactly the machines this fork exists to serve. So this does what finalize_gcode does,
+        //per plate, with that plate's own config - and if it cannot, it refuses that plate BY
+        //NAME rather than writing a file that is quietly wrong.
+        std::string source = plate->get_tmp_gcode_path();
+        const bool  already_post_processed = bundle != nullptr && bundle->is_bbl_vendor(resolved.config);
+        bool        post_processed = false;
+        if (!already_post_processed) {
+            //source and output_name are both in-out, exactly as finalize_gcode passes them:
+            //make_copy = true makes source the ".pp" working copy (the viewer keeps the tmp
+            //G-code memory-mapped, and a writable open of a mapped file fails on Windows), and
+            //a script is allowed to rename the output - upstream #6042.
+            std::string output_name = target.string();
+            try {
+                post_processed = run_post_process_scripts(source, true, "File", output_name, resolved.config);
+            } catch (const std::exception &ex) {
+                failed.push_back((boost::format("plate %1%: post-processing failed: %2%") % (i + 1) % ex.what()).str());
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": plate " << (i + 1)
+                                         << ": post-processing failed, nothing written: " << ex.what();
+                continue;
+            }
+            if (post_processed && !output_name.empty()) {
+                const boost::filesystem::path renamed(output_name);
+                //A bare name from a script means "call it this", not "write it to the cwd".
+                target = renamed.has_parent_path() ? renamed : folder / renamed.filename();
+            }
+        }
+
+        boost::system::error_code ec;
+        boost::filesystem::copy_file(source, target, boost::filesystem::copy_option::overwrite_if_exists, ec);
+        if (post_processed) {
+            boost::system::error_code remove_ec;
+            boost::filesystem::remove(source, remove_ec);
+            if (remove_ec)
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": could not remove the post-processing working copy "
+                                         << source << ": " << remove_ec.message();
+        }
+        if (ec) {
+            failed.push_back((boost::format("plate %1%: %2%") % (i + 1) % ec.message()).str());
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": could not write " << target.string() << ": " << ec.message();
+        } else {
+            written.push_back(target.filename().string());
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": plate " << (i + 1) << " -> " << target.string()
+                                    << (already_post_processed ? " (post-processed at slice time)" :
+                                        post_processed ? " (post-processing scripts run here)" : " (no post-processing configured)");
+        }
+    }
+
+    //One sentence, a count rather than a list, and it says what did NOT happen as well as
+    //what did - a plate left behind is the thing worth hearing about. Empty plates are not
+    //counted here: nothing was expected of them.
+    wxString message = wxString::Format(_L("Wrote %d G-code file(s) to %s."),
+                                        (int) written.size(), dialog.GetPath());
+    if (!skipped.empty()) {
+        wxString numbers;
+        wxString reason = skipped.front().reason;
+        bool     one_reason = true;
+        for (const Skipped &entry : skipped) {
+            numbers += (numbers.IsEmpty() ? "" : ", ") + wxString::Format("%d", entry.index + 1);
+            if (entry.reason != reason)
+                one_reason = false;
+        }
+        message += " " + (one_reason ?
+            wxString::Format(_L("Plate(s) %s were not written: %s."), numbers, reason) :
+            wxString::Format(_L("Plate(s) %s were not written: no finished slice, or a slice with errors."), numbers));
+    }
+    if (!failed.empty()) {
+        message += " " + wxString::Format(_L("%d plate(s) could not be written; see the log."), (int) failed.size());
+        for (const std::string &entry : failed)
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << entry;
+    }
+    if (empty_plates > 0)
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": " << empty_plates << " empty plate(s) had nothing to export";
+
+    if (NotificationManager *notifications = get_notification_manager())
+        notifications->push_notification(
+            NotificationType::CustomNotification,
+            failed.empty() ? NotificationManager::NotificationLevel::RegularNotificationLevel
+                           : NotificationManager::NotificationLevel::WarningNotificationLevel,
+            into_u8(message));
 }
 
 wxString Plater::get_export_gcode_filename_for_plate(int plate_index, const wxString &extension, bool only_filename) const
@@ -20178,14 +20373,24 @@ bool Plater::plugins_block_slicing() const
     return has_missing_plugins() || has_inactive_plugins() || has_broken_plugins();
 }
 
-//Re-resolve one plate's dependent presets after its printer identity changed, and say
-//what happened. This is the GUI half of PresetBundle::reresolve_plate_context_for_printer:
-//the mechanism decides, this applies the decision to the plate and names it to the user.
-//Shared by both write paths so a single assignment and a batch cannot drift apart.
-static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plate)
+//Re-resolve one plate's dependent presets against the printer its context names, and say what
+//happened. This is the GUI half of PresetBundle::reresolve_plate_context_for_printer: the mechanism
+//decides, this applies the decision to the plate and names it to the user.
+//
+//Shared by every path that gives a plate a printer, so they cannot drift apart. That is now three:
+//a single assignment, a batch assignment, and COMPLETION - because filling a plate's empty fields
+//from a seed is an assignment of a context, and a seed is only ever as coherent as wherever it came
+//from. The conf remembered printer 'Creality K2 Pro' beside filament 'Anycubic PLA @Kobra S1' - a
+//legitimate pair for neither machine - and completion copied it onto plate 1 verbatim, after which
+//every composition of that plate threw and the app exited during startup. A context assembled from
+//parts has to be normalised exactly like one a user assigned: the filament translated to the same
+//material for this machine, the process fallen back to a compatible one, and whatever genuinely
+//cannot resolve left unresolved AND NAMED rather than left to throw.
+void Plater::reresolve_plate_context(PartPlate *plate)
 {
+    Plater       *plater = this;
     PresetBundle *bundle = wxGetApp().preset_bundle;
-    if (bundle == nullptr)
+    if (plate == nullptr || bundle == nullptr)
         return;
 
     PlateSlicingContext context = plate->get_slicing_context();
@@ -20195,14 +20400,18 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
         //The new printer does not resolve on this build, so the context is preserved
         //verbatim: the project may be reopened on a machine that has it, and there is
         //nothing here to re-resolve against.
-        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_after_printer_change"
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_context"
             << boost::format(": plate %1%: context preserved verbatim (%2%)")
                % (plate->get_index() + 1) % resolve_error;
         return;
     }
     plate->set_slicing_context(context);
 
-    NotificationManager *notifications = plater->get_notification_manager();
+    //Completion reaches here during startup and from PartPlateList's own init, and Plater::priv is
+    //what owns the notification manager - get_notification_manager dereferences it. The same window
+    //resolve_current_plate_slicing_config guards. Everything below still runs; only the courtesy of
+    //a message is skipped, and the log lines are unconditional.
+    NotificationManager *notifications = plater->is_initialized() ? plater->get_notification_manager() : nullptr;
     const std::string    printer_name  = context.printer_preset_name;
 
     if (reresolved.process_switched()) {
@@ -20213,7 +20422,7 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
         if (reresolved.carried_process_count > 0)
             plate->config()->apply(reresolved.carried_process, true);
 
-        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_after_printer_change"
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_context"
             << boost::format(": plate %1%: process '%2%' cannot run on '%3%'; switched to '%4%' (%5%) carrying %6% chosen setting(s)%7%")
                % (plate->get_index() + 1) % reresolved.process_from % printer_name % reresolved.process_to
                % (reresolved.process_declaration_failed.empty()
@@ -20222,7 +20431,7 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
                % reresolved.carried_process_count
                % (reresolved.carried_whole_process ? ", the whole process (no parent profile here to tell tuning from choice)" : "");
         if (!reresolved.dropped_process_keys.empty())
-            BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+            BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_context"
                 << boost::format(": plate %1%: '%2%' has no definition for %3% of the carried setting(s), starting with '%4%'")
                    % (plate->get_index() + 1) % reresolved.process_to % reresolved.dropped_process_keys.size()
                    % reresolved.dropped_process_keys.front();
@@ -20258,7 +20467,7 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
                 into_u8(message));
         }
     } else if (!reresolved.process_unresolved.empty()) {
-        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_context"
             << boost::format(": plate %1%: process '%2%' cannot run on '%3%' and no switch target exists: %4%")
                % (plate->get_index() + 1) % reresolved.process_from % printer_name % reresolved.process_unresolved;
         if (notifications != nullptr)
@@ -20276,7 +20485,7 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
                 names += ", ";
             names += name;
         }
-        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_after_printer_change"
+        BOOST_LOG_TRIVIAL(warning) << "reresolve_plate_context"
             << boost::format(": plate %1%: %2% filament(s) cannot run on '%3%': %4%")
                % (plate->get_index() + 1) % reresolved.incompatible_filaments.size() % printer_name % names;
         if (notifications != nullptr)
@@ -20284,6 +20493,43 @@ static void reresolve_plate_after_printer_change(Plater *plater, PartPlate *plat
                 NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
                 into_u8(wxString::Format(_L("Plate %d: these filaments cannot run on \"%s\": %s. Filament is a material choice, so nothing was substituted — pick materials for this plate."),
                                          plate->get_index() + 1, from_u8(printer_name), from_u8(names))));
+    }
+
+    //A SLOT THAT WAS REWRITTEN HAS TO SAY SO.
+    //
+    //Both of these change which filament a plate will print with, and neither was reported
+    //anywhere: the mechanism recorded them and nothing read the record. That is the silent yes the
+    //message bar exists to prevent, and it costs more than a silent no - the user sees the slot they
+    //chose showing another preset's name, with nothing to explain when it happened or why.
+    //
+    //A count and the material, not a list of slots. Re-expressing the same material for a different
+    //machine is one fact however many slots it happened to, and a message that grows with the count
+    //fails hardest on the six-plate four-colour project that needs it most.
+    if (!reresolved.translated_filaments.empty()) {
+        const std::string material = reresolved.translated_filaments.front().material;
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_context"
+            << boost::format(": plate %1%: %2% filament slot(s) re-expressed for '%3%', starting with '%4%' -> '%5%'")
+               % (plate->get_index() + 1) % reresolved.translated_filaments.size() % printer_name
+               % reresolved.translated_filaments.front().from % reresolved.translated_filaments.front().to;
+        if (notifications != nullptr)
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d: %d filament slot(s) now use \"%s\"'s own %s. Same material, that machine's tuning."),
+                                         plate->get_index() + 1, (int) reresolved.translated_filaments.size(),
+                                         from_u8(printer_name), from_u8(material.empty() ? std::string("filament") : material))));
+    }
+
+    if (!reresolved.filled_filament_placeholders.empty()) {
+        BOOST_LOG_TRIVIAL(info) << "reresolve_plate_context"
+            << boost::format(": plate %1%: %2% placeholder filament slot(s) filled from '%3%' own declaration, starting with '%4%'")
+               % (plate->get_index() + 1) % reresolved.filled_filament_placeholders.size() % printer_name
+               % reresolved.filled_filament_placeholders.front().to;
+        if (notifications != nullptr)
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d: %d filament slot(s) held a placeholder rather than a material and now use \"%s\"'s own. Check they are what you want to print."),
+                                         plate->get_index() + 1, (int) reresolved.filled_filament_placeholders.size(),
+                                         from_u8(printer_name))));
     }
 }
 
@@ -20323,6 +20569,13 @@ void Plater::follow_plate_presets(int plate_index)
 
     Slic3r::ScopeGuard restore([]() { following = false; });
     following = true;
+
+    //THE PAGE THE USER IS ON IS NOT A CONSEQUENCE OF WHICH PLATE THEY CLICKED. Everything below
+    //reloads settings tabs, and a reloaded tab rebuilds its page list, which moves that list's
+    //selection, which promotes that tab to the front - so switching plates while editing process
+    //settings put the Printer page in front of the user, every single click. The plate-to-printer
+    //change is already shown passively by the board row. See ParamsPanel::ActiveTabPin.
+    ParamsPanel::ActiveTabPin keep_the_users_page;
 
     //Which field failed, so the message can name that one. Reporting the printer when the PROCESS
     //selection was the one that failed produced "the tabs are still showing X, plate 2 prints on X" -
@@ -20458,6 +20711,160 @@ void Plater::clear_plate_process_overrides(int plate_index)
         schedule_background_process();
 }
 
+//See the header. What this plate changed becomes a preset its machine can run.
+void Plater::save_plate_process_as_preset(int plate_index)
+{
+    PartPlate    *plate  = p->partplate_list.get_plate(plate_index);
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (plate == nullptr || bundle == nullptr)
+        return;
+
+    const std::vector<std::string> overrides = plate->process_override_keys();
+    if (overrides.empty()) {
+        MessageDialog dlg(this, _L("This plate has not changed anything about its process, so there is nothing to save."),
+                          _L("Save the plate's settings as a preset"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+
+    const PlateSlicingContext context = plate->get_slicing_context();
+    const Preset *base    = bundle->prints.find_preset(context.print_preset_name, false);
+    const Preset *printer = bundle->printers.find_preset(context.printer_preset_name, false);
+    if (base == nullptr || printer == nullptr) {
+        MessageDialog dlg(this, _L("This plate's printer or process is not installed here, so a preset cannot be built from it."),
+                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
+        dlg.ShowModal();
+        return;
+    }
+    //Taken by value now: find_preset hands back a pointer into the collection, and everything
+    //below - the save, the reselect, update_compatible - moves that collection underneath it.
+    const std::string base_name    = base->name;
+    const std::string printer_name = printer->name;
+
+    //A name that says what it is and what it runs on, which is the whole point of saving it.
+    const wxString suggested = wxString::Format("%s @%s", from_u8(base_name), from_u8(printer_name));
+    wxTextEntryDialog ask(this,
+                          wxString::Format(_L("Save the %d setting(s) this plate changed as a process preset for \"%s\". Plate %d will be resliced against it."),
+                                           (int) overrides.size(), from_u8(printer_name), plate_index + 1),
+                          _L("Save the plate's settings as a preset"), suggested);
+    if (ask.ShowModal() != wxID_OK)
+        return;
+    const std::string name = into_u8(ask.GetValue());
+    if (name.empty())
+        return;
+
+    //REFUSE A NAME THAT CANNOT BE WRITTEN, BEFORE WRITING ANYTHING. save_current_preset takes
+    //the can_overwrite() branch silently: a system or bundle preset of the same name makes it
+    //return having done nothing at all, and every step after it would then be reporting a
+    //success that never happened.
+    if (const Preset *clash = bundle->prints.find_preset(name, false); clash != nullptr && !clash->can_overwrite()) {
+        MessageDialog dlg(this,
+                          wxString::Format(_L("\"%s\" is a built-in process preset and cannot be overwritten. Choose another name."),
+                                           from_u8(name)),
+                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
+        dlg.ShowModal();
+        return;
+    }
+
+    //THE PRESET IS THE BASE PLUS WHAT THE PLATE CHANGED, which is exactly what the plate slices
+    //with today. Built from the base rather than from the edited preset, so an unrelated unsaved
+    //edit somewhere else cannot ride along into it.
+    //
+    //The name, the flags and the inherits stay the BASE's. save_current_preset reads them: it
+    //renames the copy itself and sets `inherits = old_name`, which is how the saved preset ends
+    //up a child of the base and how Preset::save writes a DIFF against that parent. Handing it a
+    //copy already renamed to the new name made the preset inherit from itself, so the diff was
+    //against itself and the .ini written to disk was empty - the settings were destroyed by the
+    //act of saving them.
+    Preset saved = *base;
+    saved.config.apply_only(*plate->config(), overrides, true);
+    //Compatible with THIS machine and stated as such, so it appears where it is usable and
+    //nowhere else. Without this the preset keeps the base's compatibility list, which after a
+    //printer change is the OLD machine's, and the preset would be invisible on the very printer
+    //it was made for. The condition is cleared for the same reason: an inherited expression
+    //written for another vendor's fields answers a question about a machine it never saw.
+    saved.config.option<ConfigOptionStrings>("compatible_printers", true)->values = { printer_name };
+    saved.config.option<ConfigOptionString>("compatible_printers_condition", true)->value.clear();
+
+    //ONE snapshot for one action. This deliberately does not chain set_plate_process() and
+    //clear_plate_process_overrides(): each takes its own, and a single menu click that needs two
+    //undo presses to reverse is a worse answer than repeating four lines of their bodies.
+    //The preset file itself is not in the snapshot - writing a file is not undoable - so undo
+    //returns the plate to its overrides and leaves the preset on disk, which is the honest half.
+    take_snapshot(std::string("Save plate settings as a preset"));
+
+    bundle->prints.save_current_preset(name, false, false, &saved);
+
+    //VERIFY, do not assume. save_current_preset returns void and has a silent early exit; the
+    //only evidence it did anything is that the selection moved to the new name.
+    if (bundle->prints.get_selected_preset_name() != name || bundle->prints.find_preset(name, false) == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the preset '" << name << "' was not saved, plate "
+                                 << (plate_index + 1) << " is unchanged";
+        MessageDialog dlg(this,
+                          wxString::Format(_L("\"%s\" could not be saved, so plate %d was left as it is."),
+                                           from_u8(name), plate_index + 1),
+                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
+        dlg.ShowModal();
+        return;
+    }
+
+    //The set of presets that run on each printer just changed, so the bundle has to be told.
+    //Never: nothing here may reselect anything on the user's behalf.
+    bundle->update_compatible(PresetSelectCompatibleType::Never);
+
+    //Point the plate at it and drop the overrides: the values are IN the preset now, and
+    //leaving them piled on top would mean editing the preset no longer changed this plate.
+    PlateSlicingContext updated = context;
+    updated.print_preset_name   = name;
+    plate->set_slicing_context(updated);
+    plate->clear_process_overrides();
+
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+        << boost::format(": plate %1%: %2% setting(s) saved as process preset '%3%' (base '%4%') for printer '%5%'")
+           % (plate_index + 1) % overrides.size() % name % base_name % printer_name;
+
+    //Say so if the result does not resolve, exactly as set_plate_process does. A preset that was
+    //just built for this printer should, and if it does not the user has to hear it here rather
+    //than discover it at the next slice.
+    ResolvedPlateSlicingConfig resolved;
+    std::string                resolve_error;
+    if (!resolve_plate_slicing_config(plate, resolved, resolve_error)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+            << boost::format(": plate %1% does not resolve after the save: %2%") % (plate_index + 1) % resolve_error;
+        if (NotificationManager *notifications = get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(wxString::Format(_L("Plate %d cannot slice with \"%s\": %s"),
+                                         plate_index + 1, from_u8(name), from_u8(resolve_error))));
+    }
+
+    update_project_dirty_from_presets();
+    set_plater_dirty(true);
+
+    //save_current_preset moved the GLOBAL selection onto the new preset. That is only where the
+    //cursor belongs if the plate that was saved is the one on screen, so the cursor is put back
+    //where it belongs: on the current plate. Reload first, or the Process page keeps describing
+    //the preset that was selected before the save.
+    if (Tab *tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
+        tab->load_current_preset();
+    if (p->sidebar != nullptr) {
+        p->sidebar->update_presets(Preset::TYPE_PRINT);
+        p->sidebar->refresh_plate_board(plate_index);
+    }
+    follow_plate_presets(p->partplate_list.get_curr_plate_index());
+
+    if (NotificationManager *notifications = get_notification_manager())
+        notifications->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+            into_u8(wxString::Format(_L("Plate %d now uses \"%s\", a process preset for \"%s\". You can choose it on any plate on that machine."),
+                                     plate_index + 1, from_u8(name), from_u8(printer_name))));
+
+    //The plate's configuration changed - print_settings_id is part of it - so its retained slice
+    //is stale by the same rule everything else is judged by, and it reslices.
+    if (plate_index == p->partplate_list.get_curr_plate_index())
+        schedule_background_process();
+}
+
 //The user's own choice of materials for one plate.
 //
 //An empty list leaves the plate with no materials, which is an unresolved plate and is reported
@@ -20565,7 +20972,7 @@ bool Plater::set_plate_printer(int plate_index, std::string preset_name)
     //mechanism, not a patch per dependent (see PresetBundle::reresolve_plate_context_for_printer)
     {
         PETKOS_PERF_SCOPE(Perf::Probe::SppReresolve);
-        reresolve_plate_after_printer_change(this, plate);
+        reresolve_plate_context(plate);
     }
     {
         PETKOS_PERF_SCOPE(Perf::Probe::SppApply);
@@ -20702,7 +21109,7 @@ void Plater::set_plate_printers(const std::vector<int>& plate_indices, std::stri
         plate->set_printer_preset_name(preset_name);
         //same mechanism as the single-plate path: the printer identity changed, so its
         //dependents re-resolve, per plate, before any bed is applied
-        reresolve_plate_after_printer_change(this, plate);
+        reresolve_plate_context(plate);
     }
     for (int idx : changed)
         p->partplate_list.apply_printer_to_plate(idx, false);

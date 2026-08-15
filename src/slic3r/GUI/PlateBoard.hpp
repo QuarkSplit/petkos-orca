@@ -1,6 +1,7 @@
 #ifndef slic3r_GUI_PlateBoard_hpp_
 #define slic3r_GUI_PlateBoard_hpp_
 
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -227,7 +228,7 @@ public:
     const PlateBoardRollup &            rollup() const { return m_rollup; }
 
     //The largest bed dimension anywhere in the project, floored, which is what the row
-    //glyphs are drawn in proportion to. See the note on bed_glyph_size in the .cpp.
+    //glyphs are drawn in proportion to. See the note on draw_bed_plan_in in the .cpp.
     double glyph_reference_mm() const { return m_glyph_reference_mm; }
 
     //The collapsed printer-section title: the machine's name when the project is on one
@@ -308,6 +309,15 @@ private:
         //not have yet, and a number produced by a cheaper test would be a guess wearing a
         //number's clothes. The row state names the parts once the assignment is committed.
         bool        smaller_bed = false;
+        //HOW MANY PLATES OF THIS PROJECT ARE ALREADY ON THIS MACHINE, and whether one of them
+        //is the plate being assigned. The whole question at this popup is same-or-different, and
+        //it used to be answerable only by closing it and reading the board: the count was
+        //appended to the right-hand detail text, next to the bed size, where the eye is not. It
+        //is a column of its own beside the name now, and this plate's own machine is marked in
+        //the accent, so "where am I, and where is everything else" is one glance.
+        //Counted once when the popup is built, which is O(plates) - never per paint.
+        int         plates_here = 0;
+        bool        is_current_machine = false;
         bool        is_header = false;
         bool        keep_missing = false;
         bool        is_bulk_toggle = false;  //"every unassigned plate"
@@ -334,6 +344,12 @@ private:
     int         m_scroll = 0;          //pixels; the list scrolls when taller than the popup
     std::string m_current_name;        //the plate's stored assignment, for rebuilds
     std::string m_current_variant;     //its nozzle variant: the value that carries over
+    //How many of this project's plates sit on each printer PRESET, counted once when the popup
+    //is built. Kept rather than folded straight into the rows because the nozzle step rebuilds
+    //the list from one machine's variants and has to answer the same question per variant; a
+    //second walk of the plates there would make the cost depend on how the user navigates.
+    std::map<std::string, int> m_plate_counts;
+    std::string m_current_machine;     //the preset this plate names right now
 
     Plater *          m_plater = nullptr;
     int               m_plate_index = PLATE_BOARD_NO_PLATE;
