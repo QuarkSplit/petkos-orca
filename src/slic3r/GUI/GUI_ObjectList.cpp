@@ -6289,13 +6289,28 @@ void GUI::ObjectList::smooth_mesh()
         }
         return false;
     };
-    auto show_smooth_mesh_error_dlg = [this](std::string name) {
+    //SAY WHICH PROBLEM THIS IS. "contains errors, please repair it first" was the only thing
+    //this feature could say, and it was said for every refusal - including the ones repairing
+    //cannot fix, such as a mesh too large to quadruple. TriangleMeshDeal::smooth_triangle_mesh
+    //now names the reason, so the message can carry it and the user can act on it.
+    auto show_smooth_mesh_error_dlg = [this](const std::string &name, const std::string &reason) {
         auto name_str = wxString::FromUTF8(name);
-        auto content  = wxString::Format(_L("\"%s\" part's mesh contains errors. Please repair it first."), name_str);
+        auto content  = reason.empty() ?
+            wxString::Format(_L("\"%s\" part's mesh contains errors. Please repair it first."), name_str) :
+            wxString::Format(_L("\"%s\" was not subdivided: %s."), name_str, wxString::FromUTF8(reason));
         WarningDialog dlg(static_cast<wxWindow *>(wxGetApp().mainframe), content, wxEmptyString, wxOK);
         dlg.ShowModal();
     };
-    const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
+
+    //PAINT IS REMAPPED HERE WHATEVER THE PREFERENCE SAYS, and the reason is what the two
+    //branches actually were. "keep_painting" is a warning about operations where remapping is a
+    //guess - a cut, a boolean, a fix - and its off state is meant to mean "leave the paint
+    //alone". It cannot mean that here: subdivision replaces the triangle set the annotations
+    //index, so the old bitstream describes triangles that no longer exist and the code DELETED
+    //it (restore_painting with nothing saved calls reset_extra_facets). The choice was never
+    //"remap or keep"; it was "remap or lose", and losing a four-colour paint job to a menu item
+    //called Subdivide is not a preference anybody expressed. It is also the case remapping is
+    //most reliable in: the result is a refinement of the same surface, not a new one.
     bool has_show_smooth_mesh_error_dlg = false;
     if (vol_idxs.empty()) {
         obj        = object(object_idx);
@@ -6304,12 +6319,11 @@ void GUI::ObjectList::smooth_mesh()
             return;
         }
         for (auto mv : obj->volumes) {
-            bool ok;
-            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok);
+            bool        ok = false;
+            std::string reason;
+            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok, &reason);
             if (ok) {
-                const std::optional<TriangleSelector::SavedPainting> saved_painting = keep_painting ?
-                                                                                          mv->save_painting() :
-                                                                                          std::optional<TriangleSelector::SavedPainting>{};
+                const std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
                 mv->set_mesh(result_mesh);
                 mv->restore_painting(saved_painting);
                 mv->calculate_convex_hull();
@@ -6317,7 +6331,7 @@ void GUI::ObjectList::smooth_mesh()
                 mv->set_new_unique_id();
             } else {
                 if (!has_show_smooth_mesh_error_dlg) {
-                    show_smooth_mesh_error_dlg(mv->name);
+                    show_smooth_mesh_error_dlg(mv->name, reason);
                     has_show_smooth_mesh_error_dlg = true;
                 }
             }
@@ -6333,12 +6347,11 @@ void GUI::ObjectList::smooth_mesh()
             if (show_warning_dlg(future_face_count, mv->name,true)) {
                 return;
             }
-            bool ok;
-            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(),ok);
+            bool        ok = false;
+            std::string reason;
+            auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok, &reason);
             if (ok) {
-                const std::optional<TriangleSelector::SavedPainting> saved_painting = keep_painting ?
-                                                                                          mv->save_painting() :
-                                                                                          std::optional<TriangleSelector::SavedPainting>{};
+                const std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
                 mv->set_mesh(result_mesh);
                 mv->restore_painting(saved_painting);
                 mv->calculate_convex_hull();
@@ -6346,7 +6359,7 @@ void GUI::ObjectList::smooth_mesh()
                 mv->set_new_unique_id();
             } else {
                 if (!has_show_smooth_mesh_error_dlg) {
-                    show_smooth_mesh_error_dlg(mv->name);
+                    show_smooth_mesh_error_dlg(mv->name, reason);
                     has_show_smooth_mesh_error_dlg = true;
                 }
             }
