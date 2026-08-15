@@ -1991,3 +1991,212 @@ import-check ran includes the device-layer fixes.
   (`Bambu Lab A1 0.4 nozzle(KATANAPainted-Optimized.3mf)(KATANAPainted-Optimized.3mf)`) written
   by a pre-fix binary; if it recurs on a post-fix conf write, the suffix stripper has a hole on
   the orca_presets remember path.
+
+# Work log — 2026-08-15, daylight (cutting stage 1: the plane that stops somewhere)
+
+Stage 1 of the cutting design, plus the boolean hardening the design decided on the way. Upstream's
+cut plane is infinite: cutting an arm off a figure also slices the torso, which is why the request
+has been refiled ten times since 2023 and why both upstreams twice "answered" it with
+component-deselect - a mechanism that cannot cut an *attached* arm at all. The plane now stops at a
+region drawn on it, and only what that region sweeps is separated.
+
+### The gizmo the toolbar opens is not the one the design named
+
+`GLGizmoAdvancedCut.cpp` is **not in `src/slic3r/CMakeLists.txt`**, so it has never been compiled.
+Its only referrer anywhere is an `#include` in `GLGizmos.hpp`, and `GLGizmos.hpp` is included by no
+file in the tree. Both are dead. The live one is `GLGizmoCut3D` in `GLGizmoCut.cpp`, registered at
+`GLGizmosManager.cpp:220` for `EType::Cut`. Checking which file the toolbar actually reaches took
+two greps and saved a day's work landing in a file the build ignores.
+
+### The bounded cut, and why it is one boolean pair rather than a new engine
+
+`CutBounds` is a closed contour in the **cut plane's own frame** - the plane is z = 0 there and the
+units are millimetres - so what is drawn and what is executed are the same numbers, at any plane
+orientation. `Unbounded` is not a degenerate case of the bounded cut; it is the historical cut and
+it runs `cut_mesh` exactly as before, which is what makes "bounds off" identical rather than merely
+equivalent.
+
+Bounded, the region is extruded along the plane normal into a cutter solid that leaves the mesh on
+the far side, and the split is that solid used twice: the intersection with it is one part, the
+difference from it is the other. Everything follows from that one sentence. The parts agree on the
+cut face because they came out of the same solid; their volumes add up for the same reason; and
+material the region does not sweep is never separated, which is the whole feature. The walls of the
+cutter are drawn on the plane while you place them, because they are what you are choosing: run them
+through air and only the plane cuts, run them through material and the walls cut there too. Nothing
+in the code decides which you meant.
+
+Rectangle, disc and lasso are the same value with different constructors. A hand-drawn lasso
+crosses itself and a rectangle dragged backwards comes out clockwise; both go through `union_ex`
+once, which returns simple, correctly wound `ExPolygons` with holes where the stroke wrapped twice -
+so neither the tessellator nor the point-in-region test has a special case for the shape that
+produced the region.
+
+Connectors keep working, and a connector placed outside the region is refused with the reason
+rather than dropped: outside it there is no cut face and nothing to join. One placed while the plane
+was unbounded, and left outside when a region appeared, counts as out of the cut contour, which is
+the same fault in the user's terms and already has a message.
+
+Per-object config and paint survive because the bounded cut IS `perform_with_plane` with one
+function swapped underneath it: `clone_for_cut` and `TriangleSelector::SavedPainting` are untouched.
+
+### Two ways to build a cutter that renders perfectly and that every backend refuses
+
+The prism has to be welded - a triangle soup is not a manifold, and CGAL and MCUT both refuse one.
+Getting there cost two real defects, and both had the same shape: a mesh that looks right and is
+open.
+
+- **The tessellator's winding is not a fact.** GLU answers in fans and strips, so a cap whose
+  triangles disagree with the walls about which way is out leaves the solid open along every edge
+  the two share. Signed area decides orientation now, which makes it a property of the geometry
+  rather than of whoever produced the triangles.
+- **unscale()/scale() do not round-trip.** The weld key was the scaled integer, recovered from the
+  tessellator's millimetre output by scaling back up - and 1e-6 is not exact in binary while the
+  inverse truncates. A rectangle survived that, because whole millimetres round-trip fine. A
+  72-segment disc did not: **64 of its 72 wall edges found no cap edge to meet.** The key is now one
+  `llround` of the millimetre value, applied identically on both sides.
+
+The second is the one worth remembering: the test that caught it passed for the rectangle and failed
+for the disc, which is exactly the pattern a fixture of clean primitives hides.
+
+### The boolean ladder, and the three ways it used to lie
+
+Dirty downloaded meshes are the substrate, not the edge case, so a boolean is now several backends
+and a named outcome: `MeshBoolean::execute(Op, A, B)` returns a result or a reason, never a mesh
+that is not the operation it was asked for. CGAL is rung one because where it succeeds it is exact;
+MCUT is rung two because it tolerates input CGAL refuses.
+
+- **CGAL destroyed the input it failed on.** `_cgal_do` ran `A = std::move(result)` *before* success
+  was ever checked, so every failure that did not throw - a corefinement reporting a non-manifold
+  result by returning false, a SIGSEGV caught by `try_catch_signal` - replaced the caller's mesh
+  with the empty partial result and then threw. There was nothing left for a second rung to work
+  with, which is why there was never a second rung. The move is the last statement now.
+- **MCUT answered a failed UNION with a concatenation.** A refused `mcDispatch` returned true with
+  the two meshes standing next to each other - two interpenetrating shells, unprintable, and the
+  caller had no way to find out. The only concatenation left is the one that is a theorem: bounding
+  boxes that do not overlap cannot intersect, so their union IS the two meshes side by side, and
+  even that reports `DisjointUnion` rather than `Success`. (`BoundingBoxBase::overlap()` tests x and
+  y only, so the disjointness test is written out over three axes rather than borrowed.)
+- **An unknown op string was undefined behaviour.** The op was looked up in a table and
+  dereferenced without checking the lookup found anything, so whatever flags came back decided which
+  boolean the user got. It is `Status::UnsupportedOp` now, answered before anything else is
+  measured so that an empty operand cannot rename the fault.
+
+`ModelObject::make_boolean` had the same disease one level up - it cleared its volumes before
+looking at the result, so a refused dispatch emptied the object and reported success. It refuses
+without touching the geometry now.
+
+**Not vendored today: Manifold.** It is the design's named default backend (Apache-2.0, v3.5.x,
+adopted by Blender and OpenSCAD) and the reason is that its failure is a clean status rather than a
+throw. Adding it is a deps-tree job and belongs in its own session; the ladder is built to take it
+as rung one when it lands.
+
+### Threading: the line is drawn at the meshes
+
+A 103 MB boolean is ten seconds of work, and on the UI thread that is a window that has stopped
+responding. The cut cannot simply move to a worker, though: `ModelConfig` carries one global
+timestamp counter and `Model` is not thread-safe either. So the split is exactly at the geometry.
+`collect_bounded_cut_inputs` snapshots each volume's mesh as a `shared_ptr` on the UI thread - free,
+because a `ModelVolume`'s mesh is immutable - `compute_bounded_splits` runs the booleans on the
+worker touching no `Model`, no `ModelConfig` and no GUI, and `Cut::set_precomputed_splits` hands the
+result back so the cut itself is unchanged and stays on the UI thread. `BoundedCutJob` is that,
+wired through `replace_job`, and it identifies its object by `ObjectID` rather than by index because
+the model can be edited while the worker runs.
+
+Empty splits mean "compute them here", so a test or a CLI caller runs one code path rather than a
+second implementation of the same thing.
+
+### Cut-and-distribute
+
+Seven filings, all still open upstream, zero maintainer replies ever. The tail of
+`Plater::apply_cut_object_to_model` had a commented-out arrange call marking the spot; it now takes
+`distribute_to_plates` and lands the parts through `place_instances_on_plate`, which packs into the
+plate's own free space against that plate's own bed, moves nothing already standing there, and lays
+anything that will not fit in a visible row in front of the plate with the reason named. Bare
+`add_to_plate` centres and stacks and is never the mechanism. The option is a checkbox in the cut
+panel, persisted in the app config, off by default.
+
+### A cut that cannot be executed leaves the model alone
+
+Every refusal path reports and abandons. A bounded cut whose boolean fails produces no parts and
+says why; one whose region never crossed the model says that instead of replacing the object with a
+copy of itself; a region too small to be a region leaves the gizmo armed rather than quietly
+reverting to the infinite plane. The alternative - applying an empty result - deletes the source
+object and puts nothing in its place, which is the one outcome worse than refusing.
+
+### Verification
+
+**Unit level, `tests/libslic3r/test_cutbounds.cpp` and `test_meshboolean.cpp`.** Every fixture is a
+solid whose exact volume is known by construction, because the claim is arithmetic. The
+discriminating one is a **U**: a base slab with two prongs, cut horizontally above the joint. The
+infinite plane cannot help splitting the top into two, so the object becomes **three** pieces -
+`its_split(upper).size() == 2` is asserted, not described. Bounded to one prong, it is two. That is
+the whole feature in one assertion, and a test that passed for the wrong reason could not pass it.
+Alongside: watertightness of both parts, volume conservation, a disc plug against pi r squared h,
+the plane's-own-frame rule under a tilted plane, a region that misses the model taking nothing and
+losing nothing, and the unbounded path still going through `cut_mesh`.
+
+**Full libslic3r suite, from a scratch cwd: 200 test cases, 49,380 assertions, all passed** (187
+before, plus the 13 added). The intermittents the overnight session named - marchingsquares,
+voronoi, hollowing - all passed on this run.
+
+**Fixture level, the 103 MB energy revolver**, driven through the app by a new `cut` phase in
+`PetkosPerfDriver` and `pod cut`:
+
+    cut check passed - both parts watertight, volume conserved (source 290534 mm3,
+    parts 290534 mm3), the region took 122675 mm3 where the infinite plane would have
+    taken 181012 mm3, boolean 9867 ms
+
+One volume, 2,070,184 faces, **0 open edges in the source**. Both booleans answered by CGAL - MCUT
+was never needed. **58,337 mm3, 32% of what the infinite plane would have severed, stayed
+attached**; that comparison is the number that says the bound did anything, and it is asserted, not
+just printed. The parts then went through `Cut` and `apply_cut_object_to_model` and were packed onto
+the plate. Evidence in `perf-runs/cut-revolver/` (both part STLs plus a README with the verdict).
+
+`pod verify`: VERIFIED, all five, including the G-code gate (Anycubic Kobra S1, wall_loops 5,
+27.70 g).
+
+### Three instrument faults found by using the instruments
+
+None of these were the work; all three cost time, and all three are now mechanisms rather than
+warnings.
+
+- **`petkos-dev-build.ps1` deadlocked on every re-configure.** It read stdout to the end and *then*
+  read stderr, which deadlocks the moment the child writes more to stderr than the pipe buffer
+  holds - the child blocks writing, the script blocks reading the other stream, neither moves. The
+  signature is indistinguishable from a slow build: a live `cmake.exe` with **no children, no
+  output, and no new `.obj` files**. The trigger is the common case, because a changed `CMakeLists`
+  makes MSBuild re-run the whole configure and that is 600+ lines. It cost 30 minutes before the
+  process tree gave it away. Both streams are read async now.
+- **`pod status` cried wolf for 15 minutes after every build.** It reported `MSBUILD ACTIVE - do not
+  edit sources` whenever `msbuild` appeared in the task list, and MSBuild's node reuse leaves one
+  worker per core alive long after the build. A warning that is wrong most of the time is a warning
+  nobody reads. A build is a live `cmake --build` or a live compiler; the idle workers under it are
+  not.
+- **The verify clone carried the last run's state.** The app writes its conf on exit, so a `pod cut`
+  on a Bambu-authored download left the shared clone remembering that project's presets - and the
+  next `pod verify` assigned plate 1 to a machine whose bed the driver's cube did not fit, so the
+  slice never started and four green checks were followed by a G-code gate failing for no reason in
+  the code. `pod verify` and `pod import-check` make the clone fresh now. A latency run may reuse
+  one; a run whose whole point is a verdict may not.
+
+### And one fault in the check itself, which is the same lesson
+
+The first revolver run reported source 289,050 mm3 against parts 289,304 mm3 - a 0.088% gain, with a
+0.1% tolerance passing it. Attributing that rather than shrugging at it is what found the real
+problem: **`its_volume` accumulates in float.** Two million signed tetrahedra, each of magnitude
+~1e6, summing to ~3e5 lose their low digits to cancellation - about 250 mm3 of pure measurement
+error on this mesh, and 1,484 mm3 (0.5%) of error in the source figure itself. A check whose noise
+floor sits above the fault it is looking for is not a check. Summed in double, the drift vanished
+entirely: source and parts agree to better than 1e-5, and the tolerance is now tight enough to catch
+a boolean that actually loses material.
+
+### Named, not chased
+
+- **One heap-corruption exit (`0xC0000374`) at app teardown, in twelve driven cut runs.** No crash
+  log; the crash handler never fired, which is consistent with the heap validator raising it during
+  process teardown. Eleven consecutive clean runs followed, on three different binaries, with and
+  without `--distribute`, so it is not attributable to the distribute path. Recorded with its count
+  rather than guessed at.
+- Manifold vendoring, as above.
+- Stages 2-5 of the design - paint-the-seam, the waist cut, assembly-informed decomposition and
+  Chopper-for-the-farm - are untouched. Stage 1 was designed to ship alone and it does.
