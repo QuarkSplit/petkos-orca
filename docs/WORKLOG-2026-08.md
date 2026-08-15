@@ -1812,3 +1812,182 @@ first real file. `tools/petkos-verify.ps1` now slices and reads it as a fourth q
 `tools/petkos-import-check.ps1` runs the whole cross-printer workflow end to end: open a real
 Bambu-authored 3MF, retarget it to a machine this farm owns, slice, and check the project's own
 wall/infill/pattern choices are still in the G-code.
+
+# Work log — 2026-08-15, overnight (the queries all report, and the app stops narrating its own boot)
+
+The overnight half of the ship sprint, run unattended. Petko's live session (an unsaved
+KATANAPainted project) stayed open on the live datadir the whole night; everything below ran
+beside it on the instrument's own datadir clone, which is what the harness learned to do first.
+
+### The sweep: no GUI query throws on an unresolved plate any more
+
+The 01:24 crash log was the night's opening evidence, and it was the sweep's own mechanism one
+build behind: `Plater::set_bed_shape` reported an unresolved plate through a notification during
+`on_init_inner`, before ImGui's first frame, and `CalcTextSizeA` dereferenced a null font. The
+guard (`PopNotification::init` defers until ImGui can measure text) had landed in `1cf04da958`
+at 02:09; the crash was the 56ffcafa5a binary's last gasp. Reading the crash log first is the
+house rule, and this time it closed the item rather than opening one.
+
+The sweep itself: 16 throw sites in 12 files became reporting queries on the IMSlider model —
+log, mark, degrade to honest defaults, never substitute. The judgment calls, per class:
+
+- **ConfigManipulation (4 sites)**: a validation with no printer context skips — "no check
+  performed" is an answer. The spiral-mode dialog keeps working and only loses its I3 note.
+- **Render-path gizmos (BrimEars ×2, FuzzySkin)**: the crash class. They draw against
+  `FullPrintConfig::defaults()` plus the plate's own overrides — the honest absence of a preset.
+- **Value queries (DragDropPanel, FilamentMapPanel ×4, FilamentMapDialog ×2, EditGCodeDialog,
+  GLGizmoRotate, AmsMappingPopup, GUI_ObjectList)**: empty/zero/skip, each matching what its
+  callers already do on the sibling failure path.
+- **WipeTowerDialog**: the front door (`open_flushing_dialog`) now refuses with a message before
+  the dialog's own reads can throw behind it. A button that does nothing silently is always a bug.
+
+Left throwing, deliberately: Jobs (Arrange/FillBed/Orient/Rotoptimize) — commands refusing
+loudly through `e.eptr` → finalize or the floor, both of which report; PostProcessor and
+BackgroundSlicingProcess (their own catch/report channels); genuine invariants
+(PartPlate::preprocess_exclude_areas index check, GUI_App::post_init).
+
+### Startup: the boot was narrating itself, 7,892 lines per boot
+
+Measured from the live session's own log (no launch needed): cold boot is 16.3–19.0 s to first
+window, ~20–22 s interactive. Three sinks: network plugin DLL + agent 7.24 s (36%), main-window
+construction 6.18 s (31%, incl. four WebView creations and a 1.8 s unlogged gap), preset load
+3.68 s — of which 2.14 s is TWO log lines: `set_printer_hold_alias` (5,573×, one per
+preset×printer, from inside the compatible-printers loop) and `set_visible_from_appconfig`
+(2,319×), through a sink that flushes every record (`utils.cpp` `auto_flush=true`), from six
+vendor-load threads at once. 96.4% of the startup log's bytes were these two lines, identical
+counts every boot. Both demoted to `trace`. [A/B: startup log after = ___ lines, alias window = ___ s]
+
+The network-DLL and WebView sinks are named for daylight: `restart_networking()` already proves
+a full late re-init works, so deferring `on_init_network` past first paint is feasible — but it
+reorders against `PluginManager::initialize()` and the agent callbacks, not a 4 AM change.
+
+### Plate switch: the click was five tab rebuilds wearing one cursor move
+
+Live-log decomposition of six real clicks: `SelectPlate` itself is 81–93 ms; then
+`follow_plate_presets` runs from its CallAfter and costs 433–670 ms when the printer changes —
+78–87% of every such click. Inside it: `Tab::select_preset(printer)` 272–474 ms (which cascades
+`load_current_preset` for machine + process + filament), then `select_preset(process)` 76–105 ms
+(two more loads) — **five full tab rebuilds per click**, each with `update_visibility()`'s
+page-tree teardown. A same-printer click costs 20 ms. The harness had a 225 ms hole here:
+`Tab.cpp` had zero probes. It now has them (`TabSelectPreset`, `TabLoadCurrentPreset`,
+`TabUpdateVisibility`, plus `FollowPlatePresets`, `PlaterSetBedShape`, `BundleFullConfig`,
+`LoadBedtypeTextures`), so the dedup (5 loads → the 2 the click needs) is a measured daylight
+fix instead of blind surgery in the region whose dialog fixes Petko confirmed hours earlier.
+
+### The black flash, and every plate now wears its own bed
+
+The mechanism, confirmed in code: `PartPlateList` held ONE logo texture for the whole list.
+Changing the selected plate's printer reset it and started an async reload —
+`load_from_svg_file(compress=true)` allocates the GPU texture EMPTY (`glTexImage2D` with null
+data) and fills it frames later from the compressor thread. Between reset and fill, the bed
+bound an empty texture: black. And unselected plates drew no texture at all, which on a
+mixed-printer project made every switch a black-then-appear.
+
+The repair is Petko's own design plus a cache:
+
+- `PlateBed` gained `bed_texture`, resolved in `resolve_printer_bed` exactly as `bed_model` is —
+  so a plate's texture is a fact about ITS printer, not about the selection.
+- `PartPlateList::logo_texture_for()` — one texture per filename, loaded once, never evicted,
+  and not handed out until `all_compressed_data_sent_to_gpu()`. Until then the plate keeps
+  drawing the texture it last drew (`m_logo_texture_shown`). No frame can bind an empty texture.
+- **Every plate renders its texture now** — the selected one full-strength, the rest at 0.35
+  alpha through a new `opacity` uniform on the printbed shader (both GLSL 110 and 140; the other
+  three users of that shader pin it to 1.0).
+
+### The harness runs beside an open session, and the first attempt found out why it never had
+
+`pod run`/`pod slice` refused to run while ANY slicer was open. The invariant it protects is
+exclusive use of a datadir, so the clone route petkos-verify.ps1 already described became the
+shared mechanism. But the clone had never actually been USED: the "both suites green" runs at
+~02:09 predate Petko's 02:14 launch and ran on the live datadir. The first real clone run hung
+for its whole 600 s timeout with a healthy event loop and zero driver lines, and the mechanism
+is a trap worth naming: **the clone excludes plugins/ but its conf still claimed
+`installed_networking: true`**, so `on_init_network` set `m_networking_need_update`, and
+`post_init` answered that with `NetworkPluginDownloadDialog::ShowModal()` — a modal an
+unattended run can never click, sitting exactly BEFORE the line that starts the perf driver.
+The log signature: post_init reaches "end load_gl_resources" and never prints
+"finished post_init", while Backup timers tick happily forever.
+
+The clone is now made by ONE implementation, `pod clone` (the three ps1 harnesses call it):
+copy minus plugins/ and log/, then falsify the conf's networking claim honestly — this datadir
+really has no plugin — and recompute the MD5 trailer. The app then boots it as a clean
+no-networking install, straight through to the driver. The rerun went 600 s hang → 31 s green.
+
+Also in the same pass: `pod status` names the running instance's pid and WHICH datadir it
+holds; `petkos-dev-build.ps1` learned that the post-build event's `rm -rf Release/python`
+fails while the app maps `python312.dll` from it (the whole directory moves aside now, same
+rename trick as the exe); `PETKOS_TEST_ASSIGN` learned `;`-separated multi-assignment, which
+is what built the fixture below.
+
+### Verify, on the night's build (05:26)
+
+All five questions PASS on the datadir clone: scope isolation (plate 1 wall_loops=5, plate 2
+untouched), context ownership, per-plate printers on disk, override surviving save, and the
+G-code gate — the emitted file names `Anycubic Kobra S1 0.4 nozzle`, its real process and
+filament, wall_loops 5, 27.57 g. The new Tab probes came back alive in the same run:
+`TabLoadCurrentPreset` ×8 for two plate switches (166 ms mean, 410 ms p95),
+`FollowPlatePresets` 594 ms p50 — the 225 ms hole in SelectPlate is now named spans.
+
+### Wave 2c, stage 0.1 and the three device-layer lies (the pre-authorized set only)
+
+- `SelectMachine.cpp resolve_plate_slicing_context`'s success path returned `false` — every
+  caller read a resolved plate as a failure, and the whole Bambu send path was dead by one
+  keyword. It returns `true`.
+- `DeviceManager::subscribe_device_list` cleared `subscribe_list_cache` and then iterated it
+  to build the unsubscribe list — always empty, so `del_subscribe` never fired and stale
+  subscriptions accumulated per ever-selected machine. Collect first, clear after.
+- `DeviceManagerRefresher::on_timer` returned when no machine was selected, which starved the
+  account-level `check_pushing`/`refresh_connection` for the whole fleet — and a board full of
+  plates naming machines has no "selection" at all. Only the per-machine cert install is gated
+  on the selection now.
+- `MoonrakerPrinterAgent` inherited `IPrinterAgent::add_subscribe`'s do-nothing
+  `BAMBU_NETWORK_SUCCESS`, telling DeviceManager a list of machines was being watched when a
+  Moonraker websocket watches exactly the one it is connected to. It now answers honestly:
+  the connected device is subscribed by construction, anything else is a visible refusal.
+  (CrealityPrintAgent inherits the same silent default — named here, not fixed tonight.)
+
+### Import-check, on the same build (05:47)
+
+VERIFIED. The Bambu-authored Superdestroyer project retargeted to
+`Elegoo Centauri Carbon 0.4 nozzle` and the emitted G-code holds the five numbers:
+max_volumetric_speed 12 (not the placeholder's 2), wall_loops 2, density 15%, pattern grid,
+280.40 g of a real PLA. Both suites green on the complete night's edit set - the gate binary
+import-check ran includes the device-layer fixes.
+
+### Endgame results
+
+- **Both suites green on the final binary.** `pod verify`: five PASSes including the G-code
+  gate (Kobra S1 preset, wall_loops 5 override in the emitted file, 27.57 g).
+  `pod import-check`: VERIFIED - Bambu→Elegoo holds 12 / 2 / 15% / grid / 280.40 g.
+- **Perf regression 1/6/36 (tag `overnight`)**: CanvasRender p50 at 36 plates **5.365 ms** vs
+  the 13 Aug baseline ~5.8 ms - no frame regression, WITH every plate now rendering its pale
+  texture. PlateSwitch settle p50 92 ms (n=11). The new probes put numbers on the daylight
+  fix: `FollowPlatePresets` 1.51 s for one cursor move at 36 plates, `TabSelectPreset`
+  1.11 s p50 - the tab-rebuild cost GROWS with plate count.
+- **Six test suites, from a scratch cwd.** The fork's own surfaces are green and stable:
+  slic3rutils 72 passed / 34 skipped / 0 failed, libnest2d and filament_group all pass, and
+  a full-pass libslic3r run (187/187) once its stale tests were modernised. Three test
+  archaeology finds, all the same shape - tests asserting the pre-14-Aug world:
+  `process_now_inherits`, the board's `project_row`/`assigned`, an all-empty context
+  resolving by inheritance, and the `enable_filament_dynamic_map` lossy pin (which fired
+  exactly as its own comment promised, once full plate persistence made the key survive).
+  One REAL code fix fell out: the generic `plater_plate_config` 3MF channel deserialized
+  `filament_volume_map` verbatim while the legacy attribute channel clamps it - the
+  unvalidated channel always won. They agree now; whether the clamp should spare TPU High
+  Flow (which the filament-map panel can emit) is flagged for daylight.
+- **Intermittents, named and not chased**: test_marchingsquares, test_voronoi,
+  test_hollowing (libslic3r), test_print:382 + test_skirt_brim:281 (fff_print), and
+  sla_print_tests:226 fail in roughly half of runs and pass in the others, on upstream
+  geometry surfaces no commit of this branch touches.
+- **The fixture**: `perf-runs/fixture-superdestroyer-mixed.3mf` - 21 plates, ALL owning
+  their printer, seven distinct machines across plates 1-10, a verified slice attached to
+  plate 1, and board screenshots (`perf-runs/fixture-board-*.png`) showing the machine-
+  grouped board with per-plate inspectors and honest unresolved flags for parts that
+  genuinely do not fit their new beds. Building it exposed and fixed one more instrument
+  gap: the driver's `save=` only executed inside the scope phase; it is phase-independent
+  now.
+
+- Watch item: the live conf holds a double-decorated preset name
+  (`Bambu Lab A1 0.4 nozzle(KATANAPainted-Optimized.3mf)(KATANAPainted-Optimized.3mf)`) written
+  by a pre-fix binary; if it recurs on a post-fix conf write, the suffix stripper has a hole on
+  the orca_presets remember path.
