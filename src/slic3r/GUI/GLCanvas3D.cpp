@@ -1767,7 +1767,10 @@ void GLCanvas3D::set_model(Model* model)
 void GLCanvas3D::bed_shape_changed()
 {
     refresh_camera_scene_box();
-    wxGetApp().plater()->get_camera().requires_zoom_to_bed = true;
+    //The camera is the user's; a bed swap must not move it. With per-plate printers a
+    //plate click can change the bed shape, and the selected plate's grey-to-dark render
+    //is the whole selection feedback. Paths that genuinely want a re-frame (startup,
+    //project load, the view cube) request requires_zoom_to_bed/plate themselves.
     m_dirty = true;
 }
 
@@ -9320,7 +9323,7 @@ void GLCanvas3D::_render_imgui_select_plate_toolbar()
             text_bottom = std::to_string(sliced_plates_cnt) + " / " + std::to_string(total_plates_cnt);
             ImVec2 bar_fg_end = ImVec2(bar_bg_bgn.x + bar_total_perc_pos + bar_current_perc_pos, bar_bg_end.y);
             ImGui::GetWindowDrawList()->AddRectFilled(bar_bg_bgn, bar_bg_end, IM_COL32(128, 128, 128, 255), bar_size.y); // BAR BACKGROUND
-            ImGui::GetWindowDrawList()->AddRectFilled(bar_bg_bgn, bar_fg_end, IM_COL32(0, 150, 136, 255),   bar_size.y); // BAR PROGRESS
+            ImGui::GetWindowDrawList()->AddRectFilled(bar_bg_bgn, bar_fg_end, IM_COL32(79, 135, 165, 255),   bar_size.y); // BAR PROGRESS
         }
         else if (all_plates_stats_item->slice_state == IMToolbarItem::SliceState::SLICE_FAILED) {
             text_top    = _u8L("Failed");
