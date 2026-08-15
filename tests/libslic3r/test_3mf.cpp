@@ -225,12 +225,14 @@ SCENARIO("H2C multi-nozzle .3mf round-trip", "[3mf][MultiNozzle]") {
                 // nozzle_volume_type read-back into PlateData::nozzle_volume_types
                 REQUIRE(rt->nozzle_volume_types == "1");
 
-                // enable_filament_dynamic_map pinned lossy: model_settings never serializes it and
-                // slice_info hardcodes false, so the `true` we set is dropped. Pinned here
-                // (absent or false, never true) so a future change that persists it must update this.
+                // enable_filament_dynamic_map used to be pinned LOSSY here (model_settings never
+                // serialized it, slice_info hardcodes false), with the pin promising that a change
+                // which persists it must update this. That change is the generic
+                // plater_plate_config record: a plate's overrides are project identity now, so
+                // the `true` set above survives the round-trip - and must.
                 auto* dyn = rt->config.option<ConfigOptionBool>("enable_filament_dynamic_map");
-                const bool persisted_true = (dyn != nullptr && dyn->value);
-                REQUIRE_FALSE(persisted_true);
+                REQUIRE(dyn != nullptr);
+                REQUIRE(dyn->value);
             }
 
             release_PlateData_list(dst_plates);
