@@ -7,6 +7,7 @@ re-derived from the shell by the next session:
     pod status                       what state is the build, staging, datadir, last crash in
     pod inspect  <3mf>               what does this project DECLARE (plates, contexts, key values)
     pod run      [flags]             drive the real app through the perf driver and report honestly
+    pod printers [--add V/M/N]       what machines are installed; add or remove one for real
     pod slice    <3mf> --printer P   open, retarget, slice, keep the G-code (the proven write path)
     pod cut      [--project 3mf]     drive a real bounded cut; watertight + volume checked, STLs kept
     pod check    <gcode> [flags]     what did a slice ACTUALLY use (petkos-gcode-check)
@@ -173,7 +174,7 @@ def cmd_status(a):
         print("app      : not running")
     print(f"build    : {'MSBUILD ACTIVE - do not edit sources' if building else 'idle'}")
     ok, why = conf_valid()
-    print(f"conf     : {'valid' if ok else 'BROKEN - ' + why + '  (pod conf --repair)'}")
+    print(f"conf     : {'valid' if ok and not why else (why if ok else 'BROKEN - ' + why + '  (pod conf --repair)')}")
     for env in ("PETKOS_PERF", "PETKOS_PERF_SCRIPT", "PETKOS_ACCEPT", "PETKOS_TEST_ASSIGN"):
         if os.environ.get(env):
             print(f"env      : {env} is SET and will affect the next launch")
@@ -288,6 +289,35 @@ def cmd_cut(a):
         print(f"     {p.name}  {p.stat().st_size // 1024} KB")
     sys.exit(rc)
 
+def cmd_printers(a):
+    """List, add or remove installed printers, and time the picker against what it replaced.
+
+    Listing reads the app config directly, because that IS the installed set - a dialog is only
+    ever a view onto it. Adding drives the real app instead, so the change goes through
+    PresetBundle::apply_vendor_config; that is what makes the presets appear, rather than just
+    the config line that claims they should.
+    """
+    if not a.add and not a.remove and not a.compare:
+        raw = CONF.read_bytes()
+        m = re.search(rb"# MD5 checksum \w+", raw)
+        cfg = json.loads((raw[: m.start()] if m else raw).decode("utf-8"))
+        models = cfg.get("models", [])
+        print(f"== {len(models)} printers installed")
+        for e in sorted(models, key=lambda x: (x.get("vendor", ""), x.get("model", ""))):
+            print(f"   {e.get('vendor',''):<12} {e.get('model',''):<34} {e.get('nozzle_diameter','')}")
+        return
+
+    #Only the picker phase, so installing a printer does not also cost an orbit benchmark.
+    parts = ["plates=0", "warmup=8", "orbit=0", "switch=0", "assign=0", "board=0", "drag=0",
+             "pick=0", "scope=0", "context=0", "picker=1", "quit=1"]
+    if a.compare:
+        parts.append(f"walk={2 if a.compare == 'full' else 1}")
+    if a.add:
+        parts.append(f"install={a.add}")
+    if a.remove:
+        parts.append(f"uninstall={a.remove}")
+    sys.exit(drive(",".join(parts), timeout=a.timeout))
+
 def cmd_slice(a):
     gcode = Path(a.out or (PERFDIR / (Path(a.project).stem + ".gcode"))).resolve()
     spec = (f"plates=0,warmup=25,orbit=0,switch=0,assign=1,printer={a.printer},"
@@ -359,36 +389,68 @@ def cmd_logs(a):
     for l in lines[-a.tail:]:
         print(l[:220])
 
-def conf_valid():
+#WHAT THE APP ACTUALLY HASHES, which is not what this used to check.
+#
+#AppConfig::load (AppConfig.cpp, the WIN32 branch) reads the file in TEXT mode, so CRLF on disk
+#arrives as LF, then takes `left_string = total[:total.rfind('}')+1]` - the JSON ending at its
+#final brace, with NO trailing newline - and compares the rest of the file against
+#"# MD5 checksum <hex>\n" over exactly that. Hashing the raw bytes up to the '#' instead, as this
+#did, is wrong by both the line endings and one newline, so it disagreed with every healthy conf
+#the app had ever written.
+#
+#That is why `pod status` reported "BROKEN - torn write" on a perfectly good file, and why
+#`pod conf --repair` then wrote a trailer the app itself would call wrong. The house rule that the
+#trailer "tears on a hard kill" appears to have been founded on this bug rather than on a tear.
+#
+#And the severity was wrong too: on a mismatch the app logs one info line and parses the JSON
+#anyway, so the checksum is ADVISORY. What can actually stop the app is invalid JSON, so that is
+#the only thing here worth the word broken.
+def _conf_parts():
+    """(json_text, trailer_text) as the app splits them, or (None, reason)."""
     if not CONF.exists():
-        return False, "missing"
-    raw = CONF.read_bytes()
-    m = re.search(rb"# MD5 checksum (\w+)", raw)
-    if not m:
-        return False, "no MD5 trailer"
-    body = raw[: m.start()]
-    if hashlib.md5(body).hexdigest().upper() != m.group(1).decode():
-        return False, "MD5 mismatch (torn write)"
+        return None, "missing"
+    text = CONF.read_bytes().decode("utf-8", "replace").replace("\r\n", "\n")
+    end = text.rfind("}")
+    if end == -1:
+        return None, "no JSON object in the file"
+    return text[: end + 1], text[end + 2 :]
+
+def conf_expected_trailer(body):
+    return "# MD5 checksum " + hashlib.md5(body.encode("utf-8")).hexdigest().upper() + "\n"
+
+def conf_valid():
+    """(ok, why). ok is about the JSON; a checksum difference is reported but is not a failure."""
+    body, rest = _conf_parts()
+    if body is None:
+        return False, rest
     try:
-        json.loads(body.decode("utf-8"))
+        json.loads(body)
     except Exception as e:
         return False, f"invalid JSON: {e}"
+    if rest != conf_expected_trailer(body):
+        return True, "checksum differs (advisory - the app logs it and loads anyway)"
     return True, ""
 
 def cmd_conf(a):
     ok, why = conf_valid()
-    if ok:
+    if ok and not why:
         print("conf valid"); return
-    print(f"conf BROKEN: {why}")
-    if not a.repair:
-        sys.exit(1)
+    if ok:
+        print(f"conf loadable: {why}")
+        if not a.repair:
+            return
+    else:
+        print(f"conf BROKEN: {why}")
+        if not a.repair:
+            sys.exit(1)
     backup = Path("E:/Backups") / f"Podslicer.conf.pre-repair-{time.strftime('%Y%m%d-%H%M%S')}"
     shutil.copy2(CONF, backup)
-    raw = CONF.read_bytes()
-    m = re.search(rb"# MD5 checksum \w+", raw)
-    body = raw[: m.start()] if m else raw
-    json.loads(body.decode("utf-8"))  # refuse to bless invalid JSON with a fresh checksum
-    fixed = body + b"# MD5 checksum " + hashlib.md5(body).hexdigest().upper().encode() + b"\n"
+    body, _ = _conf_parts()
+    if body is None:
+        sys.exit("nothing to repair: no JSON object in the file")
+    json.loads(body)  # refuse to bless invalid JSON with a fresh checksum
+    #Written the way the app writes it: LF, and the trailer immediately after the closing brace.
+    fixed = (body + "\n" + conf_expected_trailer(body)).encode("utf-8")
     CONF.write_bytes(fixed)
     (DATADIR / "Podslicer.conf.bak").write_bytes(fixed)
     print(f"repaired; original kept at {backup}")
@@ -401,6 +463,7 @@ def main():
     sub.add_parser("status").set_defaults(f=cmd_status)
     p = sub.add_parser("inspect"); p.add_argument("project"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_inspect)
     p = sub.add_parser("run"); p.add_argument("spec"); p.add_argument("--project"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--keep-env", action="store_true", help="honour PETKOS_ACCEPT/PETKOS_TEST_ASSIGN already in the environment"); p.set_defaults(f=cmd_run)
+    p = sub.add_parser("printers"); p.add_argument("--add", metavar="VENDOR/MODEL/NOZZLE", help='e.g. "Anycubic/Anycubic Kobra X/0.4"'); p.add_argument("--remove", metavar="VENDOR/MODEL"); p.add_argument("--compare", choices=("page", "full"), help="also open the web guide it replaced and report both costs"); p.add_argument("--timeout", type=int, default=900); p.set_defaults(f=cmd_printers)
     p = sub.add_parser("slice"); p.add_argument("project"); p.add_argument("--printer", required=True); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1500); p.set_defaults(f=cmd_slice)
     p = sub.add_parser("cut"); p.add_argument("--project", help=f"default: {CUT_FIXTURE}"); p.add_argument("--z", type=float, default=0.5, help="plane height as a fraction of the object"); p.add_argument("--span", type=float, default=0.5, help="the region's share of the footprint in X"); p.add_argument("--distribute", action="store_true", help="land the parts on the plate"); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1800); p.set_defaults(f=cmd_cut)
     p = sub.add_parser("check"); p.add_argument("gcode"); p.add_argument("--expect-printer"); p.add_argument("--expect-filament"); p.add_argument("--min-flow", type=float); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_check)

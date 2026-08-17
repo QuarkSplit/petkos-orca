@@ -179,6 +179,7 @@
 #include "nlohmann/json.hpp"
 
 #include "PhysicalPrinterDialog.hpp"
+#include "PodPrinterPicker.hpp"
 #include "PrintHostDialogs.hpp"
 #include "PlateBoard.hpp"
 #include "PlateSettingsDialog.hpp"
@@ -14094,8 +14095,15 @@ int Plater::save_project(bool saveAs)
     auto filename = get_project_filename(".3mf");
     if (!saveAs && filename.IsEmpty())
         saveAs = true;
-    if (saveAs)
-        filename = p->get_export_file(FT_3MF);
+    if (saveAs) {
+        //Podslicer: WHERE is a question about the project library, not about the disk. The
+        //native dialog answers it in the library's own vocabulary - group, stage, name - and
+        //returns "<browse>" when the user wants the ordinary file dialog after all, so that
+        //escape stays one click away rather than being removed.
+        const wxString suggested = filename.IsEmpty() ? get_project_name() : filename;
+        const wxString picked    = pod_save_to_library(this, wxFileName(suggested).GetName(), filename);
+        filename = (picked == "<browse>") ? p->get_export_file(FT_3MF) : picked;
+    }
     if (filename.empty())
         return wxID_NO;
     if (filename == "<cancel>")
@@ -14118,6 +14126,12 @@ int Plater::save_project(bool saveAs)
 
     p->set_project_filename(filename);
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << __LINE__ << " call set_project_filename: " << filename;
+
+    //Podslicer: the Library index is a cache over the folder tree, and until now nothing
+    //invalidated it except a script run by hand - so a project saved from inside the app was
+    //invisible in the Library it had just been saved into. The writer owns the invalidation.
+    if (pod_path_in_library(filename))
+        pod_library_note_saved(filename);
 
     up_to_date(true, false);
     up_to_date(true, true);

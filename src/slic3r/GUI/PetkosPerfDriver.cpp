@@ -6,6 +6,7 @@
 #include <map>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,9 @@
 #include "MainFrame.hpp"
 #include "PartPlate.hpp"
 #include "Plater.hpp"
+//The picker phase measures the native dialog against the web guide it replaces, so it needs both.
+#include "PodPrinterPicker.hpp"
+#include "WebGuideDialog.hpp"
 //Tab: the acceptance run pushes a filament-colour change the way the colour picker does, which
 //goes through the printer tab as well as the plater.
 #include "Tab.hpp"
@@ -73,6 +77,18 @@ struct Spec
     int         cutdist = 1;
     //Where the resulting parts are written as STL. Evidence, not the check.
     std::string cutout;
+    //The printer-picker phase. picker=1 builds the native picker and reports what it cost;
+    //walk=1 or 2 additionally opens the inherited web guide so the two are measured back to
+    //back in one process, which is the only comparison the memory notes accept as valid.
+    //  walk=1  the guide's printer page (filaments and processes skipped)
+    //  walk=2  the guide's full walk, which is what shipped
+    int         picker  = 0;
+    int         walk    = 0;
+    //"Vendor/Model/Nozzle" - installs through the picker's own code path, so a headless run
+    //adds a printer exactly the way a click does.
+    std::string install;
+    //"Vendor/Model" - removes every variant of it.
+    std::string uninstall;
 };
 
 Spec parse_spec(const std::string &s)
@@ -107,6 +123,10 @@ Spec parse_spec(const std::string &s)
         else if (key == "cutspan") spec.cutspan = std::atof(val.c_str());
         else if (key == "cutdist") spec.cutdist = num();
         else if (key == "cutout")  spec.cutout = val;
+        else if (key == "picker")  spec.picker = num();
+        else if (key == "walk")    spec.walk = num();
+        else if (key == "install")   spec.install = val;
+        else if (key == "uninstall") spec.uninstall = val;
     }
     return spec;
 }
@@ -127,7 +147,7 @@ public:
     }
 
 private:
-    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Cut, Slice, SliceWait, Board, Drag, Finish, Done };
+    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Cut, Slice, SliceWait, Board, Drag, Picker, Finish, Done };
 
     void on_idle(wxIdleEvent &evt)
     {
@@ -343,11 +363,16 @@ private:
         case Phase::Drag:
             if (m_done >= m_spec.drags) {
                 Perf::mark("driver.drag_end", m_done);
-                enter(Phase::Finish);
+                enter(Phase::Picker);
             } else {
                 board_drag(plater);
                 ++m_done;
             }
+            evt.RequestMore();
+            break;
+
+        case Phase::Picker:
+            picker_step();
             evt.RequestMore();
             break;
 
@@ -849,6 +874,123 @@ private:
         enter(m_spec.gcode.empty() ? Phase::Board : Phase::Slice);
     }
 
+    //THE PRINTER PICKER, AND THE DIALOG IT REPLACES.
+    //
+    //Both are exercised inside one process, on one disk-cache state, in one run, because the
+    //only comparison worth reporting is a back-to-back one - a number from yesterday's run
+    //against a number from today's says as much about the machine as about the code.
+    //
+    //The old dialog is not simulated: a real GuideFrame is constructed the way run_wizard
+    //constructs it, and its own profile walk is what gets timed.
+    void picker_step()
+    {
+        if (m_spec.picker == 0 && m_spec.walk == 0) {
+            enter(Phase::Finish);
+            return;
+        }
+
+        //--- the inherited web guide
+        if (m_spec.walk > 0 && !m_guide_done) {
+            if (m_guide == nullptr) {
+                m_guide = new GuideFrame(&wxGetApp(), wxCAPTION | wxCLOSE_BOX | wxSYSTEM_MENU);
+                m_guide->SetStartPage(m_spec.walk >= 2 ? GuideFrame::BBL_FILAMENT_ONLY
+                                                       : GuideFrame::BBL_MODELS_ONLY);
+                BOOST_LOG_TRIVIAL(warning)
+                    << "PETKOS_PERF_SCRIPT: PICKER opened the inherited web guide ("
+                    << (m_spec.walk >= 2 ? "full walk, as shipped" : "printer page, filaments skipped")
+                    << "), waiting for its profile walk";
+                m_tick = 0;
+                return;
+            }
+            if (!m_guide->walk_finished()) {
+                //Idle ticks, not wall clock, so a stalled event loop is what this notices.
+                if (++m_tick > 200000) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICKER FAILED - the guide's profile "
+                                                "walk never finished, so there is no comparison to report";
+                    m_guide->Destroy();
+                    m_guide     = nullptr;
+                    m_guide_done = true;
+                }
+                return;
+            }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: PICKER old=web-guide files_parsed="
+                                       << m_guide->files_parsed()
+                                       << " walk_ms=" << int(m_guide->walk_ms());
+            //Destroy(), not delete: the walk queues a CallAfter that touches this object, and a
+            //deferred destroy is processed after that idle event rather than before it.
+            m_guide->Destroy();
+            m_guide      = nullptr;
+            m_guide_done = true;
+            m_tick       = 0;
+            return;
+        }
+
+        //--- the native picker
+        if (m_spec.picker != 0) {
+            const int64_t t0 = Perf::now();
+            auto dlg = std::make_unique<PrinterPickerDialog>(wxGetApp().mainframe);
+            const double build_ms = Perf::ticks_to_ms(Perf::now() - t0);
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: PICKER new=native models="
+                                       << dlg->model_count() << " files_parsed=0"
+                                       << " build_ms=" << build_ms;
+
+            bool ok = true;
+            if (!m_spec.install.empty()) {
+                std::vector<std::string> f;
+                boost::split(f, m_spec.install, boost::is_any_of("/"));
+                if (f.size() != 3) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICKER FAILED - install= wants "
+                                                "Vendor/Model/Nozzle, got '" << m_spec.install << "'";
+                    ok = false;
+                } else if (!dlg->install_headless(f[0], f[1], f[2])) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICKER FAILED - the index has no "
+                                             << m_spec.install;
+                    ok = false;
+                }
+            }
+            if (ok && !m_spec.uninstall.empty()) {
+                std::vector<std::string> f;
+                boost::split(f, m_spec.uninstall, boost::is_any_of("/"));
+                if (f.size() != 2 || !dlg->uninstall_headless(f[0], f[1])) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICKER FAILED - cannot remove "
+                                             << m_spec.uninstall;
+                    ok = false;
+                }
+            }
+            if (ok && (!m_spec.install.empty() || !m_spec.uninstall.empty())) {
+                const int64_t c0 = Perf::now();
+                if (!dlg->commit()) {
+                    BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: PICKER FAILED - commit refused";
+                    ok = false;
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: PICKER committed in "
+                                               << int(Perf::ticks_to_ms(Perf::now() - c0)) << " ms";
+                    //The check is not "the dialog said yes", it is that AppConfig now agrees.
+                    if (!m_spec.install.empty()) {
+                        std::vector<std::string> f;
+                        boost::split(f, m_spec.install, boost::is_any_of("/"));
+                        const bool present = wxGetApp().app_config->get_variant(f[0], f[1], f[2]);
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "PETKOS_PERF_SCRIPT: PICKER CHECK app_config has " << m_spec.install
+                            << ": " << (present ? "passed" : "FAILED");
+                        //And that a printer preset for it is actually visible, which is the
+                        //thing the user is trying to get - an AppConfig line nobody can select
+                        //would pass the check above and still be useless.
+                        const std::string want = f[1] + " " + f[2] + " nozzle";
+                        const Preset      *p    = wxGetApp().preset_bundle->printers.find_preset(want, false);
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "PETKOS_PERF_SCRIPT: PICKER CHECK preset '" << want << "' visible: "
+                            << (p != nullptr && p->is_visible ? "passed" : "FAILED");
+                    }
+                }
+            }
+            if (!ok)
+                Perf::mark("driver.picker_failed", 1);
+        }
+
+        enter(Phase::Finish);
+    }
+
     //SLICE IT, AND KEEP WHAT CAME OUT.
     //
     //Every check above this one is the app marking its own homework. They all passed on the
@@ -1219,6 +1361,9 @@ private:
     Spec                     m_spec;
     Phase                    m_phase   = Phase::Settle0;
     bool                     m_saved   = false;
+    //The web guide under measurement, and whether its half of the comparison is already done.
+    GuideFrame              *m_guide      = nullptr;
+    bool                     m_guide_done = false;
     int                      m_tick    = 0;
     int                      m_done    = 0;
     int                      m_quiet   = 0;

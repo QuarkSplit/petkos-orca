@@ -1305,8 +1305,17 @@ void MainFrame::init_tabpanel() {
         }
 #endif
 
-        if (panel)
-            panel->SetFocus();
+        if (panel) {
+            //Podslicer: the home page is a WebViewPanel wrapping a WebView2 child window.
+            //Focusing the wrapper leaves the browser without native focus, so its inputs -
+            //the library's search box - take a click and then swallow every keystroke. The
+            //WebView dialogs already focus m_browser directly; this is the same rule for the
+            //panel that lives in the tab bar.
+            if (panel == static_cast<wxWindow *>(m_webview) && m_webview != nullptr)
+                m_webview->SetFocusOnWebView();
+            else
+                panel->SetFocus();
+        }
 
         /*switch (sel) {
         case TabPosition::tpHome:

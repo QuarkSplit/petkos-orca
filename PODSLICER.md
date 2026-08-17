@@ -377,6 +377,38 @@ per frame while the app was doing 47 through `Plater::resolve_plate_slicing_conf
 with a hole in it is worse than none, because it is believed. When a span reads zero, confirm it
 can fire at all before concluding the path is cold. Never measure while a build runs.
 
+**"Add/Remove printers" is the native picker, not the web guide.** `GUI_App::run_wizard` routes
+`SP_PRINTERS` to `PrinterPickerDialog` (`GUI/PodPrinterPicker.{hpp,cpp}`) — routed in that one
+place so none of the five call sites can be missed, and the guide keeps first run, filaments and
+region. What the guide was doing instead: 12,277 preset JSON parses (22.7 MB) on one thread to list
+386 machines, then a 1.85 MB JSON string into WebView2 and 386 cover PNGs, plus a full
+re-serialisation of that blob on **every** message the page sent, assigned to a local and dropped.
+
+**The catalogue is not in `PresetBundle::vendors`.** That is loaded from `data_dir()/system`, so it
+holds only the vendors already INSTALLED — seven of sixty-six here. The shipped catalogue needs
+`load_system_models_from_json` → `LoadVendorOnly`: each vendor json plus each machine-model file and
+nothing else, **452 files and 1.6 MB** for the same 386 models. `CreatePresetsDialog` had the
+precedent. Do not assume the app has already parsed what a dialog needs; check which directory the
+loader was pointed at.
+
+**`AppConfig` is keyed by `VendorProfile::PrinterModel::id`**, the vendor json's
+`machine_model_list` entry name — not by `PrinterModel::name`, which comes from the model file.
+They are usually equal and nothing may assume it.
+
+**Applying a printer selection writes the WHOLE vendor map.** Anything installed but missing from
+the dialog's index is therefore uninstalled silently, presets and all, underneath whatever plate was
+using it. `PrinterPickerDialog::build_index` adopts every entry in `app_config->vendors()` that the
+catalogue cannot describe, for exactly that reason.
+
+**`pod audit-vendors` finds real defects in shipped profiles, and the Kobra X was one.** It declared
+default processes that do not exist, so the machine would have installed onto the alphabetically
+first process its vendor ships — 0.08 mm, where the vendor meant 0.20 mm. The runtime fallback is
+honest about it and still lands on the wrong layer height, so the data is what needs fixing, in the
+resources copy **and** in `datadir/system/`: `install_vendor_bundles_from_resources` does not
+re-copy a vendor that is already installed. Only 3 of the 105 declared-but-absent processes across
+all vendors are a name-convention mismatch, so a suffix-tolerant lookup would be a workaround, not
+a mechanism.
+
 **Launch only via `run-petkos-orca.bat`.** It passes an isolated `--datadir`; an un-isolated
 launch has previously run the setup wizard and clobbered the installed Orca's shared config.
 

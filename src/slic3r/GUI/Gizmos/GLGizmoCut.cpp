@@ -4001,7 +4001,20 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
 
         wxBusyCursor wait;
 
-        const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
+        //Podslicer: a cut ALWAYS keeps the paint, unconditionally.
+        //
+        //This was gated on the "keep_painting" preference, which ships OFF and is described as
+        //"highly experimental, may create artifact". So cutting a painted model silently threw
+        //away every painted facet, and the only way back from that is to colour the model again
+        //by hand. There is no answer to "when would I want to lose the colour for a cut", so
+        //there is no longer a switch to get it wrong.
+        //
+        //Not experimental in the sense of unbuilt: ModelVolume::save_painting/restore_painting
+        //drive TriangleSelector::remap_painting, which mesh-boolean and simplify already rely on.
+        //Cut was simply the one caller left behind a flag. The remap costs time on a large mesh;
+        //repainting a prop costs an evening.
+        //only_if(true, X) rather than a bare X: the bitmask operators are defined for
+        //(mask | enum), and starting the chain with a bare enumerator would need (enum | mask).
         ModelObjectCutAttributes attributes = only_if(has_connectors ? true : m_keep_upper, ModelObjectCutAttribute::KeepUpper) |
                                               only_if(has_connectors ? true : m_keep_lower, ModelObjectCutAttribute::KeepLower) |
                                               only_if(has_connectors ? false : m_keep_as_parts, ModelObjectCutAttribute::KeepAsParts) |
@@ -4011,7 +4024,7 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
                                               only_if(m_rotate_lower, ModelObjectCutAttribute::FlipLower) |
                                               only_if(dowels_count > 0, ModelObjectCutAttribute::CreateDowels) |
                                               only_if(!has_connectors && !cut_with_groove && cut_mo->cut_id.id().invalid(), ModelObjectCutAttribute::InvalidateCutInfo) |
-                                              only_if(keep_painting, ModelObjectCutAttribute::KeepPaint);
+                                              only_if(true, ModelObjectCutAttribute::KeepPaint);
 
         // update cut_id for the cut object in respect to the attributes
         update_object_cut_id(cut_mo->cut_id, attributes, dowels_count);

@@ -116,6 +116,8 @@ const char *const PROBE_NAMES[] = {
     "TabSelectPreset",  "TabLoadCurrentPreset", "TabUpdateVisibility",
     "PlaterSetBedShape", "BundleFullConfig",    "LoadBedtypeTextures",
     "FollowPlatePresets",
+    "PickerIndexBuild", "PickerBuildUi",
+    "GuideProfileWalk", "GuideProfileFamily", "GuideProfileDump",
 };
 static_assert(sizeof(PROBE_NAMES) / sizeof(PROBE_NAMES[0]) == (size_t) Probe::Count,
               "probe name table is out of step with the Probe enum");

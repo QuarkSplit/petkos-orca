@@ -12,6 +12,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/PetkosPerf.hpp"
 #include "libslic3r_version.h"
 
 #include <wx/sizer.h>
@@ -565,8 +566,8 @@ void GuideFrame::OnScriptMessage(wxWebViewEvent &evt)
         // wxMessageBox(e.what(), "json Exception", MB_OK);
         BOOST_LOG_TRIVIAL(trace) << "GuideFrame::OnScriptMessage;Error:" << e.what();
     }
-
-    wxString strAll = m_ProfileJson.dump(-1,' ',false, json::error_handler_t::ignore);
+    //Podslicer: there was a full m_ProfileJson.dump() here, assigned to a local and dropped.
+    //It serialised ~1.85 MB on every single message the page sent - every click - for nothing.
 }
 
 void GuideFrame::RunScript(const wxString &javascript)
@@ -673,9 +674,12 @@ int GuideFrame::SaveProfile()
 
     m_MainPtr->app_config->save();
 
-    std::string strAll = m_ProfileJson.dump(-1, ' ', false, json::error_handler_t::ignore);
-
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "before save to app_config: "<< std::endl<<strAll;
+    //Podslicer: at trace, not info. This is the whole profile blob; at info it wrote ~1.85 MB
+    //into every log for a routine save, which buries everything else that happened. The dump
+    //itself is inside the streaming expression, which BOOST_LOG_TRIVIAL only evaluates when the
+    //record actually opens - so a filtered-out trace level costs nothing.
+    BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << "before save to app_config: " << std::endl
+                             << m_ProfileJson.dump(-1, ' ', false, json::error_handler_t::ignore);
 
     //set filaments to app_config
     const std::string &section_name = AppConfig::SECTION_FILAMENTS;
@@ -1129,6 +1133,9 @@ int GuideFrame::GetFilamentInfo( std::string VendorDirectory, json & pFilaList, 
 
 int GuideFrame::LoadProfileData()
 {
+    PETKOS_PERF_SCOPE_NAMED(walk, Perf::Probe::GuideProfileWalk, 0);
+    m_files_parsed = 0;
+    const int64_t walk_t0 = Perf::now();
     try {
         m_ProfileJson             = json::parse("{}");
         m_ProfileJson["model"]    = json::array();
@@ -1199,15 +1206,27 @@ int GuideFrame::LoadProfileData()
                 return 0;
         }
 
+        walk.set_aux(m_files_parsed);
+        m_walk_ms = Perf::ticks_to_ms(Perf::now() - walk_t0);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", profile walk done: " << m_files_parsed
+                                << " preset files opened and parsed from disk in "
+                                << int(Perf::ticks_to_ms(Perf::now() - walk_t0)) << " ms"
+                                << (m_page == BBL_MODELS_ONLY ? " (printer page: filaments and processes skipped)" : "");
+
         wxGetApp().CallAfter([this] {
             if (!m_destroy) {
                 //sync to appconfig first to populate current selections
                 SaveProfileData();
 
-                //sync to web after selections are populated
+                //Podslicer: this dump is the string that goes into WebView2 as one JS
+                //statement, so its size is a real cost and worth naming.
+                PETKOS_PERF_SCOPE_NAMED(dmp, Perf::Probe::GuideProfileDump, 0);
                 std::string strAll = m_ProfileJson.dump(-1, ' ', false, json::error_handler_t::ignore);
+                dmp.set_aux(static_cast<int32_t>(strAll.size() / 1024));
 
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", finished, json contents: " << std::endl << strAll;
+                BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << ", finished, json contents: " << std::endl << strAll;
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", handing " << strAll.size() / 1024
+                                        << " KB of profile JSON to the web view";
                 json m_Res           = json::object();
                 m_Res["command"]     = "userguide_profile_load_finish";
                 m_Res["sequence_id"] = "10001";
@@ -1223,6 +1242,9 @@ int GuideFrame::LoadProfileData()
     }
 
     filament_info_cache.clear();
+    //Set on every exit, including the failure one: a measurement that waits for a flag the
+    //error path never sets looks exactly like a walk that is still running.
+    m_walk_done = true;
     return 0;
 }
 
@@ -1319,6 +1341,14 @@ void StringReplace(string &strBase, string strSrc, string strDes)
 
 int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath)
 {
+    PETKOS_PERF_SCOPE_NAMED(fam, Perf::Probe::GuideProfileFamily, 0);
+    const int parsed_before = m_files_parsed;
+
+    //What this vendor's presets are needed FOR decides how much of it gets read. The printer
+    //page needs machine models and their nozzle variants; filaments and processes are 10,324 of
+    //the 12,277 sub-files and answer a question that page does not ask.
+    const bool need_materials = m_page != BBL_MODELS_ONLY;
+
     // wxString strFolder = strFilePath.BeforeLast(boost::filesystem::path::preferred_separator);
     boost::filesystem::path file_path(strFilePath);
     boost::filesystem::path vendor_dir = boost::filesystem::absolute(file_path.parent_path() / strVendor).make_preferred();
@@ -1356,6 +1386,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
             LoadFile(sub_file, contents);
             // wxLogMessage("GUIDE: json_path2 content: %s", contents);
             json pm = json::parse(contents);
+            ++m_files_parsed;
             // wxLogMessage("GUIDE: json_path2  loaded");
 
             OneModel["name"]      = pm["name"];
@@ -1398,6 +1429,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
             std::string             sub_file = sub_path.string();
             LoadFile(sub_file, contents);
             json pm = json::parse(contents);
+            ++m_files_parsed;
 
             std::string strInstant = pm["instantiation"];
             if (strInstant.compare("true") == 0) {
@@ -1411,7 +1443,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
         // BBS:Filament
         json pFilament = jLocal["filament_list"];
         json tFilaList = m_OrcaFilaList;
-        nsize          = pFilament.size();
+        nsize          = need_materials ? int(pFilament.size()) : 0;
 
         for (int n = 0; n < nsize; n++) {
             json OneFF = pFilament.at(n);
@@ -1420,7 +1452,8 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
             std::string s2    = OneFF["sub_path"];
 
             tFilaList[s1] = OneFF;
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Vendor: " << strVendor <<", tFilaList Add: " << s1;
+            //trace, not info: once per filament preset, ~7,300 lines per open.
+            BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << "Vendor: " << strVendor <<", tFilaList Add: " << s1;
         }
 
         int nFalse  = 0;
@@ -1441,9 +1474,11 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
                 std::string             sub_file = sub_path.string();
                 LoadFile(sub_file, contents);
                 json pm = json::parse(contents);
+                ++m_files_parsed;
 
                 std::string strInstant = pm["instantiation"];
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "Load Filament:" << s1 << ",Path:" << sub_file << ",instantiation?" << strInstant;
+                //trace, not info: this fires once per filament preset, ~6,900 times per open.
+                BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << "Load Filament:" << s1 << ",Path:" << sub_file << ",instantiation?" << strInstant;
 
                 if (strInstant == "true") {
                     std::string sV;
@@ -1490,7 +1525,7 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
 
         // process
         json pProcess = jLocal["process_list"];
-        nsize         = pProcess.size();
+        nsize         = need_materials ? int(pProcess.size()) : 0;
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(",  got %1% processes") % nsize;
         for (int n = 0; n < nsize; n++) {
             json OneProcess = pProcess.at(n);
@@ -1503,10 +1538,13 @@ int GuideFrame::LoadProfileFamily(std::string strVendor, std::string strFilePath
             std::string             sub_file = sub_path.string();
             LoadFile(sub_file, contents);
             json pm = json::parse(contents);
+            ++m_files_parsed;
 
             std::string bInstall = pm["instantiation"];
             if (bInstall == "true") { m_ProfileJson["process"].push_back(OneProcess); }
         }
+
+        fam.set_aux(m_files_parsed - parsed_before);
 
     } catch (nlohmann::detail::parse_error &err) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": parse " << strFilePath << " got a nlohmann::detail::parse_error, reason = " << err.what();

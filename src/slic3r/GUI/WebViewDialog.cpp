@@ -77,6 +77,14 @@ bool WebViewPanel::IngestDroppedFiles(const wxArrayString &paths)
     return true;
 }
 
+void WebViewPanel::SetFocusOnWebView()
+{
+    if (m_browser != nullptr)
+        m_browser->SetFocus();
+    else
+        wxPanel::SetFocus();
+}
+
 bool HomePageDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString &filenames)
 {
     return m_panel != nullptr && m_panel->IngestDroppedFiles(filenames);

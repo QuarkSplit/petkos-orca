@@ -299,6 +299,19 @@ void AppConfig::set_defaults()
     if (get("enable_multi_machine").empty())
         set_bool("enable_multi_machine", false);
 
+    //Podslicer: painted colour survives a mesh change by DEFAULT.
+    //
+    //Upstream ships this off and calls it "highly experimental, may create artifact". That trade
+    //is the wrong way round for painted work: an artifact is a thing you can see and repaint,
+    //while the alternative is Cut silently discarding every painted facet - and the only way back
+    //from that is to colour the model again by hand.
+    //
+    //The machinery is not actually experimental in the sense of unbuilt: ModelVolume::
+    //save_painting / restore_painting drive TriangleSelector::remap_painting, and mesh-boolean
+    //and simplify already rely on it. Cut is the one caller that was gated off by this flag.
+    if (get("keep_painting").empty())
+        set_bool("keep_painting", true);
+
     if (get("drc_bits").empty())
         set("drc_bits", DRC_BITS_DEFAULT_STR);
 

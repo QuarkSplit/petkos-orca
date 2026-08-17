@@ -63,6 +63,11 @@ public:
 
     void load_url(wxString& url);
 
+    //Focus the WebView2 child, not this wrapper panel. Focusing the panel leaves the browser
+    //without native focus, so its inputs take a click and then swallow every keystroke, which
+    //is what made the library's search box look broken.
+    void SetFocusOnWebView();
+
     void UpdateState();
     void OnIdle(wxIdleEvent& evt);
     void OnUrl(wxCommandEvent& evt);

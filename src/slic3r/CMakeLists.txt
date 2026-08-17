@@ -405,6 +405,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/PetkosPerf.hpp
     GUI/PetkosPerfDriver.cpp
     GUI/PetkosPerfDriver.hpp
+    GUI/PodPrinterPicker.cpp
+    GUI/PodPrinterPicker.hpp
     GUI/FilamentGroupPopup.hpp
     GUI/FilamentGroupPopup.cpp
     GUI/PhysicalPrinterDialog.cpp

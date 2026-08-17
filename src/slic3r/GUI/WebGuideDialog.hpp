@@ -30,6 +30,7 @@
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/Utils/PresetUpdater.hpp"
 
+#include <atomic>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
@@ -97,6 +98,13 @@ public:
 
     void on_dpi_changed(const wxRect &suggested_rect) {}
 
+    //Measurement seam. The profile walk runs on its own thread, so anything timing this dialog
+    //has to be able to ask whether it has finished and what it cost - otherwise the only
+    //available number is a human with a stopwatch, and those cannot be compared across days.
+    bool   walk_finished() const { return m_walk_done; }
+    int    files_parsed()  const { return m_files_parsed; }
+    double walk_ms()       const { return m_walk_ms; }
+
 private:
     GUI_App *m_MainPtr;
     AppConfig m_appconfig_new;
@@ -125,6 +133,14 @@ private:
 
     json m_OrcaFilaList;
     std::string m_OrcaFilaLibPath;
+
+    //How many preset sub-files the profile walk actually opened. Reported so the cost of this
+    //page is a number in the log rather than a thing users describe as "a few minutes".
+    int    m_files_parsed{0};
+    double m_walk_ms{0.0};
+    //Atomic because the walk runs on its own thread and the flag is what publishes the two
+    //plain members above: a reader that sees true has, by release/acquire, seen their writes.
+    std::atomic<bool> m_walk_done{false};
 
 #if wxUSE_WEBVIEW_IE
     wxMenuItem *m_script_object_el;

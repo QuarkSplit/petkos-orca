@@ -123,6 +123,9 @@ option(SLIC3R_FHS               "Assume OrcaSlicer is to be installed in a FHS d
 option(SLIC3R_PROFILE           "Compile OrcaSlicer with an invasive Shiny profiler" 0)
 option(SLIC3R_PCH               "Use precompiled headers" 1)
 option(SLIC3R_MSVC_COMPILE_PARALLEL "Compile on Visual Studio in parallel" 1)
+# Podslicer: off by default so the Visual Studio build is untouched. Turn on for the Ninja
+# build dir, where it swaps /Zi /FS for /Z7 and /MP for ccache - see the MSVC block below.
+option(SLIC3R_CCACHE           "Compile through ccache (implies /Z7 and no /MP)" 0)
 option(SLIC3R_MSVC_PDB          "Generate PDB files on MSVC in Release mode" 1)
 option(SLIC3R_ASAN              "Enable ASan on Clang and GCC" 0)
 
@@ -338,8 +341,35 @@ else ()
     set(IS_CLANG_CL FALSE)
 endif ()
 
+# Podslicer: the cached, Ninja-driven build.
+#
+# Measured on this tree: a four-file change cost 38m19s, of which the LINK was 42 seconds and
+# the other 36 minutes were 270 translation units recompiled because a hub header changed. So
+# the wins are (a) not recompiling what has not changed, and (b) a generator whose dependency
+# graph survives a reconfigure - adding two source files to a CMakeLists cost a full 81-minute
+# rebuild under the Visual Studio generator, because regenerating the .vcxproj files
+# invalidates every object.
+#
+# ccache cannot cache /Zi (the debug info lands in a shared PDB the object does not carry) and
+# does not support /MP (one cl invocation producing many objects). Both are switched here rather
+# than globally, so the Visual Studio build keeps the flags it was tuned for.
+if (SLIC3R_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if (CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        message(STATUS "ccache: ${CCACHE_PROGRAM} (/Z7 debug info, /MP off - both required for caching)")
+    else ()
+        message(WARNING "SLIC3R_CCACHE is on but ccache was not found; building uncached")
+        set(SLIC3R_CCACHE OFF)
+    endif ()
+endif ()
+
 if (MSVC)
-    if (SLIC3R_MSVC_COMPILE_PARALLEL AND NOT IS_CLANG_CL)
+    # ccache cannot cache a /MP compile, so the two are mutually exclusive. Under Ninja this
+    # costs nothing: Ninja already runs one cl per file, in parallel, across all targets at once
+    # rather than per-project the way MSBuild does.
+    if (SLIC3R_MSVC_COMPILE_PARALLEL AND NOT IS_CLANG_CL AND NOT SLIC3R_CCACHE)
            add_compile_options(/MP)
     endif ()
     # /bigobj (Increase Number of Sections in .Obj file)
@@ -347,7 +377,13 @@ if (MSVC)
     # Generate symbols at every build target, even for the release.
 	# -Zm520 fixes error C3859 but forces the compiler to pre-allocate that memory for every translation unit regardless
 	# combining /Zi with /FS frees up a significant amount of memory pressure across all parallel compile jobs and makes /MP faster overall.
-    add_compile_options(-bigobj /Zi /FS)
+    if (SLIC3R_CCACHE)
+        # /Z7 puts the debug info IN the object, which is what makes an object cacheable at all.
+        # /FS exists to serialise writes to the shared PDB /Zi creates, so it goes with it.
+        add_compile_options(-bigobj /Z7)
+    else ()
+        add_compile_options(-bigobj /Zi /FS)
+    endif ()
     # Disable STL4007: Many result_type typedefs and all argument_type, first_argument_type, and second_argument_type typedefs are deprecated in C++17.
     #FIXME Remove this line after eigen library adapts to the new C++17 adaptor rules.
     add_compile_options(-D_SILENCE_CXX17_ADAPTOR_TYPEDEFS_DEPRECATION_WARNING)

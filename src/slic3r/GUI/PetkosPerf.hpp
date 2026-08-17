@@ -83,6 +83,11 @@ enum class Probe : uint8_t {
     BundleFullConfig,      //PresetBundle::full_config composed on the follow path
     LoadBedtypeTextures,   //PartPlateList::load_bedtype_textures - sync SVG rasterise in render
     FollowPlatePresets,    //Plater::follow_plate_presets whole - the plate-switch settle body
+    PickerIndexBuild,      //PrinterPickerDialog's whole index, from memory, aux = models
+    PickerBuildUi,         //its construction: index + widgets + first layout
+    GuideProfileWalk,      //the web guide's LoadProfileData - every vendor re-read from disk
+    GuideProfileFamily,    //  one vendor of it, aux = sub-files parsed
+    GuideProfileDump,      //  serialising the result for the WebView, aux = KB produced
     Count
 };
 

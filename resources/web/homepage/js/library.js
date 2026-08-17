@@ -22,7 +22,8 @@ var LIB = {
     versions: 'best',
     sort: 'recent',
     shown: LIB_PAGE,
-    recentPaths: {},  // filled from the real recent-files list, for the Recent chip
+    recentPaths: {},  // normalised keys of the real recent-files list, for the Recent chip
+    recentOrder: [],  // the same list in its own order, which is what "recent" means
     // Expansion and ticks are keyed by path rather than held in the DOM, because the grid
     // is re-rendered whole on every filter change and anything living only in the markup
     // would silently reset mid-selection.
@@ -52,7 +53,10 @@ var LIB_BADGE = {
     'prepped':      { text: 'prepped',     cls: 'LibBadgePrepped' },
     'sliced':       { text: 'sliced',      cls: 'LibBadgeSliced' },
     'sent':         { text: 'sent',        cls: 'LibBadgeSent' },
-    'unreadable':   { text: 'unreadable',  cls: 'LibBadgeBad' }
+    'unreadable':   { text: 'unreadable',  cls: 'LibBadgeBad' },
+    // Not a pipeline state: it means the file is real and open-able but lives outside the
+    // indexed roots, so nothing is known about it beyond its path.
+    'unindexed':    { text: 'not in library', cls: 'LibBadgeBad' }
 };
 
 function LibItems() {
@@ -65,11 +69,40 @@ function LibEscape(s) {
         .replace(/"/g, '&quot;');
 }
 
+// A path is one identity however it was spelled. The recent list is written by whoever
+// opened the file - the app writes backslashes, a command line or a drag-drop can deliver
+// forward slashes - while the index always holds backslashes. Comparing the raw strings
+// dropped every recent whose separators disagreed, silently, for a reason that has nothing
+// to do with the question being asked.
+function LibKey(p) {
+    return String(p || '').replace(/\//g, '\\').toLowerCase();
+}
+
+// A project that is genuinely recent but sits outside the indexed roots has no record to
+// find, and answering "recently opened" with silence is worse than answering it with a card
+// that says where the file actually is. One is synthesised so this view can never be
+// emptier than the truth.
+function LibSynthRecent(path) {
+    var norm = String(path).replace(/\//g, '\\');
+    var cut  = norm.lastIndexOf('\\');
+    var file = cut < 0 ? norm : norm.substr(cut + 1);
+    return {
+        path: norm,
+        name: file.replace(/\.3mf$/i, ''),
+        root: '', group: '(not in the library)', folder: cut < 0 ? '' : norm.substr(0, cut),
+        mtime: 0, sizeMB: 0, kind: '3mf', gcode: 0,
+        plateCount: 0, machines: [], perPlateMachines: false,
+        printer: '', process: '', colours: [], materials: [], filaments: [],
+        state: 'unindexed', title: '', designer: '', parts: 0,
+        thumb: '', stage: '', superseded: false, unindexed: true
+    };
+}
+
 function LibMatches(it) {
     if (LIB.kind === '3mf' && it.kind !== '3mf') return false;
     if (LIB.versions === 'best' && it.superseded) return false;
     if (LIB.state === 'recent') {
-        if (!LIB.recentPaths[it.path]) return false;
+        if (!LIB.recentPaths[LibKey(it.path)]) return false;
     } else if (LIB.state !== 'all' && it.state !== LIB.state) {
         return false;
     }
@@ -87,6 +120,26 @@ function LibMatches(it) {
 
 function LibFiltered() {
     var out = LibItems().filter(LibMatches);
+    // In the recent view, every real recent gets a card - indexed or not. Sorted by the
+    // recent list's own order, which is the order the question "what was I just working on"
+    // is actually asking about; mtime cannot answer it for a synthesised record.
+    if (LIB.state === 'recent') {
+        var seen = {}, i;
+        for (i = 0; i < out.length; i++) seen[LibKey(out[i].path)] = true;
+        for (i = 0; i < LIB.recentOrder.length; i++) {
+            var p = LIB.recentOrder[i];
+            if (!seen[LibKey(p)]) out.push(LibSynthRecent(p));
+        }
+        var rank = {};
+        for (i = 0; i < LIB.recentOrder.length; i++) rank[LibKey(LIB.recentOrder[i])] = i;
+        out.sort(function (a, b) {
+            var ra = rank[LibKey(a.path)], rb = rank[LibKey(b.path)];
+            if (ra === undefined) ra = 1e9;
+            if (rb === undefined) rb = 1e9;
+            return ra - rb;
+        });
+        return out;
+    }
     if (LIB.sort === 'name') {
         out.sort(function (a, b) { return a.name.localeCompare(b.name); });
     } else {
@@ -672,9 +725,16 @@ function LibBuildGroups() {
 // separate view, so there is one grid and one set of controls.
 function LibNoteRecent(pList) {
     LIB.recentPaths = {};
+    LIB.recentOrder = [];
     for (var i = 0; i < (pList || []).length; i++) {
-        if (pList[i] && pList[i].path) LIB.recentPaths[pList[i].path] = true;
+        if (pList[i] && pList[i].path) {
+            LIB.recentPaths[LibKey(pList[i].path)] = true;
+            LIB.recentOrder.push(pList[i].path);
+        }
     }
+    // The chip's count is only honest once the list has arrived, and it arrives after the
+    // first render, so the chips are rebuilt rather than left showing the boot-time answer.
+    LibBuildChips();
     if (LIB.state === 'recent') LibRender();
 }
 

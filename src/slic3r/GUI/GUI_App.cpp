@@ -134,6 +134,7 @@
 //BBS: DailyTip and UserGuide Dialog
 #include "WebDownPluginDlg.hpp"
 #include "WebGuideDialog.hpp"
+#include "PodPrinterPicker.hpp"
 #include "ReleaseNote.hpp"
 #include "PrivacyUpdateDialog.hpp"
 #include "ModelMall.hpp"
@@ -9501,6 +9502,15 @@ bool GUI_App::run_wizard(ConfigWizard::RunReason reason, ConfigWizard::StartPage
     //    if (preset_updater->config_update(app_config->orig_version(), PresetUpdater::UpdateParams::FORCED_BEFORE_WIZARD) == PresetUpdater::R_ALL_CANCELED)
     //        return false;
     //}
+
+    //Podslicer: "Add/Remove printers" is answered by the native picker, not by the web guide.
+    //Routed here rather than at each of the five call sites, so there is one rule and no site
+    //can be missed: every caller that asks for the printer page gets the picker.
+    //
+    //The guide keeps the pages it is actually for - first run, filaments, region - which is
+    //why this is a route and not a deletion.
+    if (start_page == ConfigWizard::SP_PRINTERS)
+        return pod_pick_printers(mainframe);
 
     //auto wizard_t = new ConfigWizard(mainframe);
     //const bool res = wizard_t->run(reason, start_page);
