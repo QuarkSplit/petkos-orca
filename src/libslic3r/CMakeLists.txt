@@ -296,6 +296,8 @@ set(lisbslic3r_sources
     Measure.cpp
     Measure.hpp
     MeasureUtils.hpp
+    MeshKnife.cpp
+    MeshKnife.hpp
     MeshSeparator.cpp
     MeshSeparator.hpp
     MeshSplitImpl.hpp

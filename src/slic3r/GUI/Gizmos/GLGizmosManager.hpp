@@ -91,6 +91,7 @@ public:
         Simplify,
         BrimEars,
         Separate,
+        Knife,
         //SlaSupports,
         // BBS
         //FaceRecognition,

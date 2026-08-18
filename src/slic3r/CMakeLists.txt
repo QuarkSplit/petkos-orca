@@ -174,6 +174,8 @@ set(SLIC3R_GUI_SOURCES
     GUI/Gizmos/GLGizmoFlatten.hpp
     GUI/Gizmos/GLGizmoSeparate.cpp
     GUI/Gizmos/GLGizmoSeparate.hpp
+    GUI/Gizmos/GLGizmoKnife.cpp
+    GUI/Gizmos/GLGizmoKnife.hpp
     GUI/Gizmos/GLGizmoFuzzySkin.cpp
     GUI/Gizmos/GLGizmoFuzzySkin.hpp
     #GUI/Gizmos/GLGizmoHollow.cpp

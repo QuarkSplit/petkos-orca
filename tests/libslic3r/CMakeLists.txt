@@ -27,6 +27,7 @@ add_executable(${_TEST_NAME}_tests
     test_nozzle_volume_type.cpp
     test_stl.cpp
     test_meshboolean.cpp
+    test_meshknife.cpp
     test_meshseparator.cpp
     test_cutbounds.cpp
     test_cutregion.cpp

@@ -18,6 +18,7 @@
 #include "slic3r/GUI/Gizmos/GLGizmoFuzzySkin.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoBrimEars.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSeparate.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoKnife.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoCut.hpp"
 //#include "slic3r/GUI/Gizmos/GLGizmoFaceDetector.hpp"
 //#include "slic3r/GUI/Gizmos/GLGizmoHollow.hpp"
@@ -190,6 +191,9 @@ void GLGizmosManager::switch_gizmos_icon_filename()
         case (EType::Separate):
             gizmo->set_icon_filename(m_is_dark ? "toolbar_separate_dark.svg" : "toolbar_separate.svg");
             break;
+        case (EType::Knife):
+            gizmo->set_icon_filename(m_is_dark ? "toolbar_knife_dark.svg" : "toolbar_knife.svg");
+            break;
         }
 
     }
@@ -234,6 +238,7 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, "reduce_triangles.svg", EType::Simplify));
     m_gizmos.emplace_back(new GLGizmoBrimEars(m_parent, m_is_dark ? "toolbar_brimears_dark.svg" : "toolbar_brimears.svg", EType::BrimEars));
     m_gizmos.emplace_back(new GLGizmoSeparate(m_parent, m_is_dark ? "toolbar_separate_dark.svg" : "toolbar_separate.svg", EType::Separate));
+    m_gizmos.emplace_back(new GLGizmoKnife(m_parent, m_is_dark ? "toolbar_knife_dark.svg" : "toolbar_knife.svg", EType::Knife));
     //m_gizmos.emplace_back(new GLGizmoSlaSupports(m_parent, "sla_supports.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoFaceDetector(m_parent, "face recognition.svg", sprite_id++));
     //m_gizmos.emplace_back(new GLGizmoHollow(m_parent, "hollow.svg", sprite_id++));
@@ -661,6 +666,11 @@ bool GLGizmosManager::on_mouse_wheel(const wxMouseEvent &evt)
 #endif
             ))
             processed = true;
+    }
+    else if (m_current == Knife && !evt.ControlDown()) {
+        // Plain scroll rotates the knife plane; Ctrl+scroll falls through and stays zoom.
+        const float rot = (float) evt.GetWheelRotation() / (float) evt.GetWheelDelta();
+        processed       = dynamic_cast<GLGizmoKnife *>(get_current())->on_wheel(rot);
     }
 
     return processed;
@@ -1503,6 +1513,8 @@ std::string get_name_from_gizmo_etype(GLGizmosManager::EType type)
         return "Fuzzy Skin Painting";
     case GLGizmosManager::EType::Separate:
         return "Separate";
+    case GLGizmosManager::EType::Knife:
+        return "Knife";
     default:
         return "";
     }
