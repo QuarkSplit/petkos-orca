@@ -103,6 +103,8 @@ set(lisbslic3r_sources
     ContourZ.cpp
     CustomGCode.cpp
     CustomGCode.hpp
+    CutRegion.cpp
+    CutRegion.hpp
     CutUtils.cpp
     CutUtils.hpp
     EdgeGrid.cpp

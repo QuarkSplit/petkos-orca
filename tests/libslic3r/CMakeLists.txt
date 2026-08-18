@@ -28,6 +28,7 @@ add_executable(${_TEST_NAME}_tests
     test_stl.cpp
     test_meshboolean.cpp
     test_cutbounds.cpp
+    test_cutregion.cpp
     test_marchingsquares.cpp
     test_utils.cpp
     test_timeutils.cpp

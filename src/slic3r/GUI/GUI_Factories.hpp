@@ -139,6 +139,7 @@ private:
     wxMenuItem* append_menu_item_printable(wxMenu* menu);
     wxMenuItem* append_menu_item_auto_drop(wxMenu* menu);
     void        append_menu_item_rename(wxMenu* menu);
+    void append_menu_item_separate_parts(wxMenu* menu);
     wxMenuItem* append_menu_item_fix_through_cgal(wxMenu* menu);
     //wxMenuItem* append_menu_item_simplify(wxMenu* menu);
     void        append_menu_item_export_stl(wxMenu* menu, bool is_mulity_menu = false);

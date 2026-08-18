@@ -886,6 +886,12 @@ public:
     // Remap painting data from previous saved source to this mesh
     void restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, bool keep_existing_paint = false);
 
+    //Podslicer: carry every painted channel across a change of mesh that kept its faces.
+    //`src_to_dst_facet[i]` is this volume's new index for the source mesh's face i, or -1 when
+    //the face went to another part. Exact and instant, where restore_painting() has to search
+    //for the paint again geometrically because a boolean left it nothing to follow.
+    void remap_painting_by_facets(const std::vector<int>& src_to_dst_facet, const ModelVolume& source);
+
     // BBS: quick access for volume extruders, 1 based
     mutable std::vector<int> mmuseg_extruders;
     mutable Timestamp        mmuseg_ts;

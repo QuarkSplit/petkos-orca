@@ -1471,6 +1471,60 @@ int TriangleSelector::num_facets(EnforcerBlockerType state) const
     return cnt;
 }
 
+std::vector<EnforcerBlockerType> TriangleSelector::get_facet_states() const
+{
+    std::vector<EnforcerBlockerType> out(size_t(m_orig_size_indices), EnforcerBlockerType::NONE);
+
+    //Twice the area of a triangle, which is all that is needed since only the comparison
+    //between states matters and the factor is common to all of them.
+    auto double_area = [this](const Triangle &tr) {
+        const Vec3f &a = m_vertices[tr.verts_idxs[0]].v;
+        const Vec3f &b = m_vertices[tr.verts_idxs[1]].v;
+        const Vec3f &c = m_vertices[tr.verts_idxs[2]].v;
+        return (b - a).cross(c - a).norm();
+    };
+
+    std::array<float, size_t(EnforcerBlockerType::ExtruderMax) + 1> area{};
+    std::vector<int> stack;
+
+    for (int i = 0; i < m_orig_size_indices; ++i) {
+        const Triangle &root = m_triangles[i];
+        if (!root.valid())
+            continue;
+        if (!root.is_split()) {
+            out[size_t(i)] = root.get_state();
+            continue;
+        }
+
+        area.fill(0.f);
+        stack.clear();
+        stack.push_back(i);
+        while (!stack.empty()) {
+            const int idx = stack.back();
+            stack.pop_back();
+            const Triangle &tr = m_triangles[idx];
+            if (!tr.valid())
+                continue;
+            if (tr.is_split()) {
+                for (int c = 0; c <= tr.number_of_split_sides(); ++c)
+                    stack.push_back(tr.children[c]);
+            } else {
+                const int st = int(tr.get_state());
+                if (st >= 0 && st < int(area.size()))
+                    area[size_t(st)] += double_area(tr);
+            }
+        }
+
+        int best = 0;
+        for (int st = 1; st < int(area.size()); ++st)
+            if (area[size_t(st)] > area[size_t(best)])
+                best = st;
+        out[size_t(i)] = EnforcerBlockerType(best);
+    }
+
+    return out;
+}
+
 indexed_triangle_set TriangleSelector::get_facets(EnforcerBlockerType state) const
 {
     indexed_triangle_set out;
@@ -1517,6 +1571,88 @@ void TriangleSelector::get_facets(std::vector<indexed_triangle_set>& facets_per_
             }
         }
     }
+}
+
+indexed_triangle_set TriangleSelector::get_facets_conforming(std::vector<EnforcerBlockerType> &states_out,
+                                                             std::vector<int>                 &source_facet_out) const
+{
+    indexed_triangle_set out;
+    states_out.clear();
+    source_facet_out.clear();
+
+    size_t num_vertices = 0;
+    for (const Vertex &v : m_vertices)
+        if (v.ref_cnt > 0)
+            ++num_vertices;
+    out.vertices.reserve(num_vertices);
+    std::vector<int> vertex_map(m_vertices.size(), -1);
+    for (size_t i = 0; i < m_vertices.size(); ++i)
+        if (const Vertex &v = m_vertices[i]; v.ref_cnt > 0) {
+            vertex_map[i] = int(out.vertices.size());
+            out.vertices.emplace_back(v.v);
+        }
+
+    out.indices.reserve(m_orig_size_indices);
+    states_out.reserve(m_orig_size_indices);
+    source_facet_out.reserve(m_orig_size_indices);
+    for (int itriangle = 0; itriangle < m_orig_size_indices; ++itriangle)
+        this->get_facets_conforming_recursive(m_triangles[itriangle], m_neighbors[itriangle], out.indices, states_out,
+                                              source_facet_out, itriangle);
+
+    for (auto &triangle : out.indices)
+        for (int i = 0; i < 3; ++i)
+            triangle(i) = vertex_map[triangle(i)];
+
+    return out;
+}
+
+void TriangleSelector::get_facets_conforming_recursive(const Triangle &tr, const Vec3i32 &neighbors,
+                                                       std::vector<stl_triangle_vertex_indices> &out_triangles,
+                                                       std::vector<EnforcerBlockerType> &states, std::vector<int> &source_facet,
+                                                       int orig_facet) const
+{
+    if (tr.is_split()) {
+        for (int i = 0; i <= tr.number_of_split_sides(); ++i)
+            this->get_facets_conforming_recursive(m_triangles[tr.children[i]], this->child_neighbors(tr, neighbors, i),
+                                                  out_triangles, states, source_facet, orig_facet);
+    } else {
+        this->get_facets_split_by_tjoints({tr.verts_idxs[0], tr.verts_idxs[1], tr.verts_idxs[2]}, neighbors, out_triangles);
+        //Whatever the T-joint split produced, it is all one leaf and therefore all one state.
+        states.resize(out_triangles.size(), tr.get_state());
+        source_facet.resize(out_triangles.size(), orig_facet);
+    }
+}
+
+TriangleSelector::TriangleSplittingData TriangleSelector::painting_from_facet_states(const std::vector<EnforcerBlockerType> &states)
+{
+    //The leaf encoding serialize() writes, for a mesh nobody has subdivided: two zero bits for
+    //"no split sides", then the state - two bits for 0..2, or "11" plus four bits of (n - 3).
+    TriangleSplittingData data;
+    data.triangles_to_split.reserve(states.size());
+    data.bitstream.reserve(states.size() * 4);
+
+    for (size_t i = 0; i < states.size(); ++i) {
+        const int n = int(states[i]);
+        if (n == int(EnforcerBlockerType::NONE))
+            continue;
+        data.triangles_to_split.emplace_back(int(i), int(data.bitstream.size()));
+        data.bitstream.insert(data.bitstream.end(), {false, false});
+        if (n >= 3) {
+            data.bitstream.insert(data.bitstream.end(), {true, true});
+            const int m = n - 3;
+            for (int bit = 0; bit < 4; ++bit)
+                data.bitstream.push_back((m & (1 << bit)) != 0);
+        } else {
+            data.bitstream.push_back((n & 0b01) != 0);
+            data.bitstream.push_back((n & 0b10) != 0);
+        }
+        if (n <= int(EnforcerBlockerType::ExtruderMax))
+            data.used_states[size_t(n)] = true;
+    }
+
+    data.triangles_to_split.shrink_to_fit();
+    data.bitstream.shrink_to_fit();
+    return data;
 }
 
 indexed_triangle_set TriangleSelector::get_facets_strict(EnforcerBlockerType state) const
@@ -1767,6 +1903,64 @@ TriangleSelector::TriangleSplittingData TriangleSelector::serialize() const {
     out.data.triangles_to_split.shrink_to_fit();
     out.data.bitstream.shrink_to_fit();
     return out.data;
+}
+
+//Podslicer: paint follows a face wherever the face goes.
+//
+//`triangles_to_split` is a list of (original facet index, first bit) in ascending order of
+//both, and every entry's bits are the self-contained encoding of that facet's subdivision
+//tree. So a permutation of faces is a permutation of entries plus a copy of the bit ranges
+//they point at - no geometry, no search, nothing lost. The entry's length is simply the gap
+//to the next entry, because serialize() writes them back to back.
+TriangleSelector::TriangleSplittingData TriangleSelector::remap_painting_by_facet_map(
+    const TriangleSplittingData &source_painting, const std::vector<int> &src_to_dst_facet)
+{
+    TriangleSplittingData result;
+    if (source_painting.bitstream.empty() || source_painting.triangles_to_split.empty())
+        return result;
+
+    const size_t n = source_painting.triangles_to_split.size();
+    result.triangles_to_split.reserve(n);
+    result.bitstream.reserve(source_painting.bitstream.size());
+
+    for (size_t i = 0; i < n; ++i) {
+        const TriangleBitStreamMapping &entry = source_painting.triangles_to_split[i];
+        const int src_facet = entry.triangle_idx;
+        if (src_facet < 0 || src_facet >= int(src_to_dst_facet.size()))
+            continue;
+        const int dst_facet = src_to_dst_facet[src_facet];
+        if (dst_facet < 0)
+            continue;
+
+        const size_t bit_from = size_t(entry.bitstream_start_idx);
+        const size_t bit_to   = (i + 1 < n) ? size_t(source_painting.triangles_to_split[i + 1].bitstream_start_idx)
+                                            : source_painting.bitstream.size();
+        if (bit_from >= bit_to || bit_to > source_painting.bitstream.size())
+            continue;
+
+        result.triangles_to_split.emplace_back(dst_facet, int(result.bitstream.size()));
+        result.bitstream.insert(result.bitstream.end(),
+                                source_painting.bitstream.begin() + bit_from,
+                                source_painting.bitstream.begin() + bit_to);
+    }
+
+    if (result.bitstream.empty()) {
+        result.triangles_to_split.clear();
+        return result;
+    }
+
+    //deserialize() walks the entries in order and each one seeks to its own start bit, so a
+    //permuted list would still decode - but every other consumer assumes the ascending order
+    //serialize() guarantees, and one of them is the 3MF writer.
+    std::sort(result.triangles_to_split.begin(), result.triangles_to_split.end(),
+              [](const TriangleBitStreamMapping &l, const TriangleBitStreamMapping &r) { return l.triangle_idx < r.triangle_idx; });
+
+    result.reset_used_states();
+    result.update_used_states(0);
+
+    result.triangles_to_split.shrink_to_fit();
+    result.bitstream.shrink_to_fit();
+    return result;
 }
 
 void TriangleSelector::deserialize(const TriangleSplittingData &data,

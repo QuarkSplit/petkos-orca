@@ -36,6 +36,8 @@
 #include <wx/utils.h>
 #include <wx/headerctrl.h>
 
+#include "libslic3r/CutRegion.hpp"
+#include "libslic3r/CutUtils.hpp"
 #include "slic3r/Utils/FixModelByCgal.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Orient.hpp"
@@ -6110,6 +6112,146 @@ void ObjectList::rename_item()
 
     if (m_objects_model->SetName(new_name, item))
         update_name_in_model(item);
+}
+
+//Podslicer: turning the parts a model only LOOKS like it has into parts it really has.
+//
+//Two ways of asking the same question - which triangles belong to which piece - and one
+//answer, because after the labelling the operation is identical. By colour: the user already
+//said where the parts are when they painted it, and the slicer already treats a painted region
+//as solid all the way through, so the split is only making that visible. By seam: where the
+//surface folds inwards past a threshold, which is what a join between two parts looks like and
+//what a corner does not.
+void ObjectList::separate_parts(bool by_paint, bool keep_as_parts)
+{
+    // A gizmo mid-edit owns the undo stack, and this is going to take a snapshot.
+    if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
+        return;
+
+    std::vector<int> obj_idxs, vol_idxs;
+    get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.size() != 1)
+        return;
+    const int    obj_idx = obj_idxs.front();
+    ModelObject *mo      = object(obj_idx);
+    if (mo == nullptr || mo->volumes.empty() || mo->instances.empty())
+        return;
+
+    auto plater = wxGetApp().plater();
+    auto say    = [plater](const std::string &text, bool bad) {
+        plater->get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            bad ? NotificationManager::NotificationLevel::WarningNotificationLevel
+                : NotificationManager::NotificationLevel::RegularNotificationLevel,
+            text);
+    };
+
+    RegionCutSpec spec;
+    spec.keep_as_parts = keep_as_parts;
+
+    if (by_paint) {
+        //Labels have to mean the same thing across every volume, so they are keyed by the
+        //filament rather than by the order each volume happened to meet them.
+        std::vector<EnforcerBlockerType> global_states;
+        auto label_of = [&global_states](EnforcerBlockerType st) {
+            for (size_t i = 0; i < global_states.size(); ++i)
+                if (global_states[i] == st)
+                    return int(i);
+            global_states.push_back(st);
+            return int(global_states.size() - 1);
+        };
+
+        for (size_t vi = 0; vi < mo->volumes.size(); ++vi) {
+            const ModelVolume *v = mo->volumes[vi];
+            if (v == nullptr || !v->is_model_part() || v->mesh().empty())
+                continue;
+            PaintedRegions regions;
+            if (!regions_from_paint(v->mesh().its, v->mmu_segmentation_facets.get_data(), regions))
+                continue;
+            RegionCutVolume rcv;
+            rcv.conforming  = std::move(regions.mesh);
+            rcv.source_face = std::move(regions.source_face);
+            rcv.labels.resize(regions.labels.size());
+            std::vector<int> local_to_global(regions.label_states.size());
+            for (size_t l = 0; l < regions.label_states.size(); ++l)
+                local_to_global[l] = label_of(regions.label_states[l]);
+            for (size_t f = 0; f < regions.labels.size(); ++f)
+                rcv.labels[f] = local_to_global[size_t(regions.labels[f])];
+            spec.volumes.emplace(vi, std::move(rcv));
+        }
+
+        spec.label_count = int(global_states.size());
+        if (spec.label_count < 2) {
+            say(_u8L("This model is not painted, so there are no colours to separate it into. "
+                     "Paint it with the colour tool first, or separate it at its seams instead."),
+                true);
+            return;
+        }
+        for (EnforcerBlockerType st : global_states) {
+            const int filament = int(st);
+            spec.part_extruders.push_back(filament);
+            spec.part_names.push_back(filament > 0 ? into_u8(wxString::Format(_L("Filament %1%"), filament))
+                                                   : into_u8(_L("Unpainted")));
+        }
+    }
+    else {
+        //Each volume's regions are its own, so the labels are offset per volume: two pieces
+        //that were never connected are two pieces, whichever volume they came out of.
+        RegionFillParams params;
+        int              base = 0;
+        for (size_t vi = 0; vi < mo->volumes.size(); ++vi) {
+            const ModelVolume *v = mo->volumes[vi];
+            if (v == nullptr || !v->is_model_part() || v->mesh().empty())
+                continue;
+            const std::vector<Vec3i32> nb = its_face_neighbors_par(v->mesh().its);
+            RegionCutVolume            rcv;
+            const int count = label_regions_by_crease(v->mesh().its, nb, params, rcv.labels);
+            if (count <= 0)
+                continue;
+            for (int &l : rcv.labels)
+                l += base;
+            base += count;
+            spec.volumes.emplace(vi, std::move(rcv));
+        }
+        spec.label_count = base;
+        if (spec.label_count < 2) {
+            say(_u8L("Nothing here comes apart: this model is one continuous surface with no "
+                     "inward seam to separate it at."),
+                true);
+            return;
+        }
+        for (int i = 0; i < spec.label_count; ++i) {
+            spec.part_extruders.push_back(0);
+            spec.part_names.push_back(into_u8(wxString::Format(_L("Part %1%"), i + 1)));
+        }
+    }
+
+    RegionCutReport report;
+    std::string     failure;
+    ModelObjectPtrs parts;
+    {
+        Plater::TakeSnapshot snapshot(plater, by_paint ? _u8L("Separate parts by colour") : _u8L("Separate parts at seams"));
+        parts = cut_object_by_regions(*mo, 0, spec, report, failure);
+        if (parts.empty()) {
+            say(_u8L("The parts could not be separated") + ": " + failure, true);
+            return;
+        }
+        plater->apply_cut_object_to_model(size_t(obj_idx), parts, false);
+    }
+
+    //What actually happened, in the terms the user asked in. An opening that could not be
+    //closed is worth saying out loud, because it is the one outcome that needs their eyes.
+    std::string msg = into_u8(wxString::Format(_L("Separated into %1% parts."), int(report.parts_made)));
+    if (report.fanned_loops > 0)
+        msg += " " + into_u8(wxString::Format(_L("%1% cut face(s) were closed with a simple lid."),
+                                              int(report.fanned_loops)));
+    if (report.unspanned_loops > 0)
+        msg += " " + into_u8(wxString::Format(_L("%1% opening(s) could not be closed and were left open."),
+                                              int(report.unspanned_loops)));
+    else if (report.open_parts > 0)
+        msg += " " + into_u8(wxString::Format(_L("%1% part(s) came out open, because the model was."),
+                                              int(report.open_parts)));
+    say(msg, report.unspanned_loops > 0 || report.open_parts > 0);
 }
 
 void ObjectList::fix_through_cgal()

@@ -5,6 +5,7 @@
 #include "libslic3r/format.hpp"
 #undef PI
 
+#include <functional>
 #include <boost/next_prior.hpp>
 #include "boost/log/trivial.hpp"
 // Include igl first. It defines "L" macro which then clashes with our localization
@@ -18,6 +19,7 @@
 #include <CGAL/Cartesian_converter.h>
 #include <CGAL/Polygon_mesh_processing/orient_polygon_soup.h>
 #include <CGAL/Polygon_mesh_processing/repair.h>
+#include <CGAL/Polygon_mesh_processing/triangulate_hole.h>
 #include <CGAL/Polygon_mesh_processing/remesh.h>
 #include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
 #include <CGAL/Polygon_mesh_processing/orientation.h>
@@ -482,7 +484,73 @@ bool empty(const CGALMesh &mesh)
     return mesh.m.is_empty();
 }
 
-bool repair(TriangleMesh& mesh, RepairedMeshErrors* repaired_errors, std::string* error)
+//Podslicer: repair is a ladder of cheap steps, and the one step that costs real time is the
+//one almost no mesh needs.
+//
+//What this replaces ran every step unconditionally, and its self-union step was
+//`corefine_and_compute_union(m, m, out)` - a mesh corefined against ITSELF. Every triangle
+//meets its own twin, so the intersection graph is the entire mesh computed in exact
+//arithmetic; on a few hundred thousand faces that does not finish in any time a person will
+//wait, which is why "repair the cut" read as a hang rather than as a computation. Resolving
+//self-intersections is only meaningful for a mesh that actually self-intersects, and CGAL
+//has that operation under its own name.
+//
+//`progress` is polled between steps and inside the hole loop; returning false cancels, and a
+//cancelled repair leaves the input mesh untouched and returns false with an empty error.
+//Podslicer: span a closed 3D loop with a triangle patch, ONCE.
+//
+//Both sides of a cut have to be closed, and the honest way to close them is with the same
+//patch twice, wound in opposite directions. Two independent hole fills across the same loop
+//produce two different surfaces that agree only on their edge, so the parts no longer mate
+//and their volumes no longer add up to the source's - a defect that is invisible on screen
+//and unmistakable on a printer. So the patch is computed here, from the loop alone, and the
+//caller gives one copy to each side.
+//
+//CGAL's triangulate_hole_polyline is the minimum-weight triangulation of the loop, with a
+//Delaunay-based search that keeps it usable well past the sizes a cut produces.
+bool triangulate_loop(const std::vector<Vec3f> &loop, std::vector<Vec3i32> &triangles, std::string *error)
+{
+    namespace PMP = CGAL::Polygon_mesh_processing;
+    triangles.clear();
+    if (loop.size() < 3) {
+        if (error)
+            *error = "a loop of fewer than three points cannot be spanned";
+        return false;
+    }
+    if (loop.size() == 3) {
+        triangles.emplace_back(0, 1, 2);
+        return true;
+    }
+
+    try {
+        std::vector<EpicKernel::Point_3> pts;
+        pts.reserve(loop.size());
+        for (const Vec3f &p : loop)
+            pts.emplace_back(p.x(), p.y(), p.z());
+
+        std::vector<CGAL::Triple<int, int, int>> patch;
+        patch.reserve(loop.size() - 2);
+        PMP::triangulate_hole_polyline(pts, std::back_inserter(patch));
+
+        if (patch.empty()) {
+            if (error)
+                *error = "the cut outline could not be spanned by a surface";
+            return false;
+        }
+
+        triangles.reserve(patch.size());
+        for (const auto &t : patch)
+            triangles.emplace_back(t.first, t.second, t.third);
+        return true;
+    } catch (const std::exception &e) {
+        if (error)
+            *error = e.what();
+        return false;
+    }
+}
+
+bool repair(TriangleMesh& mesh, RepairedMeshErrors* repaired_errors, std::string* error,
+            const std::function<bool(const char*, int)>& progress)
 {
     using namespace CGAL;
     namespace PMP = CGAL::Polygon_mesh_processing;
@@ -490,7 +558,38 @@ bool repair(TriangleMesh& mesh, RepairedMeshErrors* repaired_errors, std::string
     if (mesh.empty())
         return true;
 
+    //A step that reports "keep going" when nobody is watching, so the body below never has
+    //to ask whether it has a callback.
+    auto step = [&progress](const char *what, int percent) {
+        return progress ? progress(what, percent) : true;
+    };
+    struct Canceled {};
+
+    RepairedMeshErrors errs{};
+
     try {
+        const size_t src_faces = mesh.its.indices.size();
+
+        //Nothing to do is the common case after a cut that splits along existing edges, and
+        //it costs one pass over the faces to find out. Everything below this line is only
+        //reached by a mesh that is genuinely broken.
+        {
+            auto has_degenerate_index = [&mesh]() {
+                for (const stl_triangle_vertex_indices &f : mesh.its.indices)
+                    if (f[0] == f[1] || f[1] == f[2] || f[2] == f[0])
+                        return true;
+                return false;
+            };
+            const std::vector<Vec3i32> neighbors = its_face_neighbors_par(mesh.its);
+            if (its_num_open_edges(neighbors) == 0 && !has_degenerate_index()) {
+                if (repaired_errors)
+                    *repaired_errors = errs;
+                return true;
+            }
+        }
+
+        if (!step("Cleaning up the triangle soup", 5)) throw Canceled{};
+
         // 1) Convert to polygon soup
         std::vector<_EpicMesh::Point>         points;
         std::vector<std::vector<std::size_t>> polygons;
@@ -504,37 +603,69 @@ bool repair(TriangleMesh& mesh, RepairedMeshErrors* repaired_errors, std::string
         for (const auto& f : mesh.its.indices)
             polygons.push_back({size_t(f[0]), size_t(f[1]), size_t(f[2])});
 
-        // 2) Aggressive soup cleanup
+        // 2) Aggressive soup cleanup: merges duplicated points, drops degenerate and
+        //    duplicated polygons and orients what is left consistently.
+        const size_t soup_points_in   = points.size();
+        const size_t soup_polygons_in = polygons.size();
         PMP::repair_polygon_soup(points, polygons);
+        errs.edges_fixed      += int(soup_points_in   - points.size());
+        errs.facets_removed   += int(soup_polygons_in - polygons.size());
 
-        // 3) Convert soup → mesh
+        if (!step("Rebuilding the surface", 20)) throw Canceled{};
+
+        // 3) Convert soup -> mesh
         _EpicMesh cgal_mesh;
         PMP::polygon_soup_to_polygon_mesh(points, polygons, cgal_mesh);
 
         // 4) Remove degenerate geometry
-        PMP::remove_degenerate_faces(cgal_mesh);
+        {
+            const size_t before = num_faces(cgal_mesh);
+            PMP::remove_degenerate_faces(cgal_mesh);
+            errs.degenerate_facets += int(before - num_faces(cgal_mesh));
+            errs.facets_removed    += int(before - num_faces(cgal_mesh));
+        }
         PMP::remove_isolated_vertices(cgal_mesh);
 
         // 5) Fix remaining non-manifold vertices
-        PMP::duplicate_non_manifold_vertices(cgal_mesh);
+        errs.edges_fixed += int(PMP::duplicate_non_manifold_vertices(cgal_mesh));
 
-        // 6) Boolean union (keeps only outer shell)
-        _EpicMesh tmp;
-        if (PMP::corefine_and_compute_union(cgal_mesh, cgal_mesh, tmp)) {
-            cgal_mesh = std::move(tmp);
+        if (!step("Checking for self-intersections", 40)) throw Canceled{};
+
+        // 6) Self-intersections, and ONLY when there are any. The test is an AABB-tree
+        //    sweep; the resolution below it is the expensive operation in this function and
+        //    it is now reached by the meshes that need it instead of by all of them.
+        if (PMP::does_self_intersect(cgal_mesh)) {
+            if (!step("Resolving self-intersections", 45)) throw Canceled{};
+            BOOST_LOG_TRIVIAL(info) << "MeshBoolean::cgal::repair: mesh self-intersects, autorefining";
+            if (!PMP::experimental::autorefine_and_remove_self_intersections(cgal_mesh))
+                BOOST_LOG_TRIVIAL(warning) << "MeshBoolean::cgal::repair: some self-intersections could not be resolved";
         }
-        // If it fails, continue anyway with previous mesh
 
-        // 7) Fill holes
+        if (!step("Filling holes", 70)) throw Canceled{};
+
+        // 7) Fill holes. Plain triangulation, not triangulate_and_refine_hole: refinement
+        //    inserts vertices to match the surrounding edge density, which on the large
+        //    boundary of a cut is thousands of new triangles bought for nothing - the patch
+        //    is interior, never seen, and only has to close the mesh.
         if (!CGAL::is_closed(cgal_mesh)) {
             using halfedge_descriptor = boost::graph_traits<_EpicMesh>::halfedge_descriptor;
+            using face_descriptor     = boost::graph_traits<_EpicMesh>::face_descriptor;
 
             std::vector<halfedge_descriptor> borders;
             PMP::extract_boundary_cycles(cgal_mesh, std::back_inserter(borders));
 
+            int filled = 0;
             for (halfedge_descriptor h : borders) {
-                PMP::triangulate_and_refine_hole(cgal_mesh, h);
+                if (!step("Filling holes", 70)) throw Canceled{};
+                std::vector<face_descriptor> patch;
+                PMP::triangulate_hole(cgal_mesh, h, CGAL::parameters::default_values().face_output_iterator(std::back_inserter(patch)));
+                if (patch.empty())
+                    //A hole the fast triangulator will not span is exactly the case
+                    //refinement exists for, so it is paid for here and nowhere else.
+                    PMP::triangulate_and_refine_hole(cgal_mesh, h);
+                ++filled;
             }
+            errs.backwards_edges += filled;
         }
 
         // 8) Final validity check
@@ -544,23 +675,32 @@ bool repair(TriangleMesh& mesh, RepairedMeshErrors* repaired_errors, std::string
             return false;
         }
 
+        if (!step("Orienting the surface", 90)) throw Canceled{};
+
         // 9) Ensure outward orientation
-        if (!PMP::does_bound_a_volume(cgal_mesh))
+        if (!PMP::does_bound_a_volume(cgal_mesh)) {
             PMP::orient_to_bound_a_volume(cgal_mesh);
+            errs.facets_reversed += int(num_faces(cgal_mesh));
+        }
 
         // 10) Convert back
         indexed_triangle_set its = cgal_to_indexed_triangle_set(cgal_mesh);
 
-        RepairedMeshErrors errs{};
-        errs.facets_removed = 0;
-        errs.edges_fixed    = 0;
+        if (its.indices.size() > src_faces)
+            errs.facets_removed = std::max(0, errs.facets_removed);
 
         mesh = TriangleMesh(std::move(its), errs);
 
         if (repaired_errors)
             *repaired_errors = errs;
 
+        step("Repair finished", 100);
         return true;
+    } catch (const Canceled&) {
+        //Cancelled is not failed: the caller distinguishes the two by the error string.
+        if (error)
+            error->clear();
+        return false;
     } catch (const std::exception& e) {
         if (error)
             *error = e.what();

@@ -962,6 +962,30 @@ void MenuFactory::append_menu_item_rename(wxMenu* menu)
     menu->AppendSeparator();
 }
 
+//Podslicer: the model says it is several parts; this makes it several parts.
+//
+//Two doors on the same operation because there are two ways a model tells you where its pieces
+//are. Colour is the one the user chose themselves, and a painted region is already solid all
+//the way through when it prints - so separating by colour only makes visible what the slicer
+//was going to do anyway, and hands back pieces that can be printed apart and clicked together.
+void MenuFactory::append_menu_item_separate_parts(wxMenu* menu)
+{
+    wxMenu* sub = new wxMenu;
+
+    append_menu_item(sub, wxID_ANY, _L("By painted colour"),
+        _L("Turn each painted colour into a real part, capped where it meets the others"),
+        [](wxCommandEvent&) { obj_list()->separate_parts(true, true); }, "", sub,
+        []() { return plater()->can_separate_parts(); }, plater());
+
+    append_menu_item(sub, wxID_ANY, _L("At inward seams"),
+        _L("Separate the pieces this model already looks like it is made of"),
+        [](wxCommandEvent&) { obj_list()->separate_parts(false, false); }, "", sub,
+        []() { return plater()->can_separate_parts(); }, plater());
+
+    append_submenu(menu, sub, wxID_ANY, _L("Separate Parts"),
+                   _L("Split this model into the parts its surface is pretending it already has"), "");
+}
+
 wxMenuItem* MenuFactory::append_menu_item_fix_through_cgal(wxMenu* menu)
 {
     wxMenuItem* menu_item = append_menu_item(menu, wxID_ANY, _L("Fix Model"), "",
@@ -1487,6 +1511,7 @@ void MenuFactory::create_extra_object_menu()
     // Object Clone
     append_menu_item_clone(&m_object_menu);
     // Object Repair
+    append_menu_item_separate_parts(&m_object_menu);
     append_menu_item_fix_through_cgal(&m_object_menu);
     // Object Simplify
     append_menu_item_simplify(&m_object_menu);
@@ -1954,7 +1979,7 @@ wxMenu* MenuFactory::multi_selection_menu()
         }
         append_menu_item_center(menu);
         append_menu_item_drop(menu);
-        append_menu_item_fix_through_cgal(menu);
+    append_menu_item_fix_through_cgal(menu);
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);
         menu->AppendSeparator();
@@ -1979,7 +2004,7 @@ wxMenu* MenuFactory::multi_selection_menu()
     else {
         append_menu_item_center(menu);
         append_menu_item_drop(menu);
-        append_menu_item_fix_through_cgal(menu);
+    append_menu_item_fix_through_cgal(menu);
         //append_menu_item_simplify(menu);
         append_menu_item_delete(menu);
         append_menu_items_convert_unit(menu);

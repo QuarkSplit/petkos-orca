@@ -330,8 +330,31 @@ public:
     static bool          has_facets(const TriangleSplittingData &data, EnforcerBlockerType test_state);
     int                  num_facets(EnforcerBlockerType state) const;
     // Get facets at a given state. Don't triangulate T-joints.
+    //Podslicer: one committed state per ORIGINAL facet, chosen by area when the facet has been
+    //subdivided by painting. A part has to be bounded by whole triangles - sub-facet detail is
+    //a picture on a surface, not a place a body can end - so the question "which part is this
+    //face in" only has a whole-facet answer, and this is it.
+    std::vector<EnforcerBlockerType> get_facet_states() const;
+
     indexed_triangle_set get_facets(EnforcerBlockerType state) const;
     // Get facets at a given state. Triangulate T-joints.
+    //Podslicer: the whole painted surface as ONE conforming triangulation, plus the state and
+    //the source facet of every triangle in it.
+    //
+    //This is what makes a cut follow the paint instead of the mesh. Painting subdivides a facet
+    //to whatever depth the brush needed, and get_facets_split_by_tjoints() closes the T-joints
+    //that leaves, so painted and unpainted triangles here share their boundary vertices exactly
+    //- which means the line between two colours is an EDGE LOOP of this mesh, not a line drawn
+    //across its triangles. A cut along that loop needs no intersection, no refinement and no
+    //arithmetic: it is a choice of which triangles go where.
+    indexed_triangle_set get_facets_conforming(std::vector<EnforcerBlockerType> &states_out,
+                                               std::vector<int>                 &source_facet_out) const;
+
+    //The inverse of get_facet_states(): one committed state per face, encoded back into the
+    //form the model stores. Used to give a mesh whose faces are each a single colour the paint
+    //that says so.
+    static TriangleSplittingData painting_from_facet_states(const std::vector<EnforcerBlockerType> &states);
+
     indexed_triangle_set get_facets_strict(EnforcerBlockerType state) const;
     // Get edges around the selected area by seed fill.
     std::vector<Vec2i32> get_seed_fill_contour() const;
@@ -381,6 +404,19 @@ public:
         TriangleSplittingData mmu;
         TriangleSplittingData fuzzy;
     };
+
+    //Podslicer: the exact remap, for the case where the target mesh is the source mesh with
+    //its faces permuted and some of them dropped - which is what a cut along existing edges
+    //produces. `src_to_dst_facet[i]` is the target index of source face i, or -1 if the face
+    //is not in this part.
+    //
+    //The spatial remap below this one exists because a boolean returns geometry with no
+    //relationship to the faces that went in, so paint has to be found again by looking. When
+    //face identity survives, looking for it is not an approximation of the answer, it is a
+    //slower and worse version of an answer already in hand: this one is exact, keeps
+    //sub-facet detail bit for bit, and costs one pass over the bitstream.
+    static TriangleSplittingData remap_painting_by_facet_map(const TriangleSplittingData &source_painting,
+                                                             const std::vector<int>      &src_to_dst_facet);
 
     // Remap painting data from source mesh to target mesh using spatial mapping.
     // `target_transform` should transform the target mesh into source's coordinate space.
@@ -535,6 +571,10 @@ private:
         const Vec3i32                                 &neighbors,
         EnforcerBlockerType                          state,
         std::vector<stl_triangle_vertex_indices>    &out_triangles) const;
+    void get_facets_conforming_recursive(const Triangle &tr, const Vec3i32 &neighbors,
+                                         std::vector<stl_triangle_vertex_indices> &out_triangles,
+                                         std::vector<EnforcerBlockerType> &states, std::vector<int> &source_facet,
+                                         int orig_facet) const;
     void get_facets_split_by_tjoints(const Vec3i32 &vertices, const Vec3i32 &neighbors, std::vector<stl_triangle_vertex_indices> &out_triangles) const;
 
     void get_seed_fill_contour_recursive(int facet_idx, const Vec3i32 &neighbors, const Vec3i32 &neighbors_propagated, std::vector<Vec2i32> &edges_out) const;

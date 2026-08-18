@@ -1,5 +1,6 @@
 
 #include "CutUtils.hpp"
+#include "CutRegion.hpp"
 #include "ClipperUtils.hpp"
 #include "ExPolygon.hpp"
 #include "Geometry.hpp"
@@ -598,6 +599,240 @@ void Cut::finalize(const ModelObjectPtrs& objects, const std::vector<std::option
     m_model.objects = objects;
 }
 
+
+//Podslicer: the model-level half of a region cut.
+//
+//Nothing here moves anything. Every part keeps the volume matrix and the instance it was born
+//with, so the pieces come out sitting exactly inside the shape they were cut from - which is
+//what lets you look at the result and see whether the split is the one you meant before you
+//pull the pieces apart. The plane cutter has to reposition because it halves a bounding box;
+//this does not, because it only re-labels what is already there.
+ModelObjectPtrs cut_object_by_regions(const ModelObject &src, int instance_idx, const RegionCutSpec &spec,
+                                      RegionCutReport &report, std::string &failure)
+{
+    report  = RegionCutReport();
+    failure.clear();
+
+    //ModelObject's destructor is private - a Model owns them - so anything abandoned along the
+    //way is handed to this scratch model, which frees it when it goes out of scope.
+    Model scratch;
+    auto  discard = [&scratch](ModelObject *o) { if (o) scratch.objects.push_back(o); };
+
+    ModelObjectPtrs out;
+    if (spec.label_count < 2) {
+        failure = "the whole model is one part, so there is nothing to separate";
+        return out;
+    }
+    if (instance_idx < 0 || instance_idx >= int(src.instances.size())) {
+        failure = "the object has no instance to cut";
+        return out;
+    }
+
+    //A part is only real once it has geometry, so the objects are built first and the empty
+    //ones are dropped at the end rather than guessed at up front.
+    const int                 part_count = spec.keep_as_parts ? 1 : spec.label_count;
+    std::vector<ModelObject *> objects(size_t(part_count), nullptr);
+    for (int i = 0; i < part_count; ++i) {
+        const_cast<ModelObject &>(src).clone_for_cut(&objects[size_t(i)]);
+        objects[size_t(i)]->cut_id.invalidate();
+    }
+    // Which labels actually produced geometry, so an object holding none can be discarded.
+    std::vector<bool> label_used(size_t(spec.label_count), false);
+
+    auto part_name = [&spec](int label) {
+        if (label < int(spec.part_names.size()) && !spec.part_names[size_t(label)].empty())
+            return spec.part_names[size_t(label)];
+        return std::string("Part ") + std::to_string(label + 1);
+    };
+
+    for (size_t vi = 0; vi < src.volumes.size(); ++vi) {
+        const ModelVolume *volume = src.volumes[vi];
+        if (volume == nullptr)
+            continue;
+
+        //Modifiers, negatives and connectors are not being cut; they are placed with whichever
+        //parts they actually touch, because a modifier that reaches nothing is noise and one
+        //that is dropped changes the print.
+        if (!volume->is_model_part()) {
+            const BoundingBoxf3 vol_bb = volume->mesh().transformed_bounding_box(volume->get_matrix());
+            for (int label = 0; label < spec.label_count; ++label) {
+                ModelObject *target = objects[spec.keep_as_parts ? 0 : size_t(label)];
+                if (target == nullptr)
+                    continue;
+                bool touches = false;
+                for (const ModelVolume *v : target->volumes)
+                    if (v->is_model_part() && v->mesh().transformed_bounding_box(v->get_matrix()).intersects(vol_bb)) {
+                        touches = true;
+                        break;
+                    }
+                if (touches || spec.keep_as_parts) {
+                    target->add_volume(*volume);
+                    if (spec.keep_as_parts)
+                        break;
+                }
+            }
+            continue;
+        }
+
+        if (volume->mesh().empty())
+            continue;
+
+        const auto spec_it = spec.volumes.find(vi);
+
+        //Either the volume's own triangulation, or the finer one painting produced. Both
+        //describe the same surface, so which one is cut changes nothing about the shape - only
+        //about where the cut is allowed to run.
+        const bool                  refined = spec_it != spec.volumes.end() && !spec_it->second.conforming.indices.empty();
+        const indexed_triangle_set &its     = refined ? spec_it->second.conforming : volume->mesh().its;
+        const std::vector<int>     *src_face_of = refined ? &spec_it->second.source_face : nullptr;
+
+        std::vector<int> labels;
+        if (spec_it == spec.volumes.end() || spec_it->second.labels.size() != its.indices.size())
+            //A volume nobody labelled is not ambiguous: it was not part of the question, so it
+            //stays whole and goes to the first part.
+            labels.assign(its.indices.size(), 0);
+        else
+            labels = spec_it->second.labels;
+
+        //Whole-facet states of the volume's own faces, for the channels this cut is not being
+        //made by. Read once per volume, not once per part.
+        std::vector<std::vector<EnforcerBlockerType>> other_states;
+        if (refined) {
+            auto states_of = [&volume](const FacetsAnnotation &fa) {
+                std::vector<EnforcerBlockerType> st;
+                if (!fa.empty()) {
+                    TriangleMesh     m(volume->mesh().its);
+                    TriangleSelector sel(m);
+                    sel.deserialize(fa.get_data(), true);
+                    st = sel.get_facet_states();
+                }
+                return st;
+            };
+            other_states.push_back(states_of(volume->supported_facets));
+            other_states.push_back(states_of(volume->seam_facets));
+            other_states.push_back(states_of(volume->mmu_segmentation_facets));
+            other_states.push_back(states_of(volume->fuzzy_skin_facets));
+        }
+
+        CutRegionResult split;
+        std::string     why;
+        if (!split_by_labels(its, labels, spec.label_count, true, split, why)) {
+            failure = why;
+            for (ModelObject *o : objects)
+                discard(o);
+            return ModelObjectPtrs();
+        }
+
+        report.cut_loops       += split.cut_loops;
+        report.unspanned_loops += split.unspanned_loops;
+        report.fanned_loops    += split.fanned_loops;
+
+        //A watertight source has to come back out as the same amount of material. When it does
+        //not, something about this volume's outline defeated the lid, and handing over parts
+        //that look right and are not is the one outcome worse than refusing.
+        if (!split.volume_conserved && its_num_open_edges(its) == 0) {
+            report.volume_conserved = false;
+            failure = "the parts did not add up to the model they came from";
+            for (ModelObject *o : objects)
+                discard(o);
+            return ModelObjectPtrs();
+        }
+
+        for (int label = 0; label < spec.label_count; ++label) {
+            CutRegionPart &part = split.parts[size_t(label)];
+            if (part.mesh.indices.empty())
+                continue;
+            label_used[size_t(label)] = true;
+
+            ModelObject *target = objects[spec.keep_as_parts ? 0 : size_t(label)];
+
+            TriangleMesh part_mesh(std::move(part.mesh));
+            ModelVolume *new_volume = target->add_volume(*volume, std::move(part_mesh));
+            new_volume->name        = spec.keep_as_parts || src.volumes.size() > 1
+                                          ? volume->name + " - " + part_name(label)
+                                          : volume->name;
+            new_volume->cut_info = ModelVolume::CutInfo();
+
+            if (!refined) {
+                //Same faces, so every painted channel comes across by index: exact, instant,
+                //and it keeps detail finer than a facet.
+                std::vector<int> src_to_dst(its.indices.size(), -1);
+                for (size_t f = 0; f < part.src_face.size(); ++f)
+                    if (part.src_face[f] >= 0)
+                        src_to_dst[size_t(part.src_face[f])] = int(f);
+                new_volume->remap_painting_by_facets(src_to_dst, *volume);
+            }
+            else {
+                //The mesh was refined so the cut could follow the paint, so the other channels
+                //come across at whole-facet resolution - which is the resolution a body can be
+                //bounded at anyway.
+                FacetsAnnotation *targets[4] = {&new_volume->supported_facets, &new_volume->seam_facets,
+                                                &new_volume->mmu_segmentation_facets, &new_volume->fuzzy_skin_facets};
+                for (size_t ch = 0; ch < 4; ++ch) {
+                    if (other_states[ch].empty())
+                        continue;
+                    std::vector<EnforcerBlockerType> dst(part.src_face.size(), EnforcerBlockerType::NONE);
+                    for (size_t f = 0; f < part.src_face.size(); ++f) {
+                        const int cf = part.src_face[f];
+                        if (cf < 0 || src_face_of == nullptr || cf >= int(src_face_of->size()))
+                            continue;
+                        const int of = (*src_face_of)[size_t(cf)];
+                        if (of >= 0 && of < int(other_states[ch].size()))
+                            dst[f] = other_states[ch][size_t(of)];
+                    }
+                    auto data = TriangleSelector::painting_from_facet_states(dst);
+                    if (data.bitstream.empty())
+                        targets[ch]->reset();
+                    else
+                        targets[ch]->set_data(std::move(data));
+                }
+            }
+
+            //A part cut out of a painted model IS that colour. Saying so on the volume is the
+            //difference between "here are some shapes" and "here are the pieces, in the colours
+            //you already chose, ready to print".
+            if (label < int(spec.part_extruders.size()) && spec.part_extruders[size_t(label)] > 0) {
+                new_volume->config.set_key_value("extruder", new ConfigOptionInt(spec.part_extruders[size_t(label)]));
+                //The colour is the part now, so carrying the paint that said so would paint it
+                //on top of itself.
+                new_volume->mmu_segmentation_facets.reset();
+            }
+
+            if (its_num_open_edges(new_volume->mesh().its) > 0)
+                ++report.open_parts;
+        }
+    }
+
+    if (spec.keep_as_parts) {
+        ModelObject *object = objects.front();
+        if (object->volumes.empty()) {
+            discard(object);
+            failure = "the cut produced no geometry";
+            return ModelObjectPtrs();
+        }
+        object->sort_volumes(true);
+        object->invalidate_bounding_box();
+        out.push_back(object);
+    }
+    else {
+        for (int label = 0; label < spec.label_count; ++label) {
+            ModelObject *object = objects[size_t(label)];
+            if (!label_used[size_t(label)] || object->volumes.empty()) {
+                discard(object);
+                continue;
+            }
+            object->name = src.name + " - " + part_name(label);
+            object->invalidate_bounding_box();
+            object->ensure_on_bed();
+            out.push_back(object);
+        }
+    }
+
+    report.parts_made = out.size() == 1 && spec.keep_as_parts ? out.front()->volumes.size() : out.size();
+    if (out.empty())
+        failure = "the cut produced no geometry";
+    return out;
+}
 
 const ModelObjectPtrs& Cut::perform_with_bounded_plane(const CutBounds& bounds)
 {

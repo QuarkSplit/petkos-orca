@@ -159,9 +159,25 @@ bool fix_model_with_cgal_gui(ModelObject &model_object, int volume_idx, GUI::Pro
                                                                                             part_volume->save_painting() :
                                                                                             std::optional<TriangleSelector::SavedPainting>{};
 
+                        //The repair runs inside CGAL for as long as the mesh needs, so Cancel has to
+                        //reach in rather than be checked after it returns - that wait was the whole of
+                        //"I gave up after fifteen minutes". Returning false from here unwinds CGAL.
                         std::string error;
-                        if (!MeshBoolean::cgal::repair(mesh, nullptr, &error))
-                            throw Slic3r::RuntimeError(error.empty() ? _u8L("Repair failed") : error);
+                        const bool  repaired = MeshBoolean::cgal::repair(
+                            mesh, nullptr, &error,
+                            [&on_progress, &canceled](const char *what, int percent) {
+                                if (canceled)
+                                    return false;
+                                //10..90 of this volume's share; the surrounding loop owns the ends.
+                                on_progress(what, unsigned(10 + (percent * 80) / 100));
+                                return true;
+                            });
+                        if (!repaired) {
+                            if (error.empty())
+                                //An empty error is a cancel, not a failure.
+                                throw RepairCanceledException();
+                            throw Slic3r::RuntimeError(error);
+                        }
 
                         part_volume->set_mesh(std::move(mesh));
                         part_volume->calculate_convex_hull();

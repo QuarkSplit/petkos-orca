@@ -94,6 +94,58 @@ bool compute_bounded_splits(const std::vector<CutBoundedInput> &inputs, const Tr
                             const std::function<bool()> &canceled = std::function<bool()>());
 
 
+//Podslicer: separating the parts a model is only PRETENDING to have.
+//
+//The whole instruction is a labelling of faces - which part each triangle belongs to - and it
+//can come from a click (fill outwards from here until the surface folds inwards), from the
+//paint already on the model (the colours ARE the parts), or from anything else that can name
+//a face. The geometry never gets resampled, so this is exact, instant, and keeps every
+//painted facet by identity instead of hunting for it again afterwards.
+struct RegionCutVolume
+{
+    //Optionally, a different triangulation of the SAME surface to cut instead of the volume's
+    //own - the one painting produced, where the line between two colours is an edge rather than
+    //a line drawn across a triangle. Empty means cut the volume's mesh as it stands.
+    indexed_triangle_set conforming;
+    // For each face of `conforming`, the face of the volume's own mesh it was subdivided from.
+    std::vector<int>     source_face;
+    // One label per face of whichever of the two meshes is being cut.
+    std::vector<int>     labels;
+};
+
+struct RegionCutSpec
+{
+    // Volume index in ModelObject::volumes -> how that volume is to be divided.
+    // A model-part volume with no entry here goes to part 0 whole.
+    std::map<size_t, RegionCutVolume>  volumes;
+    int                                label_count{0};
+    //One object holding N parts, or N objects. Parts keep an assembled model together and let
+    //each piece take its own filament; objects are for sending the pieces to different plates.
+    bool                               keep_as_parts{true};
+    // Optional, per label: what to call the part, and which filament it stands for (1-based, 0 = leave alone).
+    std::vector<std::string>           part_names;
+    std::vector<int>                   part_extruders;
+};
+
+struct RegionCutReport
+{
+    size_t parts_made{0};
+    size_t cut_loops{0};
+    // Loops no surface could span: those openings are left open rather than closed wrongly.
+    size_t unspanned_loops{0};
+    // Parts that came out of this not watertight, which only happens on input that was not.
+    size_t open_parts{0};
+    // Outlines whose minimal lid would have been made of the model's own skin, fanned instead.
+    size_t fanned_loops{0};
+    //False when the parts do not add up to what went in. The cut is then refused: geometry
+    //that fails its own arithmetic is not a result, whatever it looks like on screen.
+    bool   volume_conserved{true};
+};
+
+//Returns the new objects, empty on failure with `failure` set. `src` is not modified.
+ModelObjectPtrs cut_object_by_regions(const ModelObject &src, int instance_idx, const RegionCutSpec &spec,
+                                      RegionCutReport &report, std::string &failure);
+
 class Cut {
 
     Model                       m_model;

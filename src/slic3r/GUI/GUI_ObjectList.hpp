@@ -437,6 +437,9 @@ public:
     void instances_to_separated_objects(const int obj_idx);
     void split_instances();
     void rename_item();
+    //Podslicer: separate the parts a model only looks like it has - by the colour already
+    //painted on it, or by the inward seams where its pieces meet.
+    void separate_parts(bool by_paint, bool keep_as_parts);
     void fix_through_cgal();
     void simplify();
     void smooth_mesh();

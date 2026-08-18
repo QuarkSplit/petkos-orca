@@ -2,6 +2,7 @@
 #define libslic3r_MeshBoolean_hpp_
 
 #include <memory>
+#include <functional>
 #include <exception>
 
 #include <libslic3r/TriangleMesh.hpp>
@@ -71,8 +72,15 @@ TriangleMesh merge(std::vector<TriangleMesh> meshes);
 bool does_bound_a_volume(const CGALMesh &mesh);
 bool empty(const CGALMesh &mesh);
 
+// Span a closed 3D loop with a triangle patch. Indices are into `loop`. One patch, so both
+// sides of a cut can be closed with the same surface wound opposite ways and still mate.
+bool triangulate_loop(const std::vector<Vec3f> &loop, std::vector<Vec3i32> &triangles, std::string *error = nullptr);
+
 // Repair a mesh using CGAL. Returns true on success. Optionally returns a summary of repairs and an error string.
-bool repair(TriangleMesh &mesh, RepairedMeshErrors *repaired_errors = nullptr, std::string *error = nullptr);
+// `progress` is called as (what_is_happening, percent) between steps; returning false cancels, and a
+// cancelled repair returns false with an EMPTY error string, which is how a caller tells the two apart.
+bool repair(TriangleMesh &mesh, RepairedMeshErrors *repaired_errors = nullptr, std::string *error = nullptr,
+            const std::function<bool(const char *, int)> &progress = {});
 }
 
 namespace mcut {

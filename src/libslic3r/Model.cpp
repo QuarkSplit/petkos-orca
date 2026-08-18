@@ -2015,6 +2015,26 @@ std::optional<TriangleSelector::SavedPainting> ModelVolume::save_painting() cons
     return {};
 }
 
+void ModelVolume::remap_painting_by_facets(const std::vector<int>& src_to_dst_facet, const ModelVolume& source)
+{
+    auto carry = [&src_to_dst_facet](const TriangleSelector::TriangleSplittingData& src, FacetsAnnotation& target) {
+        if (src.bitstream.empty()) {
+            target.reset();
+            return;
+        }
+        TriangleSelector::TriangleSplittingData mapped = TriangleSelector::remap_painting_by_facet_map(src, src_to_dst_facet);
+        if (mapped.bitstream.empty())
+            target.reset();
+        else
+            target.set_data(std::move(mapped));
+    };
+
+    carry(source.supported_facets.get_data(),        this->supported_facets);
+    carry(source.seam_facets.get_data(),             this->seam_facets);
+    carry(source.mmu_segmentation_facets.get_data(), this->mmu_segmentation_facets);
+    carry(source.fuzzy_skin_facets.get_data(),       this->fuzzy_skin_facets);
+}
+
 void ModelVolume::restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, const bool keep_existing_paint)
 {
     if (!keep_existing_paint) {

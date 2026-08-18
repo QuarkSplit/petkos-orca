@@ -6166,6 +6166,7 @@ struct Plater::priv
     bool can_arrange() const;
     bool can_layers_editing() const;
     bool can_fix_through_cgal() const;
+    bool can_separate_parts() const;
     bool can_simplify() const;
     bool can_smooth_mesh() const;
     bool can_set_instance_to_object() const;
@@ -13277,6 +13278,20 @@ bool Plater::priv::can_fix_through_cgal() const
             return true;
     return false;
 #endif // FIX_THROUGH_CGAL_ALWAYS
+}
+
+bool Plater::priv::can_separate_parts() const
+{
+    //One object, because the answer to "what are this thing's parts" is about one thing. The
+    //menu stays live whether or not it will find anything: whether a model comes apart is not
+    //knowable without doing the work, and a greyed-out item that would have worked is worse
+    //than a message saying it found nothing.
+    std::vector<int> obj_idxs, vol_idxs;
+    sidebar->obj_list()->get_selection_indexes(obj_idxs, vol_idxs);
+    if (obj_idxs.size() != 1)
+        return false;
+    const ModelObject *mo = model.objects[obj_idxs.front()];
+    return mo != nullptr && !mo->volumes.empty() && !mo->instances.empty();
 }
 
 bool Plater::priv::can_simplify() const
@@ -22001,6 +22016,7 @@ bool Plater::can_increase_instances() const { return p->can_increase_instances()
 bool Plater::can_decrease_instances() const { return p->can_decrease_instances(); }
 bool Plater::can_set_instance_to_object() const { return p->can_set_instance_to_object(); }
 bool Plater::can_fix_through_cgal() const { return p->can_fix_through_cgal(); }
+bool Plater::can_separate_parts() const { return p->can_separate_parts(); }
 bool Plater::can_simplify() const { return p->can_simplify(); }
 bool Plater::can_smooth_mesh() const { return p->can_smooth_mesh(); }
 bool Plater::can_split_to_objects() const { return p->can_split_to_objects(); }
