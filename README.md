@@ -1,3 +1,34 @@
+# PetkosOrca
+
+**A fork of [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) that makes one project genuinely multi-machine.**
+
+Upstream, a project targets one printer. Here, **every plate can target a different one**, each drawn at its real bed size and persisted to the 3MF. Upstream closed the request as *not planned*; this fork implements it.
+
+Default branch: [`per-plate-machines`](https://github.com/QuarkSplit/petkos-orca/tree/per-plate-machines). Upstream's own README follows below, unchanged.
+
+## Why it is not a small change
+
+Plate geometry was effectively global. Making it per-plate meant rewriting the plate layout maths and the plate-membership rebuild, then proving the single-printer path had not moved: the original code path is **verified byte-identical** against pre-change output. A slicer that quietly changes existing G-code is worse than one that lacks a feature.
+
+The fork runs on a codebase of roughly **30,000 commits**, so most of the work is reading it rather than adding to it.
+
+## What is in the fork
+
+- **Per-plate machine assignment.** One project, a different printer per plate, real bed geometry per plate, written to and read back from the 3MF.
+- **Cross-printer import.** A project authored against one machine opens against another without a load-path query throwing, and renaming a preset renames its referrers rather than orphaning them.
+- **A bounded planar cut.** Cutting driven by a face partition rather than a boolean — a loop-on-hover planar cut, and a dihedral flood-fill separation that yields one lid with consistent winding.
+- **GUI frame time: 86.6 ms → 5.8 ms.** One mechanism caused it. A 974-option configuration was being composed on every read; hoisting and memoising that composition, with a per-thread compose scope, is the whole fix. Measured back-to-back on the same machine and build, because that is the only comparison a frame-time number honestly supports.
+
+## Building
+
+Build instructions, dependencies and platform notes are upstream's and unchanged — see the OrcaSlicer README below.
+
+## Licence and attribution
+
+This is a fork of OrcaSlicer and inherits its licence (AGPL-3.0). All upstream copyright and attribution stand. OrcaSlicer is not affiliated with this fork and does not endorse it; issues with this fork belong here, not upstream.
+
+---
+
 <div align="center">
 
 <picture>
