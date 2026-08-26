@@ -6508,6 +6508,49 @@ void GCode::apply_print_config(const PrintConfig &print_config)
 #endif
 }
 
+//Two consumers read `printer_model` and they do not want the same string.
+//
+//Orca uses it as the KEY that links a machine preset to its vendor model: the printer picker,
+//the AppConfig entry and the vendor's model list are all keyed by the display name
+//("Prusa CORE One"), so the config value itself cannot change without breaking the link.
+//
+//Prusa's Buddy firmware reads `; printer_model` out of the G-code and compares it against its
+//own model id, which is a short code - COREONE, MK4IS, XLIS. PrusaSlicer has no conflict here
+//because its printer_model field IS that code. Ours is not, so a file that is correct in every
+//other respect the firmware checks - filament_type, nozzle_diameter, filament used [g], the
+//M862.3 assertion itself - still arrives as a G-code the printer does not recognise as its own,
+//and the print preview refuses it.
+//
+//The machine already states the code, in the one place that is not a guess: its own start
+//G-code asserts it to the firmware as `M862.3 P "COREONE"`. Reading it back from there makes
+//the metadata agree with the assertion by construction, and it reaches exactly the machines
+//whose firmware performs the check, because carrying M862.3 is what being one of them means.
+static std::string gcode_printer_model(const DynamicPrintConfig &cfg)
+{
+    const std::string declared = cfg.opt_serialize("printer_model");
+    if (!cfg.has("machine_start_gcode"))
+        return declared;
+    const std::string start = cfg.opt_serialize("machine_start_gcode");
+    const size_t at = start.find("M862.3");
+    if (at == std::string::npos)
+        return declared;
+    const size_t quote = start.find('"', at);
+    if (quote == std::string::npos)
+        return declared;
+    //The serialized form escapes its quotes, so take the model id as the run of id characters
+    //that follows the opening quote rather than everything up to the closing one.
+    std::string code;
+    for (size_t i = quote + 1; i < start.size(); ++i) {
+        const char c = start[i];
+        const bool id_char = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                             (c >= 'a' && c <= 'z') || c == '.';
+        if (!id_char)
+            break;
+        code += c;
+    }
+    return code.empty() ? declared : code;
+}
+
 void GCode::append_full_config(const Print &print, std::string &str)
 {
     DynamicPrintConfig cfg = print.full_print_config();
@@ -6587,6 +6630,8 @@ void GCode::append_full_config(const Print &print, std::string &str)
             }
             if(key == "extruder_colour")
                 ss << "; " << key << " = " << cfg.opt_serialize("filament_colour") << "\n";
+            else if (key == "printer_model")
+                ss << "; " << key << " = " << gcode_printer_model(cfg) << "\n";
             else
                 ss << "; " << key << " = " << cfg.opt_serialize(key) << "\n";
         }
