@@ -368,6 +368,7 @@ static constexpr const char* PLATER_PRINTER_PRESET_ATTR = "plater_printer_preset
 static constexpr const char* PLATER_PRINTER_VENDOR_ATTR = "plater_printer_vendor";
 static constexpr const char* PLATER_PRINT_PRESET_ATTR = "plater_print_preset";
 static constexpr const char* PLATER_FILAMENT_PRESETS_ATTR = "plater_filament_presets";
+static constexpr const char* PLATER_FILAMENT_COLOURS_ATTR = "plater_filament_colours";
 static constexpr const char* PLATER_PHYSICAL_PRINTER_ATTR = "plater_physical_printer";
 static constexpr const char* PLATER_SLICED_CONFIG_PREFIX = "plater_sliced_config:";
 // PetkosOrca: a plate's own config overrides, every key of them. The named attributes further
@@ -4506,6 +4507,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     return false;
                 }
             }
+            else if (key == PLATER_FILAMENT_COLOURS_ATTR) {
+                const std::string encoded = xml_unescape(value.c_str());
+                if (!unescape_strings_cstyle(encoded, m_curr_plater->slicing_context.filament_colours)) {
+                    add_error("Invalid per-plate filament colour list");
+                    return false;
+                }
+            }
             else if (key == PLATER_PHYSICAL_PRINTER_ATTR) {
                 m_curr_plater->slicing_context.physical_printer_id = xml_unescape(value.c_str());
             }
@@ -8164,6 +8172,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 if (!context.filament_preset_names.empty()) {
                     const std::string encoded = escape_strings_cstyle(context.filament_preset_names);
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_PRESETS_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
+                }
+                if (!context.filament_colours.empty()) {
+                    const std::string encoded = escape_strings_cstyle(context.filament_colours);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_COLOURS_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
                 }
                 if (!context.physical_printer_id.empty())
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PHYSICAL_PRINTER_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.physical_printer_id.c_str()) << "\"/>\n";

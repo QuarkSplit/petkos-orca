@@ -334,12 +334,21 @@ void GLGizmoKnife::commit(bool close_after)
 
         ModelVolume *old = mo->volumes[m_target_volume_idx];
 
+        //Save-before, replay-after: the cut gizmo's pattern. The fragments live in the same
+        //local frame as the source mesh, so the source's painted channels (filament colour,
+        //seams, supports, fuzzy skin) remap onto every piece spatially; a fragment simply
+        //fails to find the geometry it did not receive. Additive, so iterated cuts lose
+        //nothing. Without this every knife stroke stripped the paint off all the pieces.
+        const std::optional<TriangleSelector::SavedPainting> saved_painting = old->save_painting();
+
         ModelVolume *first_piece = nullptr;
         int          piece       = 0;
         for (const Fragment &fragment : m_fragments) {
             ModelVolume *v = mo->add_volume(*old, TriangleMesh(*fragment.mesh));
             v->name        = old->name + " - " + GUI::format(_L("cut %1%"), ++piece);
             v->set_new_unique_id();
+            if (saved_painting)
+                v->restore_painting(saved_painting, true);
             if (first_piece == nullptr)
                 first_piece = v;
         }

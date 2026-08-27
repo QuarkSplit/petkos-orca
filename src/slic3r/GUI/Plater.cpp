@@ -4258,10 +4258,11 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     if (filament_id > filament_count)
         return;
 
-    // Deleting a filament prunes every painted facet that named it, across the whole model, and it is the
-    // one path allowed to do that. An operation that destroys paint has to be undoable, so the snapshot is
-    // taken here rather than at either entry point - the sidebar button and the object menu both land here,
-    // as does change_filament - and it is taken before the first mutation, which is the tab selection below.
+    // Removing a spool from the pool removes exactly that: a row in the list of what is
+    // available. Plates hold their materials by value - preset name and colour on the plate's
+    // own context - and object extruder numbers index PLATE slots, so nothing here renumbers a
+    // plate, rewrites an object or touches a painted facet. The old behaviour did all three,
+    // which is how deleting a sidebar row could silently strip paint off every model.
     wxGetApp().plater()->take_snapshot(std::string("Delete filament"));
 
     if (wxGetApp().preset_bundle->is_the_only_edited_filament(filament_id) || (filament_id == 0)) {
@@ -4279,8 +4280,6 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     }
 
     wxGetApp().preset_bundle->update_num_filaments(filament_id);
-    wxGetApp().plater()->get_partplate_list().on_filament_deleted(filament_count, filament_id);
-    wxGetApp().plater()->on_filaments_delete(filament_count, filament_id, replace_filament_id > (int)filament_id ? (replace_filament_id - 1) : replace_filament_id);
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
 
@@ -4315,7 +4314,8 @@ void Sidebar::add_custom_filament(wxColour new_col) {
     int         filament_count = p->combos_filament.size() + 1;
     std::string new_color      = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
     wxGetApp().preset_bundle->set_num_filaments(filament_count, new_color);
-    wxGetApp().plater()->get_partplate_list().on_filament_added(filament_count);
+    //A new spool in the pool is a new row in what is available, nothing more. No plate grows
+    //a slot for it - a plate takes it from the pool when the user assigns it there.
     wxGetApp().plater()->on_filament_count_change(filament_count);
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
@@ -4735,6 +4735,10 @@ bool apply_exact_plate_ams_sync(Plater                              &plater,
 
     PlateSlicingContext context = plate.get_slicing_context();
     context.filament_preset_names = preset_names;
+    //The context is the plate's one colour store. Writing these into the plate's override
+    //config - the old home - made them count as process overrides, get deleted by "clear
+    //overrides", and stomp the properly sized composed colours.
+    context.filament_colours = colors;
     ResolvedPlateSlicingConfig prospective;
     if (!bundle.resolve_plate_slicing_config(context,
                                              plate.get_real_filament_maps(bundle.project_config),
@@ -4744,9 +4748,6 @@ bool apply_exact_plate_ams_sync(Plater                              &plater,
 
     plater.take_snapshot("Synchronize plate filaments with AMS");
     plate.set_slicing_context(context);
-    plate.config()->option<ConfigOptionStrings>("filament_colour", true)->values       = std::move(colors);
-    plate.config()->option<ConfigOptionStrings>("filament_colour_type", true)->values  = std::move(color_types);
-    plate.config()->option<ConfigOptionStrings>("filament_multi_colour", true)->values = std::move(multi);
     plater.set_plater_dirty(true);
     plater.set_current_canvas_as_dirty();
     plater.update_all_plate_thumbnails(true);
@@ -7939,6 +7940,8 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 declared.printer_preset_name   = preset_bundle->printers.get_selected_preset_name();
                                 declared.print_preset_name     = preset_bundle->prints.get_selected_preset_name();
                                 declared.filament_preset_names = preset_bundle->filament_presets;
+                                if (const auto *colours = preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour"))
+                                    declared.filament_colours = colours->values;
                                 const int completed = partplate_list.complete_plate_contexts(declared);
                                 if (completed > 0) {
                                     BOOST_LOG_TRIVIAL(info)
@@ -9179,7 +9182,8 @@ void Plater::priv::split_object(int obj_idx, bool auto_drop /* = true */)
 
     wxBusyCursor wait;
     ModelObjectPtrs new_objects;
-    current_model_object->split(&new_objects, wxGetApp().app_config->get_bool("keep_painting"));
+    //Paint always survives a split; the false branch of the old preference actively deleted it.
+    current_model_object->split(&new_objects, /*remap_paint=*/true);
     if (new_objects.size() == 1)
         // #ysFIXME use notification
         Slic3r::GUI::warning_catcher(q, _L("The selected object couldn't be split."));
@@ -9488,12 +9492,49 @@ Print::ApplyStatus Plater::priv::apply_plate_config(PartPlate* plate)
     if (plate == nullptr)
         throw Slic3r::RuntimeError("Cannot apply a slicing context without a plate");
 
-    const std::vector<int> filament_maps = plate->get_real_filament_maps(preset_bundle.project_config);
-    const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(preset_bundle.project_config);
+    std::vector<int> filament_maps = plate->get_real_filament_maps(preset_bundle.project_config);
+    std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(preset_bundle.project_config);
+
+    // A single-colour plate slices as a single-filament print. The plate's slot LIST is the
+    // spools it may draw on; what the engine needs is the spools this plate's objects actually
+    // reference. Composing all of the slots put multi-filament information - T commands, multi
+    // entry filament_type/diameter/density, a live wipe-tower step - into the G-code of a plate
+    // that uses one filament, and single-spool firmwares reject such a file outright. So when
+    // exactly one slot is referenced (custom G-code tool changes included), the context is cut
+    // down to that one slot before composition and every filament-indexed array is born
+    // single-entry. Object references to the higher slot number clamp to the only slot, which
+    // is the same filament by construction.
+    //
+    // The one case that must NOT be cut down: per-triangle painting in a slot other than 1.
+    // MultiMaterialSegmentation sizes its facet-state arrays from the filament count, and paint
+    // states are stored slot numbers - deliberately never clipped (see GLGizmoMmuSegmentation),
+    // so a painted state above the trimmed count would index out of range.
+    PlateSlicingContext context = plate->get_slicing_context();
+    if (context.filament_preset_names.size() > 1) {
+        std::vector<int> used = plate->get_extruders(true);
+        std::sort(used.begin(), used.end());
+        used.erase(std::unique(used.begin(), used.end()), used.end());
+        if (used.size() == 1) {
+            const int slot = used.front();
+            if (slot >= 1 && slot <= int(context.filament_preset_names.size()) &&
+                (slot == 1 || !plate->has_mmu_painted_object())) {
+                context.filament_preset_names = {context.filament_preset_names[size_t(slot - 1)]};
+                context.filament_colours      = {size_t(slot) <= context.filament_colours.size()
+                                                     ? context.filament_colours[size_t(slot - 1)]
+                                                     : std::string()};
+                filament_maps = {size_t(slot) <= filament_maps.size() ? filament_maps[size_t(slot - 1)] : 1};
+                volume_maps   = {size_t(slot) <= volume_maps.size() ? volume_maps[size_t(slot - 1)]
+                                                                    : int(NozzleVolumeType::nvtStandard)};
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                    << boost::format(": plate %1% references only slot %2%; slicing as a single-filament print")
+                       % (plate->get_index() + 1) % slot;
+            }
+        }
+    }
 
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (!preset_bundle.resolve_plate_slicing_config(plate->get_slicing_context(), filament_maps, volume_maps,
+    if (!preset_bundle.resolve_plate_slicing_config(context, filament_maps, volume_maps,
                                                     resolved, error)) {
         background_process.reset();
         plate->update_apply_result_invalid(true);
@@ -9996,19 +10037,15 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
         new_volume->convert_from_imperial_units();
     else if (old_volume->source.is_converted_from_meters)
         new_volume->convert_from_meters();
-    if (wxGetApp().app_config->get_bool("keep_painting")) {
-        // Proper paint remapping
+    {
+        //Proper paint remapping, always. The old off branch raw-assigned the four channels
+        //onto a DIFFERENT mesh, leaving paint indexed against triangles that no longer
+        //exist - stale data wearing the clothes of preservation.
         auto saved_painting = old_volume->save_painting();
         if (saved_painting) {
             saved_painting->mesh.transform(Geometry::translation_transform(new_volume->mesh().get_init_shift()));
             new_volume->restore_painting(saved_painting);
         }
-    } else {
-        // Won't work well if mesh changed, but kept for old behavior
-        new_volume->supported_facets.assign(old_volume->supported_facets);
-        new_volume->seam_facets.assign(old_volume->seam_facets);
-        new_volume->mmu_segmentation_facets.assign(old_volume->mmu_segmentation_facets);
-        new_volume->fuzzy_skin_facets.assign(old_volume->fuzzy_skin_facets);
     }
     std::swap(old_model_object->volumes[volume_idx], old_model_object->volumes.back());
     old_model_object->delete_volume(old_model_object->volumes.size() - 1);
@@ -10543,8 +10580,8 @@ void Plater::priv::reload_from_disk()
                 else if (old_volume->source.is_converted_from_meters)
                     new_volume->convert_from_meters();
 
-                // Remap paint
-                if (wxGetApp().app_config->get_bool("keep_painting")) {
+                // Remap paint, always; the preference that used to gate this is gone.
+                {
                     auto saved_painting = old_volume->save_painting();
                     if (saved_painting) {
                         saved_painting->mesh.transform(Geometry::translation_transform(new_volume->mesh().get_init_shift()));
@@ -11283,9 +11320,11 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
             q->set_plate_process(plate_index, wxGetApp().preset_bundle->prints.get_selected_preset_name());
             break;
         case Preset::TYPE_FILAMENT:
-            //The whole slot list, because that is what the field is: one call, one
-            //snapshot, and no chance of a slot count drifting out of step with the library.
-            q->set_plate_filaments(plate_index, wxGetApp().preset_bundle->filament_presets);
+            //Deliberately nothing. The sidebar's filament rows are the spool pool - what is
+            //available - not the plate's slots. A plate takes a material from the pool through
+            //the plate board's swatch strip, where it is translated to that plate's printer;
+            //editing the pool must not rewrite every slot of whatever plate happens to be
+            //selected.
             break;
         default:
             break;
@@ -19464,28 +19503,10 @@ bool Plater::set_printer_technology(PrinterTechnology printer_technology)
     return ret;
 }
 
-void Plater::clear_before_change_mesh(int obj_idx)
-{
-    ModelObject* mo = model().objects[obj_idx];
-
-    // If there are custom supports/seams/mmu/fuzzy skin segmentation, remove them. Fixed mesh
-    // may be different and they would make no sense.
-    bool paint_removed = false;
-    for (ModelVolume* mv : mo->volumes) {
-        paint_removed |= ! mv->supported_facets.empty() || ! mv->seam_facets.empty() || ! mv->mmu_segmentation_facets.empty() || !mv->fuzzy_skin_facets.empty();
-        mv->supported_facets.reset();
-        mv->seam_facets.reset();
-        mv->mmu_segmentation_facets.reset();
-        mv->fuzzy_skin_facets.reset();
-    }
-    if (paint_removed) {
-        // snapshot_time is captured by copy so the lambda knows where to undo/redo to.
-        get_notification_manager()->push_notification(
-                    NotificationType::CustomSupportsAndSeamRemovedAfterRepair,
-                    NotificationManager::NotificationLevel::PrintInfoNotificationLevel,
-                    _u8L("Custom supports and color painting were removed before repairing."));
-    }
-}
+//clear_before_change_mesh is gone. It wiped every painted channel on the whole object as a
+//prelude to a repair, behind a preference that shipped OFF - a function whose entire job was
+//deleting the user's colour work. Painted features now always survive a mesh change through
+//save_painting/restore_painting, so nothing may call a wipe "in preparation".
 
 void Plater::changed_mesh(int obj_idx)
 {
@@ -20031,10 +20052,15 @@ int Plater::select_plate(int plate_index, bool need_slice)
         else
         {
             //check inside status
-            //model_fits = p->view3D->get_canvas3d()->check_volumes_outside_state() != ModelInstancePVS_Partly_Outside;
-            //bool validate_err = false;
             validate_current_plate(model_fits, validate_err);
-            if (model_fits && !validate_err) {
+            //Only a REAL validation error may arm this flag - reslice() hard-refuses while it
+            //names the current plate. model_fits comes off the canvas's outside-state, which
+            //at this instant can predate the scene reload that follows a plate switch or bed
+            //change: a driven run read "does not fit" here for a plate whose objects were
+            //fully inside, and the stale answer then blocked every reslice() of that plate.
+            //The fit approximation still dims the slice button through can_slice; a maybe
+            //must not block a definite.
+            if (!validate_err) {
                 p->process_completed_with_error = -1;
             }
             else {
@@ -20626,9 +20652,11 @@ void Plater::follow_plate_presets(int plate_index)
                                  context.printer_preset_name != bundle->printers.get_selected_preset_name();
     const bool process_differs = !context.print_preset_name.empty() &&
                                  context.print_preset_name != bundle->prints.get_selected_preset_name();
-    const bool filaments_differ = !context.filament_preset_names.empty() &&
-                                  context.filament_preset_names != bundle->filament_presets;
-    if (!printer_differs && !process_differs && !filaments_differ)
+    //Filament is deliberately NOT followed. The sidebar's filament list is the spool pool -
+    //what is available - and a plate draws on it; a plate's own slots are shown and edited on
+    //the plate. Copying a plate's slots into the pool on every click is what made the pool a
+    //lossy mirror: extra slots dropped, surplus slots stale, colours from the previous plate.
+    if (!printer_differs && !process_differs)
         return;
 
     //A preset this build does not have cannot be shown by a tab. The plate keeps it - a
@@ -20680,21 +20708,6 @@ void Plater::follow_plate_presets(int plate_index)
             failed_wanted  = from_u8(context.print_preset_name);
         }
     }
-    if (!failed && filaments_differ) {
-        //Filament slots take no dialog of their own: set_filament_preset is the same call
-        //the sidebar's own filament combo makes.
-        for (size_t i = 0; i < context.filament_preset_names.size(); ++i) {
-            if (i < bundle->filament_presets.size() &&
-                bundle->filament_presets[i] == context.filament_preset_names[i])
-                continue;
-            if (bundle->filaments.find_preset(context.filament_preset_names[i], false) == nullptr)
-                continue;
-            bundle->set_filament_preset(i, context.filament_preset_names[i]);
-        }
-        if (p->sidebar != nullptr)
-            p->sidebar->update_presets(Preset::TYPE_FILAMENT);
-    }
-
     if (failed) {
         //The tabs are now describing a different plate from the one on screen. Nobody chose that, so
         //it has to be said once rather than left to be discovered.
@@ -20949,7 +20962,7 @@ void Plater::save_plate_process_as_preset(int plate_index)
 //as one; there are no project filaments behind it to fall back to. Nothing here substitutes a
 //material either: an incompatible choice is recorded and named, because filament is what the
 //object is made of and swapping it silently has a real cost in the physical world.
-void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names)
+void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names, std::vector<std::string> colours)
 {
     PartPlate *plate = p->partplate_list.get_plate(plate_index);
     if (plate == nullptr) {
@@ -20957,15 +20970,22 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
             << boost::format(": no plate at index %1%, nothing assigned") % plate_index;
         return;
     }
-    if (plate->get_slicing_context().filament_preset_names == preset_names)
+    PlateSlicingContext context = plate->get_slicing_context();
+    //An empty colour list means "keep what the plate holds", resized to the new slot count;
+    //a caller with colours to say - the spool picker, the AMS sync - passes them.
+    if (colours.empty()) {
+        colours = context.filament_colours;
+        colours.resize(preset_names.size());
+    }
+    if (context.filament_preset_names == preset_names && context.filament_colours == colours)
         return;
 
     take_snapshot(std::string("Assign plate filaments"));
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
         << boost::format(": plate %1% filaments -> %2% slot(s)") % (plate_index + 1) % preset_names.size();
 
-    PlateSlicingContext context = plate->get_slicing_context();
     context.filament_preset_names = std::move(preset_names);
+    context.filament_colours      = std::move(colours);
     plate->set_slicing_context(context);
 
     ResolvedPlateSlicingConfig resolved;

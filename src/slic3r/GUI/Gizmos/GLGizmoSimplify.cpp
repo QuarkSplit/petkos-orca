@@ -535,17 +535,14 @@ void GLGizmoSimplify::apply_simplify() {
 
     auto plater = wxGetApp().plater();
     plater->take_snapshot(GUI::format("Simplify %1%", m_volume->name));
-    const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
-    if (!keep_painting) {
-        plater->clear_before_change_mesh(object_idx);
-    }
 
     ModelVolume* mv = get_model_volume(selection, wxGetApp().model());
     assert(mv == m_volume);
 
-    // Save paint
-    std::optional<TriangleSelector::SavedPainting> saved_painting = keep_painting ? mv->save_painting() :
-                                                                                    std::optional<TriangleSelector::SavedPainting>{};
+    //Paint always survives a mesh change. The old "keep_painting" preference shipped OFF and
+    //its off branch deleted every painted channel; deleting colour information is never what
+    //a geometry operation was asked to do. Same call the cut gizmo makes, unconditionally.
+    std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
     mv->set_mesh(std::move(*m_state.result));
     // Remap paint
     mv->restore_painting(saved_painting);

@@ -7288,9 +7288,9 @@ void Tab::write_selection_to_current_plate()
         plater->set_plate_process(index, m_preset_bundle->prints.get_selected_preset_name());
         break;
     case Preset::TYPE_FILAMENT:
-        //The whole slot list, because that is the field. One call, one snapshot, and no
-        //chance of a slot count drifting out of step with the library.
-        plater->set_plate_filaments(index, m_preset_bundle->filament_presets);
+        //Deliberately nothing. The filament tab edits the spool pool - what is available -
+        //and a plate's slots are assigned from the pool on the plate board, where the
+        //material is translated to that plate's printer. See on_select_preset.
         break;
     default:
         break;

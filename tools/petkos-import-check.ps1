@@ -28,7 +28,12 @@ values came with it.
 #>
 [CmdletBinding()]
 param(
-    [string] $Source  = 'E:\3D-Printing\Projects\Comic Con 2026\01-source\1607565-las-58-talon-v2-helldivers-2\energy_revolver_-_part_1.3mf',
+    # The previous fixture (energy_revolver_-_part_1.3mf) was overwritten in place by a driven
+    # run on 2026-08-17: its process became an INSTALLED system preset, so it carried no user
+    # deviation and the check went half-vacuous, half-failing. This one is Bambu-authored with
+    # two values no installed vendor default shares (10% density, gyroid), so a vacuous pass is
+    # impossible. The 01-source 3MFs are read-only on disk now for the same reason.
+    [string] $Source  = 'E:\3D-Printing\Projects\Comic Con 2026\01-source\1035578-star-wars-keychain-logo-empire-rebellion-ams\3MF+-+Star+Wars+logo.3mf',
     [string] $Printer = 'Elegoo Centauri Carbon 0.4 nozzle',
     [int]    $TimeoutSec = 900,
     [switch] $Keep,
@@ -145,7 +150,11 @@ if (-not (Test-Path $gcode)) {
 }
 
 Write-Host ''
-& python $checker $gcode --expect-printer $Printer --expect-filament PETG --min-flow 8
+# The expected material is the FIXTURE's own declaration, not a literal: 'PETG' hardcoded here
+# was the previous fixture's material, and a fixture swap silently turned it into a wrong test.
+$expectedMaterial = @($declared.filament_type)[0]
+if (-not $expectedMaterial) { $expectedMaterial = 'PLA' }
+& python $checker $gcode --expect-printer $Printer --expect-filament $expectedMaterial --min-flow 8
 $checkOk = ($LASTEXITCODE -eq 0)
 
 # ---------------------------------------------------------------- did the CHOICES come with it

@@ -2074,8 +2074,8 @@ void PreferencesDialog::create_items()
     //// DEVELOPER > Experimental Features
     g_sizer->Add(create_item_title(_L("Experimental Features")), 1, wxEXPAND);
 
-    auto item_keep_painting    = create_item_checkbox(_L("Keep painted feature after mesh change"), _L("Attempt to keep painted features (color/seam/support/fuzzy etc.) after changing the object mesh (such as cut/reload from disk/simplify/fix etc.)\nHighly experimental! Slow and may create artifact."), "keep_painting");
-    g_sizer->Add(item_keep_painting);
+    //The "keep_painting" checkbox is gone: painted features always survive a mesh change now.
+    //An option whose off position deletes the user's colour work is not a preference.
 
     //// DEVELOPER > Storage
 

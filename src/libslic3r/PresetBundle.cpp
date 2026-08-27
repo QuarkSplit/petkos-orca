@@ -621,7 +621,12 @@ bool PresetBundle::complete_plate_context(PlateSlicingContext &context, const Pl
             }
         }
         if (!slots.empty()) {
+            //The colours ride with the materials. A seed slot with no recorded colour stays
+            //empty, and composition fills it from the preset's own default.
+            std::vector<std::string> colours = seed.filament_colours;
+            colours.resize(slots.size());
             context.filament_preset_names = std::move(slots);
+            context.filament_colours      = std::move(colours);
             wrote                         = true;
         }
     }
@@ -836,6 +841,11 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
         context.filament_preset_names[slot] = translated;
     }
 
+    //A translation re-expresses the material for the new machine; the colour IS the material's
+    //and stays exactly where it was. Only the vector's length is kept honest here, so a slot
+    //always has a colour cell to write into.
+    context.filament_colours.resize(context.filament_preset_names.size());
+
     return true;
 }
 
@@ -1000,6 +1010,43 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
         // plate: a setting the user changed for the project applies to all of its plates, and a
         // plate that disagrees still wins.
         apply_project_overrides(resolved.config);
+
+        // The project's colour-family vectors arrive sized to the GLOBAL slot count, and the
+        // engine reads filament_colour.size() as THE filament count (Print, ToolOrdering,
+        // MultiMaterialSegmentation and GCode all do). A plate with a different slot count than
+        // the project therefore sliced as a different-width print than it is - which is what put
+        // multi-filament information into a single-spool machine's G-code. The invariant is
+        // enforced here, where the plate's config is born: every colour-family vector is exactly
+        // as wide as the plate's slot list, and the plate's own colours outrank the project's.
+        // Colour is material information; the plate owns its materials.
+        {
+            const size_t n = filament_names.size();
+            auto &colours  = resolved.config.option<ConfigOptionStrings>("filament_colour", true)->values;
+            colours.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                if (i < context.filament_colours.size() && !context.filament_colours[i].empty())
+                    colours[i] = context.filament_colours[i];
+                if (colours[i].empty()) {
+                    const auto *def = dynamic_cast<const ConfigOptionStrings *>(filament_copies[i].config.option("default_filament_colour"));
+                    if (def != nullptr && !def->values.empty() && !def->values.front().empty())
+                        colours[i] = def->values.front();
+                }
+                if (colours[i].empty())
+                    colours[i] = "#26A69A";
+            }
+            resolved.config.option<ConfigOptionStrings>("filament_colour_type", true)->values.resize(n, "1");
+            //filament_finish is coEnums, not coStrings - a typed cast here dereferenced null.
+            //Resize it through the vector base, padding by repeating its own front value.
+            if (ConfigOption *finish_opt = resolved.config.option("filament_finish"); finish_opt != nullptr)
+                if (auto *finish = dynamic_cast<ConfigOptionVectorBase *>(finish_opt);
+                    finish != nullptr && finish->size() != n && finish->size() > 0)
+                    finish->resize(n, finish_opt);
+            auto &multi = resolved.config.option<ConfigOptionStrings>("filament_multi_colour", true)->values;
+            multi.resize(n);
+            for (size_t i = 0; i < n; ++i)
+                if (multi[i].empty())
+                    multi[i] = colours[i];
+        }
     } catch (const std::exception &ex) {
         error = "Unable to compose plate context: " + std::string(ex.what());
         resolved = {};
@@ -5161,28 +5208,58 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
         // exactly one dangling reference, the project's own printer, onto the preset this same load
         // created from it. Anything else the list names is left alone and still has to match.
         if (is_external && !printer_name_in_project.empty()) {
-            const std::string printer_name_loaded = this->printers.get_selected_preset_name();
-            Preset &print_stored = this->prints.get_selected_preset();
-            if (!printer_name_loaded.empty() && printer_name_loaded != printer_name_in_project && print_stored.is_external) {
-                const auto rewrite = [&](DynamicPrintConfig &cfg) {
+            // Selection-INDEPENDENT, and additive. The first version of this read the printer off
+            // printers.get_selected_preset_name() and patched prints.get_selected_preset() - which
+            // works only on the loads where load_external_preset's selection actually landed on the
+            // project's presets, and whether it does depends on what the bundle remembered from the
+            // previous session. The same file then resolved on one run and not the next, which is
+            // the worst kind of fault to chase.
+            //
+            // So: every external process preset that THIS file created (its name carries this
+            // file's decoration) that refers to the project's printer by its original name gets the
+            // DECORATED printer name appended - appended, not substituted, because the original
+            // name may legitimately be an installed machine and the process runs on both. Still
+            // not a compatibility fallback: it maps only the project's own reference onto the
+            // preset this same load created from it, and only when that preset exists.
+            // The reference in the file is to the printer's BASE name - and a re-saved project's
+            // printer_settings_id may itself already carry a "(file)" decoration, so both sides
+            // are normalised: the reference to look for is the stripped base, and the name to add
+            // is whatever the printer actually loaded under in this installation.
+            const std::string decoration = "(" + boost::filesystem::path(name_or_path).filename().string() + ")";
+            const std::string base       = Preset::strip_project_decoration(printer_name_in_project);
+            std::string       loaded;
+            for (const std::string &candidate : {printer_name_in_project, base + decoration}) {
+                if (candidate != base && this->printers.find_preset(candidate, false) != nullptr) {
+                    loaded = candidate;
+                    break;
+                }
+            }
+            if (!loaded.empty()) {
+                const auto complete = [&](DynamicPrintConfig &cfg) {
                     auto *listed = cfg.option<ConfigOptionStrings>("compatible_printers", false);
-                    if (listed == nullptr)
+                    if (listed == nullptr || listed->values.empty())
                         return false;
-                    bool changed = false;
-                    for (std::string &v : listed->values)
-                        if (v == printer_name_in_project) {
-                            v = printer_name_loaded;
-                            changed = true;
-                        }
-                    return changed;
+                    const bool refers  = std::find(listed->values.begin(), listed->values.end(),
+                                                   base) != listed->values.end();
+                    const bool already = std::find(listed->values.begin(), listed->values.end(),
+                                                   loaded) != listed->values.end();
+                    if (!refers || already)
+                        return false;
+                    listed->values.push_back(loaded);
+                    return true;
                 };
-                const bool changed_stored = rewrite(print_stored.config);
-                rewrite(this->prints.get_edited_preset().config);
-                if (changed_stored)
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": process preset '" << print_stored.name
-                                            << "' referred to its printer as '" << printer_name_in_project
-                                            << "'; the same load renamed that printer to '" << printer_name_loaded
-                                            << "', so the reference was updated to match";
+                for (auto it = this->prints.begin(); it != this->prints.end(); ++it) {
+                    if (!it->is_external || !boost::algorithm::ends_with(it->name, decoration))
+                        continue;
+                    if (complete(it->config))
+                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": process preset '" << it->name
+                                                << "' referred to its printer as '" << base
+                                                << "'; this installation holds that printer as '" << loaded
+                                                << "', so the loaded name was added to its compatible list";
+                }
+                if (this->prints.get_edited_preset().is_external &&
+                    boost::algorithm::ends_with(this->prints.get_edited_preset().name, decoration))
+                    complete(this->prints.get_edited_preset().config);
             }
         }
 

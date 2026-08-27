@@ -2929,7 +2929,8 @@ void ObjectList::split()
 
     take_snapshot(_u8L("Split to parts"));
 
-    volume->split(filament_cnt, wxGetApp().app_config->get_bool("keep_painting"));
+    //Paint always survives a split; the false branch of the old preference actively deleted it.
+    volume->split(filament_cnt, /*remap_paint=*/true);
 
     wxBusyCursor wait;
 
@@ -3311,9 +3312,9 @@ void ObjectList::boolean()
 
     ModelObject* object = (*m_objects)[obj_idxs.front()];
 
-    const bool keep_painting = wxGetApp().app_config->get_bool("keep_painting");
+    //Paint always survives a boolean; the preference that used to gate this is gone.
     std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paintings;
-    if (keep_painting) {
+    {
         // Save painting of all the positive parts
         saved_paintings.reserve(object->volumes.size());
         for (const ModelVolume* vol : object->volumes) {
@@ -3338,7 +3339,7 @@ void ObjectList::boolean()
     ModelVolume* new_volume = new_object->add_volume(mesh);
 
     // Remap paint
-    if (keep_painting) {
+    {
         for (auto& saved_painting : saved_paintings) {
             if (saved_painting) {
                 // For each original painted volume, we need to apply to each instance
@@ -6318,13 +6319,11 @@ void ObjectList::fix_through_cgal()
             msg += "\n";
         }
 
-        const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
-        if (!keep_painting) {
-            plater->clear_before_change_mesh(obj_idx);
-        }
+        //Paint always survives a repair. The off branch of the old preference deleted every
+        //painted channel before the fix even ran.
         const size_t volumes_before = object(obj_idx)->volumes.size();
         std::string res;
-        if (!fix_model_with_cgal_gui(*(object(obj_idx)), vol_idx, progress_dlg, msg, res, keep_painting))
+        if (!fix_model_with_cgal_gui(*(object(obj_idx)), vol_idx, progress_dlg, msg, res, /*keep_painting=*/true))
             return false;
         //wxGetApp().plater()->changed_mesh(obj_idx);
         object(obj_idx)->ensure_on_bed();

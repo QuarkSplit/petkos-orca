@@ -6626,9 +6626,11 @@ void GCode::append_full_config(const Print &print, std::string &str)
     for (const std::string& key : cfg.keys()) {
         if (!is_banned(key) && !cfg.option(key)->is_nil()) {
             if (key == "wipe_tower_x" || key == "wipe_tower_y") {
+                // PODSLICER: this branch continues; without it the key was emitted TWICE, once
+                // as the plate-indexed scalar and again as the full per-plate vector below.
                 ss << std::fixed << std::setprecision(3) << "; " << key << " = " << dynamic_cast<const ConfigOptionFloats*>(cfg.option(key))->get_at(print.get_plate_index()) << "\n";
             }
-            if(key == "extruder_colour")
+            else if(key == "extruder_colour")
                 ss << "; " << key << " = " << cfg.opt_serialize("filament_colour") << "\n";
             else if (key == "printer_model")
                 ss << "; " << key << " = " << gcode_printer_model(cfg) << "\n";

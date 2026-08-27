@@ -2213,6 +2213,42 @@ void ModelObject::merge()
         return;
     }
 
+    //Merging is a geometry operation and must not be a colour operation. Two things are
+    //saved before the volumes die, and replayed onto the merged volume afterwards:
+    // - each part's painted channels (filament colour, seams, supports, fuzzy skin),
+    //   spatially and additively - the cut gizmo's pattern, and the same reason: a saved
+    //   painting simply fails to find geometry its part did not contribute;
+    // - each part's own filament slot, when it differs from the base part's. A merged
+    //   volume has one "extruder" field, so a part whose colour lived in that field would
+    //   lose it silently; expressed as whole-facet paint it is the same fact in the form
+    //   the merged volume can carry. The fill goes on first and real paint stamps over it,
+    //   so painted detail wins where both exist.
+    const ModelVolume *first_part = nullptr;
+    for (const ModelVolume *v : volumes)
+        if (v->is_model_part()) { first_part = v; break; }
+    const int base_extruder = first_part != nullptr ? first_part->extruder_id() : 0;
+
+    std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paint;
+    std::vector<std::optional<TriangleSelector::SavedPainting>> saved_fill;
+    for (const ModelVolume *v : volumes) {
+        saved_paint.emplace_back(v->save_painting());
+        std::optional<TriangleSelector::SavedPainting> fill;
+        if (v->is_model_part() && !v->mesh().empty() && base_extruder > 0) {
+            const int e = v->extruder_id();
+            if (e > 0 && e != base_extruder && e <= int(EnforcerBlockerType::ExtruderMax)) {
+                TriangleSelector::SavedPainting sp;
+                sp.mesh = v->mesh();
+                sp.mmu  = TriangleSelector::painting_from_facet_states(std::vector<EnforcerBlockerType>(
+                    v->mesh().its.indices.size(), static_cast<EnforcerBlockerType>(e)));
+                fill    = std::move(sp);
+            }
+        }
+        saved_fill.emplace_back(std::move(fill));
+    }
+    DynamicPrintConfig first_config;
+    if (first_part != nullptr)
+        first_config = first_part->config.get();
+
     TriangleMesh mesh;
 
     for (ModelVolume* volume : volumes)
@@ -2224,6 +2260,17 @@ void ModelObject::merge()
 
     if (!vol)
         return;
+
+    //The base part's settings are still the settings somebody chose; a merged volume that
+    //forgets them prints a multi-part object with defaults.
+    if (first_part != nullptr)
+        vol->config.assign_config(std::move(first_config));
+    for (const std::optional<TriangleSelector::SavedPainting> &fill : saved_fill)
+        if (fill)
+            vol->restore_painting(fill, true);
+    for (const std::optional<TriangleSelector::SavedPainting> &paint : saved_paint)
+        if (paint)
+            vol->restore_painting(paint, true);
 }
 
 ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)

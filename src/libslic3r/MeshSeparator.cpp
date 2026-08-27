@@ -266,9 +266,10 @@ struct PartBuilder
         }
         return m;
     }
-    void add_surface_face(const stl_triangle_vertex_indices &t)
+    void add_surface_face(const stl_triangle_vertex_indices &t, int src_face_idx)
     {
         part.mesh.indices.emplace_back(remap(t[0]), remap(t[1]), remap(t[2]));
+        part.src_face.push_back(src_face_idx);
         ++part.surface_faces;
     }
     int add_point(const Vec3f &p)
@@ -319,7 +320,7 @@ bool separate(const indexed_triangle_set &its,
     PartBuilder region(out.region, its);
     PartBuilder rest(out.rest, its);
     for (int f = 0; f < n; ++f)
-        (selected[f] ? region : rest).add_surface_face(its.indices[f]);
+        (selected[f] ? region : rest).add_surface_face(its.indices[f], f);
 
     //One patch per loop, appended to BOTH parts: the rest keeps the emitted winding (its faces
     //see the seam running opposite to the selection's, so the patch as wound closes it), the
@@ -344,8 +345,10 @@ bool separate(const indexed_triangle_set &its,
         auto rest_idx   = [&](int k) { return k == loop_size ? centre_rest : rest.remap(loop[k]); };
         for (const Vec3i32 &t : patch.triangles) {
             out.rest.mesh.indices.emplace_back(rest_idx(t[0]), rest_idx(t[1]), rest_idx(t[2]));
+            out.rest.src_face.push_back(-1);
             ++out.rest.cap_faces;
             out.region.mesh.indices.emplace_back(region_idx(t[0]), region_idx(t[2]), region_idx(t[1]));
+            out.region.src_face.push_back(-1);
             ++out.region.cap_faces;
         }
     }

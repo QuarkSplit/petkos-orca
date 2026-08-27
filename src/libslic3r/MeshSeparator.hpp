@@ -42,6 +42,11 @@ struct Part
     indexed_triangle_set mesh;
     size_t               surface_faces{0}; // faces carried over from the source, unchanged
     size_t               cap_faces{0};     // faces added to seal the seam
+    // For each face of `mesh`, the source face it IS (surface faces are the input faces,
+    // bit for bit), or -1 for a cap face, which has no ancestor. This is what lets painted
+    // per-triangle data (filament colour, seams, supports) cross the split exactly, via
+    // ModelVolume::remap_painting_by_facets, instead of dying with the old volume.
+    std::vector<int>     src_face;
 };
 
 struct Result

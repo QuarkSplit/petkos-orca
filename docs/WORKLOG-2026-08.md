@@ -2254,3 +2254,75 @@ six plates still framed after the switch phase), perf-runs/theme-board-headers.p
 Both gates re-ran VERIFIED on the shipping binary after the sweep, and `pod cut` passed
 on it (volume conserved 290534 = 290534 mm3, bounded region 122675 vs the plane's
 181012 mm3).
+
+## 2026-08-27 — the spool pool, per-plate colour, single-filament G-code, and paint that survives
+
+**The complaint that started it:** per-plate and global colour/material were "a huge inconsistent
+mess" — the global filament list was silently overwritten by whichever plate was clicked, colours
+were project-wide so recolouring one plate recoloured all of them, single-spool printers rejected
+files sliced "for them" because the G-code carried the project's multi-filament arrays, and most
+mesh operations deleted painted colour outright.
+
+**Diagnosis in one sentence each:**
+- The engine reads `filament_colour.size()` as THE filament count (Print.cpp, ToolOrdering.cpp,
+  MultiMaterialSegmentation.cpp:2198, GCode.cpp:9120), and composition applied the project's
+  full-width colour vector to every plate — so a one-colour plate in a four-slot project WAS a
+  four-filament print as far as the engine could tell.
+- `GCodeWriter::toolchange` emitted `T0` whenever `filament_diameter.values.size() > 1`,
+  regardless of what the print used. Buddy-class firmwares reject a file announcing tools they
+  do not have.
+- `follow_plate_presets` slot-copied plate→global (dropping extra slots, leaving stale ones);
+  `on_select_preset`/`Tab::write_selection_to_current_plate` wrote the whole global list back
+  onto the current plate. Two lossy copies in opposite directions is the definition of the mess.
+- Sidebar delete-filament called `Model::update_extruder_count_when_delete_filament`, which
+  pruned painted facets model-wide. Separate and Knife constructed bare volumes (the
+  `ModelVolume(object, other, TriangleMesh&&)` ctor drops all four paint channels); merge
+  destroyed paint AND per-volume config; the "keep_painting" pref shipped OFF upstream and its
+  off branches actively deleted paint at simplify/fix/reload/boolean/split.
+
+**What was built (see PODSLICER.md "The spool pool and the plate's own materials"):**
+- `PlateSlicingContext::filament_colours` — plate-owned colours, 3MF-persisted
+  (`plater_filament_colours`), seeded/carried through complete/reresolve, migrated from the old
+  AMS-sync plate-config keys at load.
+- The colour-count invariant in `compose_plate_slicing_config` and the CLI's
+  `resolve_cli_plate_config`.
+- The single-filament cut-down in `Plater::priv::apply_plate_config` and the CLI mirror —
+  guarded against painted-above-slot-1 plates (segmentation states are never clipped).
+- Used-count gate on `GCodeWriter::toolchange`; the wipe_tower_x/y double-emit in
+  `append_full_config` fixed.
+- Pool/plate decoupling: follow stops following filament, sidebar/tab stop writing the pool onto
+  plates, pool add/delete touches nothing but the pool.
+- The plate-board slot menu is the assignment surface: spools first with colour bitmaps,
+  translation via `translate_filament_to_printer`, refusals named, "Change colour…", trailing
+  "+" to add a slot, last-unused-slot removal.
+- Paint survives everything: Separate (exact remap via new `MeshSeparator::Part::src_face`),
+  Knife (cut-gizmo save/restore pattern), merge (spatial additive replay + per-part extruder
+  expressed as whole-facet paint + base config kept), Emboss update (spatial remap), and every
+  "keep_painting" gate removed — `Plater::clear_before_change_mesh` deleted outright.
+
+**What the verification run itself shook out (same day, driven slices of a real 4-slot project
+retargeted to a Prusa Core One):**
+- `filament_finish` is `coEnums`, not `coStrings` — the colour-invariant block's typed cast
+  dereferenced null and killed the app inside compose. Resized through `ConfigOptionVectorBase`
+  now, padding by repeating its own front value.
+- The compatible-printers rename completion in `load_config_file_config` read the printer off
+  the COLLECTION SELECTION, so whether a project's own embedded process/printer pair declared
+  itself compatible depended on what the previous session left selected — the same file
+  resolved on one run and not the next. It now strips the project decoration from
+  `printer_settings_id` (a re-saved project carries it pre-decorated), finds the name the
+  printer actually loaded under, and APPENDS it to every external process preset of that file
+  that refers to the base name — appended, not substituted, because the base name may
+  legitimately be an installed machine.
+- `select_plate` armed the sticky `process_completed_with_error` flag off the canvas's
+  outside-bed state, which at that instant can predate the scene reload that follows a plate
+  or bed change — and `reslice()` hard-refuses while the flag names the current plate, so a
+  stale "does not fit" silently blocked slicing forever after. Only a REAL validation error
+  arms the flag now; the fit approximation still dims the slice button.
+- The perf driver gained `plate=N` (and `pod slice --plate N`): a driven run can assign and
+  slice a specific plate of a loaded project.
+
+**The proof:** plate 2 (single-colour) of the 4-slot crests project, retargeted to
+`Prusa CORE One 0.4 nozzle`: `; filament: 1`, single-entry `filament_type/colour/diameter/
+density`, zero bare `T` commands, `M104 T0` only from the machine's own start template,
+25.78 g. The painted 4-colour plate 1 of the same project keeps its full 4-slot composition
+(`; filament: 2,3,4,1`, 54 tool changes) — the paint guard working as designed.

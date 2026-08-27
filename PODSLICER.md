@@ -172,6 +172,45 @@ the one that today presents itself as filament colour. Per-plate `filament_prese
 field; the swatch strip is its control, one slot at a time. Anything that treats a slot as a colour
 rather than as a material is describing half the fact.
 
+### The spool pool and the plate's own materials (2026-08-27)
+
+**The sidebar's filament list is the POOL: what spools exist, material plus colour, independent of
+any printer. A plate's slots are the plate's own, and the two are linked in one direction only.**
+Before this, the global list was a lossy mirror of whichever plate was selected - extra slots
+dropped, surplus slots stale, recolouring slot 2 recoloured slot 2 on every plate - and the engine
+read the global colour vector's SIZE as the filament count, so a one-colour plate in a four-colour
+project sliced as a four-filament print.
+
+The rules, each load-bearing:
+
+- **A plate owns its colours.** `PlateSlicingContext::filament_colours` rides parallel to
+  `filament_preset_names`, persists in the 3MF (`plater_filament_colours`), and outranks the
+  project's colours in composition. The old per-plate store - untyped `filament_colour` keys in the
+  plate's override config, written only by AMS sync, deleted by "clear overrides" - is migrated
+  into the context at load and retired.
+- **The colour-count invariant.** `compose_plate_slicing_config` (and the CLI's
+  `resolve_cli_plate_config`) sizes every colour-family vector to the plate's slot count. The
+  engine reads `filament_colour.size()` as THE filament count in Print, ToolOrdering,
+  MultiMaterialSegmentation and GCode; after composition that number is the plate's, never the
+  project's.
+- **A single-colour plate slices as a single-filament print.** When a plate's objects reference
+  exactly one slot (custom G-code tool changes included), the slicing feed cuts the context down
+  to that slot, so every filament-indexed array is born single-entry: no `T0`, no multi-entry
+  `filament_type`, `initial_tool` is 0 and the start G-code's `[0]` reads are the actual material.
+  Guard: per-triangle paint states are stored slot numbers and never clipped, so a plate painted
+  above slot 1 keeps its full width. `GCodeWriter::toolchange`'s spurious raw-config-size gate is
+  used-count gated for the same reason.
+- **Assignment is translation.** The plate-board slot menu lists the pool first, colour swatch and
+  all. Choosing a spool re-expresses it for the plate's printer via
+  `translate_filament_to_printer` when it does not run there directly, names the refusal when the
+  material does not exist for that machine, and the colour rides with the material either way.
+  Slots are added from the strip's trailing "+", recoloured per plate, and the last unused slot
+  can be removed. Adding or deleting a POOL row touches no plate, no object and no painted facet -
+  the old delete path pruned paint model-wide.
+- **The pool is not followed and not written back.** `follow_plate_presets` no longer copies plate
+  filaments into the pool; the sidebar filament combo and the filament tab no longer write the
+  pool onto the current plate.
+
 **The hard cases, named rather than deferred vaguely.** These are genuine work, not edge cases, and
 none of them may be allowed to trip project import or a printer swap - which is the base, and the
 base has to keep working while they are built:

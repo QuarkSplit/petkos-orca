@@ -48,6 +48,14 @@ struct PlateSlicingContext
     std::string              printer_vendor_id;
     std::string              print_preset_name;
     std::vector<std::string> filament_preset_names;
+    // Colour is material information and the plate owns its materials, so the plate owns
+    // the colours too - one per slot, parallel to filament_preset_names. Before this the
+    // only colour store was the project-wide filament_colour vector, sized to the global
+    // slot count, which recoloured every plate at once and made a one-filament plate look
+    // four filaments wide to the engine. An empty entry means "no colour chosen for this
+    // slot"; composition fills it from the preset's own default. The vector may be shorter
+    // than the slot list (older projects); it is never longer.
+    std::vector<std::string> filament_colours;
     std::string              physical_printer_id;
 
     // Everything a slice needs to be named. printer_vendor_id is excluded: it is a
@@ -66,6 +74,7 @@ struct PlateSlicingContext
                printer_vendor_id == rhs.printer_vendor_id &&
                print_preset_name == rhs.print_preset_name &&
                filament_preset_names == rhs.filament_preset_names &&
+               filament_colours == rhs.filament_colours &&
                physical_printer_id == rhs.physical_printer_id;
     }
 

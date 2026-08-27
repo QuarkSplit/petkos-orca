@@ -3735,8 +3735,34 @@ int CLI::run(int argc, char **argv)
         resolved = m_print_config;
         vendor_id.clear();
         error.clear();
-        const PlateSlicingContext context = plate->get_slicing_context();
+        PlateSlicingContext context = plate->get_slicing_context();
         const Preset *resolved_printer_preset = nullptr;
+
+        //A single-colour plate slices as a single-filament print, exactly as the GUI's
+        //apply_plate_config decides it (see the comment there): when the plate's objects
+        //reference exactly one slot, the context is cut down to that slot before
+        //composition, so no multi-filament information reaches a single-spool machine's
+        //G-code. Same paint guard: painted states are stored slot numbers and are never
+        //clipped, so a plate painted above slot 1 keeps its full width.
+        int trimmed_slot = 0;
+        if (context.filament_preset_names.size() > 1) {
+            std::vector<int> used = plate->get_extruders_under_cli(true, m_print_config);
+            std::sort(used.begin(), used.end());
+            used.erase(std::unique(used.begin(), used.end()), used.end());
+            if (used.size() == 1) {
+                const int slot = used.front();
+                if (slot >= 1 && slot <= int(context.filament_preset_names.size()) &&
+                    (slot == 1 || !plate->has_mmu_painted_object())) {
+                    context.filament_preset_names = {context.filament_preset_names[size_t(slot - 1)]};
+                    context.filament_colours      = {size_t(slot) <= context.filament_colours.size()
+                                                         ? context.filament_colours[size_t(slot - 1)]
+                                                         : std::string()};
+                    trimmed_slot = slot;
+                    BOOST_LOG_TRIVIAL(info) << boost::format("plate %1% references only slot %2%; slicing as a single-filament print")
+                                               % (plate->get_index() + 1) % slot;
+                }
+            }
+        }
 
         const auto apply_named = [&](Preset::Type type, const std::string &name, const char *settings_key,
                                      const char *label) -> bool {
@@ -3779,8 +3805,14 @@ int CLI::run(int argc, char **argv)
                 effective_printer.config = resolved;
                 effective_process.config = resolved;
                 DynamicPrintConfig project;
-                const std::vector<int> filament_maps = plate->get_real_filament_maps(m_print_config);
-                const std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(m_print_config);
+                std::vector<int> filament_maps = plate->get_real_filament_maps(m_print_config);
+                std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(m_print_config);
+                if (trimmed_slot > 0) {
+                    //the one remaining slot keeps ITS map entry, not slot 1's
+                    filament_maps = {size_t(trimmed_slot) <= filament_maps.size() ? filament_maps[size_t(trimmed_slot - 1)] : 1};
+                    volume_maps   = {size_t(trimmed_slot) <= volume_maps.size() ? volume_maps[size_t(trimmed_slot - 1)]
+                                                                                : int(NozzleVolumeType::nvtStandard)};
+                }
                 resolved = PresetBundle::construct_full_config(effective_printer, effective_process, project,
                                                                filaments, false, filament_maps, volume_maps);
             }
@@ -3788,6 +3820,33 @@ int CLI::run(int argc, char **argv)
 
         resolved.apply(*plate->config(), true);
         resolved.apply(m_extra_config, true);
+
+        //The colour-count invariant, mirroring compose_plate_slicing_config: the engine reads
+        //filament_colour.size() as THE filament count, so the colour-family vectors are sized
+        //to this plate's slot list and the plate's own colours outrank the project's.
+        if (!context.filament_preset_names.empty()) {
+            const size_t n     = context.filament_preset_names.size();
+            auto &colours      = resolved.option<ConfigOptionStrings>("filament_colour", true)->values;
+            colours.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                if (i < context.filament_colours.size() && !context.filament_colours[i].empty())
+                    colours[i] = context.filament_colours[i];
+                if (colours[i].empty())
+                    colours[i] = "#26A69A";
+            }
+            resolved.option<ConfigOptionStrings>("filament_colour_type", true)->values.resize(n, "1");
+            //filament_finish is coEnums, not coStrings - resize through the vector base.
+            if (ConfigOption *finish_opt = resolved.option("filament_finish"); finish_opt != nullptr)
+                if (auto *finish = dynamic_cast<ConfigOptionVectorBase *>(finish_opt);
+                    finish != nullptr && finish->size() != n && finish->size() > 0)
+                    finish->resize(n, finish_opt);
+            auto &multi = resolved.option<ConfigOptionStrings>("filament_multi_colour", true)->values;
+            multi.resize(n);
+            for (size_t i = 0; i < n; ++i)
+                if (multi[i].empty())
+                    multi[i] = colours[i];
+        }
+
         const ConfigOptionFloats *nozzles = resolved.option<ConfigOptionFloats>("nozzle_diameter");
         if (nozzles == nullptr || nozzles->values.empty()) {
             error = "The resolved printer has no nozzle definition";

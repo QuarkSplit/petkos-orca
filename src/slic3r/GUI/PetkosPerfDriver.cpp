@@ -45,6 +45,11 @@ namespace {
 struct Spec
 {
     int         plates  = -1;
+    //Which plate the Assign and Slice phases act on, 1-based. 0 keeps the old behaviour
+    //(Assign iterates from plate 1, Slice takes plate 1). Added so a driven run can slice
+    //a specific plate of a loaded project - the single-colour plate of a multi-colour
+    //project is the case that needed it.
+    int         plate   = 0;
     int         warmup  = 60;
     int         orbit   = 600;
     int         switches = 10;
@@ -104,6 +109,7 @@ Spec parse_spec(const std::string &s)
         const std::string val = part.substr(eq + 1);
         auto              num = [&val]() { return std::atoi(val.c_str()); };
         if (key == "plates")       spec.plates = num();
+        else if (key == "plate")   spec.plate = num();
         else if (key == "warmup")  spec.warmup = num();
         else if (key == "orbit")   spec.orbit = num();
         else if (key == "switch")  spec.switches = num();
@@ -276,7 +282,8 @@ private:
                                                           : (m_spec.context > 0 ? Phase::Context : next_after_context())));
             } else {
                 const int count = plater->get_partplate_list().get_plate_count();
-                const int plate = count > 0 ? (m_done % count) : 0;
+                const int plate = m_spec.plate > 0 && m_spec.plate <= count ? m_spec.plate - 1
+                                                                            : (count > 0 ? (m_done % count) : 0);
                 //A REAL printer, and one this plate does not already have.
                 //
                 //Two earlier versions of this line each timed nothing. The first alternated a named
@@ -998,16 +1005,20 @@ private:
     //to a placeholder preset is a COMPLETE plate - it is simply pinned to the wrong thing.
     //The emitted G-code is the only artefact that cannot be wrong about what was used, so
     //the run produces one and the harness reads it without the app.
+    //1-based spec.plate, clamped to "plate 1" when unset.
+    int slice_plate_index() const { return m_spec.plate > 0 ? m_spec.plate - 1 : 0; }
+
     void slice_step(Plater *plater)
     {
-        PartPlate *plate = plater->get_partplate_list().get_plate(0);
+        const int  idx   = slice_plate_index();
+        PartPlate *plate = plater->get_partplate_list().get_plate(idx);
         if (plate == nullptr) {
-            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE SKIPPED - there is no plate 1";
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: SLICE SKIPPED - there is no plate " << (idx + 1);
             enter(Phase::Board);
             return;
         }
-        plater->select_plate(0);
-        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: slicing plate 1 on '"
+        plater->select_plate(idx);
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: slicing plate " << (idx + 1) << " on '"
                                    << plate->get_printer_preset_name() << "' with process '"
                                    << plate->get_print_preset_name() << "'";
         plater->reslice();
@@ -1038,7 +1049,7 @@ private:
         }
         const long long secs = (long long) std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
-        PartPlate *plate = plater->get_partplate_list().get_plate(0);
+        PartPlate *plate = plater->get_partplate_list().get_plate(slice_plate_index());
         //THREE DIFFERENT FAILURES, SAID APART. They used to share one sentence because one
         //test answered all three, which is the test's convenience rather than the reader's:
         //a slice that never started, a slice still running when the bound expired, and a

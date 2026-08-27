@@ -322,6 +322,8 @@ def cmd_slice(a):
     gcode = Path(a.out or (PERFDIR / (Path(a.project).stem + ".gcode"))).resolve()
     spec = (f"plates=0,warmup=25,orbit=0,switch=0,assign=1,printer={a.printer},"
             f"board=0,drag=0,pick=0,scope=0,context=1,gcode={gcode},quit=1")
+    if getattr(a, "plate", 0):
+        spec += f",plate={a.plate}"
     rc = drive(spec, a.project, a.timeout)
     if gcode.exists():
         print(f"   kept {gcode}")
@@ -464,7 +466,7 @@ def main():
     p = sub.add_parser("inspect"); p.add_argument("project"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_inspect)
     p = sub.add_parser("run"); p.add_argument("spec"); p.add_argument("--project"); p.add_argument("--timeout", type=int, default=900); p.add_argument("--keep-env", action="store_true", help="honour PETKOS_ACCEPT/PETKOS_TEST_ASSIGN already in the environment"); p.set_defaults(f=cmd_run)
     p = sub.add_parser("printers"); p.add_argument("--add", metavar="VENDOR/MODEL/NOZZLE", help='e.g. "Anycubic/Anycubic Kobra X/0.4"'); p.add_argument("--remove", metavar="VENDOR/MODEL"); p.add_argument("--compare", choices=("page", "full"), help="also open the web guide it replaced and report both costs"); p.add_argument("--timeout", type=int, default=900); p.set_defaults(f=cmd_printers)
-    p = sub.add_parser("slice"); p.add_argument("project"); p.add_argument("--printer", required=True); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1500); p.set_defaults(f=cmd_slice)
+    p = sub.add_parser("slice"); p.add_argument("project"); p.add_argument("--printer", required=True); p.add_argument("--out"); p.add_argument("--plate", type=int, default=0, help="1-based plate to assign and slice (default: plate 1)"); p.add_argument("--timeout", type=int, default=1500); p.set_defaults(f=cmd_slice)
     p = sub.add_parser("cut"); p.add_argument("--project", help=f"default: {CUT_FIXTURE}"); p.add_argument("--z", type=float, default=0.5, help="plane height as a fraction of the object"); p.add_argument("--span", type=float, default=0.5, help="the region's share of the footprint in X"); p.add_argument("--distribute", action="store_true", help="land the parts on the plate"); p.add_argument("--out"); p.add_argument("--timeout", type=int, default=1800); p.set_defaults(f=cmd_cut)
     p = sub.add_parser("check"); p.add_argument("gcode"); p.add_argument("--expect-printer"); p.add_argument("--expect-filament"); p.add_argument("--min-flow", type=float); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_check)
     sub.add_parser("verify").set_defaults(f=cmd_verify)

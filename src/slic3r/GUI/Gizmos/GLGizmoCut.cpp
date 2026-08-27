@@ -3913,7 +3913,8 @@ void GLGizmoCut3D::apply_cut_objects(int object_idx, const CutObjectBase &cut_id
     {
         bool is_showed_dialog = false;
         bool user_fix_model   = false;
-        const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
+        //Paint always survives; the last pref-gated door in the cut flow closes with the rest.
+        const bool keep_painting = true;
         for (size_t i = 0; i < new_objects.size(); i++) {
             for (size_t j = 0; j < new_objects[i]->volumes.size(); j++) {
                 if (its_num_open_edges(new_objects[i]->volumes[j]->mesh().its) > 0) {

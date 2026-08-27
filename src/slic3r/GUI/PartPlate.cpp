@@ -1620,6 +1620,18 @@ int PartPlate::picking_id_component(int idx) const
     return this->m_plate_index * GRABBER_COUNT + idx;
 }
 
+bool PartPlate::has_mmu_painted_object() const
+{
+	for (int obj_idx = 0; obj_idx < (int) m_model->objects.size(); ++obj_idx) {
+		if (!contain_instance_totally(obj_idx, 0))
+			continue;
+		for (const ModelVolume *mv : m_model->objects[obj_idx]->volumes)
+			if (!mv->mmu_segmentation_facets.empty())
+				return true;
+	}
+	return false;
+}
+
 std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
 {
 	std::vector<int> plate_extruders;
@@ -4690,6 +4702,8 @@ int PartPlateList::complete_plate_contexts()
 	selection.printer_preset_name   = bundle->printers.get_selected_preset_name();
 	selection.print_preset_name     = bundle->prints.get_selected_preset_name();
 	selection.filament_preset_names = bundle->filament_presets;
+	if (const auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour"))
+		selection.filament_colours = colours->values;
 	return complete_plate_contexts(selection);
 }
 
@@ -7243,7 +7257,23 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 		//dropped at load and the row must say so rather than render as never sliced.
 		m_plate_list[index]->set_sliced_config_dropped_reason(plate_data_list[i]->sliced_config_dropped_reason);
 		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
-		m_plate_list[index]->set_slicing_context(plate_data_list[i]->slicing_context);
+		{
+			//Migration: before the plate context owned its colours, the one per-plate colour
+			//store was an untyped "filament_colour" key in the plate's override config (written
+			//by AMS sync). Left there it would be counted as a process override, deleted by
+			//"clear overrides", and applied OVER the properly sized per-plate colours - so it
+			//is hoisted into the context here and the override keys are retired.
+			PlateSlicingContext context = plate_data_list[i]->slicing_context;
+			DynamicPrintConfig *plate_cfg = m_plate_list[index]->config();
+			if (context.filament_colours.empty())
+				if (const auto *legacy = plate_cfg->option<ConfigOptionStrings>("filament_colour");
+				    legacy != nullptr && !legacy->values.empty())
+					context.filament_colours = legacy->values;
+			for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour"})
+				plate_cfg->erase(key);
+			context.filament_colours.resize(context.filament_preset_names.size());
+			m_plate_list[index]->set_slicing_context(context);
+		}
 		if (plate_data_list[i]->plate_index != index)
 		{
 			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;

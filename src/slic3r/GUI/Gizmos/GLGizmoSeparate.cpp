@@ -294,6 +294,21 @@ void GLGizmoSeparate::perform_separation()
     region_volume->name        = old->name + " - " + _u8L("separated");
     region_volume->set_new_unique_id();
 
+    //The surface triangles ARE the input triangles, bit for bit - the separator says so and
+    //records which is which in src_face - so every painted channel (filament colour, seams,
+    //supports, fuzzy skin) crosses by index: exact, instant, finer than a facet. Cap faces
+    //have no ancestor and stay unpainted. Without this the split silently stripped the paint
+    //off both halves, which is losing material information to a geometry operation.
+    auto carry_paint = [old](ModelVolume *new_volume, const MeshSeparator::Part &part) {
+        std::vector<int> src_to_dst(old->mesh().its.indices.size(), -1);
+        for (size_t f = 0; f < part.src_face.size(); ++f)
+            if (part.src_face[f] >= 0)
+                src_to_dst[size_t(part.src_face[f])] = int(f);
+        new_volume->remap_painting_by_facets(src_to_dst, *old);
+    };
+    carry_paint(rest_volume, result.rest);
+    carry_paint(region_volume, result.region);
+
     std::swap(mo->volumes[old_idx], mo->volumes.back());
     mo->delete_volume(mo->volumes.size() - 1);
 

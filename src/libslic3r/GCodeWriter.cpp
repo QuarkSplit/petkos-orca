@@ -696,7 +696,13 @@ std::string GCodeWriter::toolchange(unsigned int filament_id, int nozzle_id)
     // if we are running a single-extruder setup, just set the extruder and return nothing
     std::ostringstream gcode;
     // Orca: also emit for non-BBL single-extruder multi-filament setups (MMU-style).
-    if (this->multiple_extruders || (this->config.filament_diameter.values.size() > 1 && !is_bbl_printers())) {
+    // PODSLICER: gated on the filaments this print actually USES, not on the config's slot
+    // count. The raw-size test emitted a T0 into every single-filament print that happened to
+    // live in a multi-slot project, and single-spool firmwares reject a file that announces a
+    // tool they do not have. An MMU printing one colour from a higher slot still gets its T:
+    // that print's used set has max id > 0, so multiple_extruders is already true.
+    if (this->multiple_extruders ||
+        (m_filament_extruders.size() > 1 && this->config.filament_diameter.values.size() > 1 && !is_bbl_printers())) {
         // Orca: manual filament change keeps its tag line even on BBL machines, so the
         // M1020 form must not shadow it. nozzle_id is signed: the null-safe nozzle
         // lookup legitimately yields -1 ("no specific nozzle"), matching the literal

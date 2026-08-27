@@ -190,7 +190,8 @@ CommonGizmosDataID GLGizmoMeshBoolean::on_get_requirements() const
 
 std::optional<TriangleSelector::SavedPainting> VolumeInfo::save_painting() const
 {
-    if (wxGetApp().app_config->get_bool("keep_painting")) {
+    //Paint always survives a boolean; the preference that used to gate this is gone.
+    {
         std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
         if (saved_painting) {
             saved_painting->mesh.transform(trafo);

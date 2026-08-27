@@ -216,6 +216,7 @@ private:
     std::string m_printer_vendor_id;
     std::string m_print_preset_name;
     std::vector<std::string> m_filament_preset_names;
+    std::vector<std::string> m_filament_colours;
     std::string m_physical_printer_id;
 
     // Printable height of this plate's own printer, 0 meaning it has not been applied
@@ -427,7 +428,7 @@ public:
 
     PlateSlicingContext get_slicing_context() const
     {
-        return {m_printer_preset_name, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id};
+        return {m_printer_preset_name, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id};
     }
     void set_slicing_context(const PlateSlicingContext &context)
     {
@@ -436,6 +437,7 @@ public:
         m_printer_vendor_id        = context.printer_vendor_id;
         m_print_preset_name        = context.print_preset_name;
         m_filament_preset_names    = context.filament_preset_names;
+        m_filament_colours         = context.filament_colours;
         m_physical_printer_id      = context.physical_printer_id;
         if (printer_changed)
             invalidate_plate_name_texture();
@@ -443,6 +445,7 @@ public:
     const std::string& get_print_preset_name() const { return m_print_preset_name; }
     const std::string& get_printer_vendor_id() const { return m_printer_vendor_id; }
     const std::vector<std::string>& get_filament_preset_names() const { return m_filament_preset_names; }
+    const std::vector<std::string>& get_filament_colours() const { return m_filament_colours; }
     const std::string& get_physical_printer_id() const { return m_physical_printer_id; }
 
     //How tall this plate can print: its printer's height once the bed has been applied,
@@ -484,6 +487,10 @@ public:
     bool check_objects_empty_and_gcode3mf(std::vector<int> &result) const;
     // get used filaments from config, 1 based idx
     std::vector<int> get_extruders(bool conside_custom_gcode = false) const;
+    // Whether any object on this plate carries per-triangle filament painting. Paint states
+    // are stored slot numbers and are deliberately never clipped, so the single-filament
+    // slicing cut-down must not run over a painted plate unless the paint is all in slot 1.
+    bool has_mmu_painted_object() const;
     std::vector<int> get_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
     std::vector<int> get_extruders_without_support(bool conside_custom_gcode = false) const;
     // get used filaments from gcode result, 1 based idx
@@ -730,7 +737,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -748,7 +755,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {

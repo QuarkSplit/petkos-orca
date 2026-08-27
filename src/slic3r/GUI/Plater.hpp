@@ -571,7 +571,6 @@ public:
     void reslice_SLA_hollowing(const ModelObject &object, bool postpone_error_messages = false);
     void reslice_SLA_until_step(SLAPrintObjectStep step, const ModelObject &object, bool postpone_error_messages = false);
 
-    void clear_before_change_mesh(int obj_idx);
     void changed_mesh(int obj_idx);
 
     void changed_object(ModelObject &object);
@@ -676,7 +675,8 @@ public:
     // This is what upstream #7880, #8216, #10209 and #12943 are actually asking for. None of
     // them wants preset inheritance; they want not to retype their settings on a new machine.
     void save_plate_process_as_preset(int plate_index);
-    void set_plate_filaments(int plate_index, std::vector<std::string> preset_names);
+    void set_plate_filaments(int plate_index, std::vector<std::string> preset_names,
+                             std::vector<std::string> colours = {});
     //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
     //had. The board's inline editor and any MCP surface should both land here.
     void rename_plate(int plate_index, const std::string &name);
