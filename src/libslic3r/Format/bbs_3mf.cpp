@@ -362,13 +362,15 @@ static constexpr const char* INSTANCEID_ATTR = "instance_id";
 static constexpr const char* IDENTIFYID_ATTR = "identify_id";
 static constexpr const char* PLATERID_ATTR = "plater_id";
 static constexpr const char* PLATER_NAME_ATTR = "plater_name";
-// Complete per-plate slicing identity. Attributes are omitted only when the
-// corresponding field explicitly inherits the Project-row default.
+// Complete per-plate slicing identity. Missing attributes are legacy/unresolved data.
 static constexpr const char* PLATER_PRINTER_PRESET_ATTR = "plater_printer_preset";
 static constexpr const char* PLATER_PRINTER_VENDOR_ATTR = "plater_printer_vendor";
 static constexpr const char* PLATER_PRINT_PRESET_ATTR = "plater_print_preset";
 static constexpr const char* PLATER_FILAMENT_PRESETS_ATTR = "plater_filament_presets";
 static constexpr const char* PLATER_FILAMENT_COLOURS_ATTR = "plater_filament_colours";
+static constexpr const char* PLATER_FILAMENT_COLOUR_TYPES_ATTR = "plater_filament_colour_types";
+static constexpr const char* PLATER_FILAMENT_MULTI_COLOURS_ATTR = "plater_filament_multi_colours";
+static constexpr const char* PLATER_FILAMENT_FINISHES_ATTR = "plater_filament_finishes";
 static constexpr const char* PLATER_PHYSICAL_PRINTER_ATTR = "plater_physical_printer";
 static constexpr const char* PLATER_SLICED_CONFIG_PREFIX = "plater_sliced_config:";
 // PetkosOrca: a plate's own config overrides, every key of them. The named attributes further
@@ -2749,41 +2751,43 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 //skip this file
                 return;
             }
-            ConfigOptionString* print_name;
-            ConfigOptionStrings* filament_names;
-            std::string preset_name;
-            if (type == Preset::TYPE_PRINT) {
-                print_name = dynamic_cast < ConfigOptionString* > (config.option("print_settings_id"));
-                if (!print_name) {
-                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", can not found print_settings_id from  %1%\n") % dest_file;
-                    //skip this file
-                    return;
-                }
-                preset_name = print_name->value;
-            }
-            else if (type == Preset::TYPE_FILAMENT) {
-                filament_names = dynamic_cast < ConfigOptionStrings* > (config.option("filament_settings_id"));
-                if (!filament_names) {
-                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", can not found filament_settings_id from  %1%\n") % dest_file;
-                    //skip this file
-                    return;
-                }
-                preset_name = filament_names->values[0];
-            }
-            else if (type == Preset::TYPE_PRINTER) {
-                print_name = dynamic_cast < ConfigOptionString* > (config.option("printer_settings_id"));
-                if (!print_name) {
-                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", can not found printer_settings_id from  %1%\n") % dest_file;
-                    //skip this file
-                    return;
-                }
-                preset_name = print_name->value;
-            }
+            const char *settings_key = nullptr;
+            if (type == Preset::TYPE_PRINT)
+                settings_key = "print_settings_id";
+            else if (type == Preset::TYPE_FILAMENT)
+                settings_key = "filament_settings_id";
+            else if (type == Preset::TYPE_PRINTER)
+                settings_key = "printer_settings_id";
             else {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(", invalid type  %1% from file %2%\n")% Preset::get_type_string(type) % dest_file;
-                //skip this file
+                add_error("Unsupported embedded preset type in " + std::string(stat.m_filename));
                 return;
             }
+
+            //The exporter writes Preset::name separately from inherited config identifiers.
+            std::string preset_name;
+            if (use_json) {
+                const auto declared_name = key_values.find(BBL_JSON_KEY_NAME);
+                if (declared_name != key_values.end())
+                    preset_name = declared_name->second;
+            }
+            if (preset_name.empty()) {
+                if (type == Preset::TYPE_FILAMENT) {
+                    const auto *names = config.option<ConfigOptionStrings>(settings_key);
+                    if (names != nullptr && !names->values.empty())
+                        preset_name = names->values.front();
+                } else if (const auto *name = config.option<ConfigOptionString>(settings_key)) {
+                    preset_name = name->value;
+                }
+            }
+            if (preset_name.empty()) {
+                add_error("Embedded preset " + std::string(stat.m_filename) +
+                          " has neither a name nor a nonempty " + settings_key + "; its settings were not loaded.");
+                return;
+            }
+            if (type == Preset::TYPE_FILAMENT)
+                config.set_key_value(settings_key, new ConfigOptionStrings({preset_name}));
+            else
+                config.set_key_value(settings_key, new ConfigOptionString(preset_name));
 
             Preset *preset = new Preset(type, preset_name, false);
             preset->file = dest_file;
@@ -4513,6 +4517,23 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     add_error("Invalid per-plate filament colour list");
                     return false;
                 }
+            }
+            else if (key == PLATER_FILAMENT_COLOUR_TYPES_ATTR || key == PLATER_FILAMENT_MULTI_COLOURS_ATTR) {
+                auto &values = key == PLATER_FILAMENT_COLOUR_TYPES_ATTR
+                                   ? m_curr_plater->slicing_context.filament_colour_types
+                                   : m_curr_plater->slicing_context.filament_multi_colours;
+                if (!unescape_strings_cstyle(xml_unescape(value.c_str()), values)) {
+                    add_error("Invalid per-plate filament appearance list");
+                    return false;
+                }
+            }
+            else if (key == PLATER_FILAMENT_FINISHES_ATTR) {
+                ConfigOptionInts finishes;
+                if (!finishes.deserialize(xml_unescape(value.c_str()))) {
+                    add_error("Invalid per-plate filament finish list");
+                    return false;
+                }
+                m_curr_plater->slicing_context.filament_finishes = std::move(finishes.values);
             }
             else if (key == PLATER_PHYSICAL_PRINTER_ATTR) {
                 m_curr_plater->slicing_context.physical_printer_id = xml_unescape(value.c_str());
@@ -7988,7 +8009,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
 
             if (preset) {
                 const std::string temp_file = temp_path + std::string("/") + "_temp_1.config";
-                const DynamicPrintConfig& config = preset->config;
+                DynamicPrintConfig config = preset->config;
+                if (preset->type == Preset::TYPE_PRINTER && preset->vendor != nullptr)
+                    config.option<ConfigOptionString>("printer_vendor_id", true)->value = preset->vendor->id;
                 config.save_to_json(temp_file, preset->name, std::string("project"), preset->version.to_string());
 
                 std::string dest_file;
@@ -8176,6 +8199,18 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 if (!context.filament_colours.empty()) {
                     const std::string encoded = escape_strings_cstyle(context.filament_colours);
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_COLOURS_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
+                }
+                if (!context.filament_colour_types.empty()) {
+                    const std::string encoded = escape_strings_cstyle(context.filament_colour_types);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_COLOUR_TYPES_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
+                }
+                if (!context.filament_multi_colours.empty()) {
+                    const std::string encoded = escape_strings_cstyle(context.filament_multi_colours);
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_MULTI_COLOURS_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
+                }
+                if (!context.filament_finishes.empty()) {
+                    const std::string encoded = ConfigOptionInts(context.filament_finishes).serialize();
+                    stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_FILAMENT_FINISHES_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(encoded.c_str()) << "\"/>\n";
                 }
                 if (!context.physical_printer_id.empty())
                     stream << "    <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << PLATER_PHYSICAL_PRINTER_ATTR << "\" " << VALUE_ATTR << "=\"" << xml_escape(context.physical_printer_id.c_str()) << "\"/>\n";

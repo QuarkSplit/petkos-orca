@@ -96,40 +96,9 @@ PlateBoardGrouping PlateBoardModel::default_grouping(int plate_count)
     return plate_count > PLATE_BOARD_COMPACT_ABOVE ? PlateBoardGrouping::ByMachine : PlateBoardGrouping::PlateOrder;
 }
 
-namespace {
-
-//The project's filament library, in slot order. Slot numbers on a plate are 1-based; this
-//vector is 0-based, so a slot indexes it at slot - 1.
-std::vector<std::string> project_filament_colours(const PresetBundle &bundle)
-{
-    const ConfigOptionStrings *colours = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
-    return colours != nullptr ? colours->values : std::vector<std::string>();
-}
-
-//filament_type of the preset currently loaded in a library slot. Empty when the slot is
-//past the end of the library or its preset is not installed, which the material grouping
-//reports as an unnamed material rather than filling in with a plausible one.
-std::string slot_material_type(const PresetBundle &bundle, int slot)
-{
-    if (slot < 1 || (size_t) slot > bundle.filament_presets.size())
-        return std::string();
-
-    const Preset *preset = bundle.filaments.find_preset(bundle.filament_presets[(size_t) slot - 1], false);
-    if (preset == nullptr)
-        return std::string();
-
-    const ConfigOptionStrings *type = preset->config.option<ConfigOptionStrings>("filament_type");
-    if (type == nullptr || type->values.empty())
-        return std::string();
-    return type->values.front();
-}
-
-} // namespace
-
 void PlateBoardModel::build_row(int                             plate_index,
                                 const PartPlateList &           plates,
                                 const PresetBundle &            bundle,
-                                const std::vector<std::string> &colours,
                                 PlateBoardRow &                 row) const
 {
     const PartPlate *plate = plates.get_plate(plate_index);
@@ -206,14 +175,12 @@ void PlateBoardModel::build_row(int                             plate_index,
         }
     }
 
-    //The plate's own colours when it carries them - the context is the plate's one colour
-    //store - and the library's otherwise. Reading the library unconditionally showed the
-    //wrong colour for exactly the plates whose materials had been set deliberately.
-    const std::vector<std::string> &own_colours   = plate->get_filament_colours();
+    // Blank slot colours come from that slot's material, never the unrelated pool row.
+    const auto own_colours = bundle.plate_filament_colours(plate->get_slicing_context());
     auto slot_colour = [&](int slot) -> std::string {
         if (slot >= 1 && (size_t) slot <= own_colours.size() && !own_colours[(size_t) slot - 1].empty())
             return own_colours[(size_t) slot - 1];
-        return slot >= 1 && (size_t) slot <= colours.size() ? colours[(size_t) slot - 1] : std::string();
+        return std::string();
     };
 
     for (int slot : plate->get_extruders(true)) {
@@ -254,8 +221,6 @@ void PlateBoardModel::build_row(int                             plate_index,
                     type != nullptr && !type->values.empty())
                     row.material_type = type->values.front();
         }
-        if (row.material_type.empty())
-            row.material_type = slot_material_type(bundle, row.dominant_slot);
         row.material_colour = slot_colour(row.dominant_slot);
     }
 }
@@ -314,8 +279,6 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
     PETKOS_PERF_SCOPE_AUX(Perf::Probe::BoardRowLayout, (int32_t) plates.get_plate_count());
     m_rows.clear();
 
-    const std::vector<std::string> colours = project_filament_colours(bundle);
-
     //Every row composes its plate's config to read which extruders it uses. Plates that
     //share a printer, a process and a filament set share that answer, and in a real project
     //most of them do - so the loop composes once per distinct context rather than once per
@@ -328,7 +291,7 @@ void PlateBoardModel::rebuild(const PartPlateList &plates, const PresetBundle &b
         if (plates.get_plate(i) == nullptr)
             continue;
         PlateBoardRow row;
-        build_row(i, plates, bundle, colours, row);
+        build_row(i, plates, bundle, row);
         m_rows.push_back(std::move(row));
     }
 
@@ -359,9 +322,7 @@ bool PlateBoardModel::refresh_plate(int plate_index, const PartPlateList &plates
     if (pos == m_rows.size())
         return false;
 
-    const std::vector<std::string> colours = project_filament_colours(bundle);
-
-    build_row(plate_index, plates, bundle, colours, m_rows[pos]);
+    build_row(plate_index, plates, bundle, m_rows[pos]);
 
     //A plate that changed machine changes which group it belongs to and every total that
     //counts machines, so the derived half is recomputed in full. That is arithmetic over
@@ -3950,15 +3911,18 @@ void PlateInspector::on_process_click()
 //decided, which is why the menu leads with the material type rather than with the preset
 //name. The swatch is the control because the swatch is the thing showing the value.
 //
-//Filament is also the one field the re-resolution mechanism will not rewrite on the user's
-//behalf, because substituting a material is a silent yes with a cost in the physical
-//world. So this is the only way it changes, and it changes one slot at a time: writing a
-//whole new list to alter one slot is how the other slots get quietly reset.
+//The same picker serves the sidebar's assigned-material rows. Replacing an existing slot
+//asks which matching assignments to change, leaving unrelated materials alone.
 void PlateInspector::on_filament_slot_click(int slot)
 {
-    if (m_plater == nullptr || !m_plater->is_initialized() || m_plate_index == PLATE_BOARD_NO_PLATE)
+    show_plate_filament_menu(this, m_plater, m_plate_index, slot);
+}
+
+void show_plate_filament_menu(wxWindow *parent, Plater *plater, int plate_index, int slot)
+{
+    if (plater == nullptr || !plater->is_initialized() || plate_index == PLATE_BOARD_NO_PLATE)
         return;
-    PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index);
+    PartPlate *plate = plater->get_partplate_list().get_plate(plate_index);
     if (plate == nullptr || slot < 0)
         return;
 
@@ -3975,8 +3939,10 @@ void PlateInspector::on_filament_slot_click(int slot)
     PresetBundle *bundle  = wxGetApp().preset_bundle;
     const Preset *printer = bundle->printers.find_preset(context.printer_preset_name, false);
     const Preset *process = bundle->prints.find_preset(context.print_preset_name, false);
-    if (printer == nullptr || process == nullptr)
+    if (printer == nullptr || process == nullptr) {
+        show_error(parent, _L("Choose an installed printer and process for this plate before assigning materials."), false);
         return;
+    }
 
     const PresetWithVendorProfile printer_profile = bundle->printers.get_preset_with_vendor_profile(*printer);
     const PresetWithVendorProfile process_profile = bundle->prints.get_preset_with_vendor_profile(*process);
@@ -3998,8 +3964,8 @@ void PlateInspector::on_filament_slot_click(int slot)
     }
 
     //a small filled square, so a spool row shows the colour it is
-    auto colour_bitmap = [this](const std::string &colour_str) -> wxBitmap {
-        const int side = FromDIP(14);
+    auto colour_bitmap = [parent](const std::string &colour_str) -> wxBitmap {
+        const int side = parent->FromDIP(14);
         wxBitmap  bmp(side, side);
         wxMemoryDC dc(bmp);
         wxColour   colour;
@@ -4018,16 +3984,19 @@ void PlateInspector::on_filament_slot_click(int slot)
     //handler is one lookup with no id arithmetic to get wrong.
     struct SlotAction
     {
-        enum Kind { Assign, ChangeColour, RemoveSlot } kind { Assign };
+        enum Kind { Assign, ChangeColour, RemoveSlot, Keep } kind { Assign };
         std::string preset_name; //Assign: the preset to write (already translated)
         std::string colour;      //Assign: the colour that rides with it; empty keeps the slot's
+        std::string colour_type { "1" };
+        std::string multi_colour;
+        int finish { int(FilamentFinish::ffStandard) };
     };
     std::vector<SlotAction> actions;
 
     menu.Append(base_id + 9000, adding ? wxString(_L("New slot")) : wxString::Format(_L("Slot %d"), slot))->Enable(false);
     menu.AppendSeparator();
     if (!current.empty() && bundle->filaments.find_preset(current, false) == nullptr) {
-        actions.push_back({SlotAction::Assign, current, std::string()});
+        actions.push_back({SlotAction::Keep, current, std::string()});
         menu.AppendCheckItem(base_id + (int) actions.size() - 1,
                              wxString::Format(_L("Keep %s (not installed)"), from_u8(current)))->Check(true);
         menu.AppendSeparator();
@@ -4049,6 +4018,10 @@ void PlateInspector::on_filament_slot_click(int slot)
             std::string colour;
             if (pool_colours != nullptr && i < pool_colours->values.size())
                 colour = pool_colours->values[i];
+            if (colour.empty())
+                if (const auto *defaults = pool_preset->config.option<ConfigOptionStrings>("default_filament_colour");
+                    defaults != nullptr && !defaults->values.empty())
+                    colour = defaults->values.front();
 
             std::string target = pool_preset->name;
             std::string note;
@@ -4077,6 +4050,16 @@ void PlateInspector::on_filament_slot_click(int slot)
                 header_done = true;
             }
             actions.push_back({SlotAction::Assign, target, colour});
+            SlotAction &action = actions.back();
+            if (const auto *types = bundle->project_config.option<ConfigOptionStrings>("filament_colour_type");
+                types != nullptr && i < types->values.size())
+                action.colour_type = types->values[i];
+            if (const auto *multi = bundle->project_config.option<ConfigOptionStrings>("filament_multi_colour");
+                multi != nullptr && i < multi->values.size())
+                action.multi_colour = multi->values[i];
+            if (const auto *finishes = bundle->project_config.option<ConfigOptionEnumsGeneric>("filament_finish");
+                finishes != nullptr && i < finishes->values.size())
+                action.finish = finishes->values[i];
             wxMenuItem *item = menu.AppendCheckItem(base_id + (int) actions.size() - 1,
                                                     from_u8(pool_preset->name + note));
             item->SetBitmap(colour_bitmap(colour));
@@ -4133,19 +4116,21 @@ void PlateInspector::on_filament_slot_click(int slot)
     }
     if (actions.empty()) {
         menu.Append(base_id + 9002, _L("No filament in this installation runs on this plate"))->Enable(false);
-        PopupMenu(&menu);
+        parent->PopupMenu(&menu);
         return;
     }
 
-    Plater *plater      = m_plater;
-    const int plate_index = m_plate_index;
     const int slot_index  = slot - 1;
-    PlateInspector *self  = this;
+    wxWindow *self = parent;
     std::vector<std::string> names   = context.filament_preset_names;
-    std::vector<std::string> colours = context.filament_colours;
+    std::vector<std::string> colours = bundle->plate_filament_colours(context);
     colours.resize(names.size());
+    PlateSlicingContext appearance = context;
+    appearance.filament_colour_types.resize(names.size(), "1");
+    appearance.filament_multi_colours.resize(names.size());
+    appearance.filament_finishes.resize(names.size(), int(FilamentFinish::ffStandard));
     menu.Bind(wxEVT_MENU,
-              [plater, plate_index, slot_index, adding, actions, names, colours, base_id, self](wxCommandEvent &evt) mutable {
+              [plater, plate_index, slot_index, adding, actions, names, colours, appearance, base_id, self](wxCommandEvent &evt) mutable {
         const size_t i = (size_t) (evt.GetId() - base_id);
         if (i >= actions.size())
             return;
@@ -4153,14 +4138,22 @@ void PlateInspector::on_filament_slot_click(int slot)
         if (adding && action.kind == SlotAction::Assign) {
             names.emplace_back();
             colours.emplace_back();
+            appearance.filament_colour_types.emplace_back("1");
+            appearance.filament_multi_colours.emplace_back();
+            appearance.filament_finishes.emplace_back(int(FilamentFinish::ffStandard));
         }
         if ((size_t) slot_index >= names.size())
             return;
         switch (action.kind) {
+        case SlotAction::Keep:
+            return;
         case SlotAction::Assign:
             names[(size_t) slot_index] = action.preset_name;
             if (!action.colour.empty())
                 colours[(size_t) slot_index] = action.colour;
+            appearance.filament_colour_types[(size_t) slot_index] = action.colour_type;
+            appearance.filament_multi_colours[(size_t) slot_index] = action.multi_colour;
+            appearance.filament_finishes[(size_t) slot_index] = action.finish;
             break;
         case SlotAction::ChangeColour: {
             wxColourData data;
@@ -4175,16 +4168,27 @@ void PlateInspector::on_filament_slot_click(int slot)
                 return;
             colours[(size_t) slot_index] =
                 dialog.GetColourData().GetColour().GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
+            appearance.filament_colour_types[(size_t) slot_index] = "1";
+            appearance.filament_multi_colours[(size_t) slot_index] = colours[(size_t) slot_index];
             break;
         }
         case SlotAction::RemoveSlot:
             names.pop_back();
             colours.pop_back();
+            appearance.filament_colour_types.pop_back();
+            appearance.filament_multi_colours.pop_back();
+            appearance.filament_finishes.pop_back();
             break;
         }
-        plater->set_plate_filaments(plate_index, std::move(names), std::move(colours));
+        if (!adding && action.kind == SlotAction::Assign) {
+            appearance.filament_colours = colours;
+            plater->choose_plate_material_replacement(plate_index, size_t(slot_index), action.preset_name,
+                                                       false, std::move(appearance));
+        } else {
+            plater->set_plate_filaments(plate_index, std::move(names), std::move(colours), std::move(appearance));
+        }
     });
-    PopupMenu(&menu);
+    parent->PopupMenu(&menu);
 }
 
 //Which physical machine this plate is dispatched to.
@@ -4450,12 +4454,9 @@ void PlateInspector::reload(const PlateBoardModel &model, const std::vector<int>
     if (single) {
         if (PartPlate *plate = m_plater->get_partplate_list().get_plate(m_plate_index); plate != nullptr) {
             const std::vector<std::string> &names       = plate->get_filament_preset_names();
-            const std::vector<std::string> &own_colours = plate->get_filament_colours();
-            const std::vector<std::string> pool_colours = project_filament_colours(*wxGetApp().preset_bundle);
+            const auto own_colours = wxGetApp().preset_bundle->plate_filament_colours(plate->get_slicing_context());
             for (size_t i = 0; i < names.size(); ++i) {
                 std::string colour = i < own_colours.size() ? own_colours[i] : std::string();
-                if (colour.empty() && i < pool_colours.size())
-                    colour = pool_colours[i];
                 swatches.emplace_back(int(i + 1), colour);
             }
             //slot 0 is the add affordance; the strip draws it as "+"

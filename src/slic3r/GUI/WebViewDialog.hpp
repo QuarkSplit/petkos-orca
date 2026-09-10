@@ -25,6 +25,11 @@
 #include <wx/tbarbase.h>
 #include "wx/textctrl.h"
 #include <wx/timer.h>
+#include <atomic>
+#include <cstdint>
+#include <deque>
+#include <thread>
+#include <nlohmann/json.hpp>
 
 
 namespace Slic3r {
@@ -36,9 +41,7 @@ namespace GUI {
 
 class WebViewPanel;
 
-//A drop onto the home page files the model into the library instead of opening it. The
-//distinction matters: opening a loose download leaves it loose, and the reason a library
-//exists is that a model nobody filed is a model nobody finds again.
+// Home drops add containing folders to the catalogue without moving the user's files.
 class HomePageDropTarget : public wxFileDropTarget
 {
 public:
@@ -57,8 +60,7 @@ public:
     WebViewPanel(wxWindow *parent);
     virtual ~WebViewPanel();
 
-    //Resolve, file and re-index dropped models. Returns false when nothing was filed, so
-    //the drop is refused and the file stays where the user left it.
+    // Add dropped folders (or a dropped file's folder) and refresh the catalogue.
     bool IngestDroppedFiles(const wxArrayString &paths);
 
     void load_url(wxString& url);
@@ -133,6 +135,31 @@ public:
 
     void update_mode();
 private:
+    bool HandleLibraryRequest(const std::string &message);
+    void RefreshLibrary();
+    void OnLibraryReady(wxTimerEvent &event);
+    void QueueLibraryThumbnails(const nlohmann::json &paths, bool force);
+    void StartNextLibraryThumbnail();
+    void OnLibraryThumbnailReady(wxTimerEvent &event);
+    void AddLibraryFolders(const wxArrayString &paths);
+    std::vector<std::string> LibraryRoots() const;
+    wxTimer m_library_timer;
+    std::thread m_library_worker;
+    std::atomic<bool> m_library_cancel{false};
+    std::atomic<bool> m_library_ready{false};
+    bool m_library_refresh_pending{false};
+    nlohmann::json m_library_data;
+    nlohmann::json m_library_result;
+    wxTimer m_thumbnail_timer;
+    std::thread m_thumbnail_worker;
+    std::atomic<bool> m_thumbnail_cancel{false};
+    std::atomic<bool> m_thumbnail_ready{false};
+    std::deque<std::pair<nlohmann::json, bool>> m_thumbnail_queue;
+    std::string m_thumbnail_active_path;
+    bool m_thumbnail_active_automatic{false};
+    nlohmann::json m_thumbnail_result;
+    uint64_t m_thumbnail_generation{0};
+    uint64_t m_library_thumbnail_generation{0};
 
     wxWebView* m_browser;
     wxBoxSizer *bSizer_toolbar;

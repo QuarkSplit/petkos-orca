@@ -39,6 +39,7 @@
 #include "Camera.hpp"
 #include "GUI_Colors.hpp"
 #include "GUI_ObjectList.hpp"
+#include "NotificationManager.hpp"
 #include "Tab.hpp"
 #include "format.hpp"
 #include "slic3r/GUI/GUI.hpp"
@@ -4702,8 +4703,7 @@ int PartPlateList::complete_plate_contexts()
 	selection.printer_preset_name   = bundle->printers.get_selected_preset_name();
 	selection.print_preset_name     = bundle->prints.get_selected_preset_name();
 	selection.filament_preset_names = bundle->filament_presets;
-	if (const auto *colours = bundle->project_config.option<ConfigOptionStrings>("filament_colour"))
-		selection.filament_colours = colours->values;
+	PresetBundle::capture_plate_filament_colours(selection, bundle->project_config);
 	return complete_plate_contexts(selection);
 }
 
@@ -5219,6 +5219,8 @@ void PartPlateList::reset_size(int width, int depth, int height, bool reload_obj
 //clear all the instances in the plate, but keep the plates
 void PartPlateList::clear(bool delete_plates, bool release_print_list, bool except_locked, int plate_index)
 {
+    if (delete_plates)
+        m_material_transfers.clear();
 	for (unsigned int i = 0; i < (unsigned int)m_plate_list.size(); ++i)
 	{
 		PartPlate* plate = m_plate_list[i];
@@ -5990,6 +5992,7 @@ int PartPlateList::notify_instance_update(int obj_id, int instance_id, bool is_n
 		plate = m_plate_list[index];
 		if (!plate->intersect_instance(obj_id, instance_id, &boundingbox))
 		{
+			remember_material_context(obj_id, instance_id, *plate);
 			//not include anymore, remove it from original plate
 			BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": not in plate %1% anymore, remove it") % index;
 			plate->remove_instance(obj_id, instance_id);
@@ -6155,6 +6158,7 @@ int PartPlateList::add_to_plate(int obj_id, int instance_id, int plate_id)
 		{
 			//remove it from original plate first
 			plate = m_plate_list[index];
+			remember_material_context(obj_id, instance_id, *plate);
 			plate->remove_instance(obj_id, instance_id);
 		}
 		else
@@ -6176,6 +6180,123 @@ int PartPlateList::add_to_plate(int obj_id, int instance_id, int plate_id)
 	ret = plate->add_instance(obj_id, instance_id, true);
 
 	return ret;
+}
+
+void PartPlateList::remember_material_context(int object_index, int instance_index, const PartPlate &source)
+{
+    if (m_applying_material_transfers || m_model == nullptr || object_index < 0 ||
+        size_t(object_index) >= m_model->objects.size())
+        return;
+    const ModelObject *object = m_model->objects[size_t(object_index)];
+    if (instance_index < 0 || size_t(instance_index) >= object->instances.size())
+        return;
+    const ModelInstance *instance = object->instances[size_t(instance_index)];
+    if (std::any_of(m_material_transfers.begin(), m_material_transfers.end(),
+                    [&](const MaterialTransfer &transfer) { return transfer.instance_id == instance->id(); }))
+        return;
+    m_material_transfers.push_back({instance->id(), source.id(), source.get_slicing_context(),
+                                    instance->get_transformation(), source.get_origin()});
+}
+
+void PartPlateList::remember_material_contexts()
+{
+    for (const PartPlate *plate : m_plate_list)
+        for (const auto &entry : plate->obj_to_instance_set)
+            remember_material_context(entry.first, entry.second, *plate);
+}
+
+bool PartPlateList::apply_pending_material_transfers()
+{
+    if (m_applying_material_transfers || m_material_transfers.empty() || m_plater == nullptr ||
+        wxApp::GetInstance() == nullptr || wxGetApp().preset_bundle == nullptr)
+        return false;
+    m_applying_material_transfers = true;
+    struct ResetFlag { bool &flag; ~ResetFlag() { flag = false; } } reset {m_applying_material_transfers};
+    Plater::SuppressSnapshots suppress_intermediate_snapshots(m_plater);
+    std::vector<MaterialTransfer> pending = std::move(m_material_transfers);
+    m_material_transfers.clear();
+    PresetBundle &bundle = *wxGetApp().preset_bundle;
+    bool changed = false;
+    for (const MaterialTransfer &transfer : pending) {
+        int object_index = -1, instance_index = -1;
+        for (size_t oi = 0; oi < m_model->objects.size() && object_index < 0; ++oi)
+            for (size_t ii = 0; ii < m_model->objects[oi]->instances.size(); ++ii)
+                if (m_model->objects[oi]->instances[ii]->id() == transfer.instance_id) {
+                    object_index = int(oi);
+                    instance_index = int(ii);
+                    break;
+                }
+        if (object_index < 0)
+            continue;
+        ModelObject *object = m_model->objects[size_t(object_index)];
+        BoundingBoxf3 bounds = object->instance_convex_hull_bounding_box(instance_index);
+        const int member_plate = find_instance(object_index, instance_index);
+        PartPlate *destination = member_plate >= 0 ? get_plate(member_plate) : nullptr;
+        if (destination != nullptr && !destination->intersect_instance(object_index, instance_index, &bounds))
+            destination = nullptr;
+        // Keep the existing bed while an oversized instance still intersects it.
+        // Arrange clears membership, so it resolves from the new geometry instead.
+        if (destination == nullptr)
+            for (PartPlate *plate : m_plate_list)
+                if (plate->intersect_instance(object_index, instance_index, &bounds)) {
+                    destination = plate;
+                    break;
+                }
+        if (destination == nullptr) {
+            m_material_transfers.push_back(transfer);
+            continue; // An object may be moved off a bed and onto another in separate gestures.
+        }
+        if (destination->id() == transfer.source_plate_id)
+            continue;
+        changed = true;
+        PlateSlicingContext target = destination->get_slicing_context();
+        std::vector<int> mapping;
+        std::string error;
+        bool mapped = bundle.map_transferred_filaments(transfer.source, target, object->used_filament_ids(), mapping, error);
+        if (mapped)
+            for (const ModelVolume *volume : object->volumes)
+                for (size_t slot : volume->get_extruders_from_multi_material_painting())
+                    if (mapping[slot + 1] > int(EnforcerBlockerType::ExtruderMax)) {
+                        mapped = false;
+                        error = "The destination has no free slot in the range supported by painted meshes";
+                    }
+        if (!mapped) {
+            auto original = transfer.original_transform;
+            for (const PartPlate *plate : m_plate_list)
+                if (plate->id() == transfer.source_plate_id)
+                    original.set_offset(original.get_offset() + plate->get_origin() - transfer.source_origin);
+            object->instances[size_t(instance_index)]->set_transformation(original);
+            object->invalidate_bounding_box();
+            m_plater->get_notification_manager()->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                "Could not move '" + object->name + "' without changing its materials: " + error);
+            changed = true;
+            continue;
+        }
+        bool remap = false;
+        for (size_t slot = 1; slot < mapping.size(); ++slot)
+            remap |= mapping[slot] > 0 && mapping[slot] != int(slot);
+        if (remap) {
+            if (object->instances.size() > 1) {
+                wxGetApp().obj_list()->instances_to_separated_object(object_index, {instance_index});
+                object_index = int(m_model->objects.size() - 1);
+                object = m_model->objects.back();
+            }
+            object->remap_filament_ids(mapping);
+            wxGetApp().obj_list()->update_info_items(size_t(object_index));
+            changed = true;
+        }
+        if (target != destination->get_slicing_context()) {
+            destination->set_slicing_context(target);
+            destination->update_slice_result_valid_state(false);
+            changed = true;
+        }
+    }
+    if (changed) {
+        reload_all_objects();
+        wxGetApp().obj_list()->reload_all_plates();
+    }
+    return changed;
 }
 
 //reload all objects
@@ -6988,6 +7109,7 @@ void PartPlateList::get_sliced_result(std::vector<bool>& sliced_result, std::vec
 //rebuild data which are not serialized after de-serialize
 int PartPlateList::rebuild_plates_after_deserialize(std::vector<bool>& previous_sliced_result, std::vector<std::string>& previous_gcode_paths)
 {
+    m_material_transfers.clear();
 	int ret = 0;
 
 	BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": plates count %1%") % m_plate_list.size();
@@ -7265,13 +7387,18 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 			//is hoisted into the context here and the override keys are retired.
 			PlateSlicingContext context = plate_data_list[i]->slicing_context;
 			DynamicPrintConfig *plate_cfg = m_plate_list[index]->config();
-			if (context.filament_colours.empty())
-				if (const auto *legacy = plate_cfg->option<ConfigOptionStrings>("filament_colour");
-				    legacy != nullptr && !legacy->values.empty())
-					context.filament_colours = legacy->values;
-			for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour"})
+			PresetBundle::capture_plate_filament_colours(context, *plate_cfg, true);
+			for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour", "filament_finish"})
 				plate_cfg->erase(key);
-			context.filament_colours.resize(context.filament_preset_names.size());
+			// Legacy plates may not name their filaments until completion. Resizing here
+			// discarded their AMS colours before the project presets had even been loaded.
+			if (!context.filament_preset_names.empty()) {
+				const size_t n = context.filament_preset_names.size();
+				if (context.filament_colours.size() > n) context.filament_colours.resize(n);
+				if (context.filament_colour_types.size() > n) context.filament_colour_types.resize(n);
+				if (context.filament_multi_colours.size() > n) context.filament_multi_colours.resize(n);
+				if (context.filament_finishes.size() > n) context.filament_finishes.resize(n);
+			}
 			m_plate_list[index]->set_slicing_context(context);
 		}
 		if (plate_data_list[i]->plate_index != index)

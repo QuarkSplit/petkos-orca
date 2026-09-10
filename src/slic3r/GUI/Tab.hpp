@@ -374,7 +374,7 @@ public:
     //bed, the bounds re-check, the re-resolution of dependents. And it is idempotent against
     //follow_plate_presets, which moves the cursor the other way and does nothing once the plate
     //already agrees - which, after this, it does.
-    void write_selection_to_current_plate();
+    bool write_selection_to_current_plate();
 
     //PetkosOrca: THE RULE IS "a preset selection writes the plate only when it is the user choosing
     //what THIS PLATE uses". Three things wear the costume of a selection without being that choice,
@@ -588,6 +588,7 @@ public:
 
 protected:
 	virtual void    activate_selected_page(std::function<void()> throw_if_canceled);
+	virtual bool    update_inherited_config();
 
 	virtual void    on_value_change(const std::string& opt_key, const boost::any& value) override;
 
@@ -636,6 +637,8 @@ protected:
 	virtual void    on_value_change(const std::string& opt_key, const boost::any& value) override;
 	virtual void    notify_changed(ObjectBase* object) override;
 	virtual void	update_custom_dirty(std::vector<std::string> &dirty_options, std::vector<std::string> &nonsys_options) override;
+	bool            update_inherited_config() override;
+	void            reload_config() override;
 
 private:
 	//The tab's working copy of the plate's overrides. PartPlate stores a plain

@@ -49,6 +49,8 @@
 #include "../Utils/NetworkAgentFactory.hpp"
 #include "../Utils/PrintHost.hpp"
 
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <string_view>
 
@@ -4230,7 +4232,7 @@ inline void MainFrame::FileHistory::SetMaxFiles(int max)
         RemoveFileFromHistory(--numFiles);
 }
 
-void MainFrame::get_recent_projects(boost::property_tree::wptree &tree, int images)
+void MainFrame::get_recent_projects(boost::property_tree::wptree &tree, int /*images*/)
 {
     for (size_t i = 0; i < m_recent_projects.GetCount(); ++i) {
         boost::property_tree::wptree item;
@@ -4242,12 +4244,22 @@ void MainFrame::get_recent_projects(boost::property_tree::wptree &tree, int imag
         if (!ec) {
             std::wstring time = wxDateTime(t).FormatISOCombined(' ').ToStdWstring();
             item.put(L"time", time);
-            if (i <= images) {
-                auto thumbnail = m_recent_projects.GetThumbnailUrl(i);
-                if (!thumbnail.empty()) item.put(L"image", thumbnail);
+            // Recent files use the same source identity as the indexed preview cache.
+            const auto source = std::filesystem::u8path(into_u8(m_recent_projects.GetHistoryFile(i)));
+            std::error_code source_error;
+            const auto size = std::filesystem::file_size(source, source_error);
+            if (!source_error) {
+                const auto modified = std::filesystem::last_write_time(source, source_error);
+                if (!source_error) {
+                    item.put(L"size", uint64_t(size));
+                    item.put(L"revision", std::to_wstring(int64_t(modified.time_since_epoch().count())));
+                }
             }
+            // The history image has no source stamp; validate it through the library worker.
+            item.put(L"thumbState", L"pending");
         } else {
             item.put(L"time", _L("File is missing"));
+            item.put(L"missing", true);
         }
         tree.push_back({L"", item});
     }

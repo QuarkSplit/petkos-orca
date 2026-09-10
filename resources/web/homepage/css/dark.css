@@ -138,3 +138,5 @@ body
 #BambuCloudHeader       { color: #818183; }
 #BambuCloudHeader:hover { color: #efeff0; }
 .bambu-chevron svg path { stroke: currentColor; }
+
+#LibraryArea { --library-text: #efeff0; }

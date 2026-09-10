@@ -1447,7 +1447,7 @@ static std::vector<std::string> s_Preset_printer_options {
     "printable_area", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "gcode_flavor",
     "fan_kickstart", "part_cooling_fan_min_pwm", "fan_speedup_time", "fan_speedup_overhangs",
     "single_extruder_multi_material", "manual_filament_change", "file_start_gcode", "machine_start_gcode", "machine_end_gcode", "before_layer_change_gcode", "printing_by_object_gcode", "layer_change_gcode", "time_lapse_gcode", "wrapping_detection_gcode", "change_filament_gcode", "change_extrusion_role_gcode",
-    "printer_model", "printer_variant", "printer_extruder_id", "printer_extruder_variant", "extruder_variant_list", "default_nozzle_volume_type",
+    "printer_model", "printer_variant", "printer_vendor_id", "printer_extruder_id", "printer_extruder_variant", "extruder_variant_list", "default_nozzle_volume_type",
     "printable_height", "extruder_printable_height", "extruder_clearance_radius", "extruder_clearance_height_to_lid", "extruder_clearance_height_to_rod",
     "nozzle_height", "master_extruder_id",
     "default_print_profile", "inherits",
@@ -2007,6 +2007,7 @@ void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& proje
     Preset::get_extruder_names_and_keysets(m_type, extruder_id_name, extruder_variant_name, &key_set1, &key_set2);
 
     lock();
+    const std::string selected_name = get_selected_preset_name();
     for (it = project_presets.begin(); it != project_presets.end(); it++) {
         Preset* preset = *it;
         if (preset->type != Preset::get_type_from_string(type)) continue;
@@ -2038,19 +2039,27 @@ void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& proje
                 Preset::normalize_inherits(config, inherit_preset);
             }
             const Preset& default_preset = this->default_preset_for(config);
-            if (inherit_preset) {
+            const auto schema_keys = default_preset.config.keys();
+            const bool complete_config = std::all_of(schema_keys.begin(), schema_keys.end(),
+                [&config](const std::string &key) {
+                    // Older complete machine presets predate explicit vendor metadata.
+                    return key == "printer_vendor_id" || config.has(key);
+                });
+            if (complete_config) {
+                // A resolved embedded preset already owns every setting, including its
+                // extruder layout. It does not need an installed parent to reconstruct it.
+                preset->config = config;
+                if (inherit_preset)
+                    preset->filament_id = inherit_preset->filament_id;
+            } else if (inherit_preset) {
                 preset->config = inherit_preset->config;
                 preset->filament_id = inherit_preset->filament_id;
+                preset->config.update_diff_values_to_child_config(config, extruder_id_name, extruder_variant_name, *key_set1, *key_set2);
             }
             else {
-                // Find a default preset for the config. The PrintPresetCollection provides different default preset based on the "printer_technology" field.
-                //BBS 202407: don't load project embedded preset when can not find inherit
-                //preset->config = default_preset.config;
-                BOOST_LOG_TRIVIAL(error) << boost::format("can not find parent for config %1%!")%preset->file;
+                BOOST_LOG_TRIVIAL(error) << boost::format("Incomplete embedded preset %1% has no available parent") % preset->name;
                 continue;
             }
-            preset->config.update_diff_values_to_child_config(config, extruder_id_name, extruder_variant_name, *key_set1, *key_set2);
-            //preset->config.apply(std::move(config));
             Preset::normalize(preset->config);
             // Report configuration fields, which are misplaced into a wrong group.
             std::string incorrect_keys = Preset::remove_invalid_keys(preset->config, default_preset.config);
@@ -2070,6 +2079,12 @@ void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& proje
 
     m_presets.insert(m_presets.end(), std::make_move_iterator(presets_loaded.begin()), std::make_move_iterator(presets_loaded.end()));
     sort_presets();
+    // Sorting changes indices; keep the edited preset attached to its original name.
+    // Reselecting would discard unsaved edits, so only repair the index.
+    const auto selected = std::find_if(m_presets.begin(), m_presets.end(),
+        [&selected_name](const Preset &preset) { return preset.name == selected_name; });
+    m_idx_selected = !selected_name.empty() && selected != m_presets.end()
+                         ? size_t(selected - m_presets.begin()) : size_t(-1);
     //don't select it here
     //this->select_preset(first_visible_idx());
     unlock();

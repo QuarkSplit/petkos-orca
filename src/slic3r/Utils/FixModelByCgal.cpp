@@ -154,11 +154,6 @@ bool fix_model_with_cgal_gui(ModelObject &model_object, int volume_idx, GUI::Pro
                     TriangleMesh mesh = part_volume->mesh();
                     if (its_num_open_edges(mesh.its) != 0) {
 
-                        // Save painting for later remap
-                        const std::optional<TriangleSelector::SavedPainting> saved_painting = keep_painting ?
-                                                                                            part_volume->save_painting() :
-                                                                                            std::optional<TriangleSelector::SavedPainting>{};
-
                         //The repair runs inside CGAL for as long as the mesh needs, so Cancel has to
                         //reach in rather than be checked after it returns - that wait was the whole of
                         //"I gave up after fifteen minutes". Returning false from here unwinds CGAL.
@@ -179,13 +174,11 @@ bool fix_model_with_cgal_gui(ModelObject &model_object, int volume_idx, GUI::Pro
                             throw Slic3r::RuntimeError(error);
                         }
 
-                        part_volume->set_mesh(std::move(mesh));
+                        part_volume->set_mesh_preserving_paint(std::move(mesh));
                         part_volume->calculate_convex_hull();
                         part_volume->invalidate_convex_hull_2d();
                         part_volume->set_new_unique_id();
 
-                        // Remap paint back
-                        part_volume->restore_painting(saved_painting);
                     }
                 }
 

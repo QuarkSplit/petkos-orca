@@ -1,11 +1,12 @@
-/* Project library. Colours come from the existing home page variables so the panel
-   follows the light/dark switch without a second theme to maintain. */
-
-/* Nothing on this page sets a text colour on the document, so uncoloured text falls back
-   to the browser default, which is black under either theme. Anchoring the panel to the
-   theme-aware variable is what keeps the meta lines and the pickup list legible when the
-   dark stylesheet paints the body dark; without it they are black on near-black. */
-#LibraryArea { padding: 0 24px 40px 24px; color: var(--fg-color-text); }
+/* Follow the app stylesheet, independently of the operating system colour scheme. */
+#LibraryArea { padding: 0 24px 40px 24px; color: var(--library-text, #262E30); }
+#RightBoard { min-width: 0; flex: 1 1 auto; }
+@media (max-width: 850px) {
+    #ContentBoard { padding: 0 12px; }
+    #LibraryArea { padding-left: 8px; padding-right: 8px; }
+    #MenuArea { flex-wrap: wrap; height: auto; flex-basis: auto; gap: 10px; padding: 14px 0; }
+    .MenuItem { width: auto; min-width: 180px; flex: 1 1 180px; margin-right: 0; box-sizing: border-box; }
+}
 
 #LibHeader {
     display: flex; align-items: baseline; gap: 12px;
@@ -13,7 +14,28 @@
 }
 #LibHeader .Content-Title { margin: 0; }
 #LibCount { opacity: 0.6; font-size: 12px; }
-#LibRebuildTip { opacity: 0.45; font-size: 11px; margin-left: auto; }
+#LibRefresh { margin-left: auto; }
+#LibStatus { font-size: 12px; opacity: 0.75; margin-bottom: 10px; }
+#LibShelves { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.LibShelf { background: transparent; color: inherit; border: 1px solid rgba(128,128,128,.3); border-radius: 7px; padding: 10px 15px; font: inherit; cursor: pointer; }
+.LibShelfOn { background: #4F87A5; border-color: #4F87A5; color: white; }
+#LibLocation { font-size: 13px; margin-bottom: 12px; }
+.LibOverview #LibRoot, .LibOverview #LibGroup, .LibOverview #LibSort, .LibOverview #LibKindChip,
+.LibOverview #LibPickupChip, .LibOverview #LibControls > .LibChip, .LibOverview #LibChips, .LibOverview #LibPickup { display: none !important; }
+.LibOverview #LibGrid { grid-template-columns: repeat(auto-fill,minmax(230px,1fr)); }
+.LibDesignCard { border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 14px; min-width: 0; }
+.LibDesignThumb { height: 150px; aspect-ratio: auto !important; }
+.LibDesignCard h3 { font-size: 16px; margin: 12px 0 7px; }
+.LibDesignCard p { font-size: 12px; opacity: .75; line-height: 1.5; min-height: 36px; }
+.LibDesignActions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+.LibShelf:focus-visible, .LibDesignActions button:focus-visible { outline: 2px solid #4F87A5; outline-offset: 3px; }
+#LibFolders { font-size: 12px; margin-bottom: 14px; }
+#LibFolders summary { cursor: pointer; }
+.LibRootRow { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+.LibRootRow > span:first-child { overflow-wrap: anywhere; }
+.LibPath { font-size: 10px; opacity: 0.7; margin-top: 4px; overflow-wrap: anywhere; }
+.LibFolderButton { background: transparent; border: 0; padding: 4px 0; color: inherit; text-decoration: underline; cursor: pointer; font-size: 11px; }
+.LibProblem { color: #d47630; font-size: 11px; overflow-wrap: anywhere; }
 
 #LibControls {
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;
@@ -24,14 +46,16 @@
     color: inherit; font-size: 13px; outline: none;
 }
 #LibSearch:focus { border-color: #00A26E; }
-#LibGroup, #LibSort {
+#LibGroup, #LibSort, #LibRoot {
     padding: 7px 8px; border-radius: 6px; font-size: 13px; color: inherit;
     border: 1px solid rgba(128, 128, 128, 0.35); background: transparent; outline: none;
 }
-#LibGroup option, #LibSort option { color: #222; }
+#LibGroup, #LibRoot { max-width: 260px; }
+#LibGroup option, #LibSort option, #LibRoot option { color: #222; }
 
 #LibChips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .LibChip {
+    background: transparent; color: inherit; font-family: inherit;
     padding: 5px 11px; border-radius: 999px; font-size: 12px; cursor: pointer;
     border: 1px solid rgba(128, 128, 128, 0.35); user-select: none; white-space: nowrap;
 }
@@ -39,6 +63,8 @@
 .LibChip:hover { border-color: #00A26E; }
 .LibChipOn { background: #00A26E; border-color: #00A26E; color: #fff; }
 .LibChipOn b { opacity: 0.8; }
+.LibChip:disabled { cursor: wait; opacity: 0.6; }
+.LibChip:focus-visible, .LibCard:focus-visible { outline: 2px solid #00A26E; outline-offset: 3px; }
 
 #LibGrid {
     display: grid; gap: 18px;
@@ -52,6 +78,13 @@
     display: flex; align-items: center; justify-content: center;
 }
 .LibThumb img { width: 100%; height: 100%; object-fit: contain; }
+.LibThumbnailImage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+.LibThumbnailState { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 24px 12px; text-align: center; font-size: 12px; line-height: 1.4; }
+.LibThumbnailState small { font-size: 10px; opacity: .65; overflow-wrap: anywhere; }
+.LibThumbnailPending::before { content: ''; width: 18px; height: 18px; border: 2px solid rgba(128,128,128,.25); border-top-color: #4F87A5; border-radius: 50%; animation: LibThumbnailSpin 1s linear infinite; }
+.LibThumbnailUnavailable { opacity: .7; }
+@keyframes LibThumbnailSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .LibThumbnailPending::before { animation: none; } }
 .LibCard:hover .LibThumb { outline: 2px solid #00A26E; }
 
 /* The badge is the point of the card, so it is legible against any thumbnail rather

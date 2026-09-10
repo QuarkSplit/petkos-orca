@@ -353,6 +353,17 @@ DynamicPrintConfig PresetBundle::construct_full_config(
     return out;
 }
 
+static std::string resolved_printer_vendor_id(const PresetWithVendorProfile &profile)
+{
+    if (profile.vendor != nullptr)
+        return profile.vendor->id;
+    if (profile.preset.is_project_embedded) {
+        if (const auto *vendor = profile.preset.config.option<ConfigOptionString>("printer_vendor_id"))
+            return vendor->value;
+    }
+    return {};
+}
+
 bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
                                          ResolvedPlatePresets      &presets,
                                          std::string               &error) const
@@ -385,7 +396,7 @@ bool PresetBundle::resolve_plate_presets(const PlateSlicingContext &context,
     }
 
     const PresetWithVendorProfile printer_profile = printers.get_preset_with_vendor_profile(*printer);
-    const std::string vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
+    const std::string vendor_id = resolved_printer_vendor_id(printer_profile);
     // The plate records the vendor its printer name was written against. A name that now
     // resolves to another vendor's preset is a different machine wearing the same string,
     // so it is unresolved rather than accepted.
@@ -623,10 +634,11 @@ bool PresetBundle::complete_plate_context(PlateSlicingContext &context, const Pl
         if (!slots.empty()) {
             //The colours ride with the materials. A seed slot with no recorded colour stays
             //empty, and composition fills it from the preset's own default.
-            std::vector<std::string> colours = seed.filament_colours;
+            std::vector<std::string> colours = context.filament_colours.empty() ? seed.filament_colours : context.filament_colours;
             colours.resize(slots.size());
             context.filament_preset_names = std::move(slots);
             context.filament_colours      = std::move(colours);
+            migrate_legacy_plate_filament_colours(context, seed);
             wrote                         = true;
         }
     }
@@ -670,7 +682,7 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
     // Assignment records the name and set_printer_preset_name clears the vendor id.
     // Recording it here is what makes a later name collision across vendors read as a
     // different machine wearing the same string, rather than resolve to it.
-    context.printer_vendor_id = printer_profile.vendor != nullptr ? printer_profile.vendor->id : std::string();
+    context.printer_vendor_id = resolved_printer_vendor_id(printer_profile);
 
     // The process slot.
     const Preset *process = prints.find_preset(context.print_preset_name, false);
@@ -782,8 +794,11 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
                                                         : declared_filaments->values.front();
     };
 
-    // Filament slots: reported, never rewritten. The user should hear which materials
-    // cannot follow the plate onto this machine.
+    // Resolve unspecified colours before replacing material preset names: the new
+    // machine's preset may declare a different colour for exactly the same material.
+    context.filament_colours = plate_filament_colours(context);
+
+    // Filament slots retain their material and appearance when translated.
     const Preset *post_process = prints.find_preset(context.print_preset_name, false);
     //A copy, because the loop below rewrites the slots it translates.
     const std::vector<std::string> filament_names = context.filament_preset_names;
@@ -845,7 +860,312 @@ bool PresetBundle::reresolve_plate_context_for_printer(PlateSlicingContext      
     //and stays exactly where it was. Only the vector's length is kept honest here, so a slot
     //always has a colour cell to write into.
     context.filament_colours.resize(context.filament_preset_names.size());
+    context.filament_colour_types.resize(context.filament_preset_names.size(), "1");
+    context.filament_multi_colours.resize(context.filament_preset_names.size());
+    context.filament_finishes.resize(context.filament_preset_names.size(), int(FilamentFinish::ffStandard));
 
+    return true;
+}
+
+std::vector<std::string> PresetBundle::plate_filament_colours(const PlateSlicingContext &context) const
+{
+    std::vector<std::string> colours = context.filament_colours;
+    colours.resize(context.filament_preset_names.size());
+    for (size_t i = 0; i < colours.size(); ++i) {
+        if (colours[i].empty())
+            if (const Preset *preset = filaments.find_preset(context.filament_preset_names[i], false))
+                if (const auto *defaults = preset->config.option<ConfigOptionStrings>("default_filament_colour");
+                    defaults != nullptr && !defaults->values.empty())
+                    colours[i] = defaults->values.front();
+        if (colours[i].empty())
+            colours[i] = "#26A69A";
+    }
+    return colours;
+}
+
+void PresetBundle::capture_plate_filament_colours(PlateSlicingContext &context, const DynamicPrintConfig &config,
+                                                 bool only_missing)
+{
+    auto capture = [&](const char *key, std::vector<std::string> &values) {
+        if (!only_missing || values.empty())
+            if (const auto *option = config.option<ConfigOptionStrings>(key))
+                values = option->values;
+    };
+    capture("filament_colour", context.filament_colours);
+    capture("filament_colour_type", context.filament_colour_types);
+    capture("filament_multi_colour", context.filament_multi_colours);
+    if (!only_missing || context.filament_finishes.empty())
+        if (const auto *option = config.option<ConfigOptionEnumsGeneric>("filament_finish"))
+            context.filament_finishes = option->values;
+}
+
+void PresetBundle::apply_plate_filament_colours(const PlateSlicingContext &context, DynamicPrintConfig &config)
+{
+    const size_t n = context.filament_preset_names.size();
+    auto colours = context.filament_colours;
+    colours.resize(n);
+    const auto *defaults = config.option<ConfigOptionStrings>("default_filament_colour");
+    for (size_t i = 0; i < n; ++i) {
+        if (colours[i].empty() && defaults != nullptr && i < defaults->values.size())
+            colours[i] = defaults->values[i];
+        if (colours[i].empty())
+            colours[i] = "#26A69A";
+    }
+    config.option<ConfigOptionStrings>("filament_colour", true)->values = colours;
+    auto types = context.filament_colour_types;
+    types.resize(n, "1");
+    for (std::string &type : types)
+        if (type.empty())
+            type = "1";
+    config.option<ConfigOptionStrings>("filament_colour_type", true)->values = std::move(types);
+    auto multi = context.filament_multi_colours;
+    multi.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        if (multi[i].empty())
+            multi[i] = colours[i];
+    config.option<ConfigOptionStrings>("filament_multi_colour", true)->values = std::move(multi);
+    auto finishes = context.filament_finishes;
+    finishes.resize(n, int(FilamentFinish::ffStandard));
+    config.option<ConfigOptionEnumsGeneric>("filament_finish", true)->values = std::move(finishes);
+}
+
+void PresetBundle::migrate_legacy_plate_filament_colours(PlateSlicingContext &context, const PlateSlicingContext &declared)
+{
+    // Only an absent vector marks a legacy attribute. A recorded blank colour cell
+    // deliberately asks for the material's default and must not acquire a pool colour.
+    const bool missing_colours = context.filament_colours.empty();
+    const bool missing_types = context.filament_colour_types.empty();
+    const bool missing_multi = context.filament_multi_colours.empty();
+    const bool missing_finishes = context.filament_finishes.empty();
+    const size_t n = context.filament_preset_names.size();
+    if (n == 0)
+        return; // Completion will supply the names and preserve any legacy AMS appearance.
+    context.filament_colours.resize(n);
+    context.filament_colour_types.resize(n, "1");
+    context.filament_multi_colours.resize(n);
+    context.filament_finishes.resize(n, int(FilamentFinish::ffStandard));
+    for (size_t i = 0; i < n && i < declared.filament_preset_names.size(); ++i) {
+        if (Preset::strip_project_decoration(context.filament_preset_names[i]) !=
+            Preset::strip_project_decoration(declared.filament_preset_names[i]))
+            continue;
+        const std::string colour = i < declared.filament_colours.size() ? declared.filament_colours[i] : std::string();
+        if (missing_colours)
+            context.filament_colours[i] = colour;
+        if (context.filament_colours[i] == colour) {
+            if (missing_types && i < declared.filament_colour_types.size())
+                context.filament_colour_types[i] = declared.filament_colour_types[i];
+            if (missing_multi && i < declared.filament_multi_colours.size())
+                context.filament_multi_colours[i] = declared.filament_multi_colours[i];
+        }
+        if (missing_finishes && i < declared.filament_finishes.size())
+            context.filament_finishes[i] = declared.filament_finishes[i];
+    }
+}
+
+bool PresetBundle::assign_plate_material(PlateSlicingContext &context, size_t slot,
+                                         const std::string &source_preset, std::string &error) const
+{
+    error.clear();
+    if (slot >= context.filament_preset_names.size()) {
+        error = "The plate has no material slot " + std::to_string(slot + 1);
+        return false;
+    }
+    ResolvedPlatePresets presets;
+    if (!resolve_plate_presets(context, presets, error))
+        return false;
+    const Preset *source = filaments.find_preset(source_preset, false);
+    if (source == nullptr || source->is_default) {
+        error = "Material preset is unavailable: " + source_preset;
+        return false;
+    }
+    const auto printer = printers.get_preset_with_vendor_profile(*presets.printer);
+    const auto process = prints.get_preset_with_vendor_profile(*presets.print);
+    const auto filament = filaments.get_preset_with_vendor_profile(*source);
+    std::string assigned = source->name;
+    if (!is_compatible_with_printer(filament, printer, &project_config) ||
+        !is_compatible_with_print(filament, process, printer)) {
+        assigned = translate_filament_to_printer(source->name, printer, process);
+        if (assigned.empty()) {
+            error = "No compatible " + source->config.opt_string("filament_type", 0u) +
+                    " material is available for " + presets.printer->name;
+            return false;
+        }
+    }
+    context.filament_preset_names[slot] = std::move(assigned);
+    return true;
+}
+
+void PresetBundle::rebase_assigned_material_overrides(const PlateSlicingContext &previous,
+                                                      const PlateSlicingContext &current,
+                                                      const DynamicPrintConfig &resolved,
+                                                      DynamicPrintConfig &overrides) const
+{
+    if (previous.filament_preset_names == current.filament_preset_names)
+        return;
+    const auto changed = [&](size_t slot) {
+        return slot >= previous.filament_preset_names.size() ||
+               previous.filament_preset_names[slot] != current.filament_preset_names[slot];
+    };
+    const auto &material_keys = Preset::filament_options();
+    const auto &process_keys = Preset::print_options();
+    for (const std::string &key : overrides.keys()) {
+        const bool identity = key == "filament_settings_id" || key == "filament_ids";
+        if (!identity && (std::find(material_keys.begin(), material_keys.end(), key) == material_keys.end() ||
+                          std::find(process_keys.begin(), process_keys.end(), key) != process_keys.end() ||
+                          key == "default_filament_colour"))
+            continue;
+
+        const ConfigOption *old = overrides.option(key);
+        const ConfigOption *composed = resolved.option(key);
+        const auto *old_vector = dynamic_cast<const ConfigOptionVectorBase *>(old);
+        if (old_vector == nullptr) {
+            if (!current.filament_preset_names.empty() && changed(0)) {
+                const Preset *first = filaments.find_preset(current.filament_preset_names.front(), false);
+                const ConfigOption *replacement = composed != nullptr ? composed : first != nullptr ? first->config.option(key) : nullptr;
+                if (replacement != nullptr && replacement->type() == old->type())
+                    overrides.set_key_value(key, replacement->clone());
+            }
+            continue;
+        }
+
+        // Raw composition concatenates each preset's entire vector, whose width can
+        // differ between materials. Imported flattened vectors instead carry one per slot.
+        auto widths = [&](const PlateSlicingContext &context, size_t actual_size) {
+            std::vector<size_t> result(context.filament_preset_names.size(), 0);
+            size_t known = 0, unknown = 0;
+            for (size_t i = 0; i < result.size(); ++i) {
+                const Preset *preset = filaments.find_preset(context.filament_preset_names[i], false);
+                const auto *option = preset == nullptr ? nullptr : dynamic_cast<const ConfigOptionVectorBase *>(preset->config.option(key));
+                result[i] = identity || actual_size == result.size() ? 1 : option == nullptr ? 0 : option->size();
+                known += result[i];
+                unknown += result[i] == 0;
+            }
+            if (unknown > 0) {
+                const size_t missing_width = actual_size > known && (actual_size - known) % unknown == 0
+                                               ? (actual_size - known) / unknown : 1;
+                for (size_t &width : result)
+                    if (width == 0) width = missing_width;
+            }
+            return result;
+        };
+        const auto old_widths = widths(previous, old_vector->size());
+        const auto *composed_vector = dynamic_cast<const ConfigOptionVectorBase *>(composed);
+        const auto new_widths = widths(current, composed_vector == nullptr ? 0 : composed_vector->size());
+        std::unique_ptr<ConfigOption> replacement(old->clone());
+        auto *destination = static_cast<ConfigOptionVectorBase *>(replacement.get());
+        destination->clear();
+        size_t old_offset = 0, new_offset = 0, destination_offset = 0;
+        bool complete = true;
+        for (size_t i = 0; i < current.filament_preset_names.size(); ++i) {
+            const ConfigOptionVectorBase *source = old_vector;
+            size_t start = old_offset;
+            size_t count = i < old_widths.size() ? old_widths[i] : 0;
+            ConfigOptionStrings identifier;
+            if (changed(i)) {
+                const Preset *preset = filaments.find_preset(current.filament_preset_names[i], false);
+                if (identity) {
+                    identifier.values = {key == "filament_settings_id" ? current.filament_preset_names[i]
+                                                                       : preset == nullptr ? "" : preset->filament_id};
+                    source = &identifier;
+                    start = 0;
+                    count = 1;
+                } else if (composed_vector != nullptr && new_offset + new_widths[i] <= composed_vector->size()) {
+                    source = composed_vector;
+                    start = new_offset;
+                    count = new_widths[i];
+                } else {
+                    // A different unresolved slot must not stop repairing this material.
+                    source = preset == nullptr ? nullptr : dynamic_cast<const ConfigOptionVectorBase *>(preset->config.option(key));
+                    start = 0;
+                    count = source == nullptr ? 0 : source->size();
+                }
+            }
+            if (source == nullptr || source->type() != old->type() || count == 0) {
+                complete = false;
+                break;
+            }
+            for (size_t j = 0; j < count; ++j) {
+                const size_t index = source == old_vector && source->size() == 1 ? 0 : start + j;
+                if (index >= source->size()) {
+                    complete = false;
+                    break;
+                }
+                destination->resize(destination_offset + 1, source);
+                destination->set_at(source, destination_offset++, index);
+            }
+            if (!complete) break;
+            if (i < old_widths.size()) old_offset += old_widths[i];
+            new_offset += new_widths[i];
+        }
+        if (complete)
+            overrides.set_key_value(key, replacement.release());
+    }
+}
+
+bool PresetBundle::map_transferred_filaments(const PlateSlicingContext &source, PlateSlicingContext &destination,
+                                            const std::vector<int> &used_slots, std::vector<int> &mapping,
+                                            std::string &error) const
+{
+    error.clear();
+    mapping.assign(source.filament_preset_names.size() + 1, 0);
+    PlateSlicingContext from = source, to = destination;
+    auto normalize = [&](PlateSlicingContext &context) {
+        const size_t n = context.filament_preset_names.size();
+        context.filament_colours = plate_filament_colours(context);
+        context.filament_colour_types.resize(n, "1");
+        context.filament_multi_colours.resize(n);
+        context.filament_finishes.resize(n, int(FilamentFinish::ffStandard));
+        for (size_t i = 0; i < n; ++i) {
+            if (context.filament_colour_types[i].empty()) context.filament_colour_types[i] = "1";
+            if (context.filament_multi_colours[i].empty()) context.filament_multi_colours[i] = context.filament_colours[i];
+        }
+    };
+    normalize(from);
+    normalize(to);
+    ResolvedPlatePresets presets;
+    std::string resolution_error;
+    const bool resolved = resolve_plate_presets(to, presets, resolution_error);
+    for (int slot : used_slots) {
+        if (slot <= 0 || size_t(slot) > from.filament_preset_names.size()) {
+            error = "The source plate has no material for slot " + std::to_string(slot);
+            return false;
+        }
+        const size_t i = size_t(slot - 1);
+        std::string name = from.filament_preset_names[i];
+        if (resolved) {
+            const auto printer = printers.get_preset_with_vendor_profile(*presets.printer);
+            const auto process = prints.get_preset_with_vendor_profile(*presets.print);
+            const Preset *filament = filaments.find_preset(name, false);
+            if (filament != nullptr) {
+                const auto profile = filaments.get_preset_with_vendor_profile(*filament);
+                if (!is_compatible_with_printer(profile, printer, &project_config) ||
+                    !is_compatible_with_print(profile, process, printer))
+                    if (std::string translated = translate_filament_to_printer(name, printer, process); !translated.empty())
+                        name = std::move(translated);
+            }
+        }
+        size_t target = 0;
+        for (; target < to.filament_preset_names.size(); ++target)
+            if (to.filament_preset_names[target] == name &&
+                to.filament_colours[target] == from.filament_colours[i] &&
+                to.filament_colour_types[target] == from.filament_colour_types[i] &&
+                to.filament_multi_colours[target] == from.filament_multi_colours[i] &&
+                to.filament_finishes[target] == from.filament_finishes[i])
+                break;
+        if (target == to.filament_preset_names.size()) {
+            if (target >= MAXIMUM_EXTRUDER_NUMBER) {
+                error = "The destination plate has no room for another material slot";
+                return false;
+            }
+            to.filament_preset_names.push_back(name);
+            to.filament_colours.push_back(from.filament_colours[i]);
+            to.filament_colour_types.push_back(from.filament_colour_types[i]);
+            to.filament_multi_colours.push_back(from.filament_multi_colours[i]);
+            to.filament_finishes.push_back(from.filament_finishes[i]);
+        }
+        mapping[size_t(slot)] = int(target + 1);
+    }
+    destination = std::move(to);
     return true;
 }
 
@@ -1019,34 +1339,7 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
         // enforced here, where the plate's config is born: every colour-family vector is exactly
         // as wide as the plate's slot list, and the plate's own colours outrank the project's.
         // Colour is material information; the plate owns its materials.
-        {
-            const size_t n = filament_names.size();
-            auto &colours  = resolved.config.option<ConfigOptionStrings>("filament_colour", true)->values;
-            colours.resize(n);
-            for (size_t i = 0; i < n; ++i) {
-                if (i < context.filament_colours.size() && !context.filament_colours[i].empty())
-                    colours[i] = context.filament_colours[i];
-                if (colours[i].empty()) {
-                    const auto *def = dynamic_cast<const ConfigOptionStrings *>(filament_copies[i].config.option("default_filament_colour"));
-                    if (def != nullptr && !def->values.empty() && !def->values.front().empty())
-                        colours[i] = def->values.front();
-                }
-                if (colours[i].empty())
-                    colours[i] = "#26A69A";
-            }
-            resolved.config.option<ConfigOptionStrings>("filament_colour_type", true)->values.resize(n, "1");
-            //filament_finish is coEnums, not coStrings - a typed cast here dereferenced null.
-            //Resize it through the vector base, padding by repeating its own front value.
-            if (ConfigOption *finish_opt = resolved.config.option("filament_finish"); finish_opt != nullptr)
-                if (auto *finish = dynamic_cast<ConfigOptionVectorBase *>(finish_opt);
-                    finish != nullptr && finish->size() != n && finish->size() > 0)
-                    finish->resize(n, finish_opt);
-            auto &multi = resolved.config.option<ConfigOptionStrings>("filament_multi_colour", true)->values;
-            multi.resize(n);
-            for (size_t i = 0; i < n; ++i)
-                if (multi[i].empty())
-                    multi[i] = colours[i];
-        }
+        apply_plate_filament_colours(context, resolved.config);
     } catch (const std::exception &ex) {
         error = "Unable to compose plate context: " + std::string(ex.what());
         resolved = {};

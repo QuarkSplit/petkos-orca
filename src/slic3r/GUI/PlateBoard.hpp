@@ -259,7 +259,6 @@ private:
     void build_row(int                             plate_index,
                    const PartPlateList &           plates,
                    const PresetBundle &            bundle,
-                   const std::vector<std::string> &colours,
                    PlateBoardRow &                 row) const;
 
     //Everything that is a pure function of the row set: the rollup totals, the glyph
@@ -654,6 +653,9 @@ private:
 //
 //Mixed fields carry no revert affordance. Revert is per-plate only, because a revert
 //whose effect the user cannot see is a control with an invisible blast radius.
+//Shared by the inspector swatches and the assigned-material rows above the spool pool.
+void show_plate_filament_menu(wxWindow *parent, Plater *plater, int plate_index, int slot);
+
 class PlateInspector : public wxPanel
 {
 public:

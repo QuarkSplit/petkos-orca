@@ -16,6 +16,8 @@ add_executable(${_TEST_NAME}_tests
     test_config_variant_expansion.cpp
     test_toolordering_nozzle_group.cpp
     test_preset_bundle_loading.cpp
+    test_plate_process_settings.cpp
+    test_project_thumbnail.cpp
     test_preset_setting_id.cpp
     test_preset_diff.cpp
     test_elephant_foot_compensation.cpp
@@ -27,6 +29,7 @@ add_executable(${_TEST_NAME}_tests
     test_nozzle_volume_type.cpp
     test_stl.cpp
     test_meshboolean.cpp
+    test_mesh_painting.cpp
     test_meshknife.cpp
     test_meshseparator.cpp
     test_cutbounds.cpp
@@ -45,7 +48,7 @@ if (TARGET OpenVDB::openvdb)
     target_sources(${_TEST_NAME}_tests PRIVATE test_hollowing.cpp)
 endif()
 
-target_link_libraries(${_TEST_NAME}_tests test_common libslic3r Catch2::Catch2WithMain)
+target_link_libraries(${_TEST_NAME}_tests test_common libslic3r Catch2::Catch2WithMain PNG::PNG)
 target_include_directories(${_TEST_NAME}_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 

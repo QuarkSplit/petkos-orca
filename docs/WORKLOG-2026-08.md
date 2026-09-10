@@ -2257,6 +2257,11 @@ on it (volume conserved 290534 = 290534 mm3, bounded region 122675 vs the plane'
 
 ## 2026-08-27 — the spool pool, per-plate colour, single-filament G-code, and paint that survives
 
+**Correction, 8 September:** the universal paint-preservation and pool-isolation claims below
+describe the intent of this change, not verified coverage of every operation. Later source review
+found transform/repacking/simplification failures and colour-family pool leakage. See
+[the September audit](AUDIT-2026-09-08.md) for repairs and regression evidence.
+
 **The complaint that started it:** per-plate and global colour/material were "a huge inconsistent
 mess" — the global filament list was silently overwritten by whichever plate was clicked, colours
 were project-wide so recolouring one plate recoloured all of them, single-spool printers rejected

@@ -32,6 +32,8 @@
 #include "SVG.hpp"
 #include <Eigen/Dense>
 #include <functional>
+#include <numeric>
+#include <stdexcept>
 #include "GCodeWriter.hpp"
 
 // BBS: for segment
@@ -1383,6 +1385,73 @@ bool ModelObject::is_fuzzy_skin_painted() const
     return std::any_of(this->volumes.cbegin(), this->volumes.cend(), [](const ModelVolume *mv) { return mv->is_fuzzy_skin_painted(); });
 }
 
+namespace {
+constexpr const char *object_filament_keys[] = {
+    "extruder", "support_filament", "support_interface_filament", "sparse_infill_filament_id",
+    "outer_wall_filament_id", "inner_wall_filament_id", "internal_solid_filament_id",
+    "top_surface_filament_id", "bottom_surface_filament_id", "wipe_tower_filament"
+};
+}
+
+std::vector<int> ModelObject::used_filament_ids() const
+{
+    std::set<int> slots;
+    auto collect = [&](const ModelConfig &scope) {
+        for (const char *key : object_filament_keys)
+            if (const auto *option = scope.get().option<ConfigOptionInt>(key); option != nullptr && option->value > 0)
+                slots.insert(option->value);
+    };
+    const auto *base = config.get().option<ConfigOptionInt>("extruder");
+    slots.insert(base != nullptr && base->value > 0 ? base->value : 1);
+    collect(config);
+    for (const auto &layer : layer_config_ranges)
+        collect(layer.second);
+    for (const ModelVolume *volume : volumes) {
+        collect(volume->config);
+        for (size_t slot : volume->get_extruders_from_multi_material_painting())
+            slots.insert(int(slot) + 1);
+    }
+    return {slots.begin(), slots.end()};
+}
+
+void ModelObject::remap_filament_ids(const std::vector<int> &mapping)
+{
+    for (int slot : used_filament_ids())
+        if (size_t(slot) >= mapping.size() || mapping[slot] <= 0)
+            throw std::invalid_argument("Missing destination for material slot " + std::to_string(slot));
+    for (const ModelVolume *volume : volumes)
+        for (size_t slot : volume->get_extruders_from_multi_material_painting())
+            if (mapping[slot + 1] > int(EnforcerBlockerType::ExtruderMax))
+                throw std::invalid_argument("Destination material slot exceeds the painted-slot limit");
+
+    const auto *base = config.get().option<ConfigOptionInt>("extruder");
+    const int base_slot = base != nullptr && base->value > 0 ? base->value : 1;
+    auto remap_config = [&](ModelConfig &scope) {
+        for (const char *key : object_filament_keys)
+            if (const auto *option = scope.get().option<ConfigOptionInt>(key); option != nullptr && option->value > 0)
+                scope.set(key, mapping[option->value]);
+    };
+    remap_config(config);
+    // Slot 0 in parts/features still inherits. The object's implicit slot 1 must
+    // become explicit when that source material occupies another destination slot.
+    config.set("extruder", mapping[base_slot]);
+    for (auto &layer : layer_config_ranges)
+        remap_config(layer.second);
+    EnforcerBlockerStateMap states;
+    for (size_t i = 0; i < states.size(); ++i)
+        states[i] = static_cast<EnforcerBlockerType>(i > 0 && i < mapping.size() && mapping[i] > 0 &&
+                                                   mapping[i] <= int(EnforcerBlockerType::ExtruderMax) ? mapping[i] : int(i));
+    for (ModelVolume *volume : volumes) {
+        remap_config(volume->config);
+        if (!volume->mmu_segmentation_facets.empty()) {
+            TriangleSelector selector(volume->mesh());
+            selector.deserialize(volume->mmu_segmentation_facets.get_data());
+            selector.remap_triangle_state(states);
+            volume->mmu_segmentation_facets.set(selector);
+        }
+    }
+}
+
 void ModelObject::sort_volumes(bool full_sort)
 {
     // sort volumes inside the object to order "Model Part, Negative Volume, Modifier, Support Blocker and Support Enforcer. "
@@ -2000,15 +2069,28 @@ void ModelVolume::reset_extra_facets()
     this->fuzzy_skin_facets.reset();
 }
 
-std::optional<TriangleSelector::SavedPainting> ModelVolume::save_painting() const
+std::optional<TriangleSelector::SavedPainting> ModelVolume::save_painting(bool include_material) const
 {
-    if (is_any_painted() && is_model_part() && !mesh().empty()) {
+    if ((is_any_painted() || include_material) && is_model_part() && !mesh().empty()) {
         TriangleSelector::SavedPainting sp;
         sp.mesh      = mesh();
         sp.supported = supported_facets.get_data();
         sp.seam      = seam_facets.get_data();
         sp.mmu       = mmu_segmentation_facets.get_data();
         sp.fuzzy     = fuzzy_skin_facets.get_data();
+        if (include_material) {
+            const int extruder = extruder_id();
+            if (extruder > 0 && extruder <= int(EnforcerBlockerType::ExtruderMax)) {
+                TriangleSelector selector(mesh());
+                selector.deserialize(sp.mmu, false);
+                EnforcerBlockerStateMap states;
+                for (size_t i = 0; i < states.size(); ++i)
+                    states[i] = static_cast<EnforcerBlockerType>(i);
+                states[0] = static_cast<EnforcerBlockerType>(extruder);
+                selector.remap_triangle_state(states);
+                sp.mmu = selector.serialize();
+            }
+        }
         return sp;
     }
 
@@ -2035,7 +2117,30 @@ void ModelVolume::remap_painting_by_facets(const std::vector<int>& src_to_dst_fa
     carry(source.fuzzy_skin_facets.get_data(),       this->fuzzy_skin_facets);
 }
 
-void ModelVolume::restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, const bool keep_existing_paint)
+void ModelVolume::set_mesh_preserving_paint(TriangleMesh mesh, TriangleSelector::PaintingRemapMode mode)
+{
+    const auto saved = save_painting();
+    // A copied mesh retains its old import-centering shift. No centering occurred
+    // during this replacement, so applying that shift again would displace its paint.
+    mesh.set_init_shift(Vec3d::Zero());
+    set_mesh(std::move(mesh));
+    restore_painting(saved, false, mode);
+}
+
+void ModelVolume::restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, const bool keep_existing_paint,
+                                 TriangleSelector::PaintingRemapMode mode)
+{
+    restore_painting(saved, Geometry::translation_transform(mesh().get_init_shift()), keep_existing_paint, mode);
+}
+
+void ModelVolume::restore_painting(const ModelVolume &source)
+{
+    if (const auto saved = source.save_painting())
+        restore_painting(saved, source.get_matrix().inverse() * get_matrix());
+}
+
+void ModelVolume::restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, const Transform3d &target_to_source,
+                                 const bool keep_existing_paint, TriangleSelector::PaintingRemapMode mode)
 {
     if (!keep_existing_paint) {
         reset_extra_facets();
@@ -2050,10 +2155,10 @@ void ModelVolume::restore_painting(const std::optional<TriangleSelector::SavedPa
         if (src_data.bitstream.empty())
             return;
         auto result =
-            TriangleSelector::remap_painting(saved->mesh.its, src_data, mesh().its, Geometry::translation_transform(mesh().get_init_shift()),
+            TriangleSelector::remap_painting(saved->mesh.its, src_data, mesh().its, target_to_source,
                                              keep_existing_paint ?
                                                  std::optional<std::reference_wrapper<const TriangleSelector::TriangleSplittingData>>{std::ref(target_facets.get_data())} :
-                                                 std::optional<std::reference_wrapper<const TriangleSelector::TriangleSplittingData>>{});
+                                                 std::optional<std::reference_wrapper<const TriangleSelector::TriangleSplittingData>>{}, mode);
         if (!result.bitstream.empty())
             target_facets.set_data(std::move(result));
     };
@@ -2206,71 +2311,206 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
 }
 
 
-void ModelObject::merge()
+namespace {
+
+// A reflected triangle has the opposite vertex order. Its subdivision tree cannot
+// always be reflected in the same encoding, so put the shared paint boundaries into
+// the mesh first. Intersections carry all four states without sampling a surface.
+void expand_painted_facets(TriangleSelector::SavedPainting &saved)
 {
-    if (this->volumes.size() == 1) {
-        // We can't merge meshes if there's just one volume
-        return;
+    using State = EnforcerBlockerType;
+    const std::array<TriangleSelector::TriangleSplittingData *, 4> channels {
+        &saved.supported, &saved.seam, &saved.mmu, &saved.fuzzy };
+    const bool subdivided = std::any_of(channels.begin(), channels.end(), [](const auto *data) {
+        return std::any_of(data->triangles_to_split.begin(), data->triangles_to_split.end(), [&](const auto &entry) {
+            return data->bitstream[entry.bitstream_start_idx] || data->bitstream[entry.bitstream_start_idx + 1];
+        });
+    });
+    if (!subdivided) return;
+    struct Channel {
+        indexed_triangle_set mesh;
+        std::vector<State> states;
+        std::vector<std::vector<int>> faces;
+    };
+    std::array<Channel, 4> expanded;
+    for (size_t channel = 0; channel < channels.size(); ++channel) {
+        TriangleSelector selector(saved.mesh);
+        selector.deserialize(*channels[channel]);
+        std::vector<int> original_faces;
+        auto &out = expanded[channel];
+        out.mesh = selector.get_facets_conforming(out.states, original_faces);
+        out.faces.resize(saved.mesh.its.indices.size());
+        for (size_t i = 0; i < original_faces.size(); ++i)
+            out.faces[original_faces[i]].push_back(int(i));
     }
 
-    //Merging is a geometry operation and must not be a colour operation. Two things are
-    //saved before the volumes die, and replayed onto the merged volume afterwards:
-    // - each part's painted channels (filament colour, seams, supports, fuzzy skin),
-    //   spatially and additively - the cut gizmo's pattern, and the same reason: a saved
-    //   painting simply fails to find geometry its part did not contribute;
-    // - each part's own filament slot, when it differs from the base part's. A merged
-    //   volume has one "extruder" field, so a part whose colour lived in that field would
-    //   lose it silently; expressed as whole-facet paint it is the same fact in the form
-    //   the merged volume can carry. The fill goes on first and real paint stamps over it,
-    //   so painted detail wins where both exist.
-    const ModelVolume *first_part = nullptr;
-    for (const ModelVolume *v : volumes)
-        if (v->is_model_part()) { first_part = v; break; }
-    const int base_extruder = first_part != nullptr ? first_part->extruder_id() : 0;
-
-    std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paint;
-    std::vector<std::optional<TriangleSelector::SavedPainting>> saved_fill;
-    for (const ModelVolume *v : volumes) {
-        saved_paint.emplace_back(v->save_painting());
-        std::optional<TriangleSelector::SavedPainting> fill;
-        if (v->is_model_part() && !v->mesh().empty() && base_extruder > 0) {
-            const int e = v->extruder_id();
-            if (e > 0 && e != base_extruder && e <= int(EnforcerBlockerType::ExtruderMax)) {
-                TriangleSelector::SavedPainting sp;
-                sp.mesh = v->mesh();
-                sp.mmu  = TriangleSelector::painting_from_facet_states(std::vector<EnforcerBlockerType>(
-                    v->mesh().its.indices.size(), static_cast<EnforcerBlockerType>(e)));
-                fill    = std::move(sp);
+    struct Patch {
+        std::vector<Vec3d> boundary;
+        std::array<State, 4> states{};
+    };
+    indexed_triangle_set result;
+    std::array<std::vector<State>, 4> result_states;
+    for (size_t face = 0; face < saved.mesh.its.indices.size(); ++face) {
+        const Vec3i32 indices = saved.mesh.its.indices[face];
+        const Vec3d a = saved.mesh.its.vertices[indices[0]].cast<double>();
+        const Vec3d b = saved.mesh.its.vertices[indices[1]].cast<double>();
+        const Vec3d c = saved.mesh.its.vertices[indices[2]].cast<double>();
+        const Vec3d normal = (b - a).cross(c - a);
+        Eigen::Index drop;
+        normal.cwiseAbs().maxCoeff(&drop);
+        const int u = (int(drop) + 1) % 3, v = (int(drop) + 2) % 3;
+        auto cross = [u, v](const Vec3d &p, const Vec3d &q) { return p[u] * q[v] - p[v] * q[u]; };
+        const double source_area = std::abs(cross(b - a, c - a));
+        const double epsilon = source_area * 1e-12;
+        std::vector<Patch> patches{{{a, b, c}, {}}};
+        for (size_t channel = 0; channel < channels.size(); ++channel) {
+            std::vector<Patch> next;
+            const auto &source = expanded[channel];
+            for (const Patch &patch : patches) {
+                for (int leaf : source.faces[face]) {
+                    const auto triangle = source.mesh.indices[leaf];
+                    const std::array<Vec3d, 3> clip {
+                        source.mesh.vertices[triangle[0]].cast<double>(),
+                        source.mesh.vertices[triangle[1]].cast<double>(),
+                        source.mesh.vertices[triangle[2]].cast<double>() };
+                    const double orientation = cross(clip[1] - clip[0], clip[2] - clip[0]) < 0. ? -1. : 1.;
+                    Patch intersection = patch;
+                    intersection.states[channel] = source.states[leaf];
+                    for (size_t side = 0; side < 3 && !intersection.boundary.empty(); ++side) {
+                        const Vec3d origin = clip[side];
+                        const Vec3d edge = clip[(side + 1) % 3] - origin;
+                        std::vector<Vec3d> boundary;
+                        Vec3d previous = intersection.boundary.back();
+                        double previous_distance = orientation * cross(edge, previous - origin);
+                        if (std::abs(previous_distance) <= epsilon) previous_distance = 0.;
+                        for (const Vec3d &point : intersection.boundary) {
+                            double distance = orientation * cross(edge, point - origin);
+                            if (std::abs(distance) <= epsilon) distance = 0.;
+                            if ((previous_distance < 0.) != (distance < 0.)) {
+                                const double t = previous_distance / (previous_distance - distance);
+                                boundary.push_back(previous + t * (point - previous));
+                            }
+                            if (distance >= 0.) boundary.push_back(point);
+                            previous = point;
+                            previous_distance = distance;
+                        }
+                        intersection.boundary = std::move(boundary);
+                    }
+                    auto &boundary = intersection.boundary;
+                    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
+                    if (boundary.size() > 1 && boundary.front() == boundary.back()) boundary.pop_back();
+                    double area = 0.;
+                    for (size_t i = 1; i + 1 < boundary.size(); ++i)
+                        area += cross(boundary[i] - boundary[0], boundary[i + 1] - boundary[0]);
+                    if (boundary.size() >= 3 && std::abs(area) > epsilon)
+                        next.push_back(std::move(intersection));
+                }
+            }
+            patches = std::move(next);
+        }
+        double output_area = 0.;
+        for (const Patch &patch : patches) {
+            auto add_triangle = [&](const Vec3d &p, const Vec3d &q, const Vec3d &r) {
+                const double triangle_area = std::abs(cross(q - p, r - p));
+                if (triangle_area <= epsilon) return;
+                output_area += triangle_area;
+                const int offset = int(result.vertices.size());
+                result.vertices.push_back(p.cast<float>());
+                result.vertices.push_back(q.cast<float>());
+                result.vertices.push_back(r.cast<float>());
+                result.indices.emplace_back(offset, offset + 1, offset + 2);
+                for (size_t channel = 0; channel < channels.size(); ++channel)
+                    result_states[channel].push_back(patch.states[channel]);
+            };
+            if (patch.boundary.size() == 3)
+                add_triangle(patch.boundary[0], patch.boundary[1], patch.boundary[2]);
+            else {
+                Vec3d center = Vec3d::Zero();
+                for (const Vec3d &point : patch.boundary) center += point;
+                center /= double(patch.boundary.size());
+                // A center fan retains collinear boundary vertices and their neighbours.
+                for (size_t i = 0; i < patch.boundary.size(); ++i)
+                    add_triangle(center, patch.boundary[i], patch.boundary[(i + 1) % patch.boundary.size()]);
             }
         }
-        saved_fill.emplace_back(std::move(fill));
+        if (std::abs(output_area - source_area) > source_area * 1e-5)
+            throw std::runtime_error("Could not preserve the painted surface while merging a mirrored part");
     }
-    DynamicPrintConfig first_config;
-    if (first_part != nullptr)
-        first_config = first_part->config.get();
+    its_merge_vertices(result);
+    saved.mesh = TriangleMesh(std::move(result));
+    for (size_t channel = 0; channel < channels.size(); ++channel)
+        *channels[channel] = TriangleSelector::painting_from_facet_states(result_states[channel]);
+}
 
-    TriangleMesh mesh;
+} // namespace
 
-    for (ModelVolume* volume : volumes)
-        if (!volume->mesh().empty())
-            mesh.merge(volume->mesh());
-
-    this->clear_volumes();
-    ModelVolume* vol = this->add_volume(mesh);
-
-    if (!vol)
+void ModelObject::merge()
+{
+    const auto part_count = std::count_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return v->is_model_part(); });
+    if (part_count < 2)
         return;
 
-    //The base part's settings are still the settings somebody chose; a merged volume that
-    //forgets them prints a multi-part object with defaults.
-    if (first_part != nullptr)
-        vol->config.assign_config(std::move(first_config));
-    for (const std::optional<TriangleSelector::SavedPainting> &fill : saved_fill)
-        if (fill)
-            vol->restore_painting(fill, true);
-    for (const std::optional<TriangleSelector::SavedPainting> &paint : saved_paint)
-        if (paint)
-            vol->restore_painting(paint, true);
+    const ModelVolume *first_part = *std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return v->is_model_part(); });
+    const int base_extruder = first_part->extruder_id();
+    const DynamicPrintConfig first_config = first_part->config.get();
+    const std::string first_name = first_part->name;
+    const std::string first_material = first_part->material_id();
+    std::array<TriangleSelector::TriangleSplittingData, 4> painting;
+    TriangleMesh mesh;
+
+    for (const ModelVolume *v : volumes) {
+        if (!v->is_model_part())
+            continue;
+        const size_t face_offset = mesh.its.indices.size();
+        // Concatenating meshes preserves face identity, including every painted subdivision.
+        // Part transforms must be baked into the geometry before their volumes are removed.
+        TriangleMesh part_mesh = v->mesh();
+        auto saved = v->save_painting(v->extruder_id() != base_extruder);
+        if (saved && v->is_left_handed()) {
+            expand_painted_facets(*saved);
+            part_mesh = std::move(saved->mesh);
+        }
+        part_mesh.transform(v->get_matrix(), true);
+        mesh.merge(part_mesh);
+        if (saved) {
+            const std::array<const TriangleSelector::TriangleSplittingData *, 4> channels {
+                &saved->supported, &saved->seam, &saved->mmu, &saved->fuzzy };
+            std::vector<int> face_map(part_mesh.its.indices.size());
+            std::iota(face_map.begin(), face_map.end(), int(face_offset));
+            for (size_t channel = 0; channel < channels.size(); ++channel) {
+                const auto mapped = TriangleSelector::remap_painting_by_facet_map(*channels[channel], face_map);
+                auto &target = painting[channel];
+                for (const auto &entry : mapped.triangles_to_split)
+                    target.triangles_to_split.emplace_back(entry.triangle_idx, int(target.bitstream.size()) + entry.bitstream_start_idx);
+                target.bitstream.insert(target.bitstream.end(), mapped.bitstream.begin(), mapped.bitstream.end());
+            }
+        }
+    }
+
+    // Negative volumes and modifiers still describe this object; merging positive parts
+    // must not turn a hole or a support blocker into solid printable material.
+    ModelVolumePtrs retained;
+    for (ModelVolume *v : volumes)
+        if (v->is_model_part())
+            delete v;
+        else
+            retained.push_back(v);
+    volumes = std::move(retained);
+
+    ModelVolume *merged = add_volume(std::move(mesh));
+    std::rotate(volumes.begin(), volumes.end() - 1, volumes.end());
+    merged->config.assign_config(first_config);
+    merged->name = first_name;
+    merged->set_material_id(first_material);
+    const std::array<FacetsAnnotation *, 4> channels {
+        &merged->supported_facets, &merged->seam_facets, &merged->mmu_segmentation_facets, &merged->fuzzy_skin_facets };
+    for (size_t channel = 0; channel < channels.size(); ++channel) {
+        painting[channel].reset_used_states();
+        if (!painting[channel].bitstream.empty())
+            painting[channel].update_used_states(0);
+        channels[channel]->set_data(std::move(painting[channel]));
+    }
+    invalidate_bounding_box();
 }
 
 ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)

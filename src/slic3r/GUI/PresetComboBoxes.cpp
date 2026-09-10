@@ -228,7 +228,14 @@ void PresetComboBox::update_selection()
 #endif
 }
 
-int PresetComboBox::update_ams_color()
+std::function<void()> PresetComboBox::prepare_colour_update()
+{
+    std::function<void()> update;
+    update_ams_color(&update);
+    return update;
+}
+
+int PresetComboBox::update_ams_color(std::function<void()> *deferred_update)
 {
     if (m_filament_idx < 0) return -1;
     int idx = selected_ams_filament();
@@ -264,13 +271,6 @@ int PresetComboBox::update_ams_color()
         ctype = iter->second.opt_string("filament_colour_type", 0u);
         colors = iter->second.opt<ConfigOptionStrings>("filament_multi_colour")->values;
     }
-    DynamicPrintConfig *cfg        = &wxGetApp().preset_bundle->project_config;
-    auto color_head = static_cast<ConfigOptionStrings*>(cfg->option("filament_colour")->clone()); // single color (the first color if multi-color filament)
-    auto color_pack = static_cast<ConfigOptionStrings *>(cfg->option("filament_multi_colour")->clone()); // multi color (all colors in all kinds of filament)
-    auto color_type = static_cast<ConfigOptionStrings*>(cfg->option("filament_colour_type")->clone()); // color type
-
-    color_head->values[m_filament_idx] = color;
-    color_type->values[m_filament_idx] = ctype;
     std::string color_str = ""; // Translate multi color info to config storage format
     for (auto &c : colors) {
         if (c.empty()) continue;
@@ -278,19 +278,34 @@ int PresetComboBox::update_ams_color()
     }
     if (color_str.empty()) color_str = color;
     else color_str.erase(color_str.size() - 1);
-    color_pack->values[m_filament_idx] = color_str;
-
-    // Update color informations in config
-    DynamicPrintConfig new_cfg;
-    new_cfg.set_key_value("filament_colour", color_head);
-    new_cfg.set_key_value("filament_colour_type", color_type);
-    new_cfg.set_key_value("filament_multi_colour", color_pack);
-    cfg->apply(new_cfg);
-    wxGetApp().plater()->on_config_change(new_cfg);
-    //trigger the filament color changed
-    wxCommandEvent *evt = new wxCommandEvent(EVT_FILAMENT_COLOR_CHANGED);
-    evt->SetInt(m_filament_idx);
-    wxQueueEvent(wxGetApp().plater(), evt);
+    auto apply_colour = [filament_idx = m_filament_idx, color, ctype, color_str]() {
+        DynamicPrintConfig &cfg = wxGetApp().preset_bundle->project_config;
+        const auto *head = cfg.option<ConfigOptionStrings>("filament_colour");
+        const auto *pack = cfg.option<ConfigOptionStrings>("filament_multi_colour");
+        const auto *type = cfg.option<ConfigOptionStrings>("filament_colour_type");
+        if (head == nullptr || pack == nullptr || type == nullptr || size_t(filament_idx) >= head->values.size() ||
+            size_t(filament_idx) >= pack->values.size() || size_t(filament_idx) >= type->values.size())
+            return;
+        auto *color_head = static_cast<ConfigOptionStrings *>(head->clone());
+        auto *color_pack = static_cast<ConfigOptionStrings *>(pack->clone());
+        auto *color_type = static_cast<ConfigOptionStrings *>(type->clone());
+        color_head->values[filament_idx] = color;
+        color_pack->values[filament_idx] = color_str;
+        color_type->values[filament_idx] = ctype;
+        DynamicPrintConfig new_cfg;
+        new_cfg.set_key_value("filament_colour", color_head);
+        new_cfg.set_key_value("filament_multi_colour", color_pack);
+        new_cfg.set_key_value("filament_colour_type", color_type);
+        cfg.apply(new_cfg);
+        wxGetApp().plater()->on_config_change(new_cfg);
+        auto *evt = new wxCommandEvent(EVT_FILAMENT_COLOR_CHANGED);
+        evt->SetInt(filament_idx);
+        wxQueueEvent(wxGetApp().plater(), evt);
+    };
+    if (deferred_update != nullptr)
+        *deferred_update = std::move(apply_colour);
+    else
+        apply_colour();
     return idx;
 }
 
@@ -980,8 +995,7 @@ void PlaterPresetComboBox::OnSelect(wxCommandEvent &evt)
         return;
     } else if (marker == LABEL_ITEM_PHYSICAL_PRINTER ||  selected_item >= 0 || m_collection->current_is_dirty()) {
         m_last_selected = selected_item;
-        if (m_type == Preset::TYPE_FILAMENT)
-            update_ams_color();
+        // The plater commits spool colour after material scope and dirty-edit prompts succeed.
     }
 
     evt.Skip();

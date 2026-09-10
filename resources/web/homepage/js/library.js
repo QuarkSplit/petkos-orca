@@ -1,36 +1,130 @@
-// Project library for the home page.
-//
-// Replaces "recently opened", which sorted by the one fact that does not help: when a file
-// was last touched. What matters before opening a project is what state it is in, because
-// that is what decides the next action. A raw mesh needs orientation and colour. A
-// MakerWorld project still carrying its Bambu printer needs re-targeting before it will
-// slice for this farm at all. A prepped job needs slicing. A sliced one needs sending.
-//
-// The index is built by E:\3D-Printing\Scripts\build_library.py and loaded as a script,
-// because the page cannot fetch a file:// path. Opening reuses the existing
-// homepage_open_recentfile bridge, which takes any path, so this needs no C++ change.
+// The native scanner owns filesystem access. Folder membership is organisation, never
+// proof that two files are interchangeable or that a configured project is ready to print.
 
 var LIB_PAGE = 120;
 
 var LIB = {
     state: 'all',
     group: 'all',
+    root: 'all',
     search: '',
     kind: '3mf',      // most of the library is loose STL; the pipeline is 3MF
-    // One card per model by default. A model that has become a project does not also need
-    // the raw download it came from, and sliced output is not a thing you open to work on.
-    versions: 'best',
     sort: 'recent',
     shown: LIB_PAGE,
+    shelf: 'all',
+    folderScope: '',
     recentPaths: {},  // normalised keys of the real recent-files list, for the Recent chip
     recentOrder: [],  // the same list in its own order, which is what "recent" means
+    recentRecords: {},
     // Expansion and ticks are keyed by path rather than held in the DOM, because the grid
     // is re-rendered whole on every filter change and anything living only in the markup
     // would silently reset mid-selection.
     expanded: {},
     picked: {},
-    pickupOpen: false
+    pickupOpen: false,
+    nativeReady: false,
+    thumbnails: {},
+    thumbFingerprints: {},
+    thumbRequested: {},
+    thumbRetried: {},
+    thumbForce: {},
+    thumbVersions: {}
 };
+
+var LIB_WORKSPACE = (typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.workspace) || {mine: [], downloads: [], jobs: []};
+try {
+    var savedWorkspace = JSON.parse(window.localStorage.getItem('podslicer.library.workspace'));
+    if (savedWorkspace && Array.isArray(savedWorkspace.mine)) LIB_WORKSPACE = savedWorkspace;
+} catch (_) { /* The library also works when webview storage is unavailable. */ }
+
+function LibWithin(path, folder) {
+    var p = LibKey(path), f = LibKey(folder);
+    return !!f && (p === f || p.indexOf(f + '\\') === 0);
+}
+
+function LibShelfFor(it) {
+    if ((LIB_WORKSPACE.mine || []).some(function (folder) { return LibWithin(it.path, folder.path); })) return 'mine';
+    if ((LIB_WORKSPACE.downloads || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'downloads';
+    if ((LIB_WORKSPACE.jobs || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'jobs';
+    return /^(models|downloads)$/i.test(String(it.root || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()) ? 'downloads' : 'jobs';
+}
+
+function LibSetShelf(shelf) {
+    LIB.shelf = shelf; LIB.folderScope = ''; LIB.root = 'all'; LIB.group = 'all';
+    LIB.state = 'all'; LIB.search = ''; LIB.shown = LIB_PAGE;
+    LIB.kind = shelf === 'jobs' ? '3mf' : 'all';
+    $('#LibSearch').val(''); $('#LibRoot').val('all');
+    $('#LibKindChip').toggleClass('LibChipOn', LIB.kind === 'all');
+    LibBuildGroups(); LibBuildChips(); LibRender();
+}
+
+function LibBrowseDesign(el) {
+    LIB.shelf = 'mine'; LIB.folderScope = el.getAttribute('data-path');
+    LIB.kind = 'all'; LIB.state = 'all'; LIB.group = 'all'; LIB.search = ''; LIB.root = 'all';
+    LIB.shown = LIB_PAGE;
+    $('#LibSearch').val(''); $('#LibRoot').val('all'); $('#LibKindChip').addClass('LibChipOn');
+    LibBuildGroups(); LibBuildChips(); LibRender();
+}
+
+function LibShowDesignFolder(el) {
+    var path = el.getAttribute('data-path');
+    if (path) SendWXMessage(JSON.stringify({command: 'homepage_explore_recentfile', data: {path: path}}));
+}
+
+function LibPinDesign(el) {
+    var path = el.getAttribute('data-path');
+    if (!path) return;
+    var mine = LIB_WORKSPACE.mine || [];
+    if (!mine.some(function (folder) { return LibKey(folder.path) === LibKey(path); })) {
+        mine.push({path: path, title: path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()});
+    }
+    LIB_WORKSPACE.mine = mine;
+    try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
+    LibSetShelf('mine');
+}
+
+function LibUnpinDesign(el) {
+    var path = el.getAttribute('data-path');
+    LIB_WORKSPACE.mine = (LIB_WORKSPACE.mine || []).filter(function (folder) { return LibKey(folder.path) !== LibKey(path); });
+    try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
+    LibSetShelf('mine');
+}
+
+function LibWorkspaceRender() {
+    var labels = [['mine', 'My projects'], ['jobs', 'Print jobs'], ['downloads', 'Downloaded models'], ['all', 'All files']];
+    $('#LibShelves').html(labels.map(function (entry) {
+        return '<button class="LibShelf' + (LIB.shelf === entry[0] ? ' LibShelfOn' : '') +
+            '" onclick="LibSetShelf(\'' + entry[0] + '\')">' + entry[1] + '</button>';
+    }).join(''));
+    var overview = LIB.shelf === 'mine' && !LIB.folderScope;
+    $('#LibraryArea').toggleClass('LibOverview', overview);
+    $('#LibSearch').attr('placeholder', overview ? 'Search your project folders' : 'Search names, folders, printers or materials');
+    $('#LibLocation').html(LIB.folderScope ? '<button class="LibFolderButton" onclick="LibSetShelf(\'mine\')">My projects</button> / ' +
+        LibEscape(LIB.folderScope.replace(/[\\/]+$/, '').split(/[\\/]/).pop()) : '');
+    if (!overview) return false;
+    var terms = LIB.search.toLowerCase().split(/\s+/).filter(Boolean);
+    var folders = (LIB_WORKSPACE.mine || []).filter(function (folder) {
+        var hay = [folder.title, folder.description, folder.path].join(' ').toLowerCase();
+        return terms.every(function (term) { return hay.indexOf(term) >= 0; });
+    });
+    var items = LibItems();
+    $('#LibGrid').html(folders.map(function (folder) {
+        var files = items.filter(function (it) { return LibWithin(it.path, folder.path); });
+        var cover = files[0] || {name: folder.title, thumbState: 'unavailable', thumbError: 'No model files in this folder'};
+        return '<article class="LibDesignCard"><div class="LibThumb LibDesignThumb">' + LibThumbnailMarkup(cover) + '</div>' +
+            '<h3>' + LibEscape(folder.title || folder.path.split(/[\\/]/).pop()) + '</h3>' +
+            '<p>' + LibEscape(folder.description || 'Design files, editable projects and working material.') + '</p>' +
+            '<div class="LibMeta">' + files.length + ' model files</div>' +
+            '<div class="LibDesignActions"><button class="LibChip" data-path="' + LibEscape(folder.path) +
+            '" onclick="LibBrowseDesign(this)">Browse files</button><button class="LibFolderButton" data-path="' +
+            LibEscape(folder.path) + '" onclick="LibShowDesignFolder(this)">Show folder</button></div>' +
+            '<button class="LibFolderButton" data-path="' + LibEscape(folder.path) +
+            '" onclick="LibUnpinDesign(this)" title="Remove this shortcut; files stay where they are">Remove shortcut</button></article>';
+    }).join('') || '<div class="LibEmpty">' + (terms.length ? 'No project folders match this search.' :
+        'Add your project folder, then choose “My project” under Library folders. CAD-only folders can live here too.') + '</div>');
+    $('#LibCount').text(folders.length + ' project folders'); $('#LibMore').hide();
+    return true;
+}
 
 // Order matters: it is the pipeline, and the chips read as a progression.
 var LIB_STATES = [
@@ -39,28 +133,42 @@ var LIB_STATES = [
     { id: 'mesh',         label: 'Raw mesh' },
     { id: 'foreign',      label: 'Bambu preset' },
     { id: 'needs-colour', label: 'Needs colour' },
-    { id: 'prepped',      label: 'Prepped' },
-    { id: 'sliced',       label: 'Sliced' },
+    { id: 'prepped',      label: 'Configured' },
+    { id: 'sliced',       label: 'Contains toolpaths' },
+    { id: 'missing',      label: 'Missing files' },
     // Listed so a corrupt archive is findable. Without a chip it appears only under All,
     // which is the one view nobody scans.
-    { id: 'unreadable',   label: 'Broken' }
+    { id: 'unreadable',   label: 'Preview unavailable' }
 ];
 
 var LIB_BADGE = {
     'mesh':         { text: 'raw mesh',    cls: 'LibBadgeMesh' },
     'foreign':      { text: 'bambu preset', cls: 'LibBadgeForeign' },
     'needs-colour': { text: 'needs colour', cls: 'LibBadgeColour' },
-    'prepped':      { text: 'prepped',     cls: 'LibBadgePrepped' },
-    'sliced':       { text: 'sliced',      cls: 'LibBadgeSliced' },
+    'prepped':      { text: 'configured',  cls: 'LibBadgePrepped' },
+    'sliced':       { text: 'toolpaths',   cls: 'LibBadgeSliced' },
     'sent':         { text: 'sent',        cls: 'LibBadgeSent' },
-    'unreadable':   { text: 'unreadable',  cls: 'LibBadgeBad' },
+    'unreadable':   { text: 'no preview',  cls: 'LibBadgeBad' },
     // Not a pipeline state: it means the file is real and open-able but lives outside the
     // indexed roots, so nothing is known about it beyond its path.
-    'unindexed':    { text: 'not in library', cls: 'LibBadgeBad' }
+    'unindexed':    { text: 'not in library', cls: 'LibBadgeBad' },
+    'pending':      { text: 'reading metadata', cls: 'LibBadgeMesh' },
+    'missing':      { text: 'file missing', cls: 'LibBadgeBad' }
 };
 
 function LibItems() {
-    return (typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.items) || [];
+    var items = ((typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.items) || []).slice();
+    var seen = Object.create(null);
+    items = items.filter(function (it) {
+        var key = LibKey(it.path);
+        if (seen[key]) return false;
+        seen[key] = true;
+        return true;
+    });
+    LIB.recentOrder.forEach(function (path) {
+        if (!seen[LibKey(path)]) items.push(LibSynthRecent(path));
+    });
+    return items;
 }
 
 function LibEscape(s) {
@@ -75,7 +183,134 @@ function LibEscape(s) {
 // dropped every recent whose separators disagreed, silently, for a reason that has nothing
 // to do with the question being asked.
 function LibKey(p) {
-    return String(p || '').replace(/\//g, '\\').toLowerCase();
+    var value = String(p || '');
+    if (/^file:/i.test(value)) {
+        value = value.replace(/^file:\/\/\/([a-z]:)/i, '$1').replace(/^file:\/\//i, '\\\\');
+        try { value = decodeURIComponent(value); } catch (_) { /* Preserve literal percent names. */ }
+    }
+    var parts = value.replace(/\//g, '\\').split('\\'), out = [];
+    parts.forEach(function (part) {
+        if (part === '.') return;
+        if (part === '..' && out.length > 1 && out[out.length - 1] !== '..') out.pop();
+        else out.push(part);
+    });
+    return out.join('\\').replace(/\\$/, '').toLowerCase();
+}
+
+function LibFindItem(path) {
+    var key = LibKey(path), items = typeof PROJECT_LIBRARY !== 'undefined' ? PROJECT_LIBRARY.items || [] : [];
+    for (var i = 0; i < items.length; i++) if (LibKey(items[i].path) === key) return items[i];
+    return LibSynthRecent(path);
+}
+
+function LibThumbnailSource(src) {
+    src = typeof src === 'string' ? src : '';
+    return /^(?:\.\/)?img\/d\.png(?:[?#]|$)/i.test(src) || /\/homepage\/img\/d\.png(?:[?#]|$)/i.test(src) ? '' : src;
+}
+
+function LibThumbnailMetadata(it) {
+    var key = LibKey(it.path), fingerprint = it.revision == null ? '' : String(it.revision) + ':' + it.size;
+    if (fingerprint && LIB.thumbFingerprints[key] && LIB.thumbFingerprints[key] !== fingerprint) {
+        delete LIB.thumbnails[key]; delete LIB.thumbRequested[key];
+        delete LIB.thumbRetried[key]; delete LIB.thumbForce[key];
+        LIB.thumbVersions[key] = (LIB.thumbVersions[key] || 0) + 1;
+    }
+    if (fingerprint) LIB.thumbFingerprints[key] = fingerprint;
+}
+
+function LibThumbnail(it) {
+    var info = LIB.thumbnails[LibKey(it.path)] || it;
+    var views = (Array.isArray(info.views) ? info.views : []).filter(function (view) {
+        return view && LibThumbnailSource(view.src);
+    });
+    var thumb = LibThumbnailSource(info.thumb) || (views[0] && views[0].src) || '';
+    var state = info.thumbState || (thumb ? 'ready' : 'pending');
+    var error = info.thumbError || '';
+    if (it.state === 'missing') { state = 'unavailable'; error = 'File unavailable'; }
+    if (state === 'ready' && !thumb) state = 'pending';
+    return {thumb: thumb, views: views, thumbState: state, thumbError: error};
+}
+
+function LibThumbnailContents(it) {
+    var info = LibThumbnail(it), key = LibKey(it.path);
+    if (info.thumbState === 'ready') {
+        return '<img src="' + LibEscape(info.thumb) + '" loading="lazy" alt="Preview of ' + LibEscape(it.name || 'model') +
+            '" data-thumb-path="' + LibEscape(it.path) + '" data-thumb-version="' + (LIB.thumbVersions[key] || 0) +
+            '" onerror="LibThumbnailError(this)" />';
+    }
+    var unavailable = info.thumbState === 'unavailable';
+    return '<span class="LibThumbnailState' + (unavailable ? ' LibThumbnailUnavailable' : ' LibThumbnailPending') +
+        '" role="status">' + (unavailable ? 'Preview unavailable' : 'Generating preview…') +
+        (unavailable && info.thumbError ? '<small>' + LibEscape(info.thumbError) + '</small>' : '') + '</span>';
+}
+
+function LibThumbnailMarkup(it) {
+    return '<div class="LibThumbnailImage" data-thumb-path="' + LibEscape(it.path || '') + '">' +
+        LibThumbnailContents(it) + '</div>';
+}
+
+// Patch only the image area: arriving previews must not replace focused cards, ticks or scroll.
+function LibPatchThumbnail(path) {
+    if (!document.querySelectorAll) return;
+    var key = LibKey(path), it = LibFindItem(path);
+    document.querySelectorAll('.LibThumbnailImage').forEach(function (node) {
+        if (LibKey(node.getAttribute('data-thumb-path')) !== key) return;
+        node.innerHTML = LibThumbnailContents(it);
+        var card = node.closest('.LibCard');
+        if (card && typeof SlideRefresh === 'function') SlideRefresh(card);
+    });
+}
+
+function LibQueueThumbnails() {
+    if (!LIB.nativeReady || !document.querySelectorAll) return;
+    var candidates = [], seen = {}, items = {};
+    LibItems().forEach(function (it) { items[LibKey(it.path)] = it; });
+    document.querySelectorAll('.LibThumbnailImage').forEach(function (node) {
+        var path = node.getAttribute('data-thumb-path'), key = LibKey(path);
+        if (!path || seen[key] || LIB.thumbRequested[key]) return;
+        seen[key] = true;
+        if (LibThumbnail(items[key] || LibSynthRecent(path)).thumbState !== 'pending') return;
+        var box = node.getBoundingClientRect();
+        candidates.push({path: path, key: key, visible: box.bottom > 0 && box.top < window.innerHeight && box.width > 0});
+    });
+    candidates.sort(function (a, b) { return Number(b.visible) - Number(a.visible); });
+    [true, false].forEach(function (force) {
+        var paths = candidates.filter(function (entry) { return !!LIB.thumbForce[entry.key] === force; }).map(function (entry) {
+            LIB.thumbRequested[entry.key] = true;
+            return entry.path;
+        });
+        if (!paths.length) return;
+        var message = {command: 'homepage_library_thumbnails', paths: paths};
+        if (force) message.force = true;
+        SendWXMessage(JSON.stringify(message));
+    });
+}
+
+function LibThumbnailError(img) {
+    img.onerror = null;
+    var path = img.getAttribute('data-thumb-path'), key = LibKey(path);
+    if (Number(img.getAttribute('data-thumb-version')) !== (LIB.thumbVersions[key] || 0)) return;
+    var again = !!LIB.thumbRetried[key];
+    LIB.thumbRetried[key] = true;
+    LIB.thumbVersions[key] = (LIB.thumbVersions[key] || 0) + 1;
+    LIB.thumbnails[key] = {thumb: '', views: [], thumbState: again ? 'unavailable' : 'pending',
+        thumbError: again ? 'The preview image could not be loaded' : ''};
+    if (!again) { LIB.thumbForce[key] = true; delete LIB.thumbRequested[key]; }
+    LibPatchThumbnail(path);
+    LibQueueThumbnails();
+}
+
+function LibThumbnailReceive(update) {
+    if (!update || !update.path) return;
+    var key = LibKey(update.path), it = LibFindItem(update.path);
+    if (it.revision != null && update.revision != null &&
+        (String(it.revision) !== String(update.revision) || Number(it.size) !== Number(update.size))) return;
+    LIB.thumbnails[key] = Object.assign({}, LIB.thumbnails[key] || it, update);
+    LIB.thumbRequested[key] = true;
+    LIB.thumbVersions[key] = (LIB.thumbVersions[key] || 0) + 1;
+    delete LIB.thumbForce[key];
+    if (update.revision != null) LIB.thumbFingerprints[key] = String(update.revision) + ':' + update.size;
+    LibPatchThumbnail(update.path);
 }
 
 // A project that is genuinely recent but sits outside the indexed roots has no record to
@@ -86,21 +321,28 @@ function LibSynthRecent(path) {
     var norm = String(path).replace(/\//g, '\\');
     var cut  = norm.lastIndexOf('\\');
     var file = cut < 0 ? norm : norm.substr(cut + 1);
+    var recent = LIB.recentRecords[LibKey(path)] || {};
+    var missing = recent.missing === true || recent.missing === 'true';
     return {
         path: norm,
-        name: file.replace(/\.3mf$/i, ''),
+        name: recent.project_name || file.replace(/\.[^.]+$/, ''),
         root: '', group: '(not in the library)', folder: cut < 0 ? '' : norm.substr(0, cut),
-        mtime: 0, sizeMB: 0, kind: '3mf', gcode: 0,
+        mtime: 0, sizeMB: 0, kind: (file.split('.').pop() || '').toLowerCase(), gcode: 0,
         plateCount: 0, machines: [], perPlateMachines: false,
         printer: '', process: '', colours: [], materials: [], filaments: [],
-        state: 'unindexed', title: '', designer: '', parts: 0,
-        thumb: '', stage: '', superseded: false, unindexed: true
+        state: missing ? 'missing' : 'unindexed', title: '', designer: '', parts: 0,
+        note: missing ? 'Reconnect the drive or add the folder where this file now lives.' : '',
+        thumb: recent.image || recent.thumb || '', views: recent.views || [], thumbState: recent.thumbState,
+        thumbError: recent.thumbError, revision: recent.revision, size: recent.size,
+        stage: '', superseded: false, unindexed: true
     };
 }
 
 function LibMatches(it) {
+    if (LIB.shelf !== 'all' && LibShelfFor(it) !== LIB.shelf) return false;
+    if (LIB.folderScope && !LibWithin(it.path, LIB.folderScope)) return false;
     if (LIB.kind === '3mf' && it.kind !== '3mf') return false;
-    if (LIB.versions === 'best' && it.superseded) return false;
+    if (LIB.root !== 'all' && LibKey(it.root) !== LibKey(LIB.root)) return false;
     if (LIB.state === 'recent') {
         if (!LIB.recentPaths[LibKey(it.path)]) return false;
     } else if (LIB.state !== 'all' && it.state !== LIB.state) {
@@ -108,8 +350,8 @@ function LibMatches(it) {
     }
     if (LIB.group !== 'all' && it.group !== LIB.group) return false;
     if (LIB.search) {
-        var hay = (it.name + ' ' + (it.title || '') + ' ' + it.group + ' ' +
-                   (it.designer || '')).toLowerCase();
+        var hay = [it.name, it.title, it.group, it.folder, it.path, it.designer,
+                   (it.machines || []).join(' '), (it.materials || []).join(' ')].join(' ').toLowerCase();
         var words = LIB.search.toLowerCase().split(/\s+/);
         for (var i = 0; i < words.length; i++) {
             if (words[i] && hay.indexOf(words[i]) < 0) return false;
@@ -124,13 +366,7 @@ function LibFiltered() {
     // recent list's own order, which is the order the question "what was I just working on"
     // is actually asking about; mtime cannot answer it for a synthesised record.
     if (LIB.state === 'recent') {
-        var seen = {}, i;
-        for (i = 0; i < out.length; i++) seen[LibKey(out[i].path)] = true;
-        for (i = 0; i < LIB.recentOrder.length; i++) {
-            var p = LIB.recentOrder[i];
-            if (!seen[LibKey(p)]) out.push(LibSynthRecent(p));
-        }
-        var rank = {};
+        var i, rank = {};
         for (i = 0; i < LIB.recentOrder.length; i++) rank[LibKey(LIB.recentOrder[i])] = i;
         out.sort(function (a, b) {
             var ra = rank[LibKey(a.path)], rb = rank[LibKey(b.path)];
@@ -149,6 +385,7 @@ function LibFiltered() {
 }
 
 function LibDate(ts) {
+    if (!ts) return '';
     var d = new Date(ts * 1000);
     function p(n) { return (n < 10 ? '0' : '') + n; }
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
@@ -262,6 +499,7 @@ function LibFilamentRows(it) {
                '<i class="LibSwatch" style="background:' + LibEscape(hex) + '"></i>' +
                '<span class="LibFilHex">' + LibEscape(hex) + '</span>' +
                '<span class="LibFilType">' + LibEscape(f.type || '?') + '</span>' +
+               (f.plate ? '<span>Plate ' + f.plate + ' · slot ' + f.slot + '</span>' : '') +
                // Grams cannot be invented. An arranged-but-unsliced project has none, and
                // printing a zero there would read as "this uses no filament".
                (typeof f.grams === 'number'
@@ -284,7 +522,6 @@ function LibToggleFilaments(ev, el) {
 
 function LibCard(it) {
     var badge = LIB_BADGE[it.state] || LIB_BADGE['mesh'];
-    var img = it.thumb ? LibEscape(it.thumb) : 'img/d.png';
 
     var facts = [];
     if (it.plateCount > 1) facts.push(it.plateCount + ' plates');
@@ -301,7 +538,7 @@ function LibCard(it) {
     // glance whether this is a one-printer job or the whole farm.
     if (it.machines && it.machines.length) {
         tags += '<span class="LibTag LibTagMachine">' + LibEscape(
-            it.machines.map(function (m) { return m.split(' ')[0]; }).join(' ')) + '</span>';
+            it.machines.join(' / ')) + '</span>';
     }
     if (it.materials && it.materials.length &&
         !(it.materials.length === 1 && it.materials[0] === 'PLA')) {
@@ -319,33 +556,41 @@ function LibCard(it) {
         : '';
 
     return '<div class="LibCard' + (picked ? ' LibCardPicked' : '') +
-             '" fpath="' + LibEscape(it.path) + '" onClick="LibOpen(this)">' +
-             '<a class="FileTip" title="' + LibEscape(it.path) + '"></a>' +
-             '<div class="LibThumb"><img src="' + img +
-               '" onerror="this.onerror=null;this.src=\'img/d.png\';" alt="" />' +
+             '" fpath="' + LibEscape(it.path) + '" tabindex="0" role="button"' +
+             ' aria-label="Open ' + LibEscape(it.name) + '" title="' + LibEscape(it.path) +
+             '" onkeydown="LibCardKey(event, this)" onClick="LibOpen(this)">' +
+             '<div class="LibThumb">' + LibThumbnailMarkup(it) +
                '<span class="LibBadge ' + badge.cls + '">' + badge.text + '</span>' +
                tick +
              '</div>' +
              '<div class="LibName TextS1">' + LibEscape(it.name) + '</div>' +
              '<div class="LibMeta">' + LibEscape(it.group) + ' &middot; ' +
                 LibDate(it.mtime) + '</div>' +
+             '<div class="LibPath">' + LibEscape(it.folder) + '</div>' +
              '<div class="LibMeta LibFacts">' + LibFilamentStrip(it) +
                 (facts.length ? '<span>' + facts.join(' &middot; ') + '</span>' : '') +
              '</div>' +
              LibFilamentRows(it) +
              (tags ? '<div class="LibTags">' + tags + '</div>' : '') +
+             (it.note ? '<div class="LibProblem">' + LibEscape(it.note) + '</div>' : '') +
+             '<button class="LibFolderButton" onclick="LibReveal(event, this)">Open folder</button>' +
+             (it.folder && LibShelfFor(it) !== 'mine' ? ' <button class="LibFolderButton" data-path="' +
+                LibEscape(it.folder) + '" onclick="LibStop(event); LibPinDesign(this)">Add folder to My projects</button>' : '') +
+             (LIB.recentPaths[LibKey(it.path)] ?
+                ' <button class="LibFolderButton" onclick="LibForgetRecent(event, this)">Remove from recent</button>' : '') +
            '</div>';
 }
 
 function LibRender() {
+    if (LibWorkspaceRender()) { LibQueueThumbnails(); return; }
     var all = LibFiltered();
     var page = all.slice(0, LIB.shown);
     var html = '';
     for (var i = 0; i < page.length; i++) html += LibCard(page[i]);
     if (!page.length) {
-        html = '<div class="LibEmpty">Nothing matches. ' +
-               (LIB.kind === '3mf' ? 'STL files are hidden; use the STL chip to include them.'
-                                   : '') + '</div>';
+        html = '<div class="LibEmpty">' + (LibItems().length ?
+            'Nothing matches these filters. <button class="LibFolderButton" onclick="LibResetFilters()">Reset filters</button>' :
+            'Add a folder to find your projects, or open a project to start a recent list.') + '</div>';
     }
     $('#LibGrid').html(html);
 
@@ -356,8 +601,9 @@ function LibRender() {
     } else {
         $('#LibMore').hide();
     }
-    $('#LibCount').text(all.length + (all.length === 1 ? ' project' : ' projects'));
+    $('#LibCount').text(all.length + (all.length === 1 ? ' file' : ' files'));
     LibPickupSync();
+    LibQueueThumbnails();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -642,19 +888,14 @@ function LibPickupCopy() {
 
 function LibSetState(id) {
     LIB.state = id;
+    // The raw-mesh category must be able to show the files it names.
+    if (id === 'mesh') {
+        LIB.kind = 'all';
+        $('#LibKindChip').addClass('LibChipOn');
+    }
     LIB.shown = LIB_PAGE;
-    $('#LibChips .LibChip').removeClass('LibChipOn');
-    $('#LibChips .LibChip[cstate="' + id + '"]').addClass('LibChipOn');
-    LibRender();
-}
-
-function LibToggleVersions() {
-    LIB.versions = (LIB.versions === 'best') ? 'all' : 'best';
-    LIB.shown = LIB_PAGE;
-    $('#LibVersionChip').toggleClass('LibChipOn', LIB.versions === 'all');
     LibBuildChips();
     LibBuildGroups();
-    $('#LibGroup').val(LIB.group);
     LibRender();
 }
 
@@ -670,9 +911,10 @@ function LibToggleKind() {
     LibRender();
 }
 
-function LibSetGroup(v) { LIB.group = v; LIB.shown = LIB_PAGE; LibRender(); }
+function LibSetGroup(v) { LIB.group = v; LIB.shown = LIB_PAGE; LibBuildChips(); LibRender(); }
+function LibSetRoot(v) { LIB.root = v; LIB.group = 'all'; LibBuildGroups(); LibBuildChips(); LibRender(); }
 function LibSetSort(v) { LIB.sort = v; LibRender(); }
-function LibSearch(v) { LIB.search = v; LIB.shown = LIB_PAGE; LibRender(); }
+function LibSearch(v) { LIB.search = v; LIB.shown = LIB_PAGE; LibBuildChips(); LibRender(); }
 function LibMore() { LIB.shown += LIB_PAGE; LibRender(); }
 
 function LibOpen(el) {
@@ -680,36 +922,82 @@ function LibOpen(el) {
     if (p) OnOpenRecentFile(encodeURI(p));
 }
 
+function LibCardKey(ev, el) {
+    if (ev.target !== el || (ev.key !== 'Enter' && ev.key !== ' ')) return;
+    ev.preventDefault();
+    LibOpen(el);
+}
+
+function LibReveal(ev, el) {
+    LibStop(ev);
+    var path = $(el).closest('.LibCard').attr('fpath');
+    if (path) SendWXMessage(JSON.stringify({command: 'homepage_explore_recentfile', data: {path: path}}));
+}
+
+function LibForgetRecent(ev, el) {
+    LibStop(ev);
+    var path = $(el).closest('.LibCard').attr('fpath');
+    if (path) SendWXMessage(JSON.stringify({command: 'homepage_delete_recentfile', data: {path: path}}));
+}
+
+function LibResetFilters() {
+    LIB.state = 'all'; LIB.root = 'all'; LIB.group = 'all'; LIB.search = ''; LIB.kind = 'all';
+    LIB.shown = LIB_PAGE;
+    $('#LibSearch').val(''); $('#LibRoot').val('all'); $('#LibKindChip').addClass('LibChipOn');
+    LibBuildGroups(); LibBuildChips(); LibRender();
+}
+
+// Text fields own their keyboard shortcuts. Forwarding Ctrl+A or suppressing every
+// keydown here made search impossible even after the native focus fix.
+function LibKeyboard(event) {
+    var target = event.target;
+    if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) return;
+    if (event.ctrlKey || event.metaKey) {
+        OutputKey(event.keyCode, !!event.ctrlKey, !!event.shiftKey, !!event.metaKey);
+        event.preventDefault();
+    }
+}
+
 // Counts sit on the chips because the useful question is usually "how much of the
 // backlog is in this state", and that should not need a click to answer.
 function LibBuildChips() {
     var counts = {};
     var items = LibItems();
+    var state = LIB.state;
+    LIB.state = 'all';
+    var recentCount = 0, allCount = 0;
     for (var i = 0; i < items.length; i++) {
-        if (LIB.kind === '3mf' && items[i].kind !== '3mf') continue;
-        if (LIB.versions === 'best' && items[i].superseded) continue;
+        if (!LibMatches(items[i])) continue;
+        allCount++;
         counts[items[i].state] = (counts[items[i].state] || 0) + 1;
+        if (LIB.recentPaths[LibKey(items[i].path)]) recentCount++;
     }
+    var kind = LIB.kind;
+    LIB.kind = 'all'; LIB.state = 'mesh';
+    counts.mesh = items.filter(LibMatches).length;
+    LIB.kind = kind;
+    LIB.state = state;
     var html = '';
     for (var s = 0; s < LIB_STATES.length; s++) {
         var st = LIB_STATES[s];
-        var n = st.id === 'all' ? Object.keys(counts).reduce(
-                    function (a, k) { return a + counts[k]; }, 0)
-              : (st.id === 'recent' ? null : (counts[st.id] || 0));
-        if (n === 0) continue;
-        html += '<div class="LibChip' + (st.id === LIB.state ? ' LibChipOn' : '') +
+        var n = st.id === 'all' ? allCount
+              : (st.id === 'recent' ? recentCount : (counts[st.id] || 0));
+        if (n === 0 && st.id !== 'all' && st.id !== 'recent' && st.id !== LIB.state && st.id !== 'mesh') continue;
+        html += '<button class="LibChip' + (st.id === LIB.state ? ' LibChipOn' : '') +
                 '" cstate="' + st.id + '" onClick="LibSetState(\'' + st.id + '\')">' +
-                st.label + (n === null ? '' : ' <b>' + n + '</b>') + '</div>';
+                st.label + ' <b>' + n + '</b></button>';
     }
     $('#LibChips').html(html);
 }
 
 function LibBuildGroups() {
-    var groups = {};
+    var groups = Object.create(null);
     var items = LibItems();
     for (var i = 0; i < items.length; i++) {
+        if (LIB.shelf !== 'all' && LibShelfFor(items[i]) !== LIB.shelf) continue;
+        if (LIB.folderScope && !LibWithin(items[i].path, LIB.folderScope)) continue;
         if (LIB.kind === '3mf' && items[i].kind !== '3mf') continue;
-        if (LIB.versions === 'best' && items[i].superseded) continue;
+        if (LIB.root !== 'all' && LibKey(items[i].root) !== LibKey(LIB.root)) continue;
         groups[items[i].group] = (groups[items[i].group] || 0) + 1;
     }
     var keys = Object.keys(groups).sort();
@@ -719,6 +1007,8 @@ function LibBuildGroups() {
                 LibEscape(keys[k]) + ' (' + groups[keys[k]] + ')</option>';
     }
     $('#LibGroup').html(html);
+    if (LIB.group !== 'all' && !groups[LIB.group]) LIB.group = 'all';
+    $('#LibGroup').val(LIB.group);
 }
 
 // The real recent list still arrives from C++. It is kept as a filter rather than a
@@ -726,25 +1016,77 @@ function LibBuildGroups() {
 function LibNoteRecent(pList) {
     LIB.recentPaths = {};
     LIB.recentOrder = [];
+    LIB.recentRecords = {};
     for (var i = 0; i < (pList || []).length; i++) {
         if (pList[i] && pList[i].path) {
-            LIB.recentPaths[LibKey(pList[i].path)] = true;
-            LIB.recentOrder.push(pList[i].path);
+            var key = LibKey(pList[i].path);
+            LibThumbnailMetadata(pList[i]);
+            if (!LIB.recentPaths[key]) LIB.recentOrder.push(pList[i].path);
+            LIB.recentPaths[key] = true;
+            LIB.recentRecords[key] = pList[i];
         }
     }
     // The chip's count is only honest once the list has arrived, and it arrives after the
     // first render, so the chips are rebuilt rather than left showing the boot-time answer.
     LibBuildChips();
-    if (LIB.state === 'recent') LibRender();
+    LibBuildGroups();
+    LibRender();
 }
 
 function LibInit() {
-    if (typeof PROJECT_LIBRARY === 'undefined') {
-        $('#LibGrid').html('<div class="LibEmpty">No library index found. Run ' +
-            '<code>python E:\\3D-Printing\\Scripts\\build_library.py</code> to build it.</div>');
-        return;
+    if ((LIB_WORKSPACE.mine || []).length) {
+        LIB.shelf = 'mine';
+        try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
     }
     LibBuildChips();
     LibBuildGroups();
     LibRender();
+    LibRefresh();
+}
+
+function LibBusy(busy) {
+    $('#LibRefresh').prop('disabled', busy).text(busy ? 'Scanning folders…' : 'Refresh');
+    $('#LibStatus').text(busy ? 'Checking files and project metadata…' : '');
+}
+
+function LibRefresh() {
+    LibBusy(true);
+    SendWXMessage(JSON.stringify({command: 'homepage_library_refresh',
+        roots: typeof PROJECT_LIBRARY !== 'undefined' ? PROJECT_LIBRARY.roots || [] : []}));
+}
+
+function LibAddFolder() {
+    SendWXMessage(JSON.stringify({command: 'homepage_library_add_folder'}));
+}
+
+function LibRemoveFolder(el) {
+    SendWXMessage(JSON.stringify({command: 'homepage_library_remove_folder', path: el.getAttribute('data-path')}));
+}
+
+function LibReceive(data) {
+    LibBusy(false);
+    if (data.error) {
+        $('#LibStatus').text('Could not refresh the library: ' + data.error);
+        return;
+    }
+    (data.items || []).forEach(LibThumbnailMetadata);
+    PROJECT_LIBRARY = data;
+    LIB.nativeReady = true;
+    var roots = data.roots || [];
+    if (roots.indexOf(LIB.root) < 0) LIB.root = 'all';
+    var options = '<option value="all">All folders</option>';
+    roots.forEach(function (root) { options += '<option value="' + LibEscape(root) + '">' + LibEscape(root) + '</option>'; });
+    $('#LibRoot').html(options).val(LIB.root);
+    var folders = '';
+    (data.rootStatus || []).forEach(function (status) {
+        folders += '<div class="LibRootRow"><span>' + LibEscape(status.path) + '</span><span class="' +
+            (status.error ? 'LibProblem' : '') + '">' + LibEscape(status.error || status.count + ' files') + '</span>' +
+            '<button class="LibFolderButton" data-path="' + LibEscape(status.path) +
+            '" onclick="LibPinDesign(this)">My project</button>' +
+            '<button class="LibFolderButton" data-path="' + LibEscape(status.path) +
+            '" onclick="LibRemoveFolder(this)" title="Remove from library; files stay on disk">Remove folder</button></div>';
+    });
+    $('#LibFoldersList').html(folders || 'No folders added yet.');
+    $('#LibStatus').text('Updated ' + new Date((data.generated || 0) * 1000).toLocaleString() + '. Files stay in their original folders.');
+    LibBuildGroups(); LibBuildChips(); LibRender();
 }

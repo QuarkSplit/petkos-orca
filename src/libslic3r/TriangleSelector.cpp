@@ -1315,7 +1315,7 @@ void TriangleSelector::remap_triangle_state(const EnforcerBlockerStateMap& state
     tbb::parallel_for(tbb::blocked_range<size_t>(0, m_triangles.size()), [this, &state_map](const tbb::blocked_range<size_t>& range) {
         for (size_t i = range.begin(); i != range.end(); ++i) {
             Triangle& tr = m_triangles[i];
-            if (tr.valid()) {
+            if (tr.valid() && !tr.is_split()) {
                 const auto current_state = static_cast<size_t>(tr.get_state());
                 tr.set_state(state_map[current_state]);
             }
@@ -1923,8 +1923,17 @@ TriangleSelector::TriangleSplittingData TriangleSelector::remap_painting_by_face
     result.triangles_to_split.reserve(n);
     result.bitstream.reserve(source_painting.bitstream.size());
 
+    // Older remaps sorted face IDs without moving their bit ranges. Find ranges in
+    // stream order, then emit both the mappings and bits in destination-face order.
+    std::vector<TriangleBitStreamMapping> entries = source_painting.triangles_to_split;
+    std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+        return a.bitstream_start_idx < b.bitstream_start_idx;
+    });
+    struct MappedRange { int face; size_t first; size_t last; };
+    std::vector<MappedRange> ranges;
+    ranges.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        const TriangleBitStreamMapping &entry = source_painting.triangles_to_split[i];
+        const TriangleBitStreamMapping &entry = entries[i];
         const int src_facet = entry.triangle_idx;
         if (src_facet < 0 || src_facet >= int(src_to_dst_facet.size()))
             continue;
@@ -1933,27 +1942,25 @@ TriangleSelector::TriangleSplittingData TriangleSelector::remap_painting_by_face
             continue;
 
         const size_t bit_from = size_t(entry.bitstream_start_idx);
-        const size_t bit_to   = (i + 1 < n) ? size_t(source_painting.triangles_to_split[i + 1].bitstream_start_idx)
+        const size_t bit_to   = (i + 1 < n) ? size_t(entries[i + 1].bitstream_start_idx)
                                             : source_painting.bitstream.size();
         if (bit_from >= bit_to || bit_to > source_painting.bitstream.size())
             continue;
 
-        result.triangles_to_split.emplace_back(dst_facet, int(result.bitstream.size()));
+        ranges.push_back({dst_facet, bit_from, bit_to});
+    }
+    std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.face < b.face; });
+    for (const MappedRange &range : ranges) {
+        result.triangles_to_split.emplace_back(range.face, int(result.bitstream.size()));
         result.bitstream.insert(result.bitstream.end(),
-                                source_painting.bitstream.begin() + bit_from,
-                                source_painting.bitstream.begin() + bit_to);
+                                source_painting.bitstream.begin() + range.first,
+                                source_painting.bitstream.begin() + range.last);
     }
 
     if (result.bitstream.empty()) {
         result.triangles_to_split.clear();
         return result;
     }
-
-    //deserialize() walks the entries in order and each one seeks to its own start bit, so a
-    //permuted list would still decode - but every other consumer assumes the ascending order
-    //serialize() guarantees, and one of them is the 3MF writer.
-    std::sort(result.triangles_to_split.begin(), result.triangles_to_split.end(),
-              [](const TriangleBitStreamMapping &l, const TriangleBitStreamMapping &r) { return l.triangle_idx < r.triangle_idx; });
 
     result.reset_used_states();
     result.update_used_states(0);
@@ -2604,16 +2611,78 @@ TriangleSelector::TriangleSplittingData TriangleSelector::remap_painting(
     const TriangleSplittingData& source_painting,
     const indexed_triangle_set& target_its,
     const Transform3d& target_transform,
-    const std::optional<std::reference_wrapper<const TriangleSplittingData>>& existing_painting)
+    const std::optional<std::reference_wrapper<const TriangleSplittingData>>& existing_painting,
+    PaintingRemapMode mode)
 {
     TriangleSelector::TriangleSplittingData result;
-    if (source_painting.bitstream.empty())
+    if (source_painting.bitstream.empty() || source_its.indices.empty() || target_its.indices.empty())
         return result;
+
+    TriangleMesh target_mesh(target_its);
+    target_mesh.transform(target_transform);
+    if (!existing_painting && source_its.indices == target_mesh.its.indices && source_its.vertices == target_mesh.its.vertices)
+        return source_painting;
 
     // 1. Deserialize source painting
     TriangleMesh source_mesh(source_its);
     TriangleSelector source_selector(source_mesh);
     source_selector.deserialize(source_painting, false);
+
+    if (mode == PaintingRemapMode::NearestSurface) {
+        indexed_triangle_set source_leaves;
+        source_leaves.vertices.reserve(source_selector.m_vertices.size());
+        for (const Vertex &vertex : source_selector.m_vertices)
+            source_leaves.vertices.push_back(vertex.v);
+        std::vector<EnforcerBlockerType> states;
+        for (const Triangle &triangle : source_selector.m_triangles) {
+            if (!triangle.valid() || triangle.is_split())
+                continue;
+            source_leaves.indices.emplace_back(triangle.verts_idxs[0], triangle.verts_idxs[1], triangle.verts_idxs[2]);
+            states.push_back(triangle.get_state());
+        }
+        const auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(source_leaves.vertices, source_leaves.indices);
+        auto state_at = [&](const Vec3f &point) {
+            size_t face = 0;
+            Vec3f hit;
+            const float distance = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                source_leaves.vertices, source_leaves.indices, tree, point, face, hit);
+            return distance < 0.f ? EnforcerBlockerType::NONE : states[face];
+        };
+
+        TriangleSelector target(target_mesh);
+        if (existing_painting)
+            target.deserialize(existing_painting->get(), false);
+        // Include unpainted source leaves in the nearest-surface query. Otherwise
+        // a small painted area expands over every unpainted face after simplification.
+        auto project = [&](auto &&self, int face, const Vec3i32 &neighbors, unsigned depth) -> void {
+            const Triangle triangle = target.m_triangles[face];
+            const Vec3f a = target.m_vertices[triangle.verts_idxs[0]].v;
+            const Vec3f b = target.m_vertices[triangle.verts_idxs[1]].v;
+            const Vec3f c = target.m_vertices[triangle.verts_idxs[2]].v;
+            const Vec3f center = (a + b + c) / 3.f;
+            const EnforcerBlockerType state = state_at(center);
+            const std::array<Vec3f, 6> samples { a, b, c, (a + b) * 0.5f, (b + c) * 0.5f, (c + a) * 0.5f };
+            const bool mixed = std::any_of(samples.begin(), samples.end(), [&](const Vec3f &point) {
+                return state_at(0.99f * point + 0.01f * center) != state;
+            });
+            const float edge_squared = std::max({(a - b).squaredNorm(), (b - c).squaredNorm(), (c - a).squaredNorm()});
+            if (!triangle.is_split() && mixed && edge_squared > 0.01f && depth < 12) {
+                target.m_triangles[face].set_division(3, 0);
+                target.perform_split(face, neighbors, EnforcerBlockerType::NONE);
+            }
+            if (target.m_triangles[face].is_split()) {
+                const Triangle parent = target.m_triangles[face];
+                for (int child = 0; child <= parent.number_of_split_sides(); ++child)
+                    self(self, parent.children[child], target.child_neighbors(parent, neighbors, child), depth + 1);
+                target.remove_useless_children(face);
+            } else if (!existing_painting || state != EnforcerBlockerType::NONE) {
+                target.m_triangles[face].set_state(state);
+            }
+        };
+        for (int face = 0; face < target.m_orig_size_indices; ++face)
+            project(project, face, target.m_neighbors[face], 0);
+        return target.serialize();
+    }
 
     // 2. Extract painted geometry
     std::vector<std::reference_wrapper<const Triangle>> painted_triangles;
@@ -2628,8 +2697,6 @@ TriangleSelector::TriangleSplittingData TriangleSelector::remap_painting(
         return result;
 
     // 3. Build AABB tree of target mesh so we could find nearest face quickly
-    TriangleMesh target_mesh(target_its);
-    target_mesh.transform(target_transform);
     AABBTreeIndirect::Tree3f target_tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(target_mesh.its.vertices, target_mesh.its.indices);
     
     // Helper: check overlap between a paint triangle and a target triangle.

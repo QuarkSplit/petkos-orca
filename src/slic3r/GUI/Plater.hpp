@@ -180,6 +180,7 @@ public:
     void refresh_plate_board();
     //The same refresh for a change confined to one plate. See PlateBoard::reload_plate.
     void refresh_plate_board(int plate_index);
+    void refresh_plate_materials();
     //The board as a plain window, for code that needs to reach it without depending on
     //PlateBoard's own header. Carried for the scripted latency run, which posts real mouse
     //events at it because a custom-painted panel has no other way in.
@@ -609,9 +610,8 @@ public:
     //tabs are left where they were and told so, rather than silently describing one plate
     //while the badge names another.
     //
-    //The filament list is made to be exactly the plate's slots, not merely overwritten as
-    //far as the plate goes: the cursor is a view of ONE plate, and a slot left over from a
-    //wider plate is a slot the next whole-list write would copy back onto this one.
+    //Assigned-material rows follow the plate independently of the spool pool. Material
+    //replacement uses an explicit scope; changing this cursor never copies the pool back.
     void follow_plate_presets(int plate_index);
 
     //The one write path for a plate's printer assignment. Every caller (the plate settings
@@ -676,7 +676,12 @@ public:
     // them wants preset inheritance; they want not to retype their settings on a new machine.
     void save_plate_process_as_preset(int plate_index);
     void set_plate_filaments(int plate_index, std::vector<std::string> preset_names,
-                             std::vector<std::string> colours = {});
+                             std::vector<std::string> colours = {},
+                             std::optional<PlateSlicingContext> appearance = std::nullopt);
+    //Choose an explicit replacement scope and validate every target before writing any plate.
+    bool choose_plate_material_replacement(int plate_index, size_t slot, const std::string &preset_name,
+                                            bool allow_pool_only = false,
+                                            std::optional<PlateSlicingContext> appearance = std::nullopt);
     //Rename a plate, with the undo snapshot the Plate Settings dialog's own path never
     //had. The board's inline editor and any MCP surface should both land here.
     void rename_plate(int plate_index, const std::string &name);

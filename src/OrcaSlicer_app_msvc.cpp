@@ -220,7 +220,10 @@ int wmain(int argc, wchar_t **argv)
     // Allow the asserts to open message box, such message box allows to ignore the assert and continue with the application.
     // Without this call, the seemingly same message box is being opened by the abort() function, but that is too late and
     // the application will be killed even if "Ignore" button is pressed.
-    _set_error_mode(_OUT_TO_MSGBOX);
+    const bool library_thumbnail = argc > 1 && wcscmp(argv[1], L"--library-thumbnail") == 0;
+    _set_error_mode(library_thumbnail ? _OUT_TO_STDERR : _OUT_TO_MSGBOX);
+    if (library_thumbnail)
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 
     std::vector<wchar_t*> argv_extended;
     argv_extended.emplace_back(argv[0]);
@@ -247,11 +250,11 @@ int wmain(int argc, wchar_t **argv)
 
 #ifdef SLIC3R_GUI
     OpenGLVersionCheck opengl_version_check;
-    bool load_mesa =
+    bool load_mesa = !library_thumbnail && (
         // Forced from the command line.
         force_mesa ||
         // Try to load the default OpenGL driver and test its context version.
-        ! opengl_version_check.load_opengl_dll() || ! opengl_version_check.is_version_greater_or_equal_to(2, 0);
+        ! opengl_version_check.load_opengl_dll() || ! opengl_version_check.is_version_greater_or_equal_to(2, 0));
 #endif /* SLIC3R_GUI */
 
     wchar_t path_to_exe[MAX_PATH + 1] = { 0 };

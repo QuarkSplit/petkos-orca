@@ -539,13 +539,9 @@ void GLGizmoSimplify::apply_simplify() {
     ModelVolume* mv = get_model_volume(selection, wxGetApp().model());
     assert(mv == m_volume);
 
-    //Paint always survives a mesh change. The old "keep_painting" preference shipped OFF and
-    //its off branch deleted every painted channel; deleting colour information is never what
-    //a geometry operation was asked to do. Same call the cut gizmo makes, unconditionally.
-    std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
-    mv->set_mesh(std::move(*m_state.result));
-    // Remap paint
-    mv->restore_painting(saved_painting);
+    // Simplification moves surfaces, so the cut tool's coplanar overlap remap
+    // cannot recover their paint. Project the original surface annotations instead.
+    mv->set_mesh_preserving_paint(TriangleMesh(std::move(*m_state.result)), TriangleSelector::PaintingRemapMode::NearestSurface);
     m_state.result.reset();
     mv->calculate_convex_hull();
     mv->invalidate_convex_hull_2d();

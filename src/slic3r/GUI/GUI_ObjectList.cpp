@@ -3216,7 +3216,7 @@ void ObjectList::merge(bool to_multipart_object)
         ModelObject* model_object = (*m_objects)[obj_idx];
         model_object->merge();
 
-        m_objects_model->DeleteVolumeChildren(item);
+        add_volumes_to_object_in_list(obj_idx);
 
         changed_object(obj_idx);
     }
@@ -3318,8 +3318,8 @@ void ObjectList::boolean()
         // Save painting of all the positive parts
         saved_paintings.reserve(object->volumes.size());
         for (const ModelVolume* vol : object->volumes) {
-            if (vol && vol->mesh_ptr() && vol->is_model_part() && vol->is_any_painted()) {
-                saved_paintings.emplace_back(vol->save_painting());
+            if (vol && vol->mesh_ptr() && vol->is_model_part()) {
+                saved_paintings.emplace_back(vol->save_painting(true));
                 if (saved_paintings.back()) {
                     saved_paintings.back()->mesh.transform(vol->get_matrix(), true);
                 }
@@ -6448,15 +6448,8 @@ void GUI::ObjectList::smooth_mesh()
         dlg.ShowModal();
     };
 
-    //PAINT IS REMAPPED HERE WHATEVER THE PREFERENCE SAYS, and the reason is what the two
-    //branches actually were. "keep_painting" is a warning about operations where remapping is a
-    //guess - a cut, a boolean, a fix - and its off state is meant to mean "leave the paint
-    //alone". It cannot mean that here: subdivision replaces the triangle set the annotations
-    //index, so the old bitstream describes triangles that no longer exist and the code DELETED
-    //it (restore_painting with nothing saved calls reset_extra_facets). The choice was never
-    //"remap or keep"; it was "remap or lose", and losing a four-colour paint job to a menu item
-    //called Subdivide is not a preference anybody expressed. It is also the case remapping is
-    //most reliable in: the result is a refinement of the same surface, not a new one.
+    // Loop subdivision moves vertices as well as adding faces. Project paint onto
+    // the smoothed surface; coplanar overlap would discard colour at rounded edges.
     bool has_show_smooth_mesh_error_dlg = false;
     if (vol_idxs.empty()) {
         obj        = object(object_idx);
@@ -6469,9 +6462,7 @@ void GUI::ObjectList::smooth_mesh()
             std::string reason;
             auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok, &reason);
             if (ok) {
-                const std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
-                mv->set_mesh(result_mesh);
-                mv->restore_painting(saved_painting);
+                mv->set_mesh_preserving_paint(std::move(result_mesh), TriangleSelector::PaintingRemapMode::NearestSurface);
                 mv->calculate_convex_hull();
                 mv->invalidate_convex_hull_2d();
                 mv->set_new_unique_id();
@@ -6497,9 +6488,7 @@ void GUI::ObjectList::smooth_mesh()
             std::string reason;
             auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok, &reason);
             if (ok) {
-                const std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
-                mv->set_mesh(result_mesh);
-                mv->restore_painting(saved_painting);
+                mv->set_mesh_preserving_paint(std::move(result_mesh), TriangleSelector::PaintingRemapMode::NearestSurface);
                 mv->calculate_convex_hull();
                 mv->invalidate_convex_hull_2d();
                 mv->set_new_unique_id();

@@ -57,6 +57,11 @@ struct PlateSlicingContext
     // than the slot list (older projects); it is never longer.
     std::vector<std::string> filament_colours;
     std::string              physical_printer_id;
+    // Spool appearance belongs to the same plate slot as its material and colour.
+    // Empty vectors are legacy data; composition supplies solid, standard defaults.
+    std::vector<std::string> filament_colour_types;
+    std::vector<std::string> filament_multi_colours;
+    std::vector<int>         filament_finishes;
 
     // Everything a slice needs to be named. printer_vendor_id is excluded: it is a
     // guard recorded against the printer name, not an identity of its own, and an
@@ -75,7 +80,10 @@ struct PlateSlicingContext
                print_preset_name == rhs.print_preset_name &&
                filament_preset_names == rhs.filament_preset_names &&
                filament_colours == rhs.filament_colours &&
-               physical_printer_id == rhs.physical_printer_id;
+               physical_printer_id == rhs.physical_printer_id &&
+               filament_colour_types == rhs.filament_colour_types &&
+               filament_multi_colours == rhs.filament_multi_colours &&
+               filament_finishes == rhs.filament_finishes;
     }
 
     bool operator!=(const PlateSlicingContext &rhs) const { return !(*this == rhs); }

@@ -1,4 +1,5 @@
 #include "WebViewDialog.hpp"
+#include "ProjectLibrary.hpp"
 
 #include "I18N.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
@@ -10,6 +11,8 @@
 #include <boost/log/trivial.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
+#include <map>
+#include <set>
 
 #include <wx/sizer.h>
 #include <wx/utils.h>
@@ -17,6 +20,8 @@
 #include <wx/toolbar.h>
 #include <wx/textdlg.h>
 #include <wx/url.h>
+#include <wx/dirdlg.h>
+#include <wx/filename.h>
 
 #include <slic3r/GUI/Widgets/WebView.hpp>
 
@@ -36,49 +41,246 @@ namespace GUI {
 
 
 
-//Where the library index and the resolver live. Both are data about Petko's own folders
-//rather than about the slicer, so they are configurable and their absence is not an error:
-//an installation without them simply has no library to file into.
-static wxString library_script_path()
-{
-    wxString from_env;
-    if (wxGetEnv("PETKOS_ORCA_INGEST", &from_env) && !from_env.empty())
-        return from_env;
-    return wxString::FromUTF8("E:\\3D-Printing\\Scripts\\ingest.py");
-}
-
-//Identifying a model means reading its embedded design id and matching it against the
-//collection manifests, which is a body of logic that already exists and is tested. Calling
-//it is a smaller and more honest dependency than reimplementing it here, where it would
-//immediately drift from the copy that files downloads.
 bool WebViewPanel::IngestDroppedFiles(const wxArrayString &paths)
 {
-    const wxString script = library_script_path();
-    if (!wxFileExists(script)) {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": no ingest script at "
-                                << script.ToUTF8().data() << ", ignoring drop";
-        return false;
+    if (paths.empty()) return false;
+    AddLibraryFolders(paths);
+    return true;
+}
+
+std::vector<std::string> WebViewPanel::LibraryRoots() const
+{
+    const auto value = nlohmann::json::parse(wxGetApp().app_config->get("project_library_roots"), nullptr, false);
+    std::vector<std::string> roots;
+    if (value.is_array())
+        for (const auto &root : value)
+            if (root.is_string()) roots.push_back(root.get<std::string>());
+    return roots;
+}
+
+void WebViewPanel::AddLibraryFolders(const wxArrayString &paths)
+{
+    auto roots = LibraryRoots();
+    for (const auto &path : paths) {
+        wxString folder = wxDirExists(path) ? path : wxFileName(path).GetPath();
+        if (folder.empty() || !wxDirExists(folder)) continue;
+        const std::string value = into_u8(folder);
+        if (std::none_of(roots.begin(), roots.end(), [&value](const std::string &root) {
+                return ProjectLibrary::path_key(root) == ProjectLibrary::path_key(value);
+            })) roots.push_back(value);
     }
+    wxGetApp().app_config->set("project_library_roots", nlohmann::json(roots).dump());
+    RefreshLibrary();
+}
 
-    wxString cmd = wxString::Format("python \"%s\" --apply", script);
-    for (const wxString &p : paths)
-        cmd += wxString::Format(" \"%s\"", p);
+void WebViewPanel::RefreshLibrary()
+{
+    RunScript("if (typeof LibBusy === 'function') LibBusy(true);");
+    if (m_library_worker.joinable()) {
+        m_library_cancel = true;
+        m_library_refresh_pending = true;
+        return;
+    }
+    const auto roots = LibraryRoots();
+    const auto previous = m_library_data;
+    m_library_thumbnail_generation = m_thumbnail_generation;
+    const std::string cache_dir = (boost::filesystem::path(data_dir()) / "cache" / "project-library").string();
+    m_library_cancel = false;
+    m_library_ready = false;
+    m_library_worker = std::thread([this, roots, cache_dir, previous] {
+#ifdef _WIN32
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        try { m_library_result = ProjectLibrary::scan(roots, cache_dir, previous, m_library_cancel); }
+        catch (const std::exception &error) {
+            m_library_result = {{"error", error.what()}};
+        }
+        m_library_ready = true;
+    });
+    m_library_timer.Start(100);
+}
 
-    //Synchronous on purpose. The page is reloaded straight afterwards to show the result,
-    //and a reload that races the filing shows the library exactly as it was.
-    const long rc = wxExecute(cmd, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ingest returned " << rc
-                            << " for " << paths.GetCount() << " file(s)";
-    if (rc != 0)
-        return false;
+void WebViewPanel::OnLibraryReady(wxTimerEvent &)
+{
+    if (!m_library_ready) return;
+    m_library_timer.Stop();
+    m_library_worker.join();
+    if (m_library_refresh_pending) {
+        m_library_refresh_pending = false;
+        RefreshLibrary();
+        return;
+    }
+    if (!m_library_result.contains("error")) {
+        // A thumbnail can finish while this metadata scan is running.
+        std::map<std::string, const nlohmann::json *> completed;
+        if (m_library_data.contains("items") && m_library_data["items"].is_array()) {
+            for (const auto &item : m_library_data["items"])
+                if (item.value("thumbState", "") == "ready" &&
+                    item.value("thumbGeneration", uint64_t(0)) > m_library_thumbnail_generation)
+                    completed.emplace(item.value("path", ""), &item);
+        }
+        for (auto &item : m_library_result["items"]) {
+            const auto old = completed.find(item.value("path", ""));
+            if (old == completed.end() || old->second->value("revision", "") != item.value("revision", "") ||
+                old->second->value("size", uint64_t(0)) != item.value("size", uint64_t(0))) continue;
+            for (auto field = old->second->begin(); field != old->second->end(); ++field)
+                if (field.key() == "views" || field.key().compare(0, 5, "thumb") == 0)
+                    item[field.key()] = field.value();
+        }
+        m_library_data = m_library_result;
+        std::set<std::string> indexed;
+        for (const auto &item : m_library_data["items"]) indexed.insert(item.value("path", ""));
+        m_thumbnail_queue.erase(std::remove_if(m_thumbnail_queue.begin(), m_thumbnail_queue.end(),
+            [&indexed](const auto &request) {
+                return request.first.value("_thumbnailAutomatic", false) &&
+                    indexed.count(request.first.value("path", "")) == 0;
+            }), m_thumbnail_queue.end());
+        if (m_thumbnail_active_automatic && indexed.count(m_thumbnail_active_path) == 0)
+            m_thumbnail_cancel = true;
+    }
+    RunScript(from_u8("LibReceive(" + m_library_result.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + ");"));
+    if (!m_library_result.contains("error")) {
+        std::set<std::string> queued{m_thumbnail_active_path};
+        for (const auto &request : m_thumbnail_queue) queued.insert(request.first.value("path", ""));
+        for (const auto &item : m_library_data["items"]) {
+            if (item.value("thumbState", "") == "pending" && queued.insert(item.value("path", "")).second) {
+                auto request = item;
+                request["_thumbnailAutomatic"] = true;
+                m_thumbnail_queue.emplace_back(std::move(request), false);
+            }
+        }
+        StartNextLibraryThumbnail();
+    }
+}
 
-    if (m_browser != nullptr)
-        m_browser->Reload();
+void WebViewPanel::QueueLibraryThumbnails(const nlohmann::json &paths, bool force)
+{
+    if (!paths.is_array()) return;
+    // Most recently visible cards go ahead of work left from an earlier filter/page.
+    const size_t count = std::min(paths.size(), size_t(256));
+    for (size_t i = count; i > 0; --i) {
+        if (!paths[i - 1].is_string()) continue;
+        const auto path = paths[i - 1].get<std::string>();
+        if (path.empty() || path.size() > 32768) continue;
+        if (path == m_thumbnail_active_path) {
+            m_thumbnail_active_automatic = false;
+            // A cancelled automatic render needs a new explicit request.
+            if (!force && !m_thumbnail_cancel) continue;
+        }
+        nlohmann::json item{{"path", path}};
+        if (m_library_data.contains("items") && m_library_data["items"].is_array()) {
+            for (const auto &entry : m_library_data["items"])
+                if (entry.value("path", "") == path) { item = entry; break; }
+        }
+        const auto queued = std::find_if(m_thumbnail_queue.begin(), m_thumbnail_queue.end(),
+            [&path](const auto &entry) { return entry.first.value("path", "") == path; });
+        bool regenerate = force;
+        if (queued != m_thumbnail_queue.end()) {
+            regenerate |= queued->second;
+            m_thumbnail_queue.erase(queued);
+        }
+        item.erase("_thumbnailAutomatic");
+        m_thumbnail_queue.emplace_front(std::move(item), regenerate);
+    }
+    StartNextLibraryThumbnail();
+}
+
+void WebViewPanel::StartNextLibraryThumbnail()
+{
+    if (m_thumbnail_worker.joinable()) return;
+    if (m_thumbnail_queue.empty()) { m_thumbnail_timer.Stop(); return; }
+    auto request = std::move(m_thumbnail_queue.front());
+    m_thumbnail_queue.pop_front();
+    m_thumbnail_active_path = request.first.value("path", "");
+    m_thumbnail_active_automatic = request.first.value("_thumbnailAutomatic", false);
+    const std::string cache_dir = (boost::filesystem::path(data_dir()) / "cache" / "project-library").string();
+    const auto executable = into_u8(wxStandardPaths::Get().GetExecutablePath());
+    m_thumbnail_ready = false;
+    m_thumbnail_cancel = false;
+    m_thumbnail_worker = std::thread([this, request = std::move(request), cache_dir, executable] {
+#ifdef _WIN32
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        try {
+            m_thumbnail_result = ProjectLibrary::thumbnail(request.first, cache_dir, executable,
+                                                            m_thumbnail_cancel, request.second);
+        } catch (const std::exception &error) {
+            m_thumbnail_result = {{"path", request.first.value("path", "")}, {"thumb", ""},
+                {"views", nlohmann::json::array()}, {"thumbState", "unavailable"}, {"thumbError", error.what()}};
+        }
+        m_thumbnail_ready = true;
+    });
+    m_thumbnail_timer.Start(100);
+}
+
+void WebViewPanel::OnLibraryThumbnailReady(wxTimerEvent &)
+{
+    if (!m_thumbnail_ready) return;
+    m_thumbnail_worker.join();
+    m_thumbnail_ready = false;
+    m_thumbnail_active_path.clear();
+    m_thumbnail_active_automatic = false;
+    if (m_thumbnail_cancel) {
+        StartNextLibraryThumbnail();
+        return;
+    }
+    bool stale = false;
+    if (m_library_data.contains("items") && m_library_data["items"].is_array()) {
+        for (auto &item : m_library_data["items"]) {
+            if (item.value("path", "") != m_thumbnail_result.value("path", "")) continue;
+            stale = m_thumbnail_result.contains("revision") &&
+                (item.value("revision", "") != m_thumbnail_result.value("revision", "") ||
+                 item.value("size", uint64_t(0)) != m_thumbnail_result.value("size", uint64_t(0)));
+            if (!stale) {
+                for (auto field = m_thumbnail_result.begin(); field != m_thumbnail_result.end(); ++field)
+                    if (field.key() == "views" || field.key().compare(0, 5, "thumb") == 0)
+                        item[field.key()] = field.value();
+                item["thumbGeneration"] = ++m_thumbnail_generation;
+            }
+            break;
+        }
+    }
+    if (stale) RefreshLibrary();
+    else RunScript(from_u8("if (typeof LibThumbnailReceive === 'function') LibThumbnailReceive(" +
+        m_thumbnail_result.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + ");"));
+    StartNextLibraryThumbnail();
+}
+
+bool WebViewPanel::HandleLibraryRequest(const std::string &message)
+{
+    const auto request = nlohmann::json::parse(message, nullptr, false);
+    if (!request.is_object()) return false;
+    if (!request.contains("command") || !request["command"].is_string()) return false;
+    const auto command = request["command"].get<std::string>();
+    if (command == "homepage_library_refresh") {
+        // Adopt folders from the old index once. New installations start with Add folder.
+        if (wxGetApp().app_config->get("project_library_roots").empty()) {
+            std::vector<std::string> roots;
+            if (request.contains("roots") && request["roots"].is_array())
+                for (const auto &root : request["roots"])
+                    if (root.is_string() && boost::filesystem::path(root.get<std::string>()).is_absolute())
+                        roots.push_back(root.get<std::string>());
+            wxGetApp().app_config->set("project_library_roots", nlohmann::json(roots).dump());
+        }
+        RefreshLibrary();
+    } else if (command == "homepage_library_thumbnails") {
+        if (request.contains("paths")) QueueLibraryThumbnails(request["paths"], request.value("force", false));
+    } else if (command == "homepage_library_add_folder") {
+        wxDirDialog dialog(this, _L("Add a library folder"), wxEmptyString, wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+        if (dialog.ShowModal() == wxID_OK) AddLibraryFolders(wxArrayString{dialog.GetPath()});
+    } else if (command == "homepage_library_remove_folder") {
+        auto roots = LibraryRoots();
+        const std::string path = request.value("path", std::string());
+        roots.erase(std::remove(roots.begin(), roots.end(), path), roots.end());
+        wxGetApp().app_config->set("project_library_roots", nlohmann::json(roots).dump());
+        RefreshLibrary();
+    } else return false;
     return true;
 }
 
 void WebViewPanel::SetFocusOnWebView()
 {
+    if (!m_library_data.is_null() && !m_library_worker.joinable()) RefreshLibrary();
     if (m_browser != nullptr)
         m_browser->SetFocus();
     else
@@ -91,8 +293,10 @@ bool HomePageDropTarget::OnDropFiles(wxCoord, wxCoord, const wxArrayString &file
 }
 
 WebViewPanel::WebViewPanel(wxWindow *parent)
-        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize), m_library_timer(this), m_thumbnail_timer(this)
  {
+    Bind(wxEVT_TIMER, &WebViewPanel::OnLibraryReady, this, m_library_timer.GetId());
+    Bind(wxEVT_TIMER, &WebViewPanel::OnLibraryThumbnailReady, this, m_thumbnail_timer.GetId());
     wxString url = wxString::Format("file://%s/web/homepage/index.html", from_u8(resources_dir()));
     wxString strlang = wxGetApp().current_language_code_safe();
     if (strlang != "")
@@ -148,10 +352,7 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
     m_browser->Hide();
     SetSizer(topsizer);
 
-    //Dropping a model onto the home page files it into the library rather than opening it.
-    //The webview cannot do this itself: a page only receives the dropped file's BYTES, not
-    //its path, so it can neither identify the file from what is on disk beside it nor move
-    //it. A wxFileDropTarget receives real paths, which is the whole difference.
+    // Native file drops provide paths; the page alone receives only file contents.
     SetDropTarget(new HomePageDropTarget(this));
 
     topsizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
@@ -286,6 +487,12 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
 
 WebViewPanel::~WebViewPanel()
 {
+    m_library_timer.Stop();
+    m_thumbnail_timer.Stop();
+    m_library_cancel = true;
+    m_thumbnail_cancel = true;
+    if (m_library_worker.joinable()) m_library_worker.join();
+    if (m_thumbnail_worker.joinable()) m_thumbnail_worker.join();
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << " Start";
     SetEvtHandlerEnabled(false);
     
@@ -743,6 +950,7 @@ void WebViewPanel::OnNewWindow(wxWebViewEvent& evt)
 void WebViewPanel::OnScriptMessage(wxWebViewEvent& evt)
 {
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << ": " << evt.GetString().ToUTF8().data();
+    if (HandleLibraryRequest(into_u8(evt.GetString()))) return;
     // update login status
     if (m_LoginUpdateTimer == nullptr) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " Create Timer";

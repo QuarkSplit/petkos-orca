@@ -425,9 +425,7 @@ void UpdateJob::update_volume(ModelVolume *volume, TriangleMesh &&mesh, const Da
     // update volume
     // A regenerated text mesh has new triangles; paint left in place would index dead ones
     // (stale, not preserved). Remap it spatially like every other mesh change does.
-    const std::optional<TriangleSelector::SavedPainting> saved_painting = volume->save_painting();
-    volume->set_mesh(std::move(mesh));
-    volume->restore_painting(saved_painting);
+    volume->set_mesh_preserving_paint(std::move(mesh));
     volume->set_new_unique_id();
     volume->calculate_convex_hull();
 

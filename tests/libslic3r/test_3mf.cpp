@@ -8,6 +8,7 @@
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/MultiNozzleUtils.hpp"
 #include "libslic3r/ProjectTask.hpp"
+#include "libslic3r/Utils.hpp"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -261,12 +262,17 @@ SCENARIO("Per-plate slicing identity survives a .3mf round-trip", "[3mf][PlateCo
         plate->slicing_context.printer_vendor_id     = "VORON";
         plate->slicing_context.print_preset_name     = "0.28mm structural";
         plate->slicing_context.filament_preset_names = {"PETG black", "PLA support interface"};
+        plate->slicing_context.filament_colours = {"#112233", "#ABCDEF"};
+        plate->slicing_context.filament_colour_types = {"1", "2"};
+        plate->slicing_context.filament_multi_colours = {"#112233", "#ABCDEF;#123456"};
+        plate->slicing_context.filament_finishes = {int(FilamentFinish::ffMatte), int(FilamentFinish::ffMetallic)};
         plate->slicing_context.physical_printer_id   = "workshop-voron-02";
 
         WHEN("the project is stored and loaded") {
             const boost::filesystem::path test_file = backup_dir / "plate_context.3mf";
+            const std::string test_path = test_file.string();
             StoreParams store_params;
-            store_params.path = test_file.string().c_str();
+            store_params.path = test_path.c_str();
             store_params.model = &model;
             store_params.config = &config;
             store_params.plate_data_list.push_back(plate);
@@ -858,6 +864,127 @@ SCENARIO("2D convex hull of sinking object", "[3mf][.]") {
                 CAPTURE(hull_2d.points);
                 REQUIRE(res);
             }
+        }
+    }
+}
+
+TEST_CASE("Embedded preset identities survive missing and stale config identifiers", "[3mf][PlateContext][EmbeddedPresetIdentity]")
+{
+    const std::string identity_case = GENERATE("empty ids", "stale ids", "missing ids", "legacy id only", "no identity");
+    CAPTURE(identity_case);
+    const bool legacy = identity_case == "legacy id only";
+    const bool unidentified = identity_case == "no identity";
+    std::array<Preset, 4> source = {
+        Preset(Preset::TYPE_PRINTER, "Imported machine 0.6"),
+        Preset(Preset::TYPE_PRINT, "Imported structural process"),
+        Preset(Preset::TYPE_FILAMENT, "Imported PLA Matte"),
+        Preset(Preset::TYPE_FILAMENT, "Imported PETG")
+    };
+    const std::array<std::string, 4> expected_names = {source[0].name, source[1].name, source[2].name, source[3].name};
+    const std::array<const char *, 4> identity_keys = {"printer_settings_id", "print_settings_id", "filament_settings_id", "filament_settings_id"};
+    source[0].config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+    source[0].config.set_key_value("printer_vendor_id", new ConfigOptionString("ARCHIVE_VENDOR"));
+    source[0].config.set_key_value("printable_height", new ConfigOptionFloat(310.));
+    source[0].config.set_key_value("machine_start_gcode", new ConfigOptionString("G28\nM104 S221"));
+    source[1].config.set_key_value("layer_height", new ConfigOptionFloat(0.28));
+    source[1].config.set_key_value("wall_loops", new ConfigOptionInt(4));
+    source[1].config.set_key_value("enable_support", new ConfigOptionBool(false));
+    source[2].config.set_key_value("filament_type", new ConfigOptionStrings({"PLA"}));
+    source[2].config.set_key_value("nozzle_temperature", new ConfigOptionInts({214}));
+    source[2].config.set_key_value("nozzle_temperature_initial_layer", new ConfigOptionInts({221}));
+    source[2].config.set_key_value("fan_max_speed", new ConfigOptionInts({100}));
+    source[2].config.set_key_value("filament_flow_ratio", new ConfigOptionFloats({0.97}));
+    source[3].config = source[2].config;
+    source[3].config.set_key_value("filament_type", new ConfigOptionStrings({"PETG"}));
+    source[3].config.set_key_value("nozzle_temperature", new ConfigOptionInts({245}));
+    source[3].config.set_key_value("nozzle_temperature_initial_layer", new ConfigOptionInts({250}));
+    for (size_t i = 0; i < source.size(); ++i) {
+        const std::string id = legacy ? expected_names[i] : identity_case == "stale ids" ? "Inherited parent identity" : "";
+        if (identity_case != "missing ids") {
+            if (source[i].type == Preset::TYPE_FILAMENT)
+                source[i].config.set_key_value(identity_keys[i], new ConfigOptionStrings(
+                    unidentified ? std::vector<std::string>() : std::vector<std::string>{id}));
+            else
+                source[i].config.set_key_value(identity_keys[i], new ConfigOptionString(id));
+        }
+        if (legacy || unidentified)
+            source[i].name.clear();
+    }
+
+    const boost::filesystem::path directory = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("podslicer_embedded_identity_%%%%%%%%");
+    boost::filesystem::create_directories(directory / "source");
+    boost::filesystem::create_directories(directory / "loaded");
+    ScopeGuard clean_directory([&]() { boost::filesystem::remove_all(directory); });
+    Model model;
+    model.set_backup_path((directory / "source").string());
+    REQUIRE(load_stl((std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl").c_str(), &model));
+    model.add_default_instances();
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    PlateData plate;
+    plate.plate_index = 0;
+    plate.slicing_context.printer_preset_name = expected_names[0];
+    plate.slicing_context.print_preset_name = expected_names[1];
+    plate.slicing_context.filament_preset_names = {expected_names[2], expected_names[3]};
+    const std::string project_path = (directory / "identity.3mf").string();
+    StoreParams store;
+    store.path = project_path;
+    store.model = &model;
+    store.config = &config;
+    store.plate_data_list = {&plate};
+    store.project_presets = {&source[0], &source[1], &source[2], &source[3]};
+    store.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store));
+
+    Model loaded_model;
+    loaded_model.set_backup_path((directory / "loaded").string());
+    DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    PlateDataPtrs loaded_plates;
+    std::vector<Preset *> loaded_presets;
+    ScopeGuard clean_loaded([&]() {
+        release_PlateData_list(loaded_plates);
+        for (Preset *preset : loaded_presets)
+            delete preset;
+    });
+    bool is_bbl = false, is_orca = false;
+    Semver version;
+    bool loaded = false;
+    REQUIRE_NOTHROW(loaded = load_bbs_3mf(project_path.c_str(), &loaded_config, &substitutions, &loaded_model,
+        &loaded_plates, &loaded_presets, &is_bbl, &is_orca, &version, nullptr,
+        LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(loaded);
+    REQUIRE(loaded_model.objects.size() == model.objects.size());
+    REQUIRE(loaded_plates.size() == 1);
+    CHECK(loaded_plates.front()->slicing_context == plate.slicing_context);
+    if (unidentified) {
+        CHECK(loaded_presets.empty());
+        return;
+    }
+    REQUIRE(loaded_presets.size() == source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        INFO("preset type " << int(source[i].type));
+        const auto found = std::find_if(loaded_presets.begin(), loaded_presets.end(), [&](const Preset *preset) {
+            return preset->type == source[i].type && preset->name == expected_names[i];
+        });
+        REQUIRE(found != loaded_presets.end());
+        CHECK((*found)->name == expected_names[i]);
+        if (source[i].type == Preset::TYPE_FILAMENT) {
+            const auto *ids = (*found)->config.option<ConfigOptionStrings>(identity_keys[i]);
+            REQUIRE(ids != nullptr);
+            CHECK(ids->values == std::vector<std::string>{expected_names[i]});
+        } else {
+            const auto *id = (*found)->config.option<ConfigOptionString>(identity_keys[i]);
+            REQUIRE(id != nullptr);
+            CHECK(id->value == expected_names[i]);
+        }
+        for (const std::string &key : source[i].config.keys()) {
+            if (key == identity_keys[i])
+                continue;
+            INFO("setting " << key);
+            const ConfigOption *restored = (*found)->config.option(key);
+            REQUIRE(restored != nullptr);
+            CHECK(restored->serialize() == source[i].config.option(key)->serialize());
         }
     }
 }

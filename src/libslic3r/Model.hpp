@@ -428,6 +428,10 @@ public:
     bool                    is_mm_painted() const;
     // Checks if any of object volume is painted using the fuzzy skin painting gizmo.
     bool                    is_fuzzy_skin_painted() const;
+    // One-based material slots used by the object, its parts, layer overrides and paint.
+    std::vector<int>         used_filament_ids() const;
+    // mapping[old_slot] is the new one-based slot; validate the complete map before writing.
+    void                    remap_filament_ids(const std::vector<int> &mapping);
     // This object may have a varying layer height by painting or by a table.
     // Even if true is returned, the layer height profile may be "flat" with no difference to default layering.
     bool                    has_custom_layering() const
@@ -881,10 +885,21 @@ public:
     // Save painting data before reset_extra_facets() discards it.
     // Used for replacing mesh without losing painting data.
     // Only for model parts (not modifiers/connectors).
-    std::optional<TriangleSelector::SavedPainting> save_painting() const;
+    // Include the part's material when several parts will become one volume.
+    std::optional<TriangleSelector::SavedPainting> save_painting(bool include_material = false) const;
     
     // Remap painting data from previous saved source to this mesh
-    void restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, bool keep_existing_paint = false);
+    void restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, bool keep_existing_paint = false,
+                         TriangleSelector::PaintingRemapMode mode = TriangleSelector::PaintingRemapMode::SurfaceOverlap);
+    void restore_painting(const std::optional<TriangleSelector::SavedPainting>& saved, const Transform3d &target_to_source,
+                         bool keep_existing_paint = false,
+                         TriangleSelector::PaintingRemapMode mode = TriangleSelector::PaintingRemapMode::SurfaceOverlap);
+    // For replacing/reloading a volume whose placement or import centering changed.
+    void restore_painting(const ModelVolume &source);
+
+    // Replacement geometry is already in this volume's local coordinate frame.
+    void set_mesh_preserving_paint(TriangleMesh mesh,
+        TriangleSelector::PaintingRemapMode mode = TriangleSelector::PaintingRemapMode::SurfaceOverlap);
 
     //Podslicer: carry every painted channel across a change of mesh that kept its faces.
     //`src_to_dst_facet[i]` is this volume's new index for the source mesh's face i, or -1 when

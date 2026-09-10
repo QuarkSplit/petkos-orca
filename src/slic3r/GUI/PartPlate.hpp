@@ -218,6 +218,9 @@ private:
     std::vector<std::string> m_filament_preset_names;
     std::vector<std::string> m_filament_colours;
     std::string m_physical_printer_id;
+    std::vector<std::string> m_filament_colour_types;
+    std::vector<std::string> m_filament_multi_colours;
+    std::vector<int> m_filament_finishes;
 
     // Printable height of this plate's own printer, 0 meaning it has not been applied
     // yet. Applied inside set_pos_and_size so that every code path that (re)sizes this
@@ -428,7 +431,8 @@ public:
 
     PlateSlicingContext get_slicing_context() const
     {
-        return {m_printer_preset_name, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id};
+        return {m_printer_preset_name, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours,
+                m_physical_printer_id, m_filament_colour_types, m_filament_multi_colours, m_filament_finishes};
     }
     void set_slicing_context(const PlateSlicingContext &context)
     {
@@ -439,6 +443,9 @@ public:
         m_filament_preset_names    = context.filament_preset_names;
         m_filament_colours         = context.filament_colours;
         m_physical_printer_id      = context.physical_printer_id;
+        m_filament_colour_types   = context.filament_colour_types;
+        m_filament_multi_colours   = context.filament_multi_colours;
+        m_filament_finishes        = context.filament_finishes;
         if (printer_changed)
             invalidate_plate_name_texture();
     }
@@ -480,7 +487,7 @@ public:
     ModelInstance* get_instance(int obj_id, int instance_id);
     BoundingBoxf3 get_objects_bounding_box();
 
-    Vec3d get_origin() { return m_origin; }
+    Vec3d get_origin() const { return m_origin; }
     //Vec3d calculate_wipe_tower_size(const DynamicPrintConfig &config, const double w, const double wipe_volume, int plate_extruder_size = 0, bool use_global_objects = false) const;
     Vec3d estimate_wipe_tower_size(const DynamicPrintConfig & config, const double w, const double wipe_volume, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false, bool enable_wrapping_detection = false) const;
     arrangement::ArrangePolygon estimate_wipe_tower_polygon(const DynamicPrintConfig & config, int plate_index, Vec3d& wt_pos, Vec3d& wt_size, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false) const;
@@ -737,7 +744,7 @@ public:
         std::vector<std::pair<int, int>>	objects_and_instances;
         std::vector<std::pair<int, int>>	instances_outside;
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id, m_filament_colour_types, m_filament_multi_colours, m_filament_finishes);
 
         for (std::vector<std::pair<int, int>>::iterator it = objects_and_instances.begin(); it != objects_and_instances.end(); ++it)
             obj_to_instance_set.insert(std::pair(it->first, it->second));
@@ -755,7 +762,7 @@ public:
         for (std::set<std::pair<int, int>>::iterator it = obj_to_instance_set.begin(); it != obj_to_instance_set.end(); ++it)
             objects_and_instances.emplace_back(it->first, it->second);
 
-        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id);
+        ar(m_plate_index, m_name, m_printer_preset_name, m_printable_height, m_print_index, m_origin, m_width, m_depth, m_height, m_locked, m_selected, m_ready_for_slice, m_slice_result_valid, m_apply_invalid, m_printable, m_tmp_gcode_path, objects_and_instances, instances_outside, m_config, m_sliced_config, m_sliced_config_dropped_reason, m_printer_vendor_id, m_print_preset_name, m_filament_preset_names, m_filament_colours, m_physical_printer_id, m_filament_colour_types, m_filament_multi_colours, m_filament_finishes);
     }
     /*template<class Archive> void serialize(Archive& ar)
     {
@@ -773,6 +780,16 @@ class PartPlateList : public ObjectBase
     PrinterTechnology  printer_technology;
 
     std::vector<PartPlate*> m_plate_list;
+    struct MaterialTransfer {
+        ObjectID instance_id;
+        ObjectID source_plate_id;
+        PlateSlicingContext source;
+        Geometry::Transformation original_transform;
+        Vec3d source_origin;
+    };
+    std::vector<MaterialTransfer> m_material_transfers;
+    bool m_applying_material_transfers { false };
+    void remember_material_context(int object_index, int instance_index, const PartPlate &source);
     std::map<int, PrintBase*> m_print_list;
     std::map<int, GCodeResult*> m_gcode_result_list;
     std::mutex m_plates_mutex;
@@ -1050,6 +1067,9 @@ public:
 
     //reload all objects
     int reload_all_objects(bool except_locked = false, int plate_index = -1);
+    // Capture before moving instances; apply only after indexed GUI/arrange loops finish.
+    void remember_material_contexts();
+    bool apply_pending_material_transfers();
 
     //reload objects for newly created plate
     int construct_objects_list_for_new_plate(int plate_index);

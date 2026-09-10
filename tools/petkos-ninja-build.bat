@@ -16,7 +16,8 @@ setlocal
 set VS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || (echo vcvars64 failed & exit /b 1)
 
-set BUILD=D:\Dev\petkos-orca\build-ninja
+set "REPO=%~dp0.."
+set "BUILD=%REPO%\build-ninja"
 if not exist "%BUILD%\build.ninja" (
   echo no build.ninja - run tools\petkos-ninja-configure.bat first
   exit /b 1
@@ -24,12 +25,16 @@ if not exist "%BUILD%\build.ninja" (
 cd /d "%BUILD%"
 
 REM The exe is a separate target from the DLL; building only OrcaSlicer leaves a stale launcher.
-set TARGETS=OrcaSlicer OrcaSlicer_app_gui
+set TARGETS=OrcaSlicer,OrcaSlicer_app_gui
 if "%~1" neq "" set TARGETS=%*
+set TARGETS=%TARGETS: =,%
+set "PODSLICER_BUILD_ROOT=%REPO%"
+set "PODSLICER_BUILD_DIR=%BUILD%"
+set "PODSLICER_BUILD_TARGETS=%TARGETS%"
 
 echo == ninja %TARGETS%
 ccache -z >nul 2>&1
-cmake --build . --target %TARGETS%
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& (Join-Path $env:PODSLICER_BUILD_ROOT 'tools\petkos-dev-build.ps1') -BuildDir $env:PODSLICER_BUILD_DIR -Targets ($env:PODSLICER_BUILD_TARGETS -split ',')"
 set RC=%ERRORLEVEL%
 echo == ccache for this build:
 ccache -s | findstr /I "Hits Misses Cacheable Uncacheable"

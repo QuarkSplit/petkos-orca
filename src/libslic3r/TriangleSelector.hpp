@@ -418,7 +418,11 @@ public:
     static TriangleSplittingData remap_painting_by_facet_map(const TriangleSplittingData &source_painting,
                                                              const std::vector<int>      &src_to_dst_facet);
 
-    // Remap painting data from source mesh to target mesh using spatial mapping.
+    enum class PaintingRemapMode { SurfaceOverlap, NearestSurface };
+
+    // SurfaceOverlap leaves newly cut surfaces unpainted. NearestSurface is for
+    // simplification, which moves existing surfaces. Mixed samples subdivide down
+    // to 0.1 mm edges or twelve levels; changed geometry is an approximation.
     // `target_transform` should transform the target mesh into source's coordinate space.
     // If `existing_painting` is present, the result will be a combine of `existing_painting` and remapped `source_painting`.
     static TriangleSplittingData remap_painting(
@@ -426,7 +430,8 @@ public:
         const TriangleSplittingData& source_painting,
         const indexed_triangle_set& target_its,
         const Transform3d& target_transform,
-        const std::optional<std::reference_wrapper<const TriangleSplittingData>>& existing_painting);
+        const std::optional<std::reference_wrapper<const TriangleSplittingData>>& existing_painting,
+        PaintingRemapMode mode = PaintingRemapMode::SurfaceOverlap);
 
 protected:
     // Triangle and info about how it's split.

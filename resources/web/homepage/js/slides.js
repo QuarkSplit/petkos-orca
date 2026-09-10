@@ -16,8 +16,14 @@
 var SLIDE_STATE = {};      // card path -> index, so paging survives a re-render
 
 function SlideImages(path) {
+    // Native image sets carry the file revision, so a regenerated thumbnail replaces its cache.
+    if (typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.native) {
+        var info = LibThumbnail(LibFindItem(path));
+        var views = info.thumbState === 'ready' ? info.views : [];
+        return views && views.length > 1 ? views : null;
+    }
     if (typeof PROJECT_VIEWS === 'undefined') return null;
-    var imgs = PROJECT_VIEWS[path];
+    var imgs = (PROJECT_VIEWS[path] || []).filter(function (view) { return view && LibThumbnailSource(view.src); });
     return (imgs && imgs.length > 1) ? imgs : null;
 }
 
@@ -35,7 +41,7 @@ function SlideShow(card, idx) {
         img.src = imgs[idx].src;
         // An SVG plate view is a drawing on a transparent ground, and `contain` letterboxes
         // it correctly; a photo wants the same treatment, so nothing special is needed here.
-        img.setAttribute('alt', imgs[idx].label || '');
+        img.setAttribute('alt', 'Preview of ' + LibFindItem(path).name + (imgs[idx].label ? ': ' + imgs[idx].label : ''));
     }
     var label = card.querySelector('.SlideLabel');
     if (label) label.textContent = imgs[idx].label + '  ' + (idx + 1) + '/' + n;
@@ -101,10 +107,16 @@ function SlideEnhanceAll() {
     for (var i = 0; i < cards.length; i++) SlideEnhance(cards[i]);
 }
 
+function SlideRefresh(card) {
+    var nav = card.querySelector('.SlideNav');
+    if (nav) nav.remove();
+    card.removeAttribute('data-slides');
+    SlideEnhance(card);
+}
+
 // The grid is rebuilt on every filter change, search keystroke and page. Watching it is what
 // makes this independent of the render path: no hook to add, nothing to keep in step.
 function SlideInit() {
-    if (typeof PROJECT_VIEWS === 'undefined') return;
     var grid = document.getElementById('LibGrid');
     if (!grid) return;
     SlideEnhanceAll();

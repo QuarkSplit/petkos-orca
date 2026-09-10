@@ -2381,7 +2381,15 @@ void GLCanvas3D::render_thumbnail(ThumbnailData &           thumbnail_data,
         shader = wxGetApp().get_shader("flat");
     else
         shader = wxGetApp().get_shader("thumbnail");
-    std::vector<ColorRGBA> colors = wxGetApp().plater()->get_extruders_colors();
+    std::vector<ColorRGBA> colors;
+    const PartPlate *palette_plate = wxGetApp().plater()->get_partplate_list().get_plate(thumbnail_params.plate_id);
+    if (palette_plate != nullptr) {
+        for (const auto &colour : wxGetApp().preset_bundle->plate_filament_colours(palette_plate->get_slicing_context())) {
+            ColorRGBA rgba = ColorRGBA::WHITE();
+            decode_color(colour, rgba);
+            colors.push_back(rgba);
+        }
+    }
     switch (OpenGLManager::get_framebuffers_type())
     {
     case OpenGLManager::EFramebufferType::Arb:
@@ -5134,6 +5142,7 @@ void GLCanvas3D::do_move(const std::string& snapshot_type)
 {
     if (m_model == nullptr)
         return;
+    wxGetApp().plater()->get_partplate_list().remember_material_contexts();
 
     if (!snapshot_type.empty())
         wxGetApp().plater()->take_snapshot(snapshot_type);
@@ -5248,6 +5257,7 @@ void GLCanvas3D::do_move(const std::string& snapshot_type)
 
 void GLCanvas3D::do_rotate(const std::string& snapshot_type)
 {
+    wxGetApp().plater()->get_partplate_list().remember_material_contexts();
     if (m_model == nullptr)
         return;
 
@@ -5350,6 +5360,7 @@ void GLCanvas3D::do_rotate(const std::string& snapshot_type)
 
 void GLCanvas3D::do_scale(const std::string& snapshot_type)
 {
+    wxGetApp().plater()->get_partplate_list().remember_material_contexts();
     if (m_model == nullptr)
         return;
 
@@ -5465,6 +5476,7 @@ void GLCanvas3D::do_center_plate(const int plate_idx) {
 
 void GLCanvas3D::do_mirror(const std::string& snapshot_type)
 {
+    wxGetApp().plater()->get_partplate_list().remember_material_contexts();
     if (m_model == nullptr)
         return;
 
@@ -6569,6 +6581,8 @@ void GLCanvas3D::render_thumbnail_internal(ThumbnailData& thumbnail_data, const 
         for (GLVolume* vol : visible_volumes) {
             //BBS set render color for thumbnails
             curr_color = vol->color;
+            if (vol->extruder_id > 0 && size_t(vol->extruder_id) <= extruder_colors.size())
+                curr_color = extruder_colors[size_t(vol->extruder_id - 1)];
 
             ColorRGBA new_color = adjust_color_for_rendering(curr_color);
             if (ban_light) {

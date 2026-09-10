@@ -210,39 +210,12 @@ function SetMallUrl( strUrl )
 
 function ShowRecentFileList( pList )
 {
-	let nTotal=pList.length;
-	
-	let strHtml='';
-	for(let n=0;n<nTotal;n++)
-	{
-		let OneFile=pList[n];
-		
-		let sPath=OneFile['path'];
-		let sImg=OneFile["image"] || sImages[sPath];
-		let sTime=OneFile['time'];
-		let sName=OneFile['project_name'];
-		sImages[sPath] = sImg;
-		
-		//let index=sPath.lastIndexOf('\\')>0?sPath.lastIndexOf('\\'):sPath.lastIndexOf('\/');
-		//let sShortName=sPath.substring(index+1,sPath.length);
-		
-		let TmpHtml='<div class="FileItem"  fpath="'+sPath+'"  >'+
-				'<a class="FileTip" title="'+sPath+'"></a>'+
-				'<div class="FileImg" ><img src="'+sImg+'" onerror="this.onerror=null;this.src=\'img/d.png\';"  alt="No Image"  /></div>'+
-				'<div class="FileName TextS1">'+sName+'</div>'+
-				'<div class="FileDate">'+sTime+'</div>'+
-			    '</div>';
-		
-		strHtml+=TmpHtml;
-	}
-	
-	$("#FileList").html(strHtml);
-
-    Set_RecentFile_MouseRightBtn_Event();
-	UpdateRecentClearBtnDisplay();
-
-	// The hidden recent grid still renders, because its right-click menu (open, explore,
-	// delete) is wired to it. What the library needs from it is only the set of paths.
+	// Keep thumbnail updates, without rebuilding an invisible grid or rebinding document
+	// handlers. All file actions belong to the visible library cards.
+	(pList || []).forEach(function (item) {
+		item.image = item.image || sImages[item.path] || '';
+		sImages[item.path] = item.image;
+	});
 	LibNoteRecent(pList);
 }
 
@@ -375,6 +348,7 @@ function OnDeleteRecentFile( )
 
 function OnDeleteAllRecentFiles()
 {
+	LibNoteRecent([]);
 	$('#FileList').html('');
 	UpdateRecentClearBtnDisplay();
 	
@@ -404,7 +378,7 @@ function OnExploreRecentFile( )
 	tSend['sequence_id']=Math.round(new Date() / 1000);
 	tSend['command']="homepage_explore_recentfile";
 	tSend['data']={};
-	tSend['data']['path']=decodeURI(RightBtnFilePath);
+	tSend['data']['path']=RightBtnFilePath;
 	
 	SendWXMessage( JSON.stringify(tSend) );	
 	

@@ -894,6 +894,7 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
     //BBS: partplate
     PartPlateList& plate_list = m_plater->get_partplate_list();
     //clear all the relations before apply the arrangement results
+    plate_list.remember_material_contexts();
     if (only_on_partplate) {
         plate_list.clear(false, false, true, current_plate_index);
     }
@@ -1009,6 +1010,11 @@ void ArrangeJob::finalize(bool canceled, std::exception_ptr &eptr) {
             concat_strings(names, "\n")));
     }
     m_plater->get_notification_manager()->close_notification_of_type(NotificationType::ArrangeOngoing);
+
+    // Resolve transfers before empty source plates are recycled, so a refused
+    // transfer can return its instance to the original bed.
+    if (plate_list.apply_pending_material_transfers())
+        m_plater->set_plater_dirty(true);
 
     //BBS: reload all objects due to arrange
     if (only_on_partplate) {

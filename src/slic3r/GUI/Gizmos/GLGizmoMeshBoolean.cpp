@@ -190,16 +190,10 @@ CommonGizmosDataID GLGizmoMeshBoolean::on_get_requirements() const
 
 std::optional<TriangleSelector::SavedPainting> VolumeInfo::save_painting() const
 {
-    //Paint always survives a boolean; the preference that used to gate this is gone.
-    {
-        std::optional<TriangleSelector::SavedPainting> saved_painting = mv->save_painting();
-        if (saved_painting) {
-            saved_painting->mesh.transform(trafo);
-        }
-        return saved_painting;
-    }
-
-    return {};
+    auto saved_painting = mv->save_painting(true);
+    if (saved_painting)
+        saved_painting->mesh.transform(trafo);
+    return saved_painting;
 }
 
 void GLGizmoMeshBoolean::on_render_input_window(float x, float y, float bottom_limit)
@@ -474,7 +468,8 @@ void GLGizmoMeshBoolean::generate_new_volume(const bool delete_input, TriangleMe
     new_volume->config.apply(old_volume->config);
     new_volume->set_type(old_volume->type());
     new_volume->set_material_id(old_volume->material_id());
-    new_volume->set_offset(old_volume->get_transformation().get_offset());
+    // The boolean already baked both part transforms into mesh_result. Keep the
+    // centering offset assigned by add_volume(), or the result moves after an edit.
     //Vec3d translate_z = { 0,0, (new_volume->source.mesh_offset - old_volume->source.mesh_offset).z() };
     //new_volume->translate(new_volume->get_transformation().get_matrix_no_offset() * translate_z);
     //new_volume->supported_facets.assign(old_volume->supported_facets);

@@ -53,6 +53,7 @@
 #include "Widgets/ComboBox.hpp"
 #include "MarkdownTip.hpp"
 #include "PetkosPerf.hpp"
+#include "PlateProcessSettings.hpp"
 #include "Search.hpp"
 #include "BedShapeDialog.hpp"
 #include "libslic3r/GCode/Thumbnails.hpp"
@@ -66,6 +67,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <unordered_set>
 
 namespace Slic3r {
@@ -2662,10 +2664,9 @@ void Tab::on_presets_changed()
 
     wxGetApp().plater()->update_project_dirty_from_presets();
 
-    // ORCA also update states of plates for plates toolbar. same method exist on Plater::priv::on_select_preset()
-    auto& plate_list = wxGetApp().plater()->get_partplate_list();
-    for (auto plate : plate_list.get_plate_list())
-        plate->update_slice_result_valid_state(false);
+    // PartPlate compares its retained slice with its freshly composed config, including
+    // changed or deleted named presets. A selector refresh must not discard unrelated slices.
+    wxGetApp().plater()->sidebar().refresh_plate_materials();
 }
 
 void Tab::build_preset_description_line(ConfigOptionsGroup* optgroup)
@@ -3609,7 +3610,6 @@ void TabPrintModel::build()
 void TabPrintModel::set_model_config(std::map<ObjectBase *, ModelConfig *> const & object_configs)
 {
     m_object_configs = object_configs;
-    m_prints.get_selected_preset().config.apply(*m_parent_tab->m_config);
     update_model_config();
 }
 
@@ -3630,31 +3630,37 @@ static std::vector<std::string> variant_keys(DynamicPrintConfig const & config)
     return t;
 }
 
-void TabPrintModel::update_model_config()
+bool TabPrintModel::update_inherited_config()
 {
-    if (m_config_manipulation.is_applying()) {
-        return;
-    }
     m_config->apply(*m_parent_tab->m_config);
-    if (m_type != Preset::TYPE_PLATE) {
-        //An object sits on a plate, so the plate's overrides are its baseline: preset, then
-        //plate, then object. Read them from the PLATE, not from the plate tab's composed config.
-        //
-        //That tab's config is the print preset plus whichever plate it was last bound to, and it
-        //is bound only when someone opens the Plate scope or picks a plate in the object tree. So
-        //an object on plate 3 could inherit plate 1's values, or a plate the user had navigated
-        //away from entirely. With eight keys in this set that was nearly invisible; now that a
-        //plate can override any process option it would be an object tab quietly describing
-        //another plate's settings as this one's defaults.
+    if (m_parent_tab->type() == Preset::TYPE_PRINT) {
+        // Parts and layer ranges inherit their object's already composed settings.
         if (Plater *plater = wxGetApp().plater(); plater != nullptr && plater->is_initialized()) {
             if (PartPlate *plate = plater->get_partplate_list().get_curr_plate(); plate != nullptr) {
-                //Only the keys the plate actually carries, and only those this tab owns. Applying
-                //the whole config would push the plate's inherited values in as overrides.
-                m_config->apply_only(*plate->config(), intersect(m_keys, plate->config()->keys()));
+                DynamicPrintConfig inherited, effective;
+                std::string error;
+                if (!resolve_plate_process_settings(*m_preset_bundle, plate->get_slicing_context(),
+                                                     *plate->config(), inherited, effective, error)) {
+                    SetToolTip(from_u8(error));
+                    Enable(false);
+                    return false;
+                }
+                m_config->apply(effective);
             }
         }
     }
+    Enable(true);
+    UnsetToolTip();
+    m_prints.get_selected_preset().config = *m_config;
+    return true;
+}
+
+void TabPrintModel::update_model_config()
+{
+    if (m_config_manipulation.is_applying() || !update_inherited_config())
+        return;
     m_null_keys.clear();
+    m_all_keys.clear();
     if (!m_object_configs.empty()) {
         DynamicPrintConfig const & global_config= *m_config;
         DynamicPrintConfig const & local_config = m_object_configs.begin()->second->get();
@@ -3990,6 +3996,64 @@ void TabPrintPlate::set_plate(PartPlate *plate)
     set_model_config({{plate, &m_plate_config}});
 }
 
+bool TabPrintPlate::update_inherited_config()
+{
+    PartPlate *plate = nullptr;
+    if (!m_object_configs.empty()) {
+        // Deletion and undo can retire the bound plate before the panel is refreshed.
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr) {
+            for (PartPlate *candidate : plater->get_partplate_list().get_plate_list()) {
+                if (static_cast<ObjectBase *>(candidate) == m_object_configs.begin()->first) {
+                    plate = candidate;
+                    break;
+                }
+            }
+        }
+    }
+    if (plate == nullptr) {
+        m_object_configs.clear();
+        m_all_keys.clear();
+        m_null_keys.clear();
+        UnsetToolTip();
+        Enable(false);
+        return false;
+    }
+
+    DynamicPrintConfig inherited, effective;
+    std::string error;
+    if (!resolve_plate_process_settings(*m_preset_bundle, plate->get_slicing_context(),
+                                         *plate->config(), inherited, effective, error)) {
+        SetToolTip(from_u8(error));
+        Enable(false);
+        return false;
+    }
+    // Refresh from the plate after imports, undo, printer changes and dependent edits.
+    m_plate_config.assign_config(*plate->config());
+    m_object_configs = {{plate, &m_plate_config}};
+    m_prints.get_selected_preset().config.apply(inherited);
+    m_config->apply(effective);
+    Enable(true);
+    UnsetToolTip();
+    return true;
+}
+
+void TabPrintPlate::reload_config()
+{
+    // ConfigManipulation calls reload while applying dependent corrections. These
+    // edits bypass on_value_change, but must use the same plate write path.
+    const auto keys = intersect(m_keys, m_config_manipulation.applying_keys());
+    if (!keys.empty()) {
+        m_all_keys = concat(m_all_keys, keys);
+        for (auto &entry : m_object_configs) {
+            if (auto *plate = dynamic_cast<PartPlate *>(entry.first)) {
+                write_plate_process_options(*entry.second, *plate->config(), *m_config, keys);
+                notify_changed(plate);
+            }
+        }
+    }
+    TabPrint::reload_config();
+}
+
 void TabPrintPlate::reset_model_config()
 {
     if (m_object_configs.empty()) return;
@@ -4060,19 +4124,9 @@ void TabPrintPlate::on_value_change(const std::string& opt_key, const boost::any
     }
     else if (set) {
         for (auto plate_item : m_object_configs) {
-            plate_item.second->apply_only(*m_config, { k });
             auto plate = dynamic_cast<PartPlate*>(plate_item.first);
-            //PetkosOrca: m_object_configs holds a COPY of the plate's config - a file-static
-            //ModelConfig in GUI_ObjectSettings.cpp, because PartPlate stores a plain
-            //DynamicPrintConfig and this map wants a ModelConfig. Writing only that copy is
-            //exactly why the eight keys below each needed a mirrored PartPlate setter to take
-            //effect, and why a key without one silently did nothing at all. That was invisible
-            //while the tab carried only those eight. The plate's own config is what
-            //Plater::resolve_plate_slicing_config layers and what the 3MF persists, so write it
-            //here, once and generically; the mirrored setters below stay for the PartPlate
-            //members they also feed.
             if (plate != nullptr)
-                plate->config()->apply_only(*m_config, { k });
+                write_plate_process_options(*plate_item.second, *plate->config(), *m_config, {k});
             BedType bed_type;
             PrintSequence print_seq;
             LayerSeq first_layer_seq_choice;
@@ -4138,7 +4192,11 @@ void TabPrintPlate::on_value_change(const std::string& opt_key, const boost::any
         }
         m_all_keys = concat(m_all_keys, { k });
     }
-    if (m_back_to_sys || set) update_changed_ui();
+    if (m_back_to_sys) {
+        m_back_to_sys = false;
+        update_model_config();
+    }
+    if (set) update_changed_ui();
     m_back_to_sys = false;
     for (auto plate_item : m_object_configs) {
         plate_item.second->touch();
@@ -6691,12 +6749,13 @@ void Tab::load_current_preset()
             wxGetApp().obj_list()->update_objects_list_filament_column(1);
     }
     if (m_type == Preset::TYPE_PRINT) {
-        if (auto tab = wxGetApp().plate_tab) {
-            tab->m_config->apply(*m_config);
+        if (auto tab = dynamic_cast<TabPrintModel *>(wxGetApp().plate_tab)) {
+            tab->update_model_config();
             tab->update_extruder_variants();
         }
         for (auto tab : wxGetApp().model_tabs_list) {
-            tab->m_config->apply(*m_config);
+            if (auto model_tab = dynamic_cast<TabPrintModel *>(tab))
+                model_tab->update_model_config();
             tab->update_extruder_variants();
         }
     }
@@ -6931,6 +6990,15 @@ bool Tab::select_preset(
     PETKOS_PERF_SCOPE_AUX(Perf::Probe::TabSelectPreset, (int32_t) m_type);
     BOOST_LOG_TRIVIAL(info) << boost::format("select preset, name %1%, delete_current %2%, from_plate_cursor %3%")
         %preset_name %delete_current %from_plate_cursor;
+    std::optional<Preset> previous_material;
+    std::vector<std::string> previous_pool;
+    DynamicPrintConfig previous_project_config;
+    if (m_type == Preset::TYPE_FILAMENT && !delete_current && !from_plate_cursor &&
+        !m_just_edit && !plate_write_suspended()) {
+        previous_material = m_presets->get_edited_preset();
+        previous_pool = m_preset_bundle->filament_presets;
+        previous_project_config = m_preset_bundle->project_config;
+    }
     //See the header. The cursor following the plate is not a decision about presets, so it asks
     //nothing: the unsaved edits are moved somewhere that survives the move, which leaves every
     //dirty check below false and every dialog site unreachable. Parking covers all three
@@ -7248,8 +7316,26 @@ bool Tab::select_preset(
     //                      Picking a filament to EDIT is not choosing it for the plate;
     //  the suspend scope - internal bookkeeping (deleting a filament, opening a tab on a slot)
     //                      that moves the selection as a side effect of something else.
-    if (!canceled && !from_plate_cursor && !m_just_edit && !plate_write_suspended())
-        write_selection_to_current_plate();
+    if (!canceled && !from_plate_cursor && !m_just_edit && !plate_write_suspended() &&
+        !(delete_current && m_type == Preset::TYPE_FILAMENT)) {
+        if (!write_selection_to_current_plate() && previous_material) {
+            PlateWriteSuspend no_plate_write;
+            m_presets->select_preset_by_name(previous_material->name, true);
+            m_presets->get_edited_preset() = *previous_material;
+            m_preset_bundle->filament_presets = previous_pool;
+            m_preset_bundle->project_config = previous_project_config;
+            load_current_preset();
+            //Refreshing the tab may synchronise its edited row back into the pool.
+            //Restore the exact pool snapshot after that refresh as well.
+            m_preset_bundle->filament_presets = previous_pool;
+            m_preset_bundle->project_config = previous_project_config;
+            m_preset_bundle->export_selections(*wxGetApp().app_config);
+            wxGetApp().plater()->sidebar().update_all_preset_comboboxes();
+            wxGetApp().plater()->on_config_change(m_preset_bundle->full_config());
+            wxGetApp().plater()->update_project_dirty_from_presets();
+            canceled = true;
+        }
+    }
 
     BOOST_LOG_TRIVIAL(info) << boost::format("select preset, exit");
 
@@ -7270,15 +7356,15 @@ Tab::PlateWriteSuspend::~PlateWriteSuspend()
 }
 
 //See select_preset. The tab picked a preset; the plate the user is looking at now uses it.
-void Tab::write_selection_to_current_plate()
+bool Tab::write_selection_to_current_plate()
 {
     Plater *plater = wxGetApp().plater();
     if (plater == nullptr || !plater->is_initialized() || plater->is_loading_project())
-        return;
+        return true;
     PartPlateList &plates = plater->get_partplate_list();
     const int      index  = plates.get_curr_plate_index();
     if (plates.get_plate(index) == nullptr)
-        return;
+        return true;
 
     switch (m_type) {
     case Preset::TYPE_PRINTER:
@@ -7287,14 +7373,17 @@ void Tab::write_selection_to_current_plate()
     case Preset::TYPE_PRINT:
         plater->set_plate_process(index, m_preset_bundle->prints.get_selected_preset_name());
         break;
-    case Preset::TYPE_FILAMENT:
-        //Deliberately nothing. The filament tab edits the spool pool - what is available -
-        //and a plate's slots are assigned from the pool on the plate board, where the
-        //material is translated to that plate's printer. See on_select_preset.
-        break;
+    case Preset::TYPE_FILAMENT: {
+        const bool accepted = plater->choose_plate_material_replacement(index,
+            size_t(std::max(0, m_presets_choice->get_filament_idx())),
+            m_preset_bundle->filaments.get_selected_preset_name(), true);
+        plater->sidebar().refresh_plate_materials();
+        return accepted;
+    }
     default:
         break;
     }
+    return true;
 }
 
 // If the current preset is dirty, the user is asked whether the changes may be discarded.

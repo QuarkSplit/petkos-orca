@@ -328,6 +328,25 @@ public:
                                               const PresetWithVendorProfile &printer,
                                               const PresetWithVendorProfile &process) const;
 
+    // Read plate colours without composing a full slicing config or consulting the spool pool.
+    std::vector<std::string> plate_filament_colours(const PlateSlicingContext &context) const;
+    // Capture at assignment/import boundaries; never follow the pool during composition.
+    static void capture_plate_filament_colours(PlateSlicingContext &context, const DynamicPrintConfig &config,
+                                               bool only_missing = false);
+    static void migrate_legacy_plate_filament_colours(PlateSlicingContext &context, const PlateSlicingContext &declared);
+    static void apply_plate_filament_colours(const PlateSlicingContext &context, DynamicPrintConfig &config);
+    // Assign one existing plate slot, translating the material for its printer and retaining appearance.
+    bool assign_plate_material(PlateSlicingContext &context, size_t slot,
+                               const std::string &source_preset, std::string &error) const;
+    void rebase_assigned_material_overrides(const PlateSlicingContext &previous,
+                                            const PlateSlicingContext &current,
+                                            const DynamicPrintConfig &resolved,
+                                            DynamicPrintConfig &overrides) const;
+    // Append/reuse exact spool identities for an object arriving from another plate.
+    bool map_transferred_filaments(const PlateSlicingContext &source, PlateSlicingContext &destination,
+                                   const std::vector<int> &used_slots, std::vector<int> &mapping,
+                                   std::string &error) const;
+
     // THE RE-RESOLUTION MECHANISM. When a plate's printer identity changes, every preset
     // that depends on it is re-resolved against the new printer through this one path.
     // Its absence is what made one missing rule surface as three unrelated faults: a

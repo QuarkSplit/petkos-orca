@@ -203,7 +203,7 @@ bool ObjectSettings::update_settings_list()
     wxDataViewItemArray items;
     objects_ctrl->GetSelections(items);
 
-    std::map<ObjectBase *, ModelConfig*> plate_configs;
+    PartPlate *settings_plate = nullptr;
     std::map<ObjectBase *, ModelConfig*> object_configs;
     bool is_plate_settings = false;
     bool is_object_settings = false;
@@ -222,11 +222,10 @@ bool ObjectSettings::update_settings_list()
             plate_id = ppl.get_curr_plate_index();
         }
         assert(plate_id >= 0 && plate_id < ppl.get_plate_count());
-        static ModelConfig cfg;
-        cfg.assign_config(*ppl.get_plate(plate_id)->config());
+        if (settings_plate == nullptr)
+            settings_plate = ppl.get_plate(plate_id);
         if (type == itPlate) {
             is_plate_settings = true;
-            plate_configs.emplace(ppl.get_plate(plate_id), &cfg);
             break;
         }
 
@@ -235,14 +234,12 @@ bool ObjectSettings::update_settings_list()
         auto object = wxGetApp().model().objects[obj_idx];
         if (type == itObject) {
             is_object_settings = true;
-            plate_configs.emplace(ppl.get_plate(plate_id), &cfg);
             object_configs.emplace(object, &object->config);
         } 
         else if(type == itVolume){
             is_volume_settings = true;
             if (parent_object && parent_object != object)
                 return false;
-            plate_configs.emplace(ppl.get_plate(plate_id), &cfg);
             parent_object = object;
             const int vol_idx = objects_model->GetVolumeIdByItem(item);
             assert(vol_idx >= 0);
@@ -253,7 +250,6 @@ bool ObjectSettings::update_settings_list()
             is_layer_range_settings = true;
             if (parent_object && parent_object != object)
                 return false;
-            plate_configs.emplace(ppl.get_plate(plate_id), &cfg);
             parent_object = object;
 
             t_layer_height_range height_range = objects_model->GetLayerRangeByItem(item);
@@ -270,35 +266,35 @@ bool ObjectSettings::update_settings_list()
     auto tab_layer = dynamic_cast<TabPrintModel*>(wxGetApp().get_layer_tab());
 
     if (is_plate_settings) {
-        tab_plate->set_model_config(plate_configs);
+        tab_plate->set_plate(settings_plate);
         tab_object->set_model_config({});
         tab_volume->set_model_config({});
         tab_layer->set_model_config({});
         ;// m_tab_active = tab_plate;
     }
     else if (is_object_settings) {
-        tab_plate->set_model_config(plate_configs);
+        tab_plate->set_plate(settings_plate);
         tab_object->set_model_config(object_configs);
         tab_volume->set_model_config({});
         tab_layer->set_model_config({});
         //m_tab_active = tab_object;
     }   
     else if (is_volume_settings) {
-        tab_plate->set_model_config(plate_configs);
+        tab_plate->set_plate(settings_plate);
         tab_object->set_model_config({ {parent_object, &parent_object->config} });
         tab_volume->set_model_config(object_configs);
         tab_layer->set_model_config({});
         //m_tab_active = tab_volume;
     }
     else if (is_layer_range_settings) {
-        tab_plate->set_model_config(plate_configs);
+        tab_plate->set_plate(settings_plate);
         tab_object->set_model_config({ {parent_object, &parent_object->config} });
         tab_volume->set_model_config({});
         tab_layer->set_model_config(object_configs);
         //m_tab_active = tab_layer;
     }    
     else {
-        tab_plate->set_model_config({});
+        tab_plate->set_plate(nullptr);
         tab_object->set_model_config({});
         tab_volume->set_model_config({});
         tab_layer->set_model_config({});

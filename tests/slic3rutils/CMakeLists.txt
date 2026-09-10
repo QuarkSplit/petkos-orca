@@ -19,6 +19,7 @@ add_executable(${_TEST_NAME}_tests
     # only test target that does, so the plate board's data layer is exercised from here. See the
     # header comment in the file. Move it to tests/libslic3r if the model ever moves to libslic3r.
     test_plate_board_model.cpp
+    test_project_library.cpp
     ../fff_print/test_helpers.cpp
     )
 

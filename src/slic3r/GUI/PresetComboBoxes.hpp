@@ -85,6 +85,8 @@ public:
 
     void set_filament_idx(const int extr_idx) { m_filament_idx = extr_idx; }
     int  get_filament_idx() const { return m_filament_idx; }
+    // Capture this selection's spool colour; apply it only after its assignment is accepted.
+    std::function<void()> prepare_colour_update();
 
     std::string get_selected_dev_id() const { return m_selected_dev_id; }
     void clear_selected_dev_id() { m_selected_dev_id.clear(); }
@@ -152,7 +154,7 @@ protected:
     void update_selection();
 
     // BBS: ams
-    int  update_ams_color();
+    int  update_ams_color(std::function<void()> *deferred_update = nullptr);
 
 #ifdef __linux__
     static const char* separator_head() { return "-- "; }

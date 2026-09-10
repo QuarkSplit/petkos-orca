@@ -711,6 +711,11 @@ struct Sidebar::priv
     std::vector<PlaterPresetComboBox*> combos_filament;
     int editing_filament = -1;
     wxBoxSizer *sizer_filaments = nullptr;
+    wxPanel *plate_materials_panel = nullptr;
+    wxBoxSizer *plate_materials_sizer = nullptr;
+    int shown_material_plate = -1;
+    int shown_material_width = 0;
+    std::vector<std::string> shown_plate_materials;
 
     //BBS Sidebar widgets
     wxPanel* m_panel_print_title;
@@ -2989,6 +2994,16 @@ Sidebar::Sidebar(Plater *parent)
 
     {
 
+    //Assigned materials stay visible even while the independent spool pool is folded.
+    p->plate_materials_panel = new wxPanel(p->scrolled);
+    p->plate_materials_sizer = new wxBoxSizer(wxVERTICAL);
+    p->plate_materials_panel->SetSizer(p->plate_materials_sizer);
+    p->plate_materials_panel->Bind(wxEVT_SIZE, [this](wxSizeEvent &evt) {
+        evt.Skip();
+        refresh_plate_materials();
+    });
+    scrolled_sizer->Add(p->plate_materials_panel, 0, wxEXPAND | wxALL, FromDIP(6));
+
     // Orca: Sidebar - Filament titlebar UI
     // add filament title
     p->m_panel_filament_title = new StaticBox(p->scrolled, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
@@ -3017,7 +3032,8 @@ Sidebar::Sidebar(Plater *parent)
     wxBoxSizer* bSizer39;
     bSizer39 = new wxBoxSizer( wxHORIZONTAL );
     p->m_filament_icon = new ScalableButton(p->m_panel_filament_title, wxID_ANY, "filament");
-    p->m_staticText_filament_settings = new Label(p->m_panel_filament_title, _L("Project Filaments"), LB_PROPAGATE_MOUSE_EVENT);
+    p->m_staticText_filament_settings = new Label(p->m_panel_filament_title, _L("Spool pool"), LB_PROPAGATE_MOUSE_EVENT);
+    p->m_staticText_filament_settings->SetToolTip(_L("Available spools. The assigned materials above are what the selected plate will print with."));
     bSizer39->Add(p->m_filament_icon, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::TitlebarMargin()));
     bSizer39->Add(p->m_staticText_filament_settings, 0, wxALIGN_CENTER | wxLEFT | wxRIGHT, FromDIP(SidebarProps::ElementSpacing()));
     bSizer39->SetMinSize(-1, FromDIP(30));
@@ -3494,10 +3510,10 @@ void Sidebar::update_all_preset_comboboxes()
     p->print_routing_printer = resolved_plate.printer_preset->name;
 
     if (cfg.opt_bool("pellet_modded_printer")) {
-		p->m_staticText_filament_settings->SetLabel(_L("Pellets"));
+		p->m_staticText_filament_settings->SetLabel(_L("Pellet pool"));
         p->m_filament_icon->SetBitmap_("pellets");
     } else {
-		p->m_staticText_filament_settings->SetLabel(_L("Filament"));
+		p->m_staticText_filament_settings->SetLabel(_L("Spool pool"));
         p->m_filament_icon->SetBitmap_("filament");
     }
 
@@ -4031,6 +4047,8 @@ void Sidebar::msw_rescale()
 void Sidebar::sys_color_changed()
 {
     wxWindowUpdateLocker noUpdates(this);
+    p->shown_material_plate = -1;
+    refresh_plate_materials();
 
 #if 0
     for (wxWindow* win : std::vector<wxWindow*>{ this, p->sliced_info->GetStaticBox(), p->object_info->GetStaticBox(), p->btn_reslice, p->btn_export_gcode })
@@ -4686,6 +4704,10 @@ bool apply_exact_plate_ams_sync(Plater                              &plater,
     std::vector<std::string> colors      = current_colors->values;
     std::vector<std::string> color_types = current_types->values;
     std::vector<std::string> multi       = current_multi->values;
+    std::vector<int> finishes(filament_count, int(FilamentFinish::ffStandard));
+    if (const auto *finish = current.config.option<ConfigOptionEnumsGeneric>("filament_finish"))
+        for (size_t i = 0; i < std::min(finishes.size(), finish->values.size()); ++i)
+            finishes[i] = finish->values[i];
     synced_slots.assign(filament_count, false);
 
     auto apply_tray = [&](size_t target, const ExactAmsTray &tray) -> bool {
@@ -4699,10 +4721,16 @@ bool apply_exact_plate_ams_sync(Plater                              &plater,
             if (!bundle.resolve_ams_filament_preset(*tray.config, current, target, preset, error))
                 return false;
             preset_names[target] = preset->name;
+            if (const auto *finish = preset->config.option<ConfigOptionEnumsGeneric>("filament_finish"))
+                if (!finish->values.empty())
+                    finishes[target] = finish->values.front();
         }
         colors[target]      = tray.color;
         color_types[target] = tray.color_type;
         multi[target]       = boost::algorithm::join(tray.multi_colors, " ");
+        if (const auto *finish = tray.config->option<ConfigOptionEnumsGeneric>("filament_finish"))
+            if (!finish->values.empty())
+                finishes[target] = finish->values.front();
         synced_slots[target] = true;
         return true;
     };
@@ -4739,6 +4767,9 @@ bool apply_exact_plate_ams_sync(Plater                              &plater,
     //config - the old home - made them count as process overrides, get deleted by "clear
     //overrides", and stomp the properly sized composed colours.
     context.filament_colours = colors;
+    context.filament_colour_types = color_types;
+    context.filament_multi_colours = multi;
+    context.filament_finishes = finishes;
     ResolvedPlateSlicingConfig prospective;
     if (!bundle.resolve_plate_slicing_config(context,
                                              plate.get_real_filament_maps(bundle.project_config),
@@ -5275,6 +5306,87 @@ void Sidebar::refresh_plate_scope()
         p->plate_board->set_scope(m_scoped_plates);
     if (p->plate_inspector != nullptr)
         p->plate_inspector->reload(p->plate_board->model(), m_scoped_plates);
+    refresh_plate_materials();
+}
+
+void Sidebar::refresh_plate_materials()
+{
+    if (p == nullptr || p->plate_materials_panel == nullptr || p->plater == nullptr || !p->plater->is_initialized())
+        return;
+    const PartPlateList &plates = p->plater->get_partplate_list();
+    const int plate_index = plates.get_curr_plate_index();
+    const PartPlate *plate = plates.get_plate(plate_index);
+    const PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (plate == nullptr || bundle == nullptr)
+        return;
+
+    std::vector<std::string> labels;
+    const auto &names = plate->get_filament_preset_names();
+    for (size_t i = 0; i < names.size(); ++i) {
+        const Preset *preset = bundle->filaments.find_preset(names[i], false);
+        std::string material;
+        if (preset != nullptr)
+            if (const auto *type = preset->config.option<ConfigOptionStrings>("filament_type");
+                type != nullptr && !type->values.empty())
+                material = type->values.front();
+        bool material_overridden = false;
+        if (const auto *type = plate->config()->option<ConfigOptionStrings>("filament_type");
+            type != nullptr && !type->values.empty()) {
+            material_overridden = material != type->get_at(i);
+            material = type->get_at(i);
+        }
+        wxString label = wxString::Format(_L("Slot %d: %s"), int(i + 1), from_u8(names[i]));
+        if (!material.empty())
+            label = wxString::Format(_L("Slot %d: %s\n%s"), int(i + 1), from_u8(material), from_u8(names[i]));
+        if (material_overridden)
+            label += " " + _L("(material changed by a plate override)");
+        if (preset == nullptr)
+            label += " " + _L("(not installed)");
+        labels.push_back(into_u8(label));
+    }
+    const int width = std::max(FromDIP(180), p->plate_materials_panel->GetClientSize().x - FromDIP(75));
+    if (p->shown_material_plate == plate_index && p->shown_material_width == width && p->shown_plate_materials == labels)
+        return;
+    p->shown_material_plate = plate_index;
+    p->shown_material_width = width;
+    p->shown_plate_materials = labels;
+    p->plate_materials_sizer->Clear(true);
+    auto *title = new wxStaticText(p->plate_materials_panel, wxID_ANY,
+                                   wxString::Format(_L("Plate %d assigned materials"), plate_index + 1));
+    title->SetFont(wxGetApp().bold_font());
+    p->plate_materials_sizer->Add(title, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+    for (size_t i = 0; i < labels.size(); ++i) {
+        auto *row = new wxBoxSizer(wxHORIZONTAL);
+        auto *label = new wxStaticText(p->plate_materials_panel, wxID_ANY, from_u8(labels[i]));
+        label->Wrap(width);
+        label->SetMinSize(wxSize(1, label->GetBestSize().y));
+        label->SetToolTip(from_u8(labels[i]));
+        row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
+        auto *change = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Change…"),
+                                    wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+        change->Bind(wxEVT_BUTTON, [this, i](wxCommandEvent &) {
+            show_plate_filament_menu(p->plate_materials_panel, p->plater,
+                                      p->plater->get_partplate_list().get_curr_plate_index(), int(i + 1));
+        });
+        row->Add(change, 0, wxALIGN_CENTER_VERTICAL);
+        p->plate_materials_sizer->Add(row, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+    }
+    if (labels.empty())
+        p->plate_materials_sizer->Add(new wxStaticText(p->plate_materials_panel, wxID_ANY,
+                                                       _L("No material assigned. Add a slot to make this plate ready to slice.")),
+                                       0, wxEXPAND);
+    auto *add = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Add plate material slot"),
+                             wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+    add->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+        show_plate_filament_menu(p->plate_materials_panel, p->plater,
+                                  p->plater->get_partplate_list().get_curr_plate_index(), 0);
+    });
+    p->plate_materials_sizer->Add(add, 0, wxTOP, FromDIP(2));
+    wxGetApp().UpdateDarkUI(p->plate_materials_panel);
+    for (wxWindow *child : p->plate_materials_panel->GetChildren())
+        wxGetApp().UpdateDarkUI(child);
+    p->plate_materials_panel->Layout();
+    p->scrolled->Layout();
 }
 
 void Sidebar::toggle_scoped_plate(int plate_index)
@@ -6873,6 +6985,11 @@ Plater::priv::~priv()
 
 void Plater::priv::update(unsigned int flags)
 {
+    if (partplate_list.apply_pending_material_transfers()) {
+        q->set_plater_dirty(true);
+        if (sidebar != nullptr)
+            sidebar->refresh_plate_board();
+    }
     // the following line, when enabled, causes flickering on NVIDIA graphics cards
 //    wxWindowUpdateLocker freeze_guard(q);
 #ifdef SUPPORT_AUTOCENTER
@@ -7940,8 +8057,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 declared.printer_preset_name   = preset_bundle->printers.get_selected_preset_name();
                                 declared.print_preset_name     = preset_bundle->prints.get_selected_preset_name();
                                 declared.filament_preset_names = preset_bundle->filament_presets;
-                                if (const auto *colours = preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour"))
-                                    declared.filament_colours = colours->values;
+                                PresetBundle::capture_plate_filament_colours(declared, preset_bundle->project_config);
+                                for (int i = 0; i < partplate_list.get_plate_count(); ++i) {
+                                    PartPlate *plate = partplate_list.get_plate(i);
+                                    PlateSlicingContext legacy = plate->get_slicing_context();
+                                    PresetBundle::migrate_legacy_plate_filament_colours(legacy, declared);
+                                    if (legacy != plate->get_slicing_context())
+                                        plate->set_slicing_context(legacy);
+                                }
                                 const int completed = partplate_list.complete_plate_contexts(declared);
                                 if (completed > 0) {
                                     BOOST_LOG_TRIVIAL(info)
@@ -9067,6 +9190,14 @@ void Plater::priv::reset(bool apply_presets_change)
 
     m_worker.cancel_all();
 
+    // Settings tabs must release model bindings before reset destroys their owners.
+    if (auto *tab = dynamic_cast<TabPrintPlate *>(wxGetApp().plate_tab))
+        tab->set_plate(nullptr);
+    for (Tab *tab : wxGetApp().model_tabs_list) {
+        if (auto *model_tab = dynamic_cast<TabPrintModel *>(tab))
+            model_tab->set_model_config({});
+    }
+
     //BBS: clear the partplate list's object before object cleared
     partplate_list.reinit();
     partplate_list.update_slice_context_to_current_plate(background_process);
@@ -9522,6 +9653,12 @@ Print::ApplyStatus Plater::priv::apply_plate_config(PartPlate* plate)
                 context.filament_colours      = {size_t(slot) <= context.filament_colours.size()
                                                      ? context.filament_colours[size_t(slot - 1)]
                                                      : std::string()};
+                context.filament_colour_types = {size_t(slot) <= context.filament_colour_types.size()
+                                                      ? context.filament_colour_types[size_t(slot - 1)] : "1"};
+                context.filament_multi_colours = {size_t(slot) <= context.filament_multi_colours.size()
+                                                      ? context.filament_multi_colours[size_t(slot - 1)] : std::string()};
+                context.filament_finishes = {size_t(slot) <= context.filament_finishes.size()
+                                                      ? context.filament_finishes[size_t(slot - 1)] : 0};
                 filament_maps = {size_t(slot) <= filament_maps.size() ? filament_maps[size_t(slot - 1)] : 1};
                 volume_maps   = {size_t(slot) <= volume_maps.size() ? volume_maps[size_t(slot - 1)]
                                                                     : int(NozzleVolumeType::nvtStandard)};
@@ -10037,16 +10174,7 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
         new_volume->convert_from_imperial_units();
     else if (old_volume->source.is_converted_from_meters)
         new_volume->convert_from_meters();
-    {
-        //Proper paint remapping, always. The old off branch raw-assigned the four channels
-        //onto a DIFFERENT mesh, leaving paint indexed against triangles that no longer
-        //exist - stale data wearing the clothes of preservation.
-        auto saved_painting = old_volume->save_painting();
-        if (saved_painting) {
-            saved_painting->mesh.transform(Geometry::translation_transform(new_volume->mesh().get_init_shift()));
-            new_volume->restore_painting(saved_painting);
-        }
-    }
+    new_volume->restore_painting(*old_volume);
     std::swap(old_model_object->volumes[volume_idx], old_model_object->volumes.back());
     old_model_object->delete_volume(old_model_object->volumes.size() - 1);
     if (!sinking)
@@ -10580,14 +10708,7 @@ void Plater::priv::reload_from_disk()
                 else if (old_volume->source.is_converted_from_meters)
                     new_volume->convert_from_meters();
 
-                // Remap paint, always; the preference that used to gate this is gone.
-                {
-                    auto saved_painting = old_volume->save_painting();
-                    if (saved_painting) {
-                        saved_painting->mesh.transform(Geometry::translation_transform(new_volume->mesh().get_init_shift()));
-                        new_volume->restore_painting(saved_painting);
-                    }
-                }
+                new_volume->restore_painting(*old_volume);
 
                 std::swap(old_model_object->volumes[vol_idx], old_model_object->volumes.back());
                 old_model_object->delete_volume(old_model_object->volumes.size() - 1);
@@ -10661,6 +10782,7 @@ void Plater::priv::reload_from_disk()
                     new_volume->convert_from_imperial_units();
                 else if (old_volume->source.is_converted_from_meters)
                     new_volume->convert_from_meters();
+                new_volume->restore_painting(*old_volume);
                 std::swap(old_model_object->volumes[sel_v.volume_idx], old_model_object->volumes.back());
                 old_model_object->delete_volume(old_model_object->volumes.size() - 1);
                 if (!sinking)
@@ -11161,8 +11283,27 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
             Preset::remove_suffix_modified(wx_name.ToUTF8().data()));
     }
 
+    bool filament_tab_selected = false;
     if (preset_type == Preset::TYPE_FILAMENT) {
+        const auto selected_filament_flag = combo->GetFlag(selection);
+        const auto apply_colour = combo->prepare_colour_update();
+        if (sidebar->is_multifilament()) {
+            if (!q->choose_plate_material_replacement(partplate_list.get_curr_plate_index(), size_t(idx), preset_name, true)) {
+                combo->update();
+                return;
+            }
+        } else {
+            // The tab owns both dirty-edit cancellation and the material-scope transaction.
+            wxWindowUpdateLocker noUpdates(sidebar->filament_panel());
+            if (!wxGetApp().get_tab(preset_type)->select_preset(preset_name)) {
+                combo->update();
+                return;
+            }
+            filament_tab_selected = true;
+        }
         wxGetApp().preset_bundle->set_filament_preset(idx, preset_name);
+        if (apply_colour)
+            apply_colour();
         wxGetApp().plater()->update_project_dirty_from_presets();
         wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
         sidebar->update_dynamic_filament_list();
@@ -11170,17 +11311,18 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
         if (flag != flag_is_change && wxGetApp().app_config->get("auto_calculate_flush") == "all") {
             sidebar->auto_calc_flushing_volumes(idx);
         }
-        auto select_flag = combo->GetFlag(selection);
-        combo->ShowBadge(select_flag == (int)PresetComboBox::FilamentAMSType::FROM_AMS);
+        combo->ShowBadge(selected_filament_flag == (int)PresetComboBox::FilamentAMSType::FROM_AMS);
         q->on_filament_change(idx);
     }
     bool select_preset = !combo->selection_is_changed_according_to_physical_printers();
+    //This event owns its plate writes; a Tab selection must not ask for material scope again.
+    Tab::PlateWriteSuspend no_duplicate_plate_write;
     // TODO: ?
     if (preset_type == Preset::TYPE_FILAMENT && sidebar->is_multifilament()) {
         // Only update the plater UI for the 2nd and other filaments.
         combo->update();
     }
-    else if (select_preset) {
+    else if (select_preset && !filament_tab_selected) {
         if (preset_type == Preset::TYPE_PRINTER) {
             PhysicalPrinterCollection& physical_printers = wxGetApp().preset_bundle->physical_printers;
             if(combo->is_selected_physical_printer())
@@ -11293,9 +11435,7 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
         }
     }
 
-    // ORCA: Always refresh the selected filament combo so its color swatch (clr_picker)
-    // matches the chosen preset. update_ams_color() (in OnSelect) updates the project
-    // filament color when the preset defines one; this repaints the swatch to match.
+    // Repaint the spool swatch after the accepted selection's deferred colour update.
     if (preset_type == Preset::TYPE_FILAMENT)
         combo->update();
 
@@ -11320,11 +11460,7 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
             q->set_plate_process(plate_index, wxGetApp().preset_bundle->prints.get_selected_preset_name());
             break;
         case Preset::TYPE_FILAMENT:
-            //Deliberately nothing. The sidebar's filament rows are the spool pool - what is
-            //available - not the plate's slots. A plate takes a material from the pool through
-            //the plate board's swatch strip, where it is translated to that plate's printer;
-            //editing the pool must not rewrite every slot of whatever plate happens to be
-            //selected.
+            //The explicit material scope was committed before the pool selection changed.
             break;
         default:
             break;
@@ -11405,11 +11541,8 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     // BBS: log modify of filament selection
     Slic3r::put_other_changes();
 
-    // update slice state and set bedtype default for 3rd-party printer
-    auto plate_list = partplate_list.get_plate_list();
-    for (auto plate : plate_list) {
-         plate->update_slice_result_valid_state(false);
-    }
+    //The plate write paths invalidate their own changed assignments. A pool edit or a
+    //selection on one plate does not invalidate retained results on unrelated plates.
 }
 
 void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
@@ -17676,18 +17809,28 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
 
     // Embed every effective preset referenced by a plate. This preserves exact
     // contexts across close/reopen; it does not attempt compatibility remapping.
-    std::set<std::pair<Preset::Type, std::string>> embedded;
-    for (Preset *preset : project_presets)
-        if (preset != nullptr)
-            embedded.emplace(preset->type, preset->name);
-    const auto append_preset = [&](const Preset *preset) {
-        if (preset != nullptr && embedded.emplace(preset->type, preset->name).second)
-            project_presets.push_back(new Preset(*preset));
+    const auto append_preset = [&](const Preset *preset, const std::string &printer_vendor_id = std::string()) {
+        if (preset == nullptr)
+            return;
+        const auto existing = std::find_if(project_presets.begin(), project_presets.end(),
+            [preset](const Preset *candidate) {
+                return candidate != nullptr && candidate->type == preset->type && candidate->name == preset->name;
+            });
+        Preset *embedded;
+        if (existing == project_presets.end()) {
+            embedded = new Preset(*preset);
+            project_presets.push_back(embedded);
+        } else {
+            embedded = *existing;
+            *embedded = *preset;
+        }
+        if (preset->type == Preset::TYPE_PRINTER)
+            embedded->config.option<ConfigOptionString>("printer_vendor_id", true)->value = printer_vendor_id;
     };
     for (const auto &resolved : plate_contexts) {
         if (!resolved.has_value())
             continue;
-        append_preset(resolved->printer_preset);
+        append_preset(resolved->printer_preset, resolved->printer_vendor_id);
         append_preset(resolved->print_preset);
         for (const Preset *filament : resolved->filament_presets)
             append_preset(filament);
@@ -20956,13 +21099,111 @@ void Plater::save_plate_process_as_preset(int plate_index)
         schedule_background_process();
 }
 
-//The user's own choice of materials for one plate.
-//
-//An empty list leaves the plate with no materials, which is an unresolved plate and is reported
-//as one; there are no project filaments behind it to fall back to. Nothing here substitutes a
-//material either: an incompatible choice is recorded and named, because filament is what the
-//object is made of and swapping it silently has a real cost in the physical world.
-void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names, std::vector<std::string> colours)
+//The scope refers to exact stored preset identities, never to slot numbers on unrelated plates.
+bool Plater::choose_plate_material_replacement(int plate_index, size_t slot, const std::string &preset_name,
+                                               bool allow_pool_only, std::optional<PlateSlicingContext> appearance)
+{
+    PartPlate *plate = p->partplate_list.get_plate(plate_index);
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (plate == nullptr || bundle == nullptr || is_loading_project())
+        return false;
+    const auto &names = plate->get_filament_preset_names();
+    if (names.empty()) {
+        show_error(this, _L("Add a material slot to this plate before assigning a spool."), false);
+        return false;
+    }
+    if (slot >= names.size())
+        slot = 0;
+    const std::string previous = names[slot];
+
+    using Target = std::pair<int, size_t>;
+    std::vector<std::vector<Target>> scopes{{{plate_index, slot}}};
+    wxArrayString choices;
+    choices.Add(wxString::Format(_L("Plate %d, slot %d only"), plate_index + 1, int(slot + 1)));
+    auto matching_slots = [&](const std::vector<int> &indices) {
+        std::vector<Target> targets;
+        for (int index : indices)
+            if (const PartPlate *target = p->partplate_list.get_plate(index)) {
+                const auto &target_names = target->get_filament_preset_names();
+                for (size_t i = 0; i < target_names.size(); ++i)
+                    if (target_names[i] == previous)
+                        targets.emplace_back(index, i);
+            }
+        return targets;
+    };
+    auto append_scope = [&](std::vector<Target> targets, const wxString &description) {
+        if (targets.empty() || std::find(scopes.begin(), scopes.end(), targets) != scopes.end())
+            return;
+        choices.Add(description);
+        scopes.push_back(std::move(targets));
+    };
+    auto current_matches = matching_slots({plate_index});
+    append_scope(current_matches, wxString::Format(_L("Replace this same preset in all %d matching slots on plate %d"),
+                                                    int(current_matches.size()), plate_index + 1));
+    const std::vector<int> selected = sidebar().scoped_plates();
+    auto selected_matches = matching_slots(selected);
+    append_scope(selected_matches, wxString::Format(_L("Replace this same preset in %d matching slots on the selected plates"),
+                                                     int(selected_matches.size())));
+    std::vector<int> all_indices;
+    for (int i = 0; i < p->partplate_list.get_plate_count(); ++i)
+        all_indices.push_back(i);
+    auto all_matches = matching_slots(all_indices);
+    append_scope(all_matches, wxString::Format(_L("Replace this same preset in all %d matching slots across the project"),
+                                                int(all_matches.size())));
+    if (allow_pool_only) {
+        choices.Add(_L("Spool pool only; leave every plate assignment unchanged"));
+        scopes.emplace_back();
+    }
+    wxSingleChoiceDialog dialog(this,
+        wxString::Format(_L("Use \"%s\" in place of \"%s\".\nChoose which assignments to change. Other materials keep their assignments and colours."),
+                          from_u8(preset_name), from_u8(previous)),
+        _L("Replace assigned material"), choices);
+    dialog.SetSelection(0);
+    if (dialog.ShowModal() != wxID_OK)
+        return false;
+    const auto &targets = scopes[size_t(dialog.GetSelection())];
+    if (targets.empty())
+        return true;
+
+    std::map<int, PlateSlicingContext> prepared;
+    for (const Target &target : targets) {
+        PartPlate *target_plate = p->partplate_list.get_plate(target.first);
+        if (target_plate == nullptr)
+            return false;
+        auto entry = prepared.emplace(target.first, target_plate->get_slicing_context());
+        PlateSlicingContext &context = entry.first->second;
+        std::string error;
+        if (!bundle->assign_plate_material(context, target.second, preset_name, error)) {
+            show_error(this, wxString::Format(_L("Plate %d, slot %d: %s\nNo plate assignments were changed."),
+                                              target.first + 1, int(target.second + 1), from_u8(error)), false);
+            return false;
+        }
+        //A picker may supply a new spool colour for the slot clicked. Replacing other
+        //occurrences changes their material while preserving their individual appearance.
+        if (appearance && target.first == plate_index && target.second == slot) {
+            const size_t count = context.filament_preset_names.size();
+            auto copy_slot = [slot, count](auto &to, const auto &from) {
+                if (slot < from.size()) {
+                    to.resize(count);
+                    to[slot] = from[slot];
+                }
+            };
+            copy_slot(context.filament_colours, appearance->filament_colours);
+            copy_slot(context.filament_colour_types, appearance->filament_colour_types);
+            copy_slot(context.filament_multi_colours, appearance->filament_multi_colours);
+            copy_slot(context.filament_finishes, appearance->filament_finishes);
+        }
+    }
+    TakeSnapshot snapshot(this, "Replace assigned material");
+    for (auto &entry : prepared) {
+        auto &context = entry.second;
+        set_plate_filaments(entry.first, context.filament_preset_names, context.filament_colours, context);
+    }
+    return true;
+}
+
+void Plater::set_plate_filaments(int plate_index, std::vector<std::string> preset_names,
+                               std::vector<std::string> colours, std::optional<PlateSlicingContext> appearance)
 {
     PartPlate *plate = p->partplate_list.get_plate(plate_index);
     if (plate == nullptr) {
@@ -20977,20 +21218,40 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
         colours = context.filament_colours;
         colours.resize(preset_names.size());
     }
-    if (context.filament_preset_names == preset_names && context.filament_colours == colours)
+    colours.resize(preset_names.size());
+    const PlateSlicingContext previous = context;
+    if (appearance) {
+        context.filament_colour_types = appearance->filament_colour_types;
+        context.filament_multi_colours = appearance->filament_multi_colours;
+        context.filament_finishes = appearance->filament_finishes;
+    }
+    context.filament_colour_types.resize(preset_names.size(), "1");
+    context.filament_multi_colours.resize(preset_names.size());
+    context.filament_finishes.resize(preset_names.size(), 0);
+    if (!appearance) {
+        for (size_t i = 0; i < colours.size(); ++i) {
+            if (i >= previous.filament_colours.size() || colours[i] != previous.filament_colours[i]) {
+                context.filament_colour_types[i] = "1";
+                context.filament_multi_colours[i] = colours[i];
+            }
+        }
+    }
+    context.filament_preset_names = std::move(preset_names);
+    context.filament_colours = std::move(colours);
+    if (context == previous)
         return;
 
     take_snapshot(std::string("Assign plate filaments"));
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
-        << boost::format(": plate %1% filaments -> %2% slot(s)") % (plate_index + 1) % preset_names.size();
+        << boost::format(": plate %1% filaments -> %2% slot(s)") % (plate_index + 1) % context.filament_preset_names.size();
 
-    context.filament_preset_names = std::move(preset_names);
-    context.filament_colours      = std::move(colours);
     plate->set_slicing_context(context);
+    const bool identities_changed = previous.filament_preset_names != context.filament_preset_names;
 
     ResolvedPlateSlicingConfig resolved;
     std::string                error;
-    if (!resolve_plate_slicing_config(plate, resolved, error)) {
+    const bool material_resolved = resolve_plate_slicing_config(plate, resolved, error, false);
+    if (!material_resolved) {
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
             << boost::format(": plate %1% does not resolve after the change: %2%") % (plate_index + 1) % error;
         if (NotificationManager *notifications = get_notification_manager())
@@ -20998,6 +21259,11 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
                 NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
                 into_u8(wxString::Format(_L("Plate %d cannot slice with these filaments: %s"),
                                          plate_index + 1, from_u8(error))));
+    }
+    if (identities_changed) {
+        wxGetApp().preset_bundle->rebase_assigned_material_overrides(previous, context,
+            material_resolved ? resolved.config : DynamicPrintConfig(), *plate->config());
+        plate->update_slice_result_valid_state(false);
     }
 
     update_project_dirty_from_presets();

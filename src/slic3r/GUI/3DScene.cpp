@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <map>
 
 #include <boost/log/trivial.hpp>
 
@@ -462,6 +463,71 @@ void GLVolume::set_range(double min_z, double max_z)
     }
 }
 
+static std::pair<float, float> filament_finish_shading(FilamentFinish finish);
+
+namespace {
+std::vector<ColorRGBA> plate_display_colours(const GUI::PartPlate *plate)
+{
+    std::vector<ColorRGBA> colours;
+    if (plate == nullptr || GUI::wxGetApp().preset_bundle == nullptr)
+        return colours;
+    for (const auto &colour : GUI::wxGetApp().preset_bundle->plate_filament_colours(plate->get_slicing_context())) {
+        ColorRGBA rgba = ColorRGBA::WHITE();
+        decode_color(colour, rgba);
+        colours.push_back(rgba);
+    }
+    return colours;
+}
+
+struct PlateVolumeAppearance {
+    std::vector<ColorRGBA> colours;
+    std::vector<int> finishes;
+};
+
+void apply_volume_appearance(GLVolume &volume, const PlateVolumeAppearance &appearance, bool update_alpha)
+{
+    if (volume.is_modifier || volume.is_wipe_tower || volume.volume_idx() < 0 || appearance.colours.empty())
+        return;
+    const size_t slot = volume.extruder_id > 0 && size_t(volume.extruder_id) <= appearance.colours.size()
+                            ? size_t(volume.extruder_id - 1) : 0;
+    const auto finish = filament_finish_shading(slot < appearance.finishes.size()
+                            ? static_cast<FilamentFinish>(appearance.finishes[slot]) : ffStandard);
+    volume.metalness = finish.first;
+    volume.gloss = finish.second;
+    const float alpha = volume.color.a();
+    volume.color = appearance.colours[slot];
+    if (!update_alpha)
+        volume.color.a(alpha);
+}
+
+// Resolve once per plate in a draw/update pass, without composing a slicing configuration.
+class VolumeAppearanceCache {
+public:
+    const PlateVolumeAppearance &get(const GLVolume &volume)
+    {
+        if (wxApp::GetInstance() == nullptr || GUI::wxGetApp().plater() == nullptr ||
+            GUI::wxGetApp().preset_bundle == nullptr)
+            return m_empty;
+        auto &plates = GUI::wxGetApp().plater()->get_partplate_list();
+        const int index = plates.find_instance(volume.object_idx(), volume.instance_idx());
+        const GUI::PartPlate *plate = plates.get_plate(index);
+        if (plate == nullptr)
+            return m_empty;
+        auto entry = m_plates.emplace(index, PlateVolumeAppearance{});
+        if (entry.second) {
+            const auto context = plate->get_slicing_context();
+            entry.first->second.colours = plate_display_colours(plate);
+            entry.first->second.finishes = context.filament_finishes;
+        }
+        return entry.first->second;
+    }
+
+private:
+    std::map<int, PlateVolumeAppearance> m_plates;
+    PlateVolumeAppearance m_empty;
+};
+}
+
 void GLVolume::render()
 {
     if (!is_active)
@@ -471,9 +537,11 @@ void GLVolume::render()
     if (shader == nullptr)
         return;
 
-    //Outside a loop, so fetching the palette here is fine. Inside one it is not - see the
-    //overload below and GLVolumeCollection::render.
-    render(GUI::wxGetApp().plater()->get_extruders_colors());
+    VolumeAppearanceCache appearances;
+    const auto &appearance = appearances.get(*this);
+    apply_volume_appearance(*this, appearance, false);
+    set_render_color();
+    render(appearance.colours);
 }
 
 void GLVolume::render(const std::vector<ColorRGBA>& extruder_colors)
@@ -496,7 +564,11 @@ void GLVolume::render(const std::vector<ColorRGBA>& extruder_colors)
 //BBS: add outline related logic
 void GLVolume::render_with_outline(const GUI::Size& cnv_size)
 {
-    render_with_outline(cnv_size, GUI::wxGetApp().plater()->get_extruders_colors());
+    VolumeAppearanceCache appearances;
+    const auto &appearance = appearances.get(*this);
+    apply_volume_appearance(*this, appearance, false);
+    set_render_color();
+    render_with_outline(cnv_size, appearance.colours);
 }
 
 void GLVolume::render_with_outline(const GUI::Size& cnv_size, const std::vector<ColorRGBA>& extruder_colors)
@@ -891,7 +963,9 @@ int GLVolumeCollection::load_wipe_tower_preview(
     if (height == 0.0f)
         height = 0.1f;
 
-    std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
+    const GUI::PartPlate* tower_plate = ppl.get_plate(plate_idx);
+    std::vector<ColorRGBA> extruder_colors = plate_display_colours(tower_plate);
     //An unresolved plate has no filament palette, and a plate that cannot slice has no
     //wipe tower to preview. The resolver reports the state; here there is only nothing
     //to draw. Indexing the empty palette took the application down from reload_scene.
@@ -901,11 +975,9 @@ int GLVolumeCollection::load_wipe_tower_preview(
         return int(this->volumes.size() - 1);
     }
     std::vector<ColorRGBA> colors;
-    GUI::PartPlateList& ppl = GUI::wxGetApp().plater()->get_partplate_list();
     //get_plate answers NULL for an index it does not have, and the wipe tower reaches this
     //function through the obj_idx-1000 encoding, which is exactly where an index survives
     //the plate it named. Nothing to draw is a state, not a reason to take the app down.
-    const GUI::PartPlate* tower_plate = ppl.get_plate(plate_idx);
     if (tower_plate == nullptr) {
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
             << boost::format(": no plate %1%; skipping wipe tower preview") % (plate_idx + 1);
@@ -950,13 +1022,14 @@ int GLVolumeCollection::load_real_wipe_tower_preview(
     int plate_idx = obj_idx - 1000;
     if (wt_mesh.its.vertices.empty()) return int(this->volumes.size() - 1);
 
-    std::vector<Slic3r::ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    GUI::PartPlateList &ppl = GUI::wxGetApp().plater()->get_partplate_list();
+    GUI::PartPlate *tower_plate = ppl.get_plate(plate_idx);
+    std::vector<ColorRGBA> extruder_colors = plate_display_colours(tower_plate);
     //same rule as load_wipe_tower_preview: an unresolved plate has no palette and no
     //tower to preview
     if (extruder_colors.empty())
         return int(this->volumes.size() - 1);
-    GUI::PartPlateList               &ppl              = GUI::wxGetApp().plater()->get_partplate_list();
-    std::vector<int>                  plate_extruders  = ppl.get_plate(plate_idx)->get_extruders(true);
+    std::vector<int>                  plate_extruders  = tower_plate->get_extruders(true);
     std::vector<Slic3r::ColorRGBA>    colors;
     if (!plate_extruders.empty()) {
         if (plate_extruders.front() >= 1 && plate_extruders.front() <= (int)extruder_colors.size())
@@ -1152,12 +1225,12 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
 
     const float support_normal_z = get_selection_support_normal_z();
 
-    //The extruder palette is identical for every volume in this loop, and obtaining it composes
-    //the plate's whole ~974-option config. Asking once per volume cost 36 compositions - 53 ms -
-    //in a 36-plate frame. The loop is here, so the hoist belongs here.
-    const std::vector<ColorRGBA> extruder_colors = GUI::wxGetApp().plater()->get_extruders_colors();
+    VolumeAppearanceCache appearances;
 
     for (GLVolumeWithIdAndZ& volume : to_render) {
+        const auto &appearance = appearances.get(*volume.first);
+        const auto &extruder_colors = appearance.colours;
+        apply_volume_appearance(*volume.first, appearance, false);
 #if ENABLE_MODIFIERS_ALWAYS_TRANSPARENT
         if (type == ERenderType::Transparent) {
             volume.first->force_transparent = true;
@@ -1670,7 +1743,15 @@ static std::pair<float, float> filament_finish_shading(FilamentFinish finish)
 
 void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *config, bool is_update_alpha)
 {
-    
+    if (config == nullptr)
+        return;
+    if (wxApp::GetInstance() != nullptr && GUI::wxGetApp().plater() != nullptr) {
+        VolumeAppearanceCache appearances;
+        for (GLVolume *volume : volumes)
+            if (volume != nullptr)
+                apply_volume_appearance(*volume, appearances.get(*volume), is_update_alpha);
+        return;
+    }
     using ColorItem = std::pair<std::string, ColorRGBA>;
     std::vector<ColorItem> colors;
 
@@ -1717,6 +1798,8 @@ void GLVolumeCollection::update_colors_by_extruder(const DynamicPrintConfig *con
         if (volume == nullptr || volume->is_modifier || volume->is_wipe_tower || volume->volume_idx() < 0)
             continue;
 
+        if (colors.empty())
+            continue;
         int extruder_id = volume->extruder_id - 1;
         if (extruder_id < 0 || (int)colors.size() <= extruder_id)
             extruder_id = 0;

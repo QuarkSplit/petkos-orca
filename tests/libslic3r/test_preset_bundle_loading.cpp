@@ -1100,5 +1100,439 @@ TEST_CASE("Reresolving a plate context after a printer change", "[Preset][PlateC
         // material choice is user intent: the slot still names what the user chose
         CHECK(context.filament_preset_names == std::vector<std::string>{"Plate Filament"});
     }
+
+    SECTION("translating material keeps its original default colour and chosen finish")
+    {
+        Preset *source = bundle.filaments.find_preset("Plate Filament", false);
+        source->config.set_key_value("compatible_printers", new ConfigOptionStrings{"Plate Printer"});
+        source->config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+        source->config.set_key_value("default_filament_colour", new ConfigOptionStrings{"#FF3300"});
+        Preset &target = add_inmemory_preset(bundle.filaments, "Other PLA");
+        target.is_visible = true;
+        target.config.set_key_value("compatible_printers", new ConfigOptionStrings{"Other Printer"});
+        target.config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+        target.config.set_key_value("default_filament_colour", new ConfigOptionStrings{"#0000FF"});
+        bundle.printers.find_preset("Other Printer", false)->config.set_key_value(
+            "default_filament_profile", new ConfigOptionStrings{"Other PLA"});
+        PlateSlicingContext context = fixture.named_context();
+        context.printer_preset_name = "Other Printer";
+        context.filament_finishes = {int(FilamentFinish::ffMetallic)};
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(context.filament_preset_names == std::vector<std::string>{"Other PLA"});
+        CHECK(context.filament_colours == std::vector<std::string>{"#FF3300"});
+        CHECK(context.filament_finishes == std::vector<int>{int(FilamentFinish::ffMetallic)});
+    }
 }
 
+TEST_CASE("Plate colours and finishes do not inherit unrelated spool pool rows", "[Preset][PlateContext][PlateAppearance]")
+{
+    PlateContextFixture fixture;
+    PresetBundle &bundle = fixture.bundle;
+    bundle.filaments.find_preset("Plate Filament", false)->config.set_key_value(
+        "default_filament_colour", new ConfigOptionStrings{"#112233"});
+    add_inmemory_preset(bundle.filaments, "Second Filament").config.set_key_value(
+        "default_filament_colour", new ConfigOptionStrings{"#445566"});
+    bundle.project_config.option<ConfigOptionStrings>("filament_colour", true)->values = {"#FF0000", "#00FF00", "#0000FF"};
+    bundle.project_config.option<ConfigOptionStrings>("filament_colour_type", true)->values = {"2", "2", "2"};
+    bundle.project_config.option<ConfigOptionStrings>("filament_multi_colour", true)->values = {"#FF0000;#000000", "#00FF00;#000000"};
+    bundle.project_config.option<ConfigOptionEnumsGeneric>("filament_finish", true)->values = {int(FilamentFinish::ffMetallic)};
+
+    PlateSlicingContext context = fixture.named_context();
+    const bool two_slots = GENERATE(false, true);
+    if (two_slots)
+        context.filament_preset_names.push_back("Second Filament");
+    const std::vector<std::string> expected = two_slots ? std::vector<std::string>{"#112233", "#445566"}
+                                                       : std::vector<std::string>{"#112233"};
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    REQUIRE(bundle.resolve_plate_slicing_config(context, std::nullopt, std::nullopt, resolved, error));
+    CHECK(resolved.config.option<ConfigOptionStrings>("filament_colour")->values == expected);
+    CHECK(bundle.plate_filament_colours(context) == expected);
+    CHECK(resolved.config.option<ConfigOptionStrings>("filament_multi_colour")->values == expected);
+    CHECK(resolved.config.option<ConfigOptionStrings>("filament_colour_type")->values == std::vector<std::string>(expected.size(), "1"));
+    CHECK(resolved.config.option<ConfigOptionEnumsGeneric>("filament_finish")->values ==
+          std::vector<int>(expected.size(), int(FilamentFinish::ffStandard)));
+    CHECK(bundle.project_config.option<ConfigOptionStrings>("filament_colour")->values.size() == 3);
+}
+
+TEST_CASE("Plate appearance survives pool changes and participates in the composition cache", "[Preset][PlateContext][PlateAppearance]")
+{
+    PlateContextFixture fixture;
+    PlateSlicingContext context = fixture.named_context();
+    context.filament_colours = {"#ABCDEF"};
+    context.filament_colour_types = {"2"};
+    context.filament_multi_colours = {"#ABCDEF;#FEDCBA"};
+    context.filament_finishes = {int(FilamentFinish::ffSilk)};
+    ResolvedPlateSlicingConfig first, second, again;
+    std::string error;
+    PresetBundle::ComposeScope scope(fixture.bundle);
+    REQUIRE(fixture.bundle.resolve_plate_slicing_config(context, std::nullopt, std::nullopt, first, error));
+    PlateSlicingContext matte = context;
+    matte.filament_finishes = {int(FilamentFinish::ffMatte)};
+    REQUIRE(fixture.bundle.resolve_plate_slicing_config(matte, std::nullopt, std::nullopt, second, error));
+    REQUIRE(fixture.bundle.resolve_plate_slicing_config(context, std::nullopt, std::nullopt, again, error));
+    CHECK(first.config.option<ConfigOptionEnumsGeneric>("filament_finish")->values == context.filament_finishes);
+    CHECK(second.config.option<ConfigOptionEnumsGeneric>("filament_finish")->values == matte.filament_finishes);
+    CHECK(again.config.option<ConfigOptionEnumsGeneric>("filament_finish")->values == context.filament_finishes);
+    CHECK(first.config.option<ConfigOptionStrings>("filament_colour_type")->values == context.filament_colour_types);
+    CHECK(first.config.option<ConfigOptionStrings>("filament_multi_colour")->values == context.filament_multi_colours);
+    // The CLI uses this same helper after all of its config overlays.
+    DynamicPrintConfig cli = first.config;
+    cli.option<ConfigOptionStrings>("filament_colour")->values = {"#000000", "#FFFFFF"};
+    PresetBundle::apply_plate_filament_colours(context, cli);
+    CHECK(cli.option<ConfigOptionStrings>("filament_colour")->values == context.filament_colours);
+    CHECK(cli.option<ConfigOptionEnumsGeneric>("filament_finish")->values == context.filament_finishes);
+}
+
+TEST_CASE("Legacy plate appearance migrates only from matching declared materials", "[Preset][PlateContext][PlateAppearance]")
+{
+    PlateSlicingContext seed;
+    seed.filament_preset_names = {"PLA", "PETG"};
+    DynamicPrintConfig project;
+    project.set_key_value("filament_colour", new ConfigOptionStrings{"#112233", "#445566"});
+    project.set_key_value("filament_colour_type", new ConfigOptionStrings{"2", "1"});
+    project.set_key_value("filament_multi_colour", new ConfigOptionStrings{"#112233;#FF0000", "#445566"});
+    project.option<ConfigOptionEnumsGeneric>("filament_finish", true)->values = {int(FilamentFinish::ffMetallic), int(FilamentFinish::ffMatte)};
+    PresetBundle::capture_plate_filament_colours(seed, project);
+
+    PlateSlicingContext context;
+    context.filament_preset_names = {"PLA", "ABS"};
+    SECTION("absent legacy colours and appearance adopt only the matching slot") {
+        PresetBundle::migrate_legacy_plate_filament_colours(context, seed);
+        CHECK(context.filament_colours == std::vector<std::string>{"#112233", ""});
+        CHECK(context.filament_colour_types == std::vector<std::string>{"2", "1"});
+        CHECK(context.filament_multi_colours == std::vector<std::string>{"#112233;#FF0000", ""});
+        CHECK(context.filament_finishes == std::vector<int>{int(FilamentFinish::ffMetallic), int(FilamentFinish::ffStandard)});
+        const PlateSlicingContext migrated = context;
+        seed.filament_colours[0] = "#000000";
+        PresetBundle::migrate_legacy_plate_filament_colours(context, seed);
+        CHECK(context == migrated);
+    }
+    SECTION("an existing colour never acquires somebody else's multi-colour stripe") {
+        context.filament_colours = {"#FFFFFF", ""};
+        PresetBundle::migrate_legacy_plate_filament_colours(context, seed);
+        CHECK(context.filament_colours == std::vector<std::string>{"#FFFFFF", ""});
+        CHECK(context.filament_colour_types[0] == "1");
+        CHECK(context.filament_multi_colours[0].empty());
+    }
+    SECTION("a recorded blank colour remains a request for the material default") {
+        context.filament_colours = {"", ""};
+        PresetBundle::migrate_legacy_plate_filament_colours(context, seed);
+        CHECK(context.filament_colours == std::vector<std::string>{"", ""});
+    }
+}
+
+TEST_CASE("Completing legacy material names preserves the plate's AMS colours", "[Preset][PlateContext][PlateAppearance]")
+{
+    PlateContextFixture fixture;
+    PlateSlicingContext seed = fixture.named_context();
+    seed.filament_colours = {"#000000"};
+    seed.filament_colour_types = {"2"};
+    seed.filament_multi_colours = {"#000000;#FF0000"};
+    PlateSlicingContext legacy;
+    DynamicPrintConfig old_overrides;
+    old_overrides.set_key_value("filament_colour", new ConfigOptionStrings{"#FFFFFF"});
+    PresetBundle::capture_plate_filament_colours(legacy, old_overrides, true);
+    REQUIRE(fixture.bundle.complete_plate_context(legacy, seed));
+    CHECK(legacy.filament_preset_names == seed.filament_preset_names);
+    CHECK(legacy.filament_colours == std::vector<std::string>{"#FFFFFF"});
+    CHECK(legacy.filament_colour_types == std::vector<std::string>{"1"});
+    CHECK(legacy.filament_multi_colours == std::vector<std::string>{""});
+}
+
+TEST_CASE("Moving between plates matches the complete spool identity and appends only used materials", "[Preset][PlateContext][PlateTransfer]")
+{
+    PlateContextFixture fixture;
+    PlateSlicingContext source = fixture.named_context();
+    source.filament_preset_names = {"Plate Filament", "Unused Filament"};
+    source.filament_colours = {"#FF0000", "#00FF00"};
+    source.filament_colour_types = {"2", "1"};
+    source.filament_multi_colours = {"#FF0000 #0000FF", "#00FF00"};
+    source.filament_finishes = {int(FilamentFinish::ffSilk), int(FilamentFinish::ffStandard)};
+    PlateSlicingContext target = fixture.named_context();
+    target.filament_colours = {"#FFFFFF"};
+    std::vector<int> mapping;
+    std::string error;
+
+    REQUIRE(fixture.bundle.map_transferred_filaments(source, target, {1}, mapping, error));
+    CHECK(mapping[1] == 2);
+    CHECK(mapping[2] == 0);
+    CHECK(target.filament_preset_names == std::vector<std::string>{"Plate Filament", "Plate Filament"});
+    CHECK(target.filament_colours == std::vector<std::string>{"#FFFFFF", "#FF0000"});
+    CHECK(target.filament_colour_types[1] == source.filament_colour_types[0]);
+    CHECK(target.filament_multi_colours[1] == source.filament_multi_colours[0]);
+    CHECK(target.filament_finishes[1] == source.filament_finishes[0]);
+    const auto once = target;
+    REQUIRE(fixture.bundle.map_transferred_filaments(source, target, {1}, mapping, error));
+    CHECK(target == once);
+    CHECK(mapping[1] == 2);
+}
+
+TEST_CASE("Replacing a plate material keeps its other slots and appearance", "[Preset][PlateContext][PlateMaterial]")
+{
+    PlateContextFixture fixture;
+    auto &replacement = add_inmemory_preset(fixture.bundle.filaments, "Replacement PLA");
+    replacement.config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    auto context = fixture.named_context();
+    context.filament_preset_names.push_back("Plate Filament");
+    context.filament_colours = {"#112233", "#445566"};
+    context.filament_colour_types = {"2", "1"};
+    context.filament_multi_colours = {"#112233;#FF0000", ""};
+    context.filament_finishes = {int(FilamentFinish::ffSilk), int(FilamentFinish::ffStandard)};
+    const auto before = context;
+    std::string error;
+    REQUIRE(fixture.bundle.assign_plate_material(context, 0, "Replacement PLA", error));
+    auto expected = before;
+    expected.filament_preset_names[0] = "Replacement PLA";
+    CHECK(context == expected);
+    CHECK(error.empty());
+    CHECK_FALSE(fixture.bundle.assign_plate_material(context, 4, "Replacement PLA", error));
+    CHECK(context == expected);
+    CHECK_FALSE(fixture.bundle.assign_plate_material(context, 0, "Absent material", error));
+    CHECK(context == expected);
+}
+
+TEST_CASE("Material replacement translates for the plate printer without substituting another material", "[Preset][PlateContext][PlateMaterial]")
+{
+    PlateContextFixture fixture;
+    auto &source = add_inmemory_preset(fixture.bundle.filaments, "Imported PLA");
+    source.config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    source.config.set_key_value("compatible_printers", new ConfigOptionStrings{"Foreign Printer"});
+    auto &target = add_inmemory_preset(fixture.bundle.filaments, "Local PLA");
+    target.is_visible = true;
+    target.config.set_key_value("filament_type", new ConfigOptionStrings{"PLA"});
+    target.config.set_key_value("compatible_printers", new ConfigOptionStrings{"Plate Printer"});
+    // Exclude the fixture's other stock filament from the candidate set.
+    fixture.bundle.filaments.find_preset("Plate Filament", false, true)->config.set_key_value(
+        "filament_type", new ConfigOptionStrings{"PETG"});
+    auto context = fixture.named_context();
+    std::string error;
+    REQUIRE(fixture.bundle.assign_plate_material(context, 0, "Imported PLA", error));
+    CHECK(context.filament_preset_names[0] == "Local PLA");
+    auto &unsupported = add_inmemory_preset(fixture.bundle.filaments, "Imported PEEK");
+    unsupported.config.set_key_value("filament_type", new ConfigOptionStrings{"PEEK"});
+    unsupported.config.set_key_value("compatible_printers", new ConfigOptionStrings{"Foreign Printer"});
+    const auto before = context;
+    CHECK_FALSE(fixture.bundle.assign_plate_material(context, 0, "Imported PEEK", error));
+    CHECK(context == before);
+    CHECK_FALSE(error.empty());
+}
+
+TEST_CASE("A failed material transfer leaves the destination unchanged", "[Preset][PlateContext][PlateTransfer]")
+{
+    PlateContextFixture fixture;
+    PlateSlicingContext source = fixture.named_context();
+    source.filament_colours = {"#FF0000"};
+    PlateSlicingContext target = fixture.named_context();
+    std::vector<int> mapping;
+    std::string error;
+    SECTION("a missing source slot cannot be guessed from the target") {
+        const auto before = target;
+        CHECK_FALSE(fixture.bundle.map_transferred_filaments(source, target, {1, 2}, mapping, error));
+        CHECK(target == before);
+        CHECK_FALSE(error.empty());
+    }
+    SECTION("a full destination cannot overwrite an existing spool") {
+        target.filament_preset_names.assign(MAXIMUM_EXTRUDER_NUMBER, "Plate Filament");
+        target.filament_colours.assign(MAXIMUM_EXTRUDER_NUMBER, "#FFFFFF");
+        const auto before = target;
+        CHECK_FALSE(fixture.bundle.map_transferred_filaments(source, target, {1}, mapping, error));
+        CHECK(target == before);
+        CHECK_FALSE(error.empty());
+    }
+}
+
+TEST_CASE("Complete embedded presets load without reconstructing an unavailable parent", "[Preset][EmbeddedPreset][PlateContext]")
+{
+    const auto type = GENERATE(Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT);
+    const std::string parent_case = GENERATE("no parent", "missing parent", "installed parent");
+    const bool complete = GENERATE(true, false);
+    CAPTURE(type, parent_case, complete);
+    PresetBundle bundle;
+    PresetCollection &collection = type == Preset::TYPE_PRINTER ? static_cast<PresetCollection &>(bundle.printers) :
+                                   type == Preset::TYPE_PRINT ? bundle.prints : bundle.filaments;
+    const std::string name = "Embedded exact profile";
+    const std::string parent_name = parent_case == "no parent" ? "" : "Embedded parent";
+    Preset source(type, name);
+    source.is_project_embedded = true;
+    source.is_external = true;
+    source.config = collection.default_preset().config;
+    source.config.option<ConfigOptionString>("inherits", true)->value = parent_name;
+    std::string omitted_key;
+    if (type == Preset::TYPE_PRINTER) {
+        source.config.option<ConfigOptionString>("printer_settings_id", true)->value = name;
+        source.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+        source.config.set_key_value("printable_height", new ConfigOptionFloat(310.));
+        source.config.set_key_value("machine_start_gcode", new ConfigOptionString("G28\nM104 S221"));
+        omitted_key = "printable_height";
+    } else if (type == Preset::TYPE_PRINT) {
+        source.config.option<ConfigOptionString>("print_settings_id", true)->value = name;
+        source.config.set_key_value("layer_height", new ConfigOptionFloat(0.28));
+        source.config.set_key_value("wall_loops", new ConfigOptionInt(4));
+        omitted_key = "wall_loops";
+    } else {
+        source.config.option<ConfigOptionStrings>("filament_settings_id", true)->values = {name};
+        source.config.set_key_value("filament_type", new ConfigOptionStrings({"PLA"}));
+        source.config.set_key_value("nozzle_temperature", new ConfigOptionInts({214}));
+        source.config.set_key_value("filament_flow_ratio", new ConfigOptionFloats({0.97}));
+        omitted_key = "filament_flow_ratio";
+    }
+    DynamicPrintConfig expected = source.config;
+    if (!complete) {
+        source.config.erase(omitted_key);
+        expected.set_key_value(omitted_key, collection.default_preset().config.option(omitted_key)->clone());
+    }
+    if (parent_case == "installed parent")
+        add_inmemory_preset(collection, parent_name);
+    std::vector<Preset *> imported{&source};
+    REQUIRE_NOTHROW(bundle.load_project_embedded_presets(imported, ForwardCompatibilitySubstitutionRule::Disable));
+    const Preset *loaded = collection.find_preset(name, false);
+    if (!complete && parent_case != "installed parent") {
+        CHECK(loaded == nullptr);
+        return;
+    }
+    REQUIRE(loaded != nullptr);
+    CHECK(loaded->is_project_embedded);
+    CHECK(loaded->is_external);
+    for (const std::string &key : expected.keys()) {
+        INFO("setting " << key);
+        const ConfigOption *actual = loaded->config.option(key);
+        REQUIRE(actual != nullptr);
+        CHECK(actual->serialize() == expected.option(key)->serialize());
+    }
+}
+
+TEST_CASE("Embedded printer vendor identity survives loading without an installed vendor", "[Preset][EmbeddedPreset][PlateContext][EmbeddedPrinterVendor]")
+{
+    const std::string source_case = GENERATE("explicit vendor", "old full config", "installed parent", "direct vendor", "installed name collision");
+    CAPTURE(source_case);
+    PresetBundle bundle;
+    const std::string printer_name = "Exact printer(project.3mf)";
+    const std::string process_name = "Exact process(project.3mf)";
+    const std::string archive_vendor = "ARCHIVE_VENDOR";
+    const std::string installed_vendor = "INSTALLED_VENDOR";
+    const bool has_installed_vendor = source_case == "installed parent" || source_case == "direct vendor" || source_case == "installed name collision";
+    bundle.vendors.emplace(installed_vendor, VendorProfile(installed_vendor));
+    bundle.vendors.emplace("SELECTED_VENDOR", VendorProfile("SELECTED_VENDOR"));
+    add_inmemory_preset(bundle.printers, "Unrelated selected printer").vendor = &bundle.vendors.at("SELECTED_VENDOR");
+    bundle.printers.select_preset_by_name("Unrelated selected printer", true);
+    add_inmemory_preset(bundle.prints, process_name);
+
+    Preset source(Preset::TYPE_PRINTER, printer_name);
+    source.is_project_embedded = true;
+    source.is_external = true;
+    source.config = bundle.printers.default_preset().config;
+    source.config.set_key_value("printer_settings_id", new ConfigOptionString(printer_name));
+    source.config.set_key_value("nozzle_diameter", new ConfigOptionFloats({0.6}));
+    source.config.set_key_value("machine_start_gcode", new ConfigOptionString("G28\nM104 S221"));
+    source.config.option<ConfigOptionString>("inherits", true)->value.clear();
+    if (source_case == "old full config")
+        source.config.erase("printer_vendor_id");
+    else
+        source.config.set_key_value("printer_vendor_id", new ConfigOptionString(archive_vendor));
+    if (source_case == "installed parent") {
+        add_inmemory_preset(bundle.printers, "Installed parent").vendor = &bundle.vendors.at(installed_vendor);
+        source.inherits() = "Installed parent";
+    } else if (source_case == "direct vendor") {
+        source.vendor = &bundle.vendors.at(installed_vendor);
+    } else if (source_case == "installed name collision") {
+        add_inmemory_preset(bundle.printers, printer_name).vendor = &bundle.vendors.at(installed_vendor);
+    }
+    const DynamicPrintConfig source_config = source.config;
+    std::vector<Preset *> imported{&source};
+    REQUIRE_NOTHROW(bundle.load_project_embedded_presets(imported, ForwardCompatibilitySubstitutionRule::Disable));
+    const Preset *loaded = bundle.printers.find_preset(printer_name, false);
+    REQUIRE(loaded != nullptr);
+    if (source_case != "installed name collision") {
+        CHECK(loaded->is_project_embedded);
+        for (const std::string &key : source_config.keys()) {
+            INFO("preserved machine setting " << key);
+            REQUIRE(loaded->config.option(key) != nullptr);
+            CHECK(loaded->config.option(key)->serialize() == source_config.option(key)->serialize());
+        }
+    }
+
+    PlateSlicingContext context;
+    context.printer_preset_name = printer_name;
+    context.printer_vendor_id = archive_vendor;
+    context.print_preset_name = process_name;
+    const PlateSlicingContext before = context;
+    ResolvedPlatePresets resolved;
+    std::string error;
+    if (source_case == "explicit vendor") {
+        REQUIRE(bundle.resolve_plate_presets(context, resolved, error));
+        CHECK(resolved.printer_vendor_id == archive_vendor);
+    } else {
+        CHECK_FALSE(bundle.resolve_plate_presets(context, resolved, error));
+        CHECK_FALSE(error.empty());
+    }
+    CHECK(context == before);
+    if (has_installed_vendor) {
+        context.printer_vendor_id = installed_vendor;
+        REQUIRE(bundle.resolve_plate_presets(context, resolved, error));
+        CHECK(resolved.printer_vendor_id == installed_vendor);
+    }
+    if (source_case == "explicit vendor") {
+        context.printer_vendor_id.clear();
+        PresetBundle::PlateContextReresolution result;
+        REQUIRE(bundle.reresolve_plate_context_for_printer(context, result, error));
+        CHECK(context.printer_vendor_id == archive_vendor);
+    }
+}
+
+TEST_CASE("Loading embedded presets preserves the current edited selection", "[Preset][EmbeddedPreset][PlateContext][EmbeddedPresetSelection]")
+{
+    const auto type = GENERATE(Preset::TYPE_PRINTER, Preset::TYPE_PRINT, Preset::TYPE_FILAMENT);
+    const std::string selection = GENERATE("custom", "default", "unresolved");
+    CAPTURE(type, selection);
+    PresetBundle bundle;
+    PresetCollection &collection = type == Preset::TYPE_PRINTER ? static_cast<PresetCollection &>(bundle.printers) :
+                                   type == Preset::TYPE_PRINT ? bundle.prints : bundle.filaments;
+    const std::string selected_name = selection == "default" ? collection.default_preset().name :
+                                     type == Preset::TYPE_FILAMENT ? "AAA selected profile" : "ZZZ selected profile";
+    const std::string imported_name = type == Preset::TYPE_FILAMENT ? "Generic Z embedded @System" : "AAA embedded profile";
+    if (selection == "unresolved") {
+        deselect_via_project_embedded(collection, selected_name);
+    } else {
+        if (selection == "custom")
+            add_inmemory_preset(collection, selected_name);
+        collection.select_preset_by_name(selected_name, true);
+        REQUIRE(collection.get_selected_preset_name() == selected_name);
+    }
+    const std::string edited_key = type == Preset::TYPE_PRINTER ? "nozzle_diameter" :
+                                   type == Preset::TYPE_PRINT ? "layer_height" : "nozzle_temperature";
+    if (type == Preset::TYPE_PRINTER)
+        collection.get_edited_preset().config.set_key_value(edited_key, new ConfigOptionFloats({0.8}));
+    else if (type == Preset::TYPE_PRINT)
+        collection.get_edited_preset().config.set_key_value(edited_key, new ConfigOptionFloat(0.31));
+    else
+        collection.get_edited_preset().config.set_key_value(edited_key, new ConfigOptionInts({207}));
+    collection.get_edited_preset().set_dirty(true);
+    const Preset edited_before = collection.get_edited_preset();
+
+    Preset source(type, imported_name);
+    source.config = collection.default_preset().config;
+    source.config.option<ConfigOptionString>("inherits", true)->value.clear();
+    source.is_project_embedded = true;
+    source.is_external = true;
+    std::vector<Preset *> imported{&source};
+    REQUIRE_NOTHROW(bundle.load_project_embedded_presets(imported, ForwardCompatibilitySubstitutionRule::Disable));
+    const Preset *stored = collection.find_preset(imported_name, false, true);
+    REQUIRE(stored != nullptr);
+    REQUIRE(stored->is_project_embedded);
+    const Preset *effective = collection.find_preset(imported_name, false);
+    REQUIRE(effective == stored);
+    CHECK(effective->name == imported_name);
+    CHECK(collection.get_selected_preset_name() == (selection == "unresolved" ? std::string() : selected_name));
+    CHECK(collection.get_edited_preset().name == edited_before.name);
+    CHECK(collection.get_edited_preset().is_dirty);
+    CHECK(collection.get_edited_preset().config.option(edited_key)->serialize() == edited_before.config.option(edited_key)->serialize());
+    if (selection != "unresolved") {
+        REQUIRE(collection.find_preset(selected_name, false) == &collection.get_edited_preset());
+        CHECK(collection.get_selected_preset().name == selected_name);
+        if (selection == "default")
+            CHECK(collection.get_selected_idx() == 0);
+    } else {
+        CHECK(collection.get_selected_idx() == size_t(-1));
+    }
+}

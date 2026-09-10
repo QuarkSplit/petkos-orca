@@ -78,10 +78,12 @@ currently being edited — and the application was reading a cursor as a fact ab
 So the rule now is: a plate names its own printer, its own process and its own materials, or it
 is unresolved. The global selection survives as what it always was, an editing cursor, and it
 **follows the current plate** (`Plater::follow_plate_presets`) instead of standing behind every
-plate. The sidebar's printer, process and filament combos write to the current plate.
+plate. Printer and process controls write to the current plate. The sidebar shows the selected
+plate's assigned materials above the independent spool pool; material changes use the same
+explicit assignment scope from the sidebar, filament tab and plate board.
 
-`PresetBundle::complete_plate_context` is the ONE remaining read of the global selection on a
-plate's behalf, and it runs once per plate, at the two moments a plate can exist without a
+`PresetBundle::complete_plate_context(context, seed)` reads the explicit seed supplied by its
+caller. It completes missing identity at the two moments a plate can exist without a
 context: a plate being created, and a project written before per-plate machines being loaded. A
 new plate is seeded from the plates that already exist, which is also what answers "what shape is
 a plate that does not exist yet" for arrange, and "what does an overflow land on".
@@ -112,10 +114,10 @@ The two callers, and what each names as the holder:
   last complete one, so a new plate lands on the machine the user is already on. Only when no plate
   has a context is the bundle's selection used, and there it is a remembered choice rather than a
   placeholder.
-- `complete_plate_contexts(declared)` - a loaded project. `Plater::priv::load_files` reads
-  `printer_settings_id`, `print_settings_id` and `filament_settings_id` **out of the 3MF's own
-  config**, before that config is moved into the bundle, and passes them in. That is correct
-  whenever it runs and whatever the bundle holds, because it came from the file.
+- `complete_plate_contexts(declared)` - a loaded project. `Plater::priv::load_files` first loads
+  the archive's embedded presets and aggregate config, then captures the resulting imported
+  selections and material appearance as the explicit seed. Existing named plate fields remain
+  intact; legacy empty fields are completed after the project's own settings are available.
 
 The driver's Context phase also asserts that no plate names a preset that `is_default`, which is
 the cheap in-app half of the check. The other half is reading `filament_settings_id` and
@@ -183,8 +185,8 @@ project sliced as a four-filament print.
 
 The rules, each load-bearing:
 
-- **A plate owns its colours.** `PlateSlicingContext::filament_colours` rides parallel to
-  `filament_preset_names`, persists in the 3MF (`plater_filament_colours`), and outranks the
+- **A plate owns its appearance.** RGB, colour type, multi-colour strands and finish ride parallel
+  to `filament_preset_names`, persist in the 3MF, and outrank the
   project's colours in composition. The old per-plate store - untyped `filament_colour` keys in the
   plate's override config, written only by AMS sync, deleted by "clear overrides" - is migrated
   into the context at load and retired.
@@ -207,9 +209,65 @@ The rules, each load-bearing:
   Slots are added from the strip's trailing "+", recoloured per plate, and the last unused slot
   can be removed. Adding or deleting a POOL row touches no plate, no object and no painted facet -
   the old delete path pruned paint model-wide.
-- **The pool is not followed and not written back.** `follow_plate_presets` no longer copies plate
-  filaments into the pool; the sidebar filament combo and the filament tab no longer write the
-  pool onto the current plate.
+- **The pool remains independent, with explicit assignment.** `follow_plate_presets` does not
+  copy plate filaments into the pool. The sidebar and filament tab offer assignment scope when
+  selecting a material; pool-only is an explicit choice. The selected plate's assigned list is
+  always visible. Dirty-edit and scope cancellation restore the previous selection and pool
+  state; spool RGB and multi-colour updates commit only after the selection is accepted.
+
+### Imported settings and the controls that edit them (10 September)
+
+Plate process controls resolve the named process, project overrides and saved plate overrides
+in the same order as slicing. Direct changes and dependent-option corrections both write to
+the authoritative plate; an explicit false remains an override until reverted. Loading the
+global editing cursor must not overwrite a plate inspector's composed values.
+
+Material replacement translates the selected preset for each target printer before committing
+the requested scope. Imported plate-level material overrides are rebased for changed slots,
+including temperature, cooling and flow; unchanged slots retain their values and colours.
+This also works while another material slot remains unresolved, so a project can be repaired
+one assignment at a time. Changed identities invalidate retained G-code. The library's stored
+G-code labels describe archive contents, not proof that a slice is current.
+
+Preset-selector refreshes do not invalidate every plate. Retained results are checked against
+the plate's freshly composed settings, including changes or deletion of a named preset, so an
+unrelated pool edit leaves a still-valid plate slice usable.
+
+3MF export embeds the full resolved profiles used by each plate, replacing an older sparse
+copy of the same profile. Import uses the JSON profile name as its identity, with the typed
+settings ID retained as a compatibility path only when the name is absent. Stale IDs can be
+shared by different profiles and are not treated as rename aliases. Complete profiles load
+directly when they contain every required setting in the current collection schema; incomplete
+profiles still need their actual parent. Explicit embedded printer vendor identity is retained,
+while an installed profile or resolved parent's vendor remains authoritative. Sorting newly
+loaded profiles preserves the selected name, unresolved state and unsaved edits.
+
+Completed bed-to-bed moves translate the object's used materials and remap its stored slot
+references together. Instances detach when they need different material mappings, inside the
+move's undo transaction. An oversized instance keeps its existing bed while it still intersects
+that bed. Off-bed moves retain the source-material association in memory until re-entry; that
+pending association is not yet saved when a project is closed with the object still off-bed.
+
+### Library previews (10 September)
+
+`ProjectLibrary` scans metadata separately from thumbnail generation. It validates embedded
+PNG previews, including standard 3MF thumbnail relationships, and queues files without one.
+`WebViewDialog` gives visible cards priority and prewarms the remaining catalogue serially.
+`LibThumbnailReceive` patches the image without rebuilding cards or losing selection and scroll.
+
+Geometry imports run through the private `--library-thumbnail` command in an isolated process:
+Model identifiers and STEP state are process globals and cannot safely be imported on a GUI
+worker. The CPU renderer applies object/volume transforms and saved colours to STL, OBJ, STEP
+and 3MF geometry, including external 3MF components. It produces antialiased 512-pixel PNGs.
+On Windows the hidden child is contained before it starts, with two processors, a 1 GiB memory
+limit, a 45-second deadline and cancellation on window shutdown. It does not load the user's
+profile or require OpenGL. Source files remain untouched.
+
+Cache identity includes the canonical source path, size, high-resolution file revision and
+renderer version. Source changes are checked before publishing. Missing cache images are
+regenerated; an image decode failure requests one forced retry. Explicit refresh retries a
+previous failure. Unreadable or unsupported geometry reports its reason instead of displaying
+the stock whale. JPEG-only embedded pictures currently use the geometry fallback.
 
 **The hard cases, named rather than deferred vaguely.** These are genuine work, not edge cases, and
 none of them may be allowed to trip project import or a printer swap - which is the base, and the
@@ -451,9 +509,10 @@ a mechanism.
 **Launch only via `run-petkos-orca.bat`.** It passes an isolated `--datadir`; an un-isolated
 launch has previously run the setup wizard and clobbered the installed Orca's shared config.
 
-**The app holds `build/src/Release/OrcaSlicer.dll` open while running**, so a link fails with
-`LNK1104` if it is not closed first. Copy the rebuilt DLL over `build/OrcaSlicer/OrcaSlicer.dll`
-afterwards, or that staging copy silently goes stale beside a current one.
+**The app holds `build/src/Release/OrcaSlicer.dll` open while running.** The build helper renames
+mapped binaries before linking so the active instance and its unsaved project stay intact.
+`run-petkos-orca.bat` launches this build output directly. `python tools/pod.py stage` refreshes
+the separate packaging copy when needed.
 
 **A full rebuild must not be a child of the shell that starts it.** A rebuild here is 30-35
 minutes, and a long-running background shell is reliably stopped before then. When it goes the
@@ -477,8 +536,13 @@ the probe attached to the wrong door below.
 image but will happily **rename** one within the same volume. Move `orca-slicer.exe` and
 `OrcaSlicer.dll` aside to `*.inuse-<date>.*` and the linker writes fresh files while the running
 instance keeps its old mapping. Killing a running slicer to unblock a build risks a project the
-user has not saved; renaming risks nothing. Delete the `.inuse-*` files once nothing is holding
-them.
+user has not saved. Retain `.inuse-*` files until they can be explicitly cleaned up.
+
+**Finish edits before compiling.** Use `tools/petkos-dev-build.ps1`: one MSBuild worker,
+memory-budgeted compiler concurrency, Idle priority, no node reuse, and a shared build lock.
+`-DryRun` shows the limits without compiling or moving mapped binaries. Running many MSBuild
+workers alongside unrestricted `/MP` exhausts this PC; the detached and target helpers now
+use the same bounded policy. See [the September audit](docs/AUDIT-2026-09-08.md).
 
 ## Dated build history
 
