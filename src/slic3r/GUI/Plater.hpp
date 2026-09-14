@@ -226,12 +226,24 @@ public:
     // BBS. Add filament_added() method.
     void on_filament_count_change(size_t num_filaments);
     void on_filaments_delete(size_t filament_id);
+    // The ONE thing that changes how many spool rows the sidebar has. It reads the pool -
+    // PresetBundle::filament_presets - and never a number a caller supplies. Returns true when
+    // it had to change something, which only happens when a caller forgot to go through it.
+    bool sync_filament_rows_to_pool();
+    // How many spools the current plate's printer can have loaded at once. 1 for most of this
+    // farm; an AMS or a single-extruder-multi-material machine is what makes it more.
+    int plate_printer_spool_capacity() const;
 
     void add_filament();
     void delete_filament(size_t filament_id = size_t(-1), int replace_filament_id = -1);  // 0 base, -1 means default
     void change_filament(size_t from_id, size_t to_id);  // 0 base
     void edit_filament();
-    void add_custom_filament(wxColour new_col);
+    //Returns false when the spool was not added, having said why. Every route into adding a spool
+    //comes through here, so the pool cap is checked and explained in exactly one place.
+    bool add_custom_filament(wxColour new_col);
+    //Decline out loud. A refusal nobody can see is how a working button and a broken one come to
+    //look the same, which is precisely how the phantom spool row presented.
+    void refuse_spool_action(const wxString &reason) const;
     bool is_new_project_in_gcode3mf();
     // BBS
     void on_bed_type_change(BedType bed_type);
@@ -674,11 +686,14 @@ public:
     //
     // This is what upstream #7880, #8216, #10209 and #12943 are actually asking for. None of
     // them wants preset inheritance; they want not to retype their settings on a new machine.
-    void save_plate_process_as_preset(int plate_index);
     void set_plate_filaments(int plate_index, std::vector<std::string> preset_names,
                              std::vector<std::string> colours = {},
                              std::optional<PlateSlicingContext> appearance = std::nullopt);
     //Choose an explicit replacement scope and validate every target before writing any plate.
+    // A pool row changed from `replaced` to `replacement`. Every slot on this plate that was
+    // still naming `replaced` follows it; a slot naming anything else was assigned on purpose
+    // and is left alone. No dialog - see the definition for why there is no question to ask.
+    bool follow_pool_material_change(int plate_index, const std::string &replaced, const std::string &replacement);
     bool choose_plate_material_replacement(int plate_index, size_t slot, const std::string &preset_name,
                                             bool allow_pool_only = false,
                                             std::optional<PlateSlicingContext> appearance = std::nullopt);
@@ -718,7 +733,6 @@ public:
 
     void on_filament_change(size_t filament_idx);
     void on_filament_count_change(size_t extruders_count);
-    void on_filaments_delete(size_t extruders_count, size_t filament_id, int replace_filament_id = -1);
     std::vector<Slic3r::ColorRGBA> get_extruders_colors();
     // BBS
     void on_bed_type_change(BedType bed_type);
@@ -909,6 +923,14 @@ public:
                                       std::string &error, bool apply_plate_overrides = true) const;
     bool resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &resolved,
                                               std::string &error, bool apply_plate_overrides = true) const;
+    // The plate's config as it PRINTS: PartPlate::get_printing_context composed. Identical to
+    // resolve_plate_slicing_config except that slots holding one and the same spool collapse
+    // to one filament, exactly as Plater::priv::apply_plate_config feeds the engine. Anything
+    // that describes the print - the prime-tower preview, the flushing-volume check - must
+    // resolve through here, or it describes a print that is not going to happen.
+    // used_slots (out, optional): 1-based slots the objects reference, in the returned width.
+    bool resolve_plate_printing_config(PartPlate *plate, ResolvedPlateSlicingConfig &resolved,
+                                       std::string &error, std::vector<int> *used_slots = nullptr) const;
     // Read ONE process-preset option for a plate WITHOUT composing that plate's whole config.
     // resolve_plate_slicing_config is the correct answer wherever a full config is wanted, but it
     // copies the printer, the process and every filament preset and then applies

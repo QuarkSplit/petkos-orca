@@ -591,16 +591,12 @@ bool PresetComboBox::add_ams_filaments(std::string selected, bool alias_name)
             int      item_id = Append(text, bmp.ConvertToImage(), &m_first_ams_filament + entry.first);
             SetFlag(GetCount() - 1, (int) FilamentAMSType::FROM_AMS);
             if (text == selected) {
-                DynamicPrintConfig *cfg    = &wxGetApp().preset_bundle->project_config;
-                if (cfg) {
-                    auto colors = static_cast<ConfigOptionStrings *>(cfg->option("filament_colour")->clone());
-                    if (m_filament_idx < colors->values.size()) {
-                        auto cur_color = colors->values[m_filament_idx];
-                        if (color == cur_color) {
-                            selected_in_ams = true;
-                        }
-                    }
-                }
+                //Reading a value needs no copy of the whole vector - the clone here was never
+                //deleted, so every AMS list rebuild leaked one ConfigOptionStrings.
+                const auto *colors = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+                if (colors != nullptr && m_filament_idx >= 0 && size_t(m_filament_idx) < colors->values.size() &&
+                    color == colors->values[m_filament_idx])
+                    selected_in_ams = true;
             }
             //validate_selection(id->value == selected); // can not select
         }
@@ -881,6 +877,13 @@ PlaterPresetComboBox::PlaterPresetComboBox(wxWindow *parent, Preset::Type preset
         clr_picker->SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
         clr_picker->SetToolTip(_L("Click to select filament color"));
         clr_picker->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
+            //Nothing below this line is meaningful for a row the pool does not have: every branch
+            //reads filament_presets[m_filament_idx] or a colour vector at the same index. The row
+            //is hidden in that state, so this is the backstop, not the mechanism.
+            if (!has_pool_spool()) {
+                BOOST_LOG_TRIVIAL(error) << "clr_picker: spool row " << m_filament_idx << " is not in the pool; ignoring the click";
+                return;
+            }
             // Check if it's an official filament
             auto fila_type = Preset::remove_suffix_modified(GetValue().ToUTF8().data());
             bool is_official = boost::algorithm::starts_with(fila_type, "Bambu");
@@ -1070,10 +1073,16 @@ bool PlaterPresetComboBox::switch_to_tab()
 
 void PlaterPresetComboBox::change_extruder_color()
 {
-    // get current color
-    DynamicPrintConfig* cfg = &wxGetApp().preset_bundle->project_config;
-    auto colors = static_cast<ConfigOptionStrings*>(cfg->option("filament_colour")->clone());
-    wxColour clr(colors->values[m_filament_idx]);
+    //The Linux "Change extruder color" menu item. Same swatch, same pool row, so it reads and
+    //writes through the same two functions as the swatch button rather than indexing the colour
+    //vector itself and writing a second, differently-shaped config patch.
+    const std::optional<PoolColour> colour = pool_colour();
+    if (!colour.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": spool row %1% has no entry in the pool, so there is no colour to edit") % m_filament_idx;
+        return;
+    }
+
+    wxColour clr(colour->colour);
     if (!clr.IsOk())
         clr = wxColour(0, 0, 0); // Don't set alfa to transparence
 
@@ -1084,16 +1093,7 @@ void PlaterPresetComboBox::change_extruder_color()
     wxColourDialog dialog(this, data);
     dialog.CenterOnParent();
     if (dialog.ShowModal() == wxID_OK)
-    {
-        colors->values[m_filament_idx] = dialog.GetColourData().GetColour().GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
-
-        DynamicPrintConfig cfg_new = *cfg;
-        cfg_new.set_key_value("filament_colour", colors);
-
-        wxGetApp().get_tab(Preset::TYPE_PRINTER)->load_config(cfg_new);
-        this->update();
-        wxGetApp().plater()->on_config_change(cfg_new);
-    }
+        sync_colour_config({dialog.GetColourData().GetColour().GetAsString(wxC2S_HTML_SYNTAX).ToStdString()}, false);
 }
 
 void PlaterPresetComboBox::show_add_menu()
@@ -1149,12 +1149,36 @@ wxString PlaterPresetComboBox::get_preset_name(const Preset& preset)
 
 // Only the compatible presets are shown.
 // If an incompatible preset is selected, it is shown as well.
+void PlaterPresetComboBox::show_pool_row(bool show)
+{
+    //A row is the whole group - swatch, combo, edit button - so it appears and disappears as one
+    //thing. Hiding only the combo would leave a numbered swatch floating next to nothing.
+    if (IsShown() != show)
+        Show(show);
+    if (clr_picker != nullptr && clr_picker->IsShown() != show)
+        clr_picker->Show(show);
+    if (edit_btn != nullptr && edit_btn->IsShown() != show)
+        edit_btn->Show(show);
+}
+
 void PlaterPresetComboBox::update()
 {
     if (m_type == Preset::TYPE_FILAMENT &&
-        (m_preset_bundle->printers.get_edited_preset().printer_technology() == ptSLA ||
-        m_preset_bundle->filament_presets.size() <= (size_t)m_filament_idx) )
+        m_preset_bundle->printers.get_edited_preset().printer_technology() == ptSLA)
         return;
+
+    if (m_type == Preset::TYPE_FILAMENT && !has_pool_spool()) {
+        //A row with no spool behind it must not be drawn. This used to return here and leave the
+        //row exactly as it was - stale label, stale swatch - so a pool of N presented N+1 rows,
+        //the last of which looked like a real library entry and crashed when its swatch was
+        //clicked. Sidebar::sync_filament_rows_to_pool keeps this from arising at all; reaching
+        //it means something set a row count the pool does not agree with, which is worth saying.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": spool row %1% has no entry in the pool of %2%; the row is hidden rather than drawn empty")
+               % m_filament_idx % m_preset_bundle->filament_presets.size();
+        show_pool_row(false);
+        return;
+    }
 
     // Otherwise fill in the list from scratch.
     this->Freeze();
@@ -1164,12 +1188,26 @@ void PlaterPresetComboBox::update()
     const Preset* selected_filament_preset = nullptr;
     if (m_type == Preset::TYPE_FILAMENT)
     {
-        std::vector<wxBitmap *> bitmaps = get_extruder_color_icons(true);
-        if (m_filament_idx < bitmaps.size()) {
-            clr_picker->SetBitmap(*bitmaps[m_filament_idx]);
-        } else {
-            return;
-        }
+        show_pool_row(true);
+        //The swatch is the POOL's colour for this row. get_extruder_color_icons() builds its
+        //icons from the CURRENT PLATE's slot colours, so using it here painted a pool row with
+        //a plate slot's colour whenever the two lists happened to be different - and returned a
+        //short list on a plate with fewer slots, which is what left a stale bitmap on screen.
+        const std::optional<PoolColour> colour = pool_colour();
+        const int icon_width  = 2 * wxGetApp().em_unit();
+        const int icon_height = 2 * wxGetApp().em_unit();
+        const std::string label = std::to_string(m_filament_idx + 1);
+        std::vector<std::string> pack;
+        for (const std::string &one : Slic3r::split_string(colour->multi, ' '))
+            if (!one.empty())
+                pack.push_back(one);
+        if (pack.empty())
+            pack.push_back(colour->colour.empty() ? std::string("#26A69A") : colour->colour);
+        wxBitmap *swatch = pack.size() == 1
+                               ? get_extruder_color_icon(pack.front(), label, icon_width, icon_height)
+                               : get_extruder_color_icon(pack, colour->colour_type == "0", label, icon_width, icon_height);
+        if (swatch != nullptr)
+            clr_picker->SetBitmap(*swatch);
 #ifdef __WXOSX__
         clr_picker->SetLabel(clr_picker->GetLabel()); // Let setBezelStyle: be called
         clr_picker->Refresh();
@@ -1566,49 +1604,77 @@ void PlaterPresetComboBox::msw_rescale()
 }
 
 
+std::optional<PlaterPresetComboBox::PoolColour> PlaterPresetComboBox::pool_colour() const
+{
+    const PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr || m_filament_idx < 0)
+        return std::nullopt;
+    const size_t idx = size_t(m_filament_idx);
+
+    //The pool's length is filament_presets.size(); the three colour vectors are held to it by
+    //PresetBundle::set_num_filaments / update_num_filaments. Asking all four means this returns
+    //nullopt for a row the pool does not have rather than reading past the end of one vector
+    //because another happened to be longer.
+    const DynamicPrintConfig &cfg = bundle->project_config;
+    const auto *head = cfg.option<ConfigOptionStrings>("filament_colour");
+    const auto *pack = cfg.option<ConfigOptionStrings>("filament_multi_colour");
+    const auto *type = cfg.option<ConfigOptionStrings>("filament_colour_type");
+    if (idx >= bundle->filament_presets.size() || head == nullptr || idx >= head->values.size())
+        return std::nullopt;
+
+    PoolColour colour;
+    colour.colour      = head->values[idx];
+    colour.multi       = pack != nullptr && idx < pack->values.size() && !pack->values[idx].empty()
+                             ? pack->values[idx] : colour.colour;
+    colour.colour_type = type != nullptr && idx < type->values.size() && !type->values[idx].empty()
+                             ? type->values[idx] : std::string("1");
+    return colour;
+}
+
+bool PlaterPresetComboBox::has_pool_spool() const
+{
+    return pool_colour().has_value();
+}
+
 FilamentColor PlaterPresetComboBox::get_cur_color_info()
 {
-    //filament colours are a property of the current plate now, so unlike the project
-    //config they used to come from, they need a plater that exists and is past its own
-    //construction. Filament combos are built from inside it.
-    Slic3r::GUI::Plater *plater = Slic3r::GUI::wxGetApp().plater();
-    if (plater == nullptr || !plater->is_initialized())
+    //This row is a POOL row, so its colour is the pool's. It used to come from
+    //Plater::get_filament_colors_render_info(), which resolves the CURRENT PLATE's slot colours -
+    //a different vector, of a different length, holding a different thing. A pool index read
+    //against a plate's slots showed one spool's colour on another spool's row, and on a plate
+    //with fewer slots than the pool it produced a blank swatch that looked like a real library
+    //entry: the phantom colour that could not be edited. The write path was never confused - it
+    //always wrote project_config - so read and write of one swatch disagreed by construction.
+    const std::optional<PoolColour> colour = pool_colour();
+    if (!colour.has_value())
         return FilamentColor();
 
-    std::vector<std::string> filaments_multi_color = plater->get_filament_colors_render_info();
-    std::vector<std::string> filament_color_type = plater->get_filament_color_render_type();
-
-    if (m_filament_idx < 0 || m_filament_idx >= static_cast<int>(filaments_multi_color.size())) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": m_filament_idx %1% out of range %2%") % m_filament_idx % filaments_multi_color.size();
-        return FilamentColor();
-    }
-
-    if (m_filament_idx >= static_cast<int>(filament_color_type.size())) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": m_filament_idx %1% out of range for color_type %2%") % m_filament_idx % filament_color_type.size();
-        return FilamentColor();
-    }
-    std::string filament_color_info = filaments_multi_color[m_filament_idx];
-    std::vector<std::string> colors;
-    colors = Slic3r::split_string(filament_color_info, ' ');
     FilamentColor fila_color;
-    for (const std::string& color_str : colors) {
+    for (const std::string &color_str : Slic3r::split_string(colour->multi, ' ')) {
         if (!color_str.empty()) {
             wxColour color(color_str);
-            if (color.IsOk()) {
+            if (color.IsOk())
                 fila_color.m_colors.insert(color);
-            }
         }
     }
-
-    fila_color.EndSet(filament_color_type[m_filament_idx] == "0" ? 0 : 1);
+    fila_color.EndSet(colour->colour_type == "0" ? 0 : 1);
     return fila_color;
 }
 
 void PlaterPresetComboBox::show_default_color_picker()
 {
-    DynamicPrintConfig* cfg = &wxGetApp().preset_bundle->project_config;
-    auto colors = static_cast<ConfigOptionStrings*>(cfg->option("filament_colour")->clone());
-    wxColour current_clr(colors->values[m_filament_idx]);
+    //The access violation in crash_Thu_Sep_10_17_14_07 was here: colors->values[m_filament_idx]
+    //on a vector that had one fewer entry than there were rows on screen, so the wxString was
+    //built from a garbage std::string. The out-of-range row no longer exists - update() hides
+    //any row the pool does not back - and this reads through the one accessor, so the index and
+    //the vector cannot come apart again.
+    const std::optional<PoolColour> colour = pool_colour();
+    if (!colour.has_value()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": spool row %1% has no entry in the pool, so there is no colour to edit") % m_filament_idx;
+        return;
+    }
+
+    wxColour current_clr(colour->colour);
     if (!current_clr.IsOk())
         current_clr = wxColour(0, 0, 0); // Don't set alfa to transparence
 
@@ -1624,6 +1690,23 @@ void PlaterPresetComboBox::show_default_color_picker()
 
 void PlaterPresetComboBox::sync_colour_config(const std::vector<std::string> &clrs, bool is_gradient)
 {
+    if (clrs.empty()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": no colour was supplied, nothing written";
+        return;
+    }
+    //This used to resize the three vectors up to m_filament_idx + 1 before writing. A write path
+    //that has to grow the data structure it writes into is a write path repairing damage done
+    //somewhere else, and it hid the divergence that produced the phantom row: the pool shrank,
+    //the sidebar kept its row, and the first colour edit on that row silently invented a pool
+    //entry for it. The pool's length is set by PresetBundle::set_num_filaments /
+    //update_num_filaments and by nothing else, so an index past the end is a bug to report.
+    if (!has_pool_spool()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": spool row %1% is not in the pool of %2%, colour not written")
+               % m_filament_idx % wxGetApp().preset_bundle->filament_presets.size();
+        return;
+    }
+
     DynamicPrintConfig *cfg = &wxGetApp().preset_bundle->project_config;
 
     // Clone the string vector and patch the value at current extruder index.
@@ -1631,9 +1714,21 @@ void PlaterPresetComboBox::sync_colour_config(const std::vector<std::string> &cl
     auto colour_type_opt = static_cast<ConfigOptionStrings *>(cfg->option("filament_colour_type")->clone());
     auto colour_opt = static_cast<ConfigOptionStrings *>(cfg->option("filament_colour")->clone());
 
-    if (m_filament_idx >= multi_colour_opt->values.size()) multi_colour_opt->values.resize(m_filament_idx + 1);
-    if (m_filament_idx >= colour_type_opt->values.size()) colour_type_opt->values.resize(m_filament_idx + 1);
-    if (m_filament_idx >= colour_opt->values.size()) colour_opt->values.resize(m_filament_idx + 1);
+    //All three are the same length as the pool by contract - PresetBundle::set_num_filaments and
+    //update_num_filaments are the only things that set it. A short one here is a divergence
+    //somewhere else, so it is named in the log rather than repaired in silence.
+    const size_t pool_size = wxGetApp().preset_bundle->filament_presets.size();
+    const auto hold_to_pool = [&](const char *key, std::vector<std::string> &values, const char *fill) {
+        if (values.size() >= pool_size)
+            return;
+        BOOST_LOG_TRIVIAL(error) << "sync_colour_config: project_config '" << key << "' holds "
+                                 << values.size() << " of the pool's " << pool_size
+                                 << " spools; something changed the pool without it";
+        values.resize(pool_size, fill);
+    };
+    hold_to_pool("filament_multi_colour", multi_colour_opt->values, "");
+    hold_to_pool("filament_colour_type", colour_type_opt->values, "1");
+    hold_to_pool("filament_colour", colour_opt->values, "");
 
     std::string clr_str = "";
     for(auto &clr : clrs) {

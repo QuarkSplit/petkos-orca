@@ -428,9 +428,13 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, int plate_index, cons
             m_bed_type_choice->Disable();
     }
 
-    // Printer this plate prints on. Empty selection means follow the project printer.
+    // The printer this plate prints on. There is no "same as project printer" entry: the
+    // project printer was deleted as a state, and an empty plate printer is not inheritance,
+    // it is an unresolved plate. Offering inheritance in a picker is how a plate silently
+    // lost its machine - OK wrote the empty string straight through set_plate_printer.
+    // An explicit unresolved row is inserted by sync_printer_preset, and only for a plate
+    // that already arrived without a machine.
     m_printer_choice = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(FromDIP(240), -1), 0, NULL, wxCB_READONLY);
-    m_printer_choice->AppendString(_L("Same as Project Printer"));
     m_cur_combox_printers.clear();
     {
         PresetBundle* bundle = wxGetApp().preset_bundle;
@@ -445,7 +449,9 @@ PlateSettingsDialog::PlateSettingsDialog(wxWindow* parent, int plate_index, cons
             }
         }
     }
-    m_printer_choice->SetSelection(0);
+    //Left unselected until sync_printer_preset says what this plate actually names. A
+    //default selection here would be a machine nobody chose, and OK would write it.
+    m_printer_choice->SetSelection(wxNOT_FOUND);
 
     wxStaticText* m_printer_txt = new wxStaticText(this, wxID_ANY, _L("Printer"));
     m_printer_txt->SetFont(Label::Body_14);
@@ -679,36 +685,53 @@ void PlateSettingsDialog::sync_printer_preset(const std::string& preset_name)
     if (m_printer_choice == nullptr)
         return;
 
-    //entry 0 is "same as project printer", so the preset list is offset by one
+    m_incoming_printer = preset_name;
+
+    //A plate with no machine is a plate in a broken state, and the picker says so in those
+    //words. The row exists only for such a plate, so a plate that HAS a machine has no way
+    //to be given none from here.
+    if (preset_name.empty()) {
+        if (!m_unresolved_entry) {
+            m_printer_choice->Insert(_L("No printer - this plate is unresolved"), 0);
+            m_unresolved_entry = true;
+        }
+        m_printer_choice->SetSelection(0);
+        return;
+    }
+    if (m_unresolved_entry) {
+        m_printer_choice->DeleteOneItem(0);
+        m_unresolved_entry = false;
+    }
+
     for (size_t i = 0; i < m_cur_combox_printers.size(); ++i) {
         if (m_cur_combox_printers[i] == preset_name) {
-            m_printer_choice->SetSelection((int)i + 1);
+            m_printer_choice->SetSelection((int) i);
             return;
         }
     }
 
-    //An assignment naming a printer this installation does not have would otherwise
-    //show as "same as project printer" and get silently discarded on OK. Show it.
-    if (!preset_name.empty()) {
-        m_printer_choice->AppendString(from_u8(preset_name) + " " + _L("(not installed)"));
-        m_cur_combox_printers.emplace_back(preset_name);
-        m_printer_choice->SetSelection((int)m_cur_combox_printers.size());
-        return;
-    }
-
-    m_printer_choice->SetSelection(0);
+    //A plate may legitimately name a machine this installation does not have - the project
+    //may be headed somewhere that does. Offering it back verbatim is what stops opening the
+    //picker from being the thing that discards it.
+    m_printer_choice->AppendString(from_u8(preset_name) + " " + _L("(not installed)"));
+    m_cur_combox_printers.emplace_back(preset_name);
+    m_printer_choice->SetSelection((int) m_cur_combox_printers.size() - 1);
 }
 
 std::string PlateSettingsDialog::get_printer_preset_choice() const
 {
     if (m_printer_choice == nullptr)
-        return std::string();
+        return m_incoming_printer;
 
-    const int sel = m_printer_choice->GetSelection();
-    if (sel <= 0 || sel > (int)m_cur_combox_printers.size())
-        return std::string();
+    const int offset = m_unresolved_entry ? 1 : 0;
+    const int index  = m_printer_choice->GetSelection() - offset;
+    if (index < 0 || index >= (int) m_cur_combox_printers.size())
+        //Nothing was chosen, or the unresolved row is still selected. Either way the answer
+        //is what the plate already said - never the empty string, which would be this dialog
+        //unassigning a machine the user came here to look at.
+        return m_incoming_printer;
 
-    return m_cur_combox_printers[sel - 1];
+    return m_cur_combox_printers[index];
 }
 
 wxString PlateSettingsDialog::get_plate_name() const {

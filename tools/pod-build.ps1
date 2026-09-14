@@ -4,7 +4,7 @@ param(
     [Parameter(Position=0)] [string] $Target = 'OrcaSlicer',
     [string] $Config = 'Release',
     [string] $BuildDir = '',
-    [ValidateRange(1,4)] [int] $Jobs = 2,
+    [ValidateRange(0,64)] [int] $Jobs = 0,
     [switch] $Quiet,
     [switch] $DryRun
 )

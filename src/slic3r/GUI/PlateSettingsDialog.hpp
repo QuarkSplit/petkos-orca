@@ -172,10 +172,16 @@ protected:
 protected:
     ComboBox* m_bed_type_choice { nullptr };
     std::vector<BedType> m_cur_combox_bed_types;
-    //printer this plate is pinned to; entry 0 is "follow the project printer" and maps
-    //to an empty preset name, so m_cur_combox_printers is offset by one from the combo
+    //The printer this plate prints on. There is no "follow the project printer" entry,
+    //because there is no project printer: a plate names its own machine or it is
+    //unresolved. An UNRESOLVED entry is inserted at index 0 only when the plate arrives
+    //without one, so m_cur_combox_printers is offset by one exactly when it is present.
     ComboBox* m_printer_choice { nullptr };
     std::vector<std::string> m_cur_combox_printers;
+    bool        m_unresolved_entry { false };
+    //What the plate named when the dialog opened. OK falls back to this rather than to an
+    //empty string, so closing this dialog can never be what unassigns a plate's machine.
+    std::string m_incoming_printer;
     ComboBox* m_print_seq_choice { nullptr };
     ComboBox* m_first_layer_print_seq_choice { nullptr };
     ComboBox* m_spiral_mode_choice { nullptr };

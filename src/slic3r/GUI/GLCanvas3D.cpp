@@ -3018,30 +3018,37 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
     // BBS
     if (printer_technology == ptFFF && m_config->has("filament_colour") && (m_canvas_type != ECanvasType::CanvasAssembleView)) {
         // Should the wipe tower be visualized ?
-        unsigned int filaments_count = (unsigned int)dynamic_cast<const ConfigOptionStrings*>(m_config->option("filament_colour"))->values.size();
-
-        bool wt = dynamic_cast<const ConfigOptionBool*>(m_config->option("enable_prime_tower"))->value;
-        auto co = dynamic_cast<const ConfigOptionEnum<PrintSequence>*>(m_config->option<ConfigOptionEnum<PrintSequence>>("print_sequence"));
-
-        if (wt && !wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
+        //
+        // Whether a plate gets a prime tower is a PROCESS decision and every plate has its own
+        // process, so the answer is per plate. It used to be read once from m_config - the
+        // editing cursor's config, i.e. whichever preset the sidebar happens to be showing -
+        // which is the singular engine this fork exists to delete: a plate whose own process
+        // enables the tower drew none because the cursor was parked on a plate whose process
+        // does not, and vice versa. The same went for the filament count and the print
+        // sequence. All three now come from the plate's own resolved PRINTING config below.
+        if (!wxGetApp().plater()->only_gcode_mode() && !wxGetApp().plater()->is_gcode_3mf()) {
             for (int plate_id = 0; plate_id < n_plates; plate_id++) {
                 // If print ByObject and there is only one object in the plate, the wipe tower is allowed to be generated.
                 PartPlate* part_plate = ppl.get_plate(plate_id);
 
-                PresetBundle &bundle = *wxGetApp().preset_bundle;
-                const std::vector<int> filament_maps = part_plate->get_real_filament_maps(bundle.project_config);
-                const std::vector<int> volume_maps   = part_plate->get_real_filament_volume_maps(bundle.project_config);
+                // The preview draws the print that is going to happen, so it resolves the
+                // PRINTING context: slots holding one and the same spool are one filament here
+                // exactly as they are in the slicing feed (Plater::priv::apply_plate_config).
+                // Resolving the raw slot list drew a prime tower on an all-black plate whose
+                // parts merely sat in two black slots.
                 ResolvedPlateSlicingConfig resolved;
                 std::string context_error;
-                if (!bundle.resolve_plate_slicing_config(part_plate->get_slicing_context(), filament_maps, volume_maps,
-                                                         resolved, context_error)) {
+                std::vector<int> used_slots;
+                if (!wxGetApp().plater()->resolve_plate_printing_config(part_plate, resolved, context_error, &used_slots)) {
                     part_plate->update_apply_result_invalid(true);
                     BOOST_LOG_TRIVIAL(error) << __FUNCTION__
                         << boost::format(": plate %1% context is unresolved: %2%") % (plate_id + 1) % context_error;
                     continue;
                 }
-                resolved.config.apply(*part_plate->config(), true);
                 const DynamicPrintConfig &plate_cfg = resolved.config;
+                const auto *prime_tower_opt = plate_cfg.option<ConfigOptionBool>("enable_prime_tower");
+                if (prime_tower_opt == nullptr || !prime_tower_opt->value)
+                    continue;
                 const auto *timelapse_type = plate_cfg.option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
                 const auto *wrapping_opt = plate_cfg.option<ConfigOptionBool>("enable_wrapping_detection");
                 const bool enable_wrapping = wrapping_opt != nullptr && wrapping_opt->value;
@@ -3068,7 +3075,8 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
                 Vec3d plate_origin = ppl.get_plate(plate_id)->get_origin();
 
                 const Print* current_print = part_plate->fff_print();
-                if (!need_wipe_tower && part_plate->get_extruders(true).size() < 2) continue;
+                // used_slots and plate_filament_count are the same fact after the single-spool
+                // cut - the width the plate prints at - so the test above is the whole of it.
                 if (part_plate->get_objects_on_this_plate().empty()) continue;
 
                 float brim_width = current_print->wipe_tower_data(plate_filament_count).brim_width;
@@ -10940,12 +10948,27 @@ bool GLCanvas3D::is_flushing_matrix_error() {
     if (!Sidebar::should_show_SEMM_buttons())
         return false;
 
+    // A flush happens between two DIFFERENT filaments that are both printed, so only those
+    // cells of the matrix can be wrong. Resolving the plate as it prints collapses slots that
+    // hold the same spool (an all-black plate is one filament, whatever slots its parts sit
+    // in) and used_slots names the rows that are printed at all; a zero anywhere else is a
+    // value for a change of filament that never happens, and blocking the slice on it was
+    // this warning's whole bug.
     ResolvedPlateSlicingConfig resolved;
     std::string error;
-    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
-        return true;
+    std::vector<int> used_slots;
+    PartPlate *cur_plate = wxGetApp().plater()->get_partplate_list().get_curr_plate();
+    if (!wxGetApp().plater()->resolve_plate_printing_config(cur_plate, resolved, error, &used_slots)) {
+        // An unresolved plate cannot be checked, so this says nothing rather than guessing -
+        // the same rule its neighbours in _update_warnings follow. It used to report a
+        // flushing-volume error, which is a second and WRONGER message on top of the real
+        // one: apply_plate_config names the unresolved context and the reason for it, and
+        // this would send the user to the flushing dialog to fix something else entirely.
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": plate unresolved, no flushing verdict: " << error;
+        return false;
     }
+    if (used_slots.size() < 2)
+        return false;
     const auto *matrix_option = resolved.config.option<ConfigOptionFloats>("flush_volumes_matrix");
     const auto *multiplier_option = resolved.config.option<ConfigOptionFloats>("flush_multiplier");
     if (matrix_option == nullptr || multiplier_option == nullptr || multiplier_option->values.empty())
@@ -10957,15 +10980,24 @@ bool GLCanvas3D::is_flushing_matrix_error() {
         if (multiplier == 0) return true;
     }
 
-    int  matrix_len = config_matrix.size() / config_multiplier.size();
-    int  row_len    = std::sqrt(matrix_len);
-    for (int i = 0; i < config_matrix.size(); i++)
-    {
-        int relative_id = i % matrix_len;
-        int row_id      = relative_id / row_len;
-        int col_id      = relative_id % row_len;
-        if (row_id != col_id && config_matrix[i] == 0) return true;
-    }
+    // KNOWN RESIDUAL: flush_volumes_matrix is a PROJECT option (s_project_options in
+    // PresetBundle.cpp), so its rows are the project pool's slots while used_slots are this
+    // plate's. The two are the same numbering only while the plate's slot list mirrors the
+    // pool's, which per-plate machines no longer guarantee. The bounds test below makes the
+    // mismatch fail SAFE - a row the matrix does not have is skipped rather than read - so the
+    // worst case is a missed warning, never a blocked slice or an out-of-range read. Closing it
+    // properly means a per-plate flush matrix, which is a storage change and not this one.
+    const int matrix_len = int(config_matrix.size() / config_multiplier.size());
+    const int row_len    = int(std::sqrt(matrix_len));
+    for (size_t extruder = 0; extruder < config_multiplier.size(); ++extruder)
+        for (int from : used_slots)
+            for (int to : used_slots) {
+                if (from == to) continue;
+                const int row = from - 1, col = to - 1;
+                if (row < 0 || col < 0 || row >= row_len || col >= row_len) continue;
+                const size_t cell = extruder * size_t(matrix_len) + size_t(row * row_len + col);
+                if (cell < config_matrix.size() && config_matrix[cell] == 0) return true;
+            }
     return false;
 }
 

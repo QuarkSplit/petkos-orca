@@ -195,13 +195,37 @@ The rules, each load-bearing:
   engine reads `filament_colour.size()` as THE filament count in Print, ToolOrdering,
   MultiMaterialSegmentation and GCode; after composition that number is the plate's, never the
   project's.
-- **A single-colour plate slices as a single-filament print.** When a plate's objects reference
-  exactly one slot (custom G-code tool changes included), the slicing feed cuts the context down
-  to that slot, so every filament-indexed array is born single-entry: no `T0`, no multi-entry
+- **A single-spool plate slices as a single-filament print.** A slot is a bay; a spool is what is
+  loaded in it, and two slots holding the same spool (same preset, colour and appearance) are one
+  filament to the print. When every slot a plate's objects reference (custom G-code tool changes
+  included) holds the same spool, the context is cut down to the lowest such slot before
+  composition, so every filament-indexed array is born single-entry: no `T0`, no multi-entry
   `filament_type`, `initial_tool` is 0 and the start G-code's `[0]` reads are the actual material.
-  Guard: per-triangle paint states are stored slot numbers and never clipped, so a plate painted
-  above slot 1 keeps its full width. `GCodeWriter::toolchange`'s spurious raw-config-size gate is
-  used-count gated for the same reason.
+  The rule is `PlateSlicingContext::single_spool_slot`, applied by
+  `PartPlate::get_printing_context`, and **every consumer that asks how many filaments a plate
+  prints with asks there**: the slicing feed (`apply_plate_config`), the prime-tower preview and
+  the flushing-volume check (`Plater::resolve_plate_printing_config`), and the CLI. Before that,
+  only the feed applied the cut and only for "exactly one slot", so an all-black plate whose parts
+  sat in two black slots got a prime tower and a "partial flushing volume is 0" block on a change
+  of filament that was never going to happen. The flushing check now also inspects only the
+  matrix cells between slots that are actually printed, and `compose_plate_slicing_config` resizes
+  `flush_volumes_matrix` to the plate's width - it is a project option sized to the POOL, and every
+  consumer slices it by the PRINT's filament count, so a narrow plate read the wrong cells and a
+  wide one read past the end of the vector. `GCodeWriter::toolchange`'s spurious raw-config-size
+  gate is used-count gated for the same reason.
+
+  **Paint needs no guard here, and the one it used to have was the bug.** `ModelVolume::get_extruders`
+  merges `mmuseg_extruders` with the volume's own slot, so the used-slot list already names every
+  slot the painting references: paint in a slot holding a different spool blocks the cut like any
+  other reference, and paint in a slot holding the same spool changes nothing the nozzle lays down.
+  The old veto - keep the full width whenever the plate is painted at all - was defending against
+  painted states indexing `MultiMaterialSegmentation`'s arrays out of range, and the engine never
+  reaches that code at one filament: `PrintObject::slice_volumes` skips `apply_mm_segmentation`
+  unless `filament_diameter.size() > 1`, and `PrintApply`'s `painting_extruders` stays empty unless
+  `num_extruders > 1`. So the veto protected nothing and cost the defect it was reported as - an
+  object painted monotone in one colour refused to slice, because "painted at all" was being passed
+  where "painted in a second spool" was meant. Above one filament, `PrintApply` clamps painted
+  states to the printing width, which is where the real out-of-range reference always was.
 - **Assignment is translation.** The plate-board slot menu lists the pool first, colour swatch and
   all. Choosing a spool re-expresses it for the plate's printer via
   `translate_filament_to_printer` when it does not run there directly, names the refusal when the
@@ -268,6 +292,89 @@ renderer version. Source changes are checked before publishing. Missing cache im
 regenerated; an image decode failure requests one forced retry. Explicit refresh retries a
 previous failure. Unreadable or unsupported geometry reports its reason instead of displaying
 the stock whale. JPEG-only embedded pictures currently use the geometry fallback.
+
+### Materials, colour and process settings (14 September)
+
+The heaviest day-to-day burdens were named as material/colour selection and process-settings
+handling. Every fault below was traced in code; where a comment claimed a reason, the reason was
+checked rather than believed, and two of them turned out to be wrong.
+
+**A pool row is not a plate slot, and almost every material bug was that confusion.** The sidebar
+list is the POOL - what spools exist, printer-independent. A plate's slots are the plate's own.
+`PlaterPresetComboBox::m_filament_idx` is a POOL index; `get_extruder_color_icons()` and
+`Plater::get_filament_colors_render_info()` are PLATE-scoped. Reading one with the other drew a
+blank uneditable swatch and then crashed on an unchecked `values[m_filament_idx]`. The pool row
+count now derives from `PresetBundle::filament_presets` through one function
+(`Sidebar::sync_filament_rows_to_pool`) and nothing else sets it; a row with no spool behind it is
+hidden and logged rather than drawn stale.
+
+**A pool operation is never gated on the plate's printer.** Adding and deleting a spool were gated
+on the current plate's printer being Bambu or multi-material, so on a Creality, Prusa or Raise3D
+you could not add a spool at all. Machine-shaped questions (flushing volumes, per-slot menus, how
+many slots a plate may have) ask `Sidebar::plate_printer_spool_capacity()`; pool questions ask the
+pool.
+
+**Paint needs no veto, and the veto was the bug.** See the single-spool rule above.
+
+**A plate is a copyable unit, not a set of preset names.** `PlateSlicingContext` is half a plate's
+identity; the values a person chose live in the plate's own override config, and `create_plate`
+built an empty one. So a new plate inherited the names and silently lost every deviation.
+`PartPlate::adopt_chosen_settings_from` and `PartPlateList::create_plate_like` are the one
+definition, used by add-plate, duplicate-plate and the calibration pattern. App-computed keys
+(`filament_map`, `nozzle_volume_type`, and the rest of `is_plate_app_computed_setting`) are
+re-derived rather than copied: they are facts about that plate's objects and the machine in front
+of it.
+
+**`flush_volumes_matrix` is filament-indexed and was not subject to the invariant.** A project
+option sized to the pool, sliced by every consumer using the PRINT's filament count: a narrow plate
+read the wrong cells, a wide one read past the end of the vector. `compose_plate_slicing_config`
+now resizes it to the plate's width where the colour vectors are resized. The values cannot be
+mapped - a cell means "from the spool in slot i to the spool in slot j" - so overlapping cells keep
+the project's number and new pairs take the largest off-diagonal it asked for anywhere. A per-plate
+matrix is the real answer and is not built.
+
+**There is no user preset, and the dialogs that assumed one are gone.** A process value is a
+deviation from the vendor default for a printer+filament, and it lives on the plate. So:
+Transfer/Discard/Save is deleted - `Tab::may_discard_current_dirty_preset` parks the edits and
+proceeds, which is what `park_dirty_edits`' own header already described; `save_plate_process_as_preset`
+is deleted; the Keep/Discard/Save three-way always keeps; `remember_printer_config` is deleted,
+along with `PresetBundle::update_selections`, which had no other caller. The one question left is
+at quit, because a preset-local park is in memory by design and genuinely dies with the process.
+
+Two evaluation-order faults were fixed with it: `Tab::select_preset` evaluated
+`may_discard_current_dirty_preset(...)` before `!force_select`, so the modal was raised, answered,
+and the answer discarded; and a filament cannot be a project layer for a structural reason recorded
+at `Tab::park_dirty_edits` - a filament option is one entry in a preset and one entry per slot in a
+composed config, and layering the first over the second rewrites how many filaments a project has.
+
+**Opening a project never asks.** Every modal is gone from `Plater::priv::load_files`, replaced by
+decisions plus notifications, with one named exemption (`StepMeshDialog`, which opens only when the
+user has set the preference asking to be asked, and is unreachable from a 3MF). A foreign project
+auto-retargets each plate to an owned machine - bed fit, then fewest keys dropped in a dry
+`carry_process_intent`, then a machine already used by this project - and reports afterwards.
+`tools/pod-lint.py` enforces the rule.
+
+**The import crash was one missing line.** `Plater::is_loading_project()` is checked by every
+plate-write guard in the tree and was set only by `Plater::load_project`, so any other route into
+`load_files` ran the whole load with those guards standing open. A printer switch accepted there
+reaches a half-written plate list with an undo snapshot still open and the backup thread
+serialising the same model. `load_files` now holds the flag for its whole duration, and
+`Plater::set_plate_printer` refuses and logs while it is set.
+
+**What survives a change of machine is now a table, not an accident.**
+`src/libslic3r/ProcessOptionClass.hpp`. Intent is the default and Machine is enumerated key by key,
+so the failure mode is carrying a value that did not need carrying - visible, and counted in the
+notification - rather than silently discarding a decision. Machine-class keys are skipped only when
+the source preset has no parent in this installation, which is the normal case for a download and
+the case where "carry the diff" had nothing to diff against.
+
+**A preset name that came from a project cannot outlive it.** A 3MF's presets load decorated
+`"<preset>(<file>.3mf)"` and are deleted when the project closes. `export_selections` persisted
+such names whenever `find_preset` returned nullptr - the one state where persisting is guaranteed
+wrong - and `translate_filament_to_printer` refused any name it could not find, so a printer change
+could not repair exactly the plates that needed repairing. Both fixed;
+`Preset::has_project_decoration` is the one definition of the question, and `AppConfig::load` drops
+persisted printer records that name one.
 
 **The hard cases, named rather than deferred vaguely.** These are genuine work, not edge cases, and
 none of them may be allowed to trip project import or a printer swap - which is the base, and the

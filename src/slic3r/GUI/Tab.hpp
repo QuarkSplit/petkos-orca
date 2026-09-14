@@ -374,7 +374,10 @@ public:
     //bed, the bounds re-check, the re-resolution of dependents. And it is idempotent against
     //follow_plate_presets, which moves the cursor the other way and does nothing once the plate
     //already agrees - which, after this, it does.
-    bool write_selection_to_current_plate();
+    //previous_pool is PresetBundle::filament_presets as it stood before this selection. The
+    //filament case needs it to know WHICH spool was replaced, which is what decides whether a
+    //plate slot was following the pool or had been deliberately assigned something else.
+    bool write_selection_to_current_plate(const std::vector<std::string> &previous_pool);
 
     //PetkosOrca: THE RULE IS "a preset selection writes the plate only when it is the user choosing
     //what THIS PLATE uses". Three things wear the costume of a selection without being that choice,
@@ -394,6 +397,15 @@ public:
     };
     static bool plate_write_suspended() { return s_plate_write_suspend_depth > 0; }
 
+    //Make a selection safe to proceed with. The name is upstream's and now describes the opposite
+    //of what it does: nothing is discarded and nothing is asked. The unsaved edits are PARKED -
+    //project layer for a process, m_parked_preset_edits for a printer or a material - and the
+    //selection goes ahead. Returns false only if a caller must abandon the selection, which after
+    //the parking rewrite it never does.
+    //
+    //Call it only where a selection genuinely may be refused, and only AFTER every cheap predicate
+    //that could decide the outcome on its own. It used to sit in front of force_select, so a
+    //forced selection raised a modal and then overruled the answer.
 	bool		may_discard_current_dirty_preset(PresetCollection* presets = nullptr, const std::string& new_printer_name = "", bool no_transfer = false, bool no_transfer_variant = false);
 
     //Move this tab's unsaved edits out of the preset, so a selection that is not the user's choice of
@@ -416,6 +428,11 @@ public:
     //A project override shows on the page as a modified option because that is what it is - the
     //project overriding the preset - but it is stored, so it can neither be lost nor usefully be
     //asked about, and both answers a save/discard dialog offers for it are wrong.
+    //A collection whose type is PRINT can be compared against the project layer, because a process
+    //option has the same shape in a preset and in a composed config. A FILAMENT option does not:
+    //one entry in the preset, one entry PER SLOT once composed, so layering the first over the
+    //second would rewrite how many filaments the project has. That is why filament deviations park
+    //against their preset instead of joining the project layer, and why this returns true for them.
     bool        dirty_beyond_project(const PresetCollection &presets) const;
 
     virtual void    clear_pages();

@@ -8670,18 +8670,23 @@ std::vector<std::pair<unsigned int, std::string>> GUI_App::get_selected_presets(
     return ret;
 }
 
-// To notify the user whether he is aware that some preset changes will be lost,
-// UnsavedChangesDialog: "Discard / Save / Cancel"
-// This is called when:
-// - Close Application & Current project isn't saved
-// - Load Project      & Current project isn't saved
-// - Undo / Redo with change of print technologie
-// - Loading snapshot
-// - Loading config_file/bundle
-// UnsavedChangesDialog: "Don't save / Save / Cancel"
-// This is called when:
-// - Exporting config_bundle
-// - Taking snapshot
+// THE ONE PRESET QUESTION THAT SURVIVES, and it is worth saying why it is not ceremony.
+//
+// Everywhere else, being asked to name a preset was the price of keeping a value: leave this
+// preset and your value is gone, so stop and save it. That is gone - a value lives on the plate,
+// in the project layer, or parked against the machine it was made for (Tab::park_dirty_edits),
+// and every one of those stores survives the thing that used to destroy it.
+//
+// A preset-local park does NOT survive the process. It is in memory by design, because a
+// printer's tuning belongs to that printer and waits for it rather than following the editing
+// cursor around. So at the end of a session those edits are genuinely about to be destroyed, the
+// destruction genuinely cannot be undone, and this dialog is the only thing that can offer to
+// keep them. That is the whole test for whether a question may exist.
+//
+// What was removed is the CALL SITE on the project-open path (Plater::load_project), where this
+// fired from inside close_with_confirm's callback, between two projects, about presets - and
+// where answering Save ran save_changes_for_preset and a full preset reload against a state that
+// belonged to neither project.
 bool GUI_App::check_and_save_current_preset_changes(const wxString& caption, const wxString& header, bool remember_choice/* = true*/, bool dont_save_insted_of_discard/* = false*/)
 {
     if (has_current_preset_changes()) {
@@ -8700,17 +8705,12 @@ bool GUI_App::check_and_save_current_preset_changes(const wxString& caption, con
             //BBS: add project embedded preset relate logic
             for (const UnsavedChangesDialog::PresetData& nt : dlg.get_names_and_types())
                 preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type), nt.save_to_project);
-            //for (const std::pair<std::string, Preset::Type>& nt : dlg.get_names_and_types())
-            //    preset_bundle->save_changes_for_preset(nt.first, nt.second, dlg.get_unselected_options(nt.second));
 
             load_current_presets(false);
 
             // if we saved changes to the new presets, we should to
             // synchronize config.ini with the current selections.
             preset_bundle->export_selections(*app_config);
-
-            //MessageDialog(nullptr, _L_PLURAL("Modifications to the preset have been saved",
-            //                                 "Modifications to the presets have been saved", dlg.get_names_and_types().size())).ShowModal();
         }
     }
 
@@ -8727,92 +8727,81 @@ void GUI_App::apply_keeped_preset_modifications()
     load_current_presets(false);
 }
 
-// This is called when creating new project or load another project
-// OR close ConfigWizard
-// to ask the user what should we do with unsaved changes for presets.
-// New Project          => Current project is saved    => UnsavedChangesDialog: "Keep / Discard / Cancel"
-//                      => Current project isn't saved => UnsavedChangesDialog: "Keep / Discard / Save / Cancel"
-// Close ConfigWizard   => Current project is saved    => UnsavedChangesDialog: "Keep / Discard / Save / Cancel"
-// Note: no_nullptr postponed_apply_of_keeped_changes indicates that thie function is called after ConfigWizard is closed
-bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, const wxString& header, int action_buttons, bool* postponed_apply_of_keeped_changes/* = nullptr*/)
+// "KEEP / DISCARD / SAVE" WAS A QUESTION ABOUT A STORE THAT NO LONGER EXISTS.
+//
+// It was raised before a new project, before the config wizard rebuilt the preset bundle, and on
+// logout: "some presets are modified - keep them for the new project, discard them, or save them
+// as new presets?" Three answers, and the only reason there were three is that a preset was the
+// one place a changed value could live. Discard meant lose it; Save meant name a file for it;
+// Keep meant carry it by hand.
+//
+// The answer is now always KEEP, and it is not a compromise - it is the only one that is true of
+// where these values actually live:
+//
+//  - a PROCESS edit is already in the project layer (Tab::park_dirty_edits), which every plate
+//    composes. Offering to discard it offers to throw away a stored value, and offering to save
+//    it as a preset offers to duplicate it.
+//  - a PRINTER or FILAMENT edit is a fact about that machine or that material, parked against
+//    the preset it was made on. It is not the new project's business either way, and it is not
+//    lost by the new project starting.
+//
+// So there is no question left, and the two-line answer is: keep everything, and let the caller
+// re-apply it after whatever reload it is about to do. The mechanics are exactly the old Keep
+// branch with nothing unselected - cache each dirty tab's whole diff, take it off the preset so
+// the reload cannot fight it, put it back afterwards.
+//
+// The caption/header/buttons survive for the callers that still pass them (ConfigWizard,
+// WebGuideDialog), and are deliberately unused: there is no dialog left to label.
+bool GUI_App::check_and_keep_current_preset_changes(const wxString& caption, const wxString& /*header*/, int /*action_buttons*/, bool* postponed_apply_of_keeped_changes/* = nullptr*/)
 {
-    if (has_current_preset_changes()) {
-        bool is_called_from_configwizard = postponed_apply_of_keeped_changes != nullptr;
+    if (!has_current_preset_changes()) {
+        if (postponed_apply_of_keeped_changes != nullptr)
+            *postponed_apply_of_keeped_changes = false;
+        return true;
+    }
 
-        UnsavedChangesDialog dlg(caption, header, "", action_buttons);
-        bool no_need_change = dlg.getUpdateItemCount() == 0 ? true : false;
-        if (!no_need_change && dlg.ShowModal() == wxID_CANCEL)
-            return false;
+    const PrinterTechnology printer_technology = preset_bundle->printers.get_edited_preset().printer_technology();
+    size_t kept_tabs = 0;
+    for (Tab *tab : tabs_list) {
+        if (!tab->supports_printer_technology(printer_technology) || !tab->current_preset_is_dirty())
+            continue;
 
-        auto reset_modifications = [this, is_called_from_configwizard]() {
-            //if (is_called_from_configwizard)
-            //    return; // no need to discared changes. It will be done fromConfigWizard closing
-
-            PrinterTechnology printer_technology = preset_bundle->printers.get_edited_preset().printer_technology();
-            for (const Tab* const tab : tabs_list) {
-                if (tab->supports_printer_technology(printer_technology) && tab->current_preset_is_dirty())
-                    tab->m_presets->discard_current_changes();
-            }
-            load_current_presets(false);
-        };
-
-        if (dlg.discard() || no_need_change)
-            reset_modifications();
-        else  // save selected changes
-        {
-            //BBS: add project embedded preset relate logic
-            const auto& preset_names_and_types = dlg.get_names_and_types();
-            if (dlg.save_preset()) {
-                for (const UnsavedChangesDialog::PresetData& nt : preset_names_and_types)
-                    preset_bundle->save_changes_for_preset(nt.name, nt.type, dlg.get_unselected_options(nt.type), nt.save_to_project);
-
-                // if we saved changes to the new presets, we should to
-                // synchronize config.ini with the current selections.
-                preset_bundle->export_selections(*app_config);
-
-                //wxString text = _L_PLURAL("Modifications to the preset have been saved",
-                //    "Modifications to the presets have been saved", preset_names_and_types.size());
-                //if (!is_called_from_configwizard)
-                //    text += "\n\n" + _L("All modifications will be discarded for new project.");
-
-                //MessageDialog(nullptr, text).ShowModal();
-                reset_modifications();
-            }
-            else if (dlg.transfer_changes() && (dlg.has_unselected_options() || is_called_from_configwizard)) {
-                // execute this part of code only if not all modifications are keeping to the new project
-                // OR this function is called when ConfigWizard is closed and "Keep modifications" is selected
-                for (const UnsavedChangesDialog::PresetData& nt : preset_names_and_types) {
-                    Preset::Type type = nt.type;
-                    Tab* tab = get_tab(type);
-                    std::vector<std::string> selected_options = dlg.get_selected_options(type);
-                    if (type == Preset::TYPE_PRINTER) {
-                        auto it = std::find(selected_options.begin(), selected_options.end(), "extruders_count");
-                        if (it != selected_options.end()) {
-                            // erase "extruders_count" option from the list
-                            selected_options.erase(it);
-                            // cache the extruders count
-                            static_cast<TabPrinter*>(tab)->cache_extruder_cnt();
-                        }
-                    }
-                    std::vector<std::string> selected_options2;
-                    std::transform(selected_options.begin(), selected_options.end(), std::back_inserter(selected_options2), [](auto & o) {
-                        auto i = o.find('#');
-                        return i != std::string::npos ? o.substr(0, i) : o;
-                    });
-                    tab->cache_config_diff(selected_options2);
-                    if (!is_called_from_configwizard)
-                        tab->m_presets->discard_current_changes();
-                }
-                if (is_called_from_configwizard)
-                    *postponed_apply_of_keeped_changes = true;
-                else
-                    apply_keeped_preset_modifications();
+        std::vector<std::string> options = tab->get_presets()->current_dirty_options();
+        if (options.empty())
+            continue;
+        //extruders_count is not an option like the others - applying it has to rebuild the
+        //printer's per-extruder vectors - so the printer tab caches the count separately and the
+        //key is taken out of the list. Same handling the Keep branch always had.
+        if (tab->type() == Preset::TYPE_PRINTER) {
+            const auto it = std::find(options.begin(), options.end(), "extruders_count");
+            if (it != options.end()) {
+                options.erase(it);
+                static_cast<TabPrinter *>(tab)->cache_extruder_cnt();
             }
         }
+        //A tree key can carry a "#variant" suffix; the config does not. Strip it, as the dialog's
+        //own transfer path did.
+        for (std::string &option : options)
+            if (const size_t hash = option.find('#'); hash != std::string::npos)
+                option = option.substr(0, hash);
+
+        tab->cache_config_diff(options);
+        tab->get_presets()->discard_current_changes();
+        ++kept_tabs;
     }
+
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": \"" << into_u8(caption) << "\" keeps the modified settings on "
+                            << kept_tabs << " tab(s); nothing is discarded and nothing is saved as a preset";
+
+    if (postponed_apply_of_keeped_changes != nullptr)
+        //The caller is about to reload the preset bundle and will apply this afterwards.
+        *postponed_apply_of_keeped_changes = kept_tabs > 0;
+    else
+        apply_keeped_preset_modifications();
 
     return true;
 }
+
 
 bool GUI_App::can_load_project()
 {

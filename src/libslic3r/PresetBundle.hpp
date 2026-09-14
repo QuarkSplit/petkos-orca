@@ -295,8 +295,15 @@ public:
     // this function and by PartPlate::process_override_keys.
     //
     // Keys the target has no definition for are named in dropped rather than forced.
+    //
+    // machine_tuning_not_carried (out, optional) counts the Machine-class keys the parentless
+    // branch declined to carry. With a parent the diff IS the author's deviation and every class
+    // of it crosses; without one there is no diff, so a speed authored for the old machine would
+    // otherwise ride along as though somebody had chosen it for the new one. See
+    // ProcessOptionClass.hpp.
     DynamicPrintConfig carry_process_intent(const Preset &from, const Preset &to,
-                                            std::vector<std::string> &dropped) const;
+                                            std::vector<std::string> &dropped,
+                                            size_t *machine_tuning_not_carried = nullptr) const;
 
     // WHAT A MATERIAL MEANS ACROSS MACHINES.
     //
@@ -335,6 +342,11 @@ public:
                                                bool only_missing = false);
     static void migrate_legacy_plate_filament_colours(PlateSlicingContext &context, const PlateSlicingContext &declared);
     static void apply_plate_filament_colours(const PlateSlicingContext &context, DynamicPrintConfig &config);
+    // The colour-count invariant, applied to the other filament-indexed vector the project owns:
+    // flush_volumes_matrix is nozzle_count * width^2 where width is the PLATE's slot count,
+    // because that is the width every consumer slices it by. Shape only - the values stay the
+    // project's, and the function says so when it has to invent a cell.
+    static void apply_plate_flush_matrix(const PlateSlicingContext &context, DynamicPrintConfig &config);
     // Assign one existing plate slot, translating the material for its printer and retaining appearance.
     bool assign_plate_material(PlateSlicingContext &context, size_t slot,
                                const std::string &source_preset, std::string &error) const;
@@ -425,6 +437,11 @@ public:
         //tuned for the old machine can ride along.
         bool                     carried_whole_process { false };
         std::vector<std::string> dropped_process_keys;    // the target has no such option
+        //Machine-class values the parentless branch did NOT carry: speeds, accelerations, jerks,
+        //firmware preferences. Counted rather than listed - it is one fact however many keys it
+        //happened to, and the keys themselves are not interesting to anybody. See
+        //ProcessOptionClass.hpp for what makes a key machine tuning.
+        size_t                   machine_tuning_not_carried { 0 };
         bool process_switched() const { return !process_to.empty(); }
     };
     bool reresolve_plate_context_for_printer(PlateSlicingContext      &context,
@@ -671,13 +688,19 @@ public:
     void reset_default_nozzle_volume_type();
 
     std::vector<int> get_used_tpu_filaments(const std::vector<int> &used_filaments);
-    // Orca: update selected filament and print
-    // preserve_project_filaments: keep the currently loaded project's filament count and
-    // colors across a printer switch instead of replacing them with the per-printer
-    // remembered ones. The painting survives a shrink now - only an explicit filament
-    // deletion prunes it - but the colours and the slot list are the project's own
-    // material choices, and a printer switch is not the user asking to change them.
-    void           update_selections(AppConfig &config, bool preserve_project_filaments = false);
+    // DELETED 2026-09-14: update_selections(AppConfig&, bool preserve_project_filaments).
+    //
+    // It restored the process and filament selections remembered per PRINTER in the app config,
+    // and its only caller was the "remember_printer_config" branch of Tab::select_preset, which
+    // is gone with the preference itself. A plate carries its own printer, process and materials
+    // here, so a machine has nothing left to remember on the app's behalf - and the restore
+    // actively fought the plate, rewriting the project's filament selections out from under
+    // whichever plate was current. The preserve_project_filaments flag existed only to defend an
+    // imported project's colours from that restore, so it had nothing left to defend either.
+    //
+    // Recorded rather than silently removed: a dead function that looks live is how the next
+    // engineer wires the behaviour back up. If per-printer memory is ever wanted again it is a
+    // plate-level question, not a global one.
     void set_calibrate_printer(std::string name);
 
     void set_is_validation_mode(bool mode) { validation_mode = mode; }

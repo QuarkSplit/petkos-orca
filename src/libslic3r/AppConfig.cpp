@@ -455,9 +455,12 @@ void AppConfig::set_defaults()
         set_bool("show_canvas_zoom_button", true);
     }
 
-    if (get("remember_printer_config").empty()) {
-        set_bool("remember_printer_config", true);
-    }
+    // "remember_printer_config" is gone. It was a global memory of which process and filament
+    // each PRINTER was last used with - a sensible idea in an app where a project has one
+    // machine, and a competing authority in one where a plate names its own. Its preference
+    // checkbox and the read that acted on it are both removed; defaulting the key back on would
+    // resurrect the behaviour with nothing in the interface admitting it exists. An existing
+    // key in someone's conf is harmless: nothing reads it.
 
     if (get("group_filament_presets").empty()) {
         set("group_filament_presets", "1"); // All "0" / None "1" / By Type "2" / By Vendor "3"
@@ -694,6 +697,10 @@ std::string AppConfig::load()
     boost::nowide::ifstream ifs;
     bool recovered = false;
     std::string error_message;
+    //Set when a persisted printer record is refused below. load() ends by declaring the
+    //config clean, so a drop has to be remembered across that line or the rotten records
+    //stay on disk and are read again at every launch.
+    bool dropped_project_records = false;
 
     try {
         ifs.open(AppConfig::loading_path());
@@ -840,7 +847,60 @@ std::string AppConfig::load()
                         BOOST_LOG_TRIVIAL(warning) << "AppConfig: skipping an orca_presets entry with no machine name";
                         continue;
                     }
-                    m_printer_settings[j_model["machine"].get<std::string>()] = j_model;
+                    //A RECORD THAT NAMES A PRESET FROM SOMEBODY ELSE'S PROJECT IS NOISE, NOT MEMORY.
+                    //
+                    //These records are what the next launch restores its printer, process and spool
+                    //pool from. A preset decorated "(<file>.3mf)" exists only while that project is
+                    //open and is deleted when it closes, so a record naming one describes a session
+                    //that cannot be re-entered. Restoring it gives the user a pool of rows whose
+                    //presets resolve to nothing - rows that draw, cannot be edited, and put the row
+                    //count out of step with the colour vector, which is the phantom swatch.
+                    //
+                    //Seven of the seventeen records on this machine were in that state, four of them
+                    //with a MACHINE name that was nothing but a decoration - "(BD-1 qadqwLower.3mf)" -
+                    //and one carrying a name decorated twice over. They were written by a guard in
+                    //PresetBundle::export_selections that declines an embedded preset but treats a
+                    //name resolving to NO preset as safe.
+                    //
+                    //Dropping the whole record rather than the offending field is the point. A record
+                    //is a coherent memory of one session: its slot names, its colour vector and its
+                    //flush matrix are sized against each other. Keeping the half that parses and
+                    //discarding the half that does not is how the counts come apart in the first
+                    //place, which is the bug, not the repair.
+                    const std::string machine = j_model["machine"].get<std::string>();
+                    std::string       rotten;
+                    if (Preset::has_project_decoration(machine))
+                        rotten = "machine=" + machine;
+                    for (auto field = j_model.begin(); rotten.empty() && field != j_model.end(); ++field) {
+                        if (!field.value().is_string())
+                            continue;
+                        const std::string &key = field.key();
+                        //The keys that hold a PRESET NAME. "filament_colors", "filament_color_types"
+                        //and "filament_multi_colors" share the prefix and hold no name, hence the
+                        //all-digits test on the suffix.
+                        // The macros, not the words. The persisted process key is "process", not
+                        // "print" - PRESET_PRINT_NAME is spelled one way and reads the other, and
+                        // writing the literal is how a check silently stops covering a whole
+                        // preset type while still looking right.
+                        bool names_a_preset = key == PRESET_PRINT_NAME || key == PRESET_FILAMENT_NAME ||
+                                              key == PRESET_PRINTER_NAME;
+                        static const std::string filament_slot_prefix = std::string(PRESET_FILAMENT_NAME) + "_";
+                        if (!names_a_preset && key.size() > filament_slot_prefix.size() &&
+                            key.compare(0, filament_slot_prefix.size(), filament_slot_prefix) == 0)
+                            names_a_preset = key.find_first_not_of("0123456789", filament_slot_prefix.size()) == std::string::npos;
+                        if (names_a_preset && Preset::has_project_decoration(field.value().get<std::string>()))
+                            rotten = key + "=" + field.value().get<std::string>();
+                    }
+                    if (!rotten.empty()) {
+                        BOOST_LOG_TRIVIAL(warning)
+                            << "AppConfig: dropping the persisted record for '" << machine
+                            << "' - it names a preset that belongs to a project and cannot outlive it ("
+                            << rotten << ")";
+                        //Written back without it at the next save.
+                        dropped_project_records = true;
+                        continue;
+                    }
+                    m_printer_settings[machine] = j_model;
                 }
             } else if (it.key() == "local_machines") {
                 for (auto m = it.value().begin(); m != it.value().end(); ++m) {
@@ -928,7 +988,7 @@ std::string AppConfig::load()
 
     // Override missing or keys with their defaults.
     this->set_defaults();
-    m_dirty = false;
+    m_dirty = dropped_project_records;
     return "";
 }
 

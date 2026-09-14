@@ -92,6 +92,33 @@ struct PlateBed
     std::string          bed_texture; //may be empty; the plate then draws a plain surface
 };
 
+//Keys that live in a plate's config because the APP put them there, not because a person
+//chose them: the filament grouping the slicer computes for that plate's objects, and the
+//nozzle facts read off whichever machine is plugged in.
+//
+//It is the second half of the classification is_plate_owned_process_setting starts. That one
+//separates "a process setting" from "a plate control"; this one separates "somebody chose it"
+//from "the app derived it", and the two questions have different answers for the same key -
+//filament_map is a plate control AND app-derived, wall_loops is a process setting AND chosen.
+//
+//The rule it serves: a value somebody chose is carried to a new plate; a value the app derived
+//is derived again there. Carrying plate 1's filament map onto an empty new plate copies a fact
+//about plate 1's objects to a plate that has none, and carrying its nozzle stats fixes a
+//snapshot of a device sync in a plate that will be re-synced anyway.
+//
+//Tab.cpp has a private copy of this list under the name plate_machine_keys, used to decide
+//whether the Plate page shows "this plate has settings". Two copies of one classification is
+//how print_sequence came to be carried, uncounted and unclearable (see PlateSlicingContext.hpp);
+//that call site should read this function instead.
+inline bool is_plate_app_computed_setting(const std::string &key)
+{
+    static const std::set<std::string> app_computed = {
+        "filament_map", "filament_nozzle_map", "filament_volume_map", "nozzle_volume_type",
+        "extruder_nozzle_stats", "enable_filament_dynamic_map", "has_filament_switcher",
+    };
+    return app_computed.count(key) > 0;
+}
+
 class PartPlate : public ObjectBase
 {
 public:
@@ -425,6 +452,22 @@ public:
     //about settings somebody chose.
     size_t process_override_count() const;
     std::vector<std::string> process_override_keys() const;
+    //Copy everything this plate holds because SOMEBODY CHOSE IT onto another plate: the
+    //presets it names and the values those presets were changed to.
+    //
+    //A plate's identity was being treated as its PlateSlicingContext, and a context is only
+    //the names. Every caller that meant "another plate like this one" - add plate, duplicate
+    //plate, the calibration pattern's extra plates - seeded the names and dropped the values,
+    //so a tuned plate reproduced itself as a stock one that showed the tuned plate's preset
+    //name. Silently: nothing in the UI distinguishes "0.20 Standard" from "0.20 Standard plus
+    //the eleven values you changed", which is exactly what process_override_count exists to
+    //say and exactly what was not being copied.
+    //
+    //What is NOT copied is what the app computes rather than what the user chose - see
+    //is_plate_app_computed_setting. Those are re-derived for the new plate, because they are
+    //facts about that plate's objects and about the machine currently plugged in, and an empty
+    //new plate inheriting plate 1's filament map is a fact copied where no fact exists yet.
+    void adopt_chosen_settings_from(const PartPlate &holder);
     //Drop them. The user's own choice, offered because a carried set is still a set of
     //values they may not want; never done on their behalf.
     void clear_process_overrides();
@@ -492,12 +535,31 @@ public:
     Vec3d estimate_wipe_tower_size(const DynamicPrintConfig & config, const double w, const double wipe_volume, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false, bool enable_wrapping_detection = false) const;
     arrangement::ArrangePolygon estimate_wipe_tower_polygon(const DynamicPrintConfig & config, int plate_index, Vec3d& wt_pos, Vec3d& wt_size, int extruder_count = 1, int plate_extruder_size = 0, bool use_global_objects = false) const;
     bool check_objects_empty_and_gcode3mf(std::vector<int> &result) const;
-    // get used filaments from config, 1 based idx
+    // The 1-based slots this plate's objects reference: their own assignments, their MMU
+    // paint (ModelVolume::get_extruders merges the painted states in), their layer ranges,
+    // the process defaults for the features they did not override, and - with
+    // conside_custom_gcode - the plate's custom tool changes. Never empty for a plate holding
+    // objects: a plate whose process does not resolve reports the model half rather than
+    // nothing, because "no filaments" is a count and every consumer reads it as one.
     std::vector<int> get_extruders(bool conside_custom_gcode = false) const;
-    // Whether any object on this plate carries per-triangle filament painting. Paint states
-    // are stored slot numbers and are deliberately never clipped, so the single-filament
-    // slicing cut-down must not run over a painted plate unless the paint is all in slot 1.
-    bool has_mmu_painted_object() const;
+    // The context the plate PRINTS with, as opposed to the slots it may draw on
+    // (get_slicing_context). When every slot the plate's objects reference holds the same
+    // spool, this is the context cut down to that one slot, and filament_maps /
+    // volume_maps (in/out, optional) are cut with it. Otherwise it is get_slicing_context()
+    // unchanged. used_slots (out, optional) receives the 1-based slots the objects reference
+    // AS THEY ARE in the returned context, so a caller indexing a filament-indexed array of
+    // the returned width uses the right rows. Rule and rationale:
+    // PlateSlicingContext::single_spool_slot. Every consumer that asks "how many filaments
+    // does this plate print with" - the slicing feed, the prime-tower preview, the flushing
+    // check, the CLI - asks it here, so they cannot disagree.
+    //
+    // MMU paint needs no special case: get_extruders already reports the slots it names, so
+    // paint in a second spool blocks the cut like any other reference to it, and paint in the
+    // same spool does not. At one filament nothing in the engine reads a painted state at all
+    // (PrintObject::slice_volumes and PrintApply both gate on the printing filament count).
+    PlateSlicingContext get_printing_context(std::vector<int> *filament_maps = nullptr,
+                                             std::vector<int> *volume_maps   = nullptr,
+                                             std::vector<int> *used_slots    = nullptr) const;
     std::vector<int> get_extruders_under_cli(bool conside_custom_gcode, DynamicPrintConfig& full_config) const;
     std::vector<int> get_extruders_without_support(bool conside_custom_gcode = false) const;
     // get used filaments from gcode result, 1 based idx
@@ -964,7 +1026,23 @@ public:
 
     /*basic plate operations*/
     //create an empty plate and return its index
+    //SEEDS NOTHING. See the body for why a completion pass cannot live in here.
     int create_plate(bool adjust_position = true);
+
+    //"ANOTHER PLATE LIKE THIS ONE" - the one way to make a plate that is a sibling of an
+    //existing plate, and the only place the rule for that lives.
+    //
+    //Every caller that wanted this had to spell it out itself, and each of them spelled it
+    //as "copy the PlateSlicingContext" - the preset NAMES. The values those presets had been
+    //changed to live in the plate's own override config and were dropped every time, so a new
+    //plate on a tuned plate's printer arrived showing the tuned plate's process name and
+    //printing stock defaults. Having each caller re-derive the rule is what let three call
+    //sites agree on the same wrong half of it.
+    //
+    //holder == nullptr falls back to bare create_plate() plus the normal completion pass, so
+    //this is safe to call from a context that has no current plate (an empty list, CLI).
+    //Returns the new plate's index, or -1 when the list is full.
+    int create_plate_like(const PartPlate *holder, bool adjust_position = true);
 
     // duplicate plate
     int duplicate_plate(int index);

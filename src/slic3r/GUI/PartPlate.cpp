@@ -1621,16 +1621,38 @@ int PartPlate::picking_id_component(int idx) const
     return this->m_plate_index * GRABBER_COUNT + idx;
 }
 
-bool PartPlate::has_mmu_painted_object() const
+PlateSlicingContext PartPlate::get_printing_context(std::vector<int> *filament_maps,
+                                                    std::vector<int> *volume_maps,
+                                                    std::vector<int> *used_slots) const
 {
-	for (int obj_idx = 0; obj_idx < (int) m_model->objects.size(); ++obj_idx) {
-		if (!contain_instance_totally(obj_idx, 0))
-			continue;
-		for (const ModelVolume *mv : m_model->objects[obj_idx]->volumes)
-			if (!mv->mmu_segmentation_facets.empty())
-				return true;
-	}
-	return false;
+    PlateSlicingContext context = get_slicing_context();
+    std::vector<int>    used    = get_extruders(true);
+
+    // Ask the question against the colours the slots will PRINT with, not the cells the
+    // plate happens to have recorded. An empty cell is not "no colour": composition fills it
+    // from the material's own default (PresetBundle::apply_plate_filament_colours), so two
+    // slots naming one black preset - one with "#000000" written down and one with nothing -
+    // are the same spool on the bed and were being read as two. plate_filament_colours is the
+    // same resolution composition performs, so the two cannot disagree. Only the COMPARISON
+    // uses the resolved copy; the context that is cut and composed is the plate's own, so
+    // this adds no second composition to the cache.
+    int slot = 0;
+    if (PresetBundle *bundle = wxApp::GetInstance() != nullptr ? wxGetApp().preset_bundle : nullptr) {
+        PlateSlicingContext probe = context;
+        probe.filament_colours    = bundle->plate_filament_colours(context);
+        slot                      = probe.single_spool_slot(used);
+    } else {
+        slot = context.single_spool_slot(used);
+    }
+
+    if (slot > 0) {
+        context = context.cut_down_to_slot(slot);
+        if (filament_maps) *filament_maps = PlateSlicingContext::cut_map_to_slot(*filament_maps, slot, 1);
+        if (volume_maps)   *volume_maps   = PlateSlicingContext::cut_map_to_slot(*volume_maps, slot, int(NozzleVolumeType::nvtStandard));
+        used = {1};
+    }
+    if (used_slots) *used_slots = std::move(used);
+    return context;
 }
 
 std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
@@ -1639,25 +1661,40 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
     if (check_objects_empty_and_gcode3mf(plate_extruders)) {
         return plate_extruders;
     }
-	// if 3mf file
+	// THE SLOTS THIS PLATE'S OBJECTS REFERENCE. Two sources, and only one of them needs a
+	// composed config: an object's own slot assignment and its per-triangle MMU paint are
+	// facts about the MODEL, while the support / wall / surface / infill slots an object did
+	// NOT override are facts about the plate's process.
+	//
+	// This used to return {} when the plate's context did not resolve. An empty extruder list
+	// is not "unknown", it is the sentence "this plate uses no filaments", and every consumer
+	// reads it as a count: the prime-tower preview skips itself, the flushing check passes,
+	// the single-spool cut declines, PlateBoard draws no slots. A transiently unresolvable
+	// plate therefore reported a different print than it has. So the config half degrades to
+	// "no process default to add" and the model half is always answered - which is never
+	// empty for a plate holding objects, because every volume has a slot.
 	ResolvedPlateSlicingConfig resolved;
-	if (!resolve_plate_context(this, resolved))
-		return {};
-	const DynamicPrintConfig& glb_config = resolved.config;
-	int glb_support_intf_extr = glb_config.opt_int("support_interface_filament");
-	int glb_support_extr = glb_config.opt_int("support_filament");
-	int glb_outer_wall_extr = glb_config.opt_int("outer_wall_filament_id");
-	int glb_inner_wall_extr = glb_config.opt_int("inner_wall_filament_id");
+	const bool have_process = resolve_plate_context(this, resolved);
+	const DynamicPrintConfig& plate_config = resolved.config;
+	const auto process_slot = [&](const char *key) { return have_process ? plate_config.opt_int(key) : 0; };
+	if (!have_process)
+		BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+			<< boost::format(": plate %1% has no resolvable process; reporting the slots its objects name and no process defaults")
+			   % (m_plate_index + 1);
+	int glb_support_intf_extr = process_slot("support_interface_filament");
+	int glb_support_extr = process_slot("support_filament");
+	int glb_outer_wall_extr = process_slot("outer_wall_filament_id");
+	int glb_inner_wall_extr = process_slot("inner_wall_filament_id");
 	if (glb_outer_wall_extr == 0) glb_outer_wall_extr = glb_inner_wall_extr;
 	if (glb_inner_wall_extr == 0) glb_inner_wall_extr = glb_outer_wall_extr;
-	int glb_sparse_infill_extr = glb_config.opt_int("sparse_infill_filament_id");
-	int glb_internal_solid_extr = glb_config.opt_int("internal_solid_filament_id");
-	int glb_top_surface_extr = glb_config.opt_int("top_surface_filament_id");
-	int glb_bottom_surface_extr = glb_config.opt_int("bottom_surface_filament_id");
+	int glb_sparse_infill_extr = process_slot("sparse_infill_filament_id");
+	int glb_internal_solid_extr = process_slot("internal_solid_filament_id");
+	int glb_top_surface_extr = process_slot("top_surface_filament_id");
+	int glb_bottom_surface_extr = process_slot("bottom_surface_filament_id");
 	if (glb_top_surface_extr == 0) glb_top_surface_extr = glb_internal_solid_extr;
 	if (glb_bottom_surface_extr == 0) glb_bottom_surface_extr = glb_internal_solid_extr;
-	bool glb_support = glb_config.opt_bool("enable_support");
-    glb_support |= glb_config.opt_int("raft_layers") > 0;
+	bool glb_support = have_process && plate_config.opt_bool("enable_support");
+    glb_support |= process_slot("raft_layers") > 0;
 
 	for (int obj_idx = 0; obj_idx < m_model->objects.size(); obj_idx++) {
 		if (!contain_instance_totally(obj_idx, 0))
@@ -1771,15 +1808,18 @@ std::vector<int> PartPlate::get_extruders(bool conside_custom_gcode) const
 	}
 
 	if (conside_custom_gcode) {
-		//BBS
-        int nums_extruders = 0;
-        if (const ConfigOptionStrings *color_option = dynamic_cast<const ConfigOptionStrings *>(glb_config.option("filament_colour"))) {
-            nums_extruders = color_option->values.size();
-			if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
-				for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
-					if (item.type == CustomGCode::Type::ToolChange && item.extruder <= nums_extruders)
-						plate_extruders.push_back(item.extruder);
-				}
+		// A tool change names one of THIS PLATE'S slots, so the bound is the plate's own slot
+		// count. It used to be read off the composed config's filament_colour vector, which is
+		// the same number only because compose_plate_slicing_config sizes that vector to the
+		// plate (apply_plate_filament_colours) - a coincidence one refactor away from being the
+		// PROJECT pool's width again, which is the bug the per-plate colour vectors exist to
+		// end. The plate's slot list says it directly and needs no composition, so it is also
+		// the right answer on a plate whose process does not resolve.
+		const int nums_extruders = int(get_slicing_context().filament_preset_names.size());
+		if (m_model->plates_custom_gcodes.find(m_plate_index) != m_model->plates_custom_gcodes.end()) {
+			for (auto item : m_model->plates_custom_gcodes.at(m_plate_index).gcodes) {
+				if (item.type == CustomGCode::Type::ToolChange && item.extruder >= 1 && item.extruder <= nums_extruders)
+					plate_extruders.push_back(item.extruder);
 			}
 		}
 	}
@@ -4665,6 +4705,47 @@ void PartPlate::clear_process_overrides()
 		m_config.erase(key);
 }
 
+//See the header. The names AND the values, minus what the app derives for itself.
+void PartPlate::adopt_chosen_settings_from(const PartPlate &holder)
+{
+	if (&holder == this)
+		return;
+
+	//The names first: the printer, process, filament list and colours the holder prints with.
+	//A sibling plate IS on the holder's machine - that is what "another plate like this one"
+	//means - so this is a copy, not a translation. Translation is what a change of machine
+	//does afterwards, through reresolve_plate_context.
+	set_slicing_context(holder.get_slicing_context());
+
+	//Then the values. Erase first, so this is "become the holder's plate" rather than "merge
+	//with whatever was here": a plate being seeded is either brand new or being made a copy,
+	//and in both cases a key the holder does not carry must not survive from before.
+	for (const std::string &key : m_config.keys())
+		if (!is_plate_app_computed_setting(key))
+			m_config.erase(key);
+
+	size_t carried = 0;
+	for (const std::string &key : holder.m_config.keys()) {
+		//What the app computes is re-derived here rather than copied. filament_map and its
+		//neighbours describe the HOLDER's objects, and the new plate has none of them yet.
+		if (is_plate_app_computed_setting(key))
+			continue;
+		const ConfigOption *opt = holder.m_config.option(key);
+		if (opt == nullptr)
+			continue;
+		m_config.set_key_value(key, opt->clone());
+		++carried;
+	}
+
+	//NOT the name. A plate's name is its identity, not one of its settings: "another plate
+	//like this one" is not "a second plate called the same thing". Duplicate copies the name
+	//itself, because a duplicate genuinely is the same plate again.
+
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+		<< boost::format(": plate %1% takes plate %2%'s printer '%3%', process '%4%' and %5% chosen value(s)")
+		   % (get_index() + 1) % (holder.get_index() + 1) % m_printer_preset_name % m_print_preset_name % carried;
+}
+
 int PartPlateList::distinct_printer_count() const
 {
 	std::set<std::string> names;
@@ -5407,11 +5488,46 @@ int PartPlateList::create_plate(bool adjust_position)
 	return new_index;
 }
 
+//See the header. ONE definition of "another plate like this one", because three call sites
+//each writing their own produced three copies of the same half-answer.
+int PartPlateList::create_plate_like(const PartPlate *holder, bool adjust_position)
+{
+	//Captured before the new plate exists: create_plate reflows the list and can renumber
+	//and move plates around, and a raw pointer taken after that is a pointer into a list
+	//that has been rearranged underneath it.
+	const int holder_index = holder != nullptr ? holder->get_index() : -1;
+
+	const int new_index = create_plate(adjust_position);
+	if (new_index < 0)
+		return new_index;
+
+	//Re-read the holder through the list, for the reason above.
+	const PartPlate *source = holder_index >= 0 ? get_plate(holder_index) : nullptr;
+	if (source != nullptr && source->has_complete_context()) {
+		if (PartPlate *plate = get_plate(new_index))
+			plate->adopt_chosen_settings_from(*source);
+	} else {
+		//No holder, or a holder that has no context of its own yet: fall back to the normal
+		//completion pass, which walks the list and seeds from the last complete plate. That
+		//is a names-only answer and it is the right one here - there is no plate whose values
+		//this plate is a sibling of.
+		complete_plate_contexts();
+	}
+
+	//The new plate names a machine now, so it gets that machine's bed. reflow=true because
+	//the bed can be a different size from the one create_plate laid the plate out for, and
+	//the neighbours have to shuffle around the real footprint.
+	apply_printer_to_plate(new_index, true);
+	return new_index;
+}
+
 
 int PartPlateList::duplicate_plate(int index)
 {
-    // create a new plate
-    int new_plate_index = create_plate(true);
+    //"Duplicate" means this plate again: its machine, its process, its materials, its
+    //overrides and its name. Everything but the name is create_plate_like's job now - the
+    //two operations differ only in whether the objects come too.
+    int new_plate_index = create_plate_like(get_plate(index), true);
     PartPlate* old_plate = NULL;
     PartPlate* new_plate = NULL;
     old_plate = get_plate(index);
@@ -5428,16 +5544,10 @@ int PartPlateList::duplicate_plate(int index)
     //complete plate in the list rather than the one being duplicated. Duplicating plate 1
     //while plate 5 was on another machine put the copy on plate 5's machine.
     //
-    //"Duplicate" means this plate again. The context and the overrides are the plate.
-    new_plate->set_slicing_context(old_plate->get_slicing_context());
-    new_plate->config()->apply(*old_plate->config(), true);
+    //The context, the overrides and the bed came with create_plate_like above. The name is
+    //duplicate's own: a duplicate is the same plate again, where a new plate is only a sibling.
     if (!old_plate->get_plate_name().empty())
         new_plate->set_plate_name(old_plate->get_plate_name());
-    //Reflow, exactly as on_action_add_plate does. The copy takes the source plate's machine,
-    //which can have a bed of a different size from the one create_plate laid out for it, and
-    //the neighbours have to shuffle around the real footprint. Deferring that left the
-    //duplicate overlapping the plate beside it until some unrelated edit reflowed the list.
-    apply_printer_to_plate(new_plate_index, true);
 
     // get the offset between plate centers
     Vec3d plate_to_plate_offset = new_plate->m_origin - old_plate->m_origin;

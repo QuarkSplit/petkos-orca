@@ -6,6 +6,9 @@
 #include <wx/gdicmn.h>
 #include <wx/clrpicker.h>
 
+#include <optional>
+#include <string>
+
 #include "libslic3r/Preset.hpp"
 #include "wxExtensions.hpp"
 #include "BitmapComboBox.hpp"
@@ -212,6 +215,28 @@ public:
     void show_default_color_picker();
     void sync_colour_config(const std::vector<std::string> &clrs, bool is_gradient);
     void sys_color_changed() override;
+
+    // A filament PlaterPresetComboBox is only ever built by Sidebar::init_filament_combo, so
+    // m_filament_idx indexes the SPOOL POOL - preset_bundle->filament_presets and the three
+    // colour vectors in project_config that are kept the same length as it. It never indexes a
+    // plate's slots: a plate holds its own materials, its own colours and its own slot count,
+    // and the two lists have no reason to be the same length.
+    //
+    // Every read of this row's colour goes through here, because the crash this replaced was a
+    // read path and a write path of one swatch indexing two different vectors. Returning
+    // nullopt means this row has no spool behind it, which is a fact about the pool and not a
+    // colour to draw - see update(), which hides the row rather than leaving stale pixels up.
+    struct PoolColour
+    {
+        std::string colour;      // filament_colour[i]        - the one solid colour
+        std::string multi;       // filament_multi_colour[i]  - space separated colour pack
+        std::string colour_type; // filament_colour_type[i]   - "0" gradient, "1" solid
+    };
+    std::optional<PoolColour> pool_colour() const;
+    // True when m_filament_idx names a spool that actually exists in the pool.
+    bool has_pool_spool() const;
+    // Swatch, combo and edit button appear and disappear together: they are one row.
+    void show_pool_row(bool show);
 
 private:
     // BBS

@@ -17,14 +17,14 @@ Two things it deliberately does NOT do:
 #>
 [CmdletBinding()]
 param(
-    [ValidateRange(1,4)]
-    [int]    $Jobs = 2,          # compiler processes, NOT multiplied by MSBuild workers
+    [ValidateRange(0,64)]
+    [int]    $Jobs = 0,          # compiler processes, NOT multiplied by MSBuild workers; 0 = size to the machine
     [switch] $Full,              # all configured build targets, without package installation
     [switch] $Configure,         # re-run cmake first (only needed when CMakeLists changed)
     [ValidateSet('Release','Debug','RelWithDebInfo','MinSizeRel')]
     [string] $Config = 'Release',
     [ValidateSet('Idle','BelowNormal','Normal')]
-    [string] $Priority = 'Idle',
+    [string] $Priority = 'BelowNormal',
     [string[]] $Targets = @('OrcaSlicer', 'OrcaSlicer_app_gui'),
     [string] $BuildDir = '',
     [string] $LogPath = '',
@@ -53,7 +53,13 @@ if ($generator -eq 'Ninja') {
 
 $freeGiB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
 if ($freeGiB -lt 6) { throw "Less than 6 GiB RAM free; build not started. Close a memory-heavy app before compiling." }
-$Jobs = [Math]::Min($Jobs, [Math]::Max(1, [int][Math]::Floor(($freeGiB - 4) / 2)))
+# Jobs 0 means "use the machine": every core but two, so the box stays responsive. A cl.exe on this
+# tree peaks around 1.5 GiB, so free RAM less a 4 GiB reserve is the other ceiling. Whichever binds
+# first wins. The old fixed ceiling of 4 was a laptop-stays-usable policy, not a fact about builds.
+$cores = [Environment]::ProcessorCount
+if ($Jobs -le 0) { $Jobs = [Math]::Max(1, $cores - 2) }
+$Jobs = [Math]::Min($Jobs, $cores)
+$Jobs = [Math]::Min($Jobs, [Math]::Max(1, [int][Math]::Floor(($freeGiB - 4) / 1.5)))
 $targets = if ($Full) { if ($isNinja) { @('all') } else { @('ALL_BUILD') } } else { $Targets }
 if ($targets.Count -eq 0 -or ($targets | Where-Object { $_ -notmatch '^[A-Za-z0-9_.+-]+$' })) {
     throw 'Targets must be CMake target names.'

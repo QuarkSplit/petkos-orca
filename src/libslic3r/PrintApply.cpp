@@ -1819,10 +1819,32 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     used_facet_states[state_idx] |= volume_used_facet_states[state_idx];
             }
 
+            // A PAINTED STATE IS A STORED SLOT NUMBER AND IS NOT BOUNDED BY THIS PRINT'S WIDTH.
+            //
+            // Paint states are deliberately never clipped when the filament count changes, so a
+            // model painted in a four-slot project keeps states up to 4 after it lands on a plate
+            // two slots wide. Each state here becomes a PaintedRegion whose config sets every
+            // *_filament_id to that number, and a painted region is built directly rather than
+            // through region_config_from_model_volume - so clamp_feature_filament_to_valid, which
+            // catches exactly this for every other filament reference, never sees it. The result
+            // is a region referencing a filament the print does not have: an assert in
+            // apply_mm_segmentation in debug, and in release a region quietly stolen into one
+            // naming a nonexistent slot.
+            //
+            // Clamping, not dropping, and for the same reason the rest of the engine clamps: a
+            // reference out of range is a reference to the widest slot there is, and dropping it
+            // would silently unpaint facets the user painted. Where the cut-down to a single spool
+            // made the plate narrow, every slot holds the same spool by construction, so the clamp
+            // cannot change what the nozzle lays down.
+            const size_t widest_slot = std::max<size_t>(num_extruders, 1);
             for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
                 if (used_facet_states[state_idx])
-                    painting_extruders.emplace_back(state_idx);
+                    painting_extruders.emplace_back(static_cast<unsigned int>(std::min(state_idx, widest_slot)));
             }
+            // Two states above the width clamp onto the same slot; one slot is one region.
+            std::sort(painting_extruders.begin(), painting_extruders.end());
+            painting_extruders.erase(std::unique(painting_extruders.begin(), painting_extruders.end()),
+                                     painting_extruders.end());
         }
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.

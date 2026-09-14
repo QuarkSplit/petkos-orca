@@ -39,6 +39,7 @@
 #include "MainFrame.hpp"
 #include "format.hpp"
 #include "UnsavedChangesDialog.hpp"
+#include "NotificationManager.hpp"
 #include "SavePresetDialog.hpp"
 #include "EditGCodeDialog.hpp"
 #include "MultiChoiceDialog.hpp"
@@ -3965,19 +3966,23 @@ void TabPrintPlate::build()
     m_pages.insert(m_pages.begin(), page);
 }
 
-//Keys that live in a plate's config but are written by the app rather than by the user through
-//this tab: the filament grouping the slicer computes and the nozzle facts it records. They are
-//in the plate's config for the slicer's benefit, so counting them as "this plate has settings"
-//would mark every plate in every project.
-static const std::vector<std::string> plate_machine_keys = {
-    "filament_map", "filament_nozzle_map", "filament_volume_map", "nozzle_volume_type",
-    "extruder_nozzle_stats", "enable_filament_dynamic_map", "has_filament_switcher" };
-
 bool TabPrintPlate::plate_has_overrides(PartPlate *plate) const
 {
     if (plate == nullptr)
         return false;
-    return !substruct(intersect(m_keys, plate->config()->keys()), plate_machine_keys).empty();
+    //"Does this plate carry settings of its own?" means settings a PERSON put there. Some keys
+    //live in a plate's config because the slicer put them there - the filament grouping it
+    //computes, the nozzle facts it records - and counting those would mark every plate in every
+    //project as overridden.
+    //
+    //Which keys those are is ONE classification, and it lives at is_plate_app_computed_setting in
+    //PartPlate.hpp. A private copy of the list used to sit here; the copies drifted, and
+    //print_sequence ended up carried by one and not the other, which is how it became uncounted
+    //and unclearable at the same time.
+    for (const std::string &key : intersect(m_keys, plate->config()->keys()))
+        if (!is_plate_app_computed_setting(key))
+            return true;
+    return false;
 }
 
 void TabPrintPlate::set_plate(PartPlate *plate)
@@ -7072,7 +7077,12 @@ bool Tab::select_preset(
     if (force_no_transfer) {
         no_transfer = true;
     }
-    if (current_dirty && ! may_discard_current_dirty_preset(nullptr, preset_name, no_transfer) && !force_select) {
+    //force_select FIRST. && is left to right, so with the call in front of it the modal was
+    //raised, the user answered, and `&& !force_select` then threw the answer away - the app
+    //asking a question it had already decided to ignore. Every other operand here is a plain
+    //bool with no side effect, so moving them in front changes nothing but which of them is
+    //allowed to put a dialog on the screen.
+    if (current_dirty && !force_select && ! may_discard_current_dirty_preset(nullptr, preset_name, no_transfer)) {
         canceled = true;
         BOOST_LOG_TRIVIAL(info) << boost::format("current dirty and cancelled");
     } else if (print_tab) {
@@ -7087,7 +7097,11 @@ bool Tab::select_preset(
         bool 			   new_preset_compatible = is_compatible_with_print(dependent.get_edited_preset_with_vendor_profile(),
         	m_presets->get_preset_with_vendor_profile(*m_presets->find_preset(preset_name, true)), printer_profile);
         if (! canceled)
-            canceled = old_preset_dirty && ! may_discard_current_dirty_preset(&dependent, preset_name) && ! new_preset_compatible && !force_select;
+            //Same reordering, same reason: new_preset_compatible and force_select each decide
+            //this on their own, so consulting them after the modal meant raising a modal whose
+            //answer could not change the outcome.
+            canceled = old_preset_dirty && ! new_preset_compatible && !force_select &&
+                       ! may_discard_current_dirty_preset(&dependent, preset_name);
         if (! canceled) {
             // The preset will be switched to a different, compatible preset, or the '-- default --'.
             m_dependent_tabs.emplace_back((printer_technology == ptFFF) ? Preset::Type::TYPE_FILAMENT : Preset::Type::TYPE_SLA_MATERIAL);
@@ -7132,7 +7146,8 @@ bool Tab::select_preset(
                 pu.old_preset_dirty = (old_printer_technology == pu.technology) && pu.presets->current_is_dirty();
                 pu.new_preset_compatible = (new_printer_technology == pu.technology) && is_compatible_with_printer(pu.presets->get_edited_preset_with_vendor_profile(), new_printer_preset_with_vendor_profile);
                 if (!canceled)
-                    canceled = pu.old_preset_dirty && !may_discard_current_dirty_preset(pu.presets, preset_name, false, no_transfer_variant) && !pu.new_preset_compatible && !force_select;
+                    canceled = pu.old_preset_dirty && !pu.new_preset_compatible && !force_select &&
+                               !may_discard_current_dirty_preset(pu.presets, preset_name, false, no_transfer_variant);
             }
             if (!canceled) {
                 for (PresetUpdate &pu : updates) {
@@ -7258,15 +7273,12 @@ bool Tab::select_preset(
         // check if there is something in the cache to move to the new selected preset
         apply_config_from_cache();
 
-        // Orca: update presets for the selected printer
-        if (m_type == Preset::TYPE_PRINTER && wxGetApp().app_config->get_bool("remember_printer_config")) {
-            // With a model on the plater, the project's filament count and colors must
-            // survive the switch — restoring the remembered per-printer setup wholesale
-            // would discard an imported project's colors and truncate its painting.
-            const bool preserve_project_filaments = !wxGetApp().model().objects.empty();
-            m_preset_bundle->update_selections(*wxGetApp().app_config, preserve_project_filaments);
-            wxGetApp().plater()->sidebar().on_filament_count_change(m_preset_bundle->filament_presets.size());
-        }
+        //Upstream restored a remembered GLOBAL per-printer process-and-filament set here, behind
+        //the "remember_printer_config" preference. A plate carries its own printer, process and
+        //materials in this fork, so a machine has nothing left to remember on the app's behalf -
+        //and the restore fought the plate: it rewrote the project's filament selections out from
+        //under whichever plate was current. The preference's checkbox and its default are gone
+        //with it, so reading the key here would read one nothing writes.
         load_current_preset();
 
 
@@ -7318,7 +7330,7 @@ bool Tab::select_preset(
     //                      that moves the selection as a side effect of something else.
     if (!canceled && !from_plate_cursor && !m_just_edit && !plate_write_suspended() &&
         !(delete_current && m_type == Preset::TYPE_FILAMENT)) {
-        if (!write_selection_to_current_plate() && previous_material) {
+        if (!write_selection_to_current_plate(previous_pool) && previous_material) {
             PlateWriteSuspend no_plate_write;
             m_presets->select_preset_by_name(previous_material->name, true);
             m_presets->get_edited_preset() = *previous_material;
@@ -7356,7 +7368,7 @@ Tab::PlateWriteSuspend::~PlateWriteSuspend()
 }
 
 //See select_preset. The tab picked a preset; the plate the user is looking at now uses it.
-bool Tab::write_selection_to_current_plate()
+bool Tab::write_selection_to_current_plate(const std::vector<std::string> &previous_pool)
 {
     Plater *plater = wxGetApp().plater();
     if (plater == nullptr || !plater->is_initialized() || plater->is_loading_project())
@@ -7374,9 +7386,16 @@ bool Tab::write_selection_to_current_plate()
         plater->set_plate_process(index, m_preset_bundle->prints.get_selected_preset_name());
         break;
     case Preset::TYPE_FILAMENT: {
-        const bool accepted = plater->choose_plate_material_replacement(index,
-            size_t(std::max(0, m_presets_choice->get_filament_idx())),
-            m_preset_bundle->filaments.get_selected_preset_name(), true);
+        //A filament selection is a POOL edit: this combo is pointed at a spool on the shelf, not
+        //at a slot on a plate. It used to call choose_plate_material_replacement, whose
+        //wxSingleChoiceDialog made the user classify the scope of their own click before it
+        //would act - on every selection, including the one-spool case. What the plate does about
+        //it is not a question: the slots that were still using the replaced spool follow it, and
+        //the slots the user deliberately assigned something else keep it.
+        const size_t slot = size_t(std::max(0, m_presets_choice->get_filament_idx()));
+        const std::string replaced = slot < previous_pool.size() ? previous_pool[slot] : std::string();
+        const bool accepted = plater->follow_pool_material_change(index, replaced,
+                                                                  m_preset_bundle->filaments.get_selected_preset_name());
         plater->sidebar().refresh_plate_materials();
         return accepted;
     }
@@ -7386,8 +7405,8 @@ bool Tab::write_selection_to_current_plate()
     return true;
 }
 
-// If the current preset is dirty, the user is asked whether the changes may be discarded.
-// if the current preset was not dirty, or the user agreed to discard the changes, 1 is returned.
+// A selection never asks. The unsaved edits are moved somewhere that survives the selection, and
+// the selection proceeds. Returns false only when the move could not be made.
 bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr*/, const std::string &new_printer_name /*= ""*/, bool no_transfer, bool no_transfer_variant)
 {
     if (presets == nullptr) presets = m_presets;
@@ -7399,81 +7418,70 @@ bool Tab::may_discard_current_dirty_preset(PresetCollection *presets /*= nullptr
     if (!dirty_beyond_project(*presets))
         return true;
 
-    UnsavedChangesDialog dlg(m_type, presets, new_printer_name, no_transfer);
-    if (dlg.ShowModal() == wxID_CANCEL)
-        return false;
-
-    if (dlg.save_preset())  // save selected changes
-    {
-        const std::vector<std::string>& unselected_options = dlg.get_unselected_options(presets->type());
-        const std::string& name = dlg.get_preset_name();
-        //BBS: add project embedded preset relate logic
-        bool save_to_project = dlg.get_save_to_project_option();
-
-        if (m_type == presets->type()) // save changes for the current preset from this tab
-        {
-            // revert unselected options to the old values
-            presets->get_edited_preset().config.apply_only(presets->get_selected_preset().config, unselected_options);
-            //BBS: add project embedded preset relate logic
-            save_preset(name, false, save_to_project);
-            //save_preset(name);
+    //THERE IS NOWHERE TO PARK A DEVIATION - that is the whole of what Transfer / Discard / Save
+    //was for, and this fork removed the premise. park_dirty_edits already states the rule in its
+    //header: "a preset cannot destroy them and cannot need a dialog to decide". A process edit is
+    //a statement about the project and goes to the project layer, which every plate composes; a
+    //printer or filament edit belongs to that machine or that material and waits in
+    //m_parked_preset_edits until its preset is selected again. Neither can be lost, so neither is
+    //worth a question - and the one question the user was being asked is to name and save a
+    //preset in an app that has decided it has no user presets.
+    //
+    //It was also reachable at project load, because loading selects the project's presets through
+    //select_preset. A Bambu-authored 3mf therefore opened with a modal that reads as "switch
+    //printer?", and ACCEPTING it went down dlg.transfer_changes() -> cache_config_diff() ->
+    //apply_config_from_cache(), which applies a config diff captured against the OLD printer to
+    //the new one. Filament-indexed options in that diff are sized for the old printer's filament
+    //count, which is why accepting crashed and ignoring it and switching printer later - the path
+    //that goes through reresolve_plate_context_for_printer and carry_process_intent, where a
+    //machine change is a TRANSLATION with a named list of what could not cross - worked fine.
+    //Parking sends every selection down the path that already worked.
+    //
+    //A dependent collection is parked by ITS tab: this may be the printer tab asking about the
+    //process or filament collections, and the stash lives on the tab that owns the preset.
+    if (Tab *owner = wxGetApp().get_tab(presets->type()); owner != nullptr && owner->m_presets == presets) {
+        const std::string parked_from = presets->get_selected_preset_name();
+        if (owner->park_dirty_edits()) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+                << boost::format(": parked the unsaved edits on %1% preset '%2%' instead of asking; selection proceeds to '%3%'"
+                                 " (no_transfer %4%, no_transfer_variant %5% - the extruder-shape mismatch that used to make"
+                                 " transferring them dangerous, and the reason nothing is transferred now)")
+                   % Preset::get_type_string(presets->type()) % parked_from % new_printer_name
+                   % no_transfer % no_transfer_variant;
+            //Report afterwards rather than interrogate beforehand. A process edit stays visible
+            //on its own page as a modified option, so it needs no telling; a printer or filament
+            //edit goes out of sight until its preset comes back, and that is worth one line.
+            if (presets->type() != Preset::TYPE_PRINT)
+                if (Plater *plater = wxGetApp().plater())
+                    if (NotificationManager *notifications = plater->get_notification_manager())
+                        notifications->push_notification(
+                            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                            into_u8(wxString::Format(_L("Your unsaved changes to \"%s\" are kept. They come back when you select it again."),
+                                                     from_u8(parked_from))));
         }
-        else
-        {
-            //BBS: add project embedded preset relate logic
-            m_preset_bundle->save_changes_for_preset(name, presets->type(), unselected_options, save_to_project);
-            //m_preset_bundle->save_changes_for_preset(name, presets->type(), unselected_options);
-
-            // If filament preset is saved for multi-material printer preset,
-            // there are cases when filament comboboxs are updated for old (non-modified) colors,
-            // but in full_config a filament_colors option aren't.
-            if (presets->type() == Preset::TYPE_FILAMENT && wxGetApp().extruders_edited_cnt() > 1)
-                wxGetApp().plater()->force_filament_colors_update();
-        }
-    }
-    else if (dlg.transfer_changes()) // move selected changes
-    {
-        std::vector<std::string> selected_options = dlg.get_selected_options();
-        if (!no_transfer && no_transfer_variant) {
-            auto & options_list = wxGetApp().get_tab(presets->type())->m_options_list;
-            bool has_variants = false;
-            for (auto &opt : selected_options) {
-                if (auto n = opt.find('#'); n != std::string::npos) {
-                    auto iter = options_list.lower_bound(opt.substr(0, n));
-                    if (iter == options_list.end() || opt.compare(0, n, iter->first)) {
-                        has_variants = true;
-                        opt.clear();
-                    }
-                }
-            }
-            if (has_variants) {
-                auto msg = _L("Switching to a printer with different extruder types or numbers will discard or reset changes to extruder or multi-nozzle-related parameters.");
-                MessageDialog(wxGetApp().plater(), msg, _L("Use Modified Value"), wxOK | wxICON_WARNING).ShowModal();
-                selected_options.erase(std::remove(selected_options.begin(), selected_options.end(), ""), selected_options.end());
-            }
-        }
-
-        if (m_type == presets->type()) // move changes for the current preset from this tab
-        {
-            if (m_type == Preset::TYPE_PRINTER) {
-                auto it = std::find(selected_options.begin(), selected_options.end(), "extruders_count");
-                if (it != selected_options.end()) {
-                    // erase "extruders_count" option from the list
-                    selected_options.erase(it);
-                    // cache the extruders count
-                    static_cast<TabPrinter*>(this)->cache_extruder_cnt();
-                }
-            }
-
-            // copy selected options to the cache from edited preset
-            cache_config_diff(selected_options);
-        }
-        else
-            wxGetApp().get_tab(presets->type())->cache_config_diff(selected_options);
+        return true;
     }
 
+    //No tab owns this collection - SLA materials in an FFF build. Nothing can park it, so the
+    //least destructive answer is to leave the edits exactly where they are and let the selection
+    //proceed; they are still on the preset afterwards. Discarding them silently, or raising the
+    //dialog this function exists to stop raising, are both worse.
+    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+        << boost::format(": no tab owns the %1% collection, so its unsaved edits stay on the preset")
+           % Preset::get_type_string(presets->type());
     return true;
 }
+
+//THE TRANSFER / DISCARD / SAVE DIALOG that used to live here is gone with its last caller.
+//It existed because a deviation had nowhere to live but a preset. This fork gave deviations
+//somewhere to live - the project layer for a process, m_parked_preset_edits for a printer or a
+//material, plate overrides for anything a plate holds - and once that is true the dialog is
+//three wrong answers to a question that no longer exists.
+//
+//Quitting still asks, through GUI_App::check_and_save_current_preset_changes, because a
+//preset-local park lives in memory and dies with the process: that is the one moment a question
+//can still help. Nothing on a SELECTION path may raise it - see may_discard_current_dirty_preset
+//for the crash that reached the user through exactly that.
 
 void Tab::clear_pages()
 {

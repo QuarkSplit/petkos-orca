@@ -1699,8 +1699,22 @@ void PreferencesDialog::create_items()
     //// GENERAL > Preset
     g_sizer->Add(create_item_title(_L("Preset")), 1, wxEXPAND);
 
-    auto item_remember_printer = create_item_checkbox(_L("Remember printer configuration"), _L("If enabled, Orca will remember and switch filament/process configuration for each printer automatically."), "remember_printer_config");
-    g_sizer->Add(item_remember_printer);
+    //REMOVED: "Remember printer configuration" ("Orca will remember and switch filament/process
+    //configuration for each printer automatically").
+    //
+    //It is a GLOBAL memory of one filament/process setup per printer, restored over whatever is
+    //selected whenever the printer changes. That was the only per-machine memory the app had when
+    //a project meant one machine. This fork gives every plate its own printer, process, materials
+    //and colours, stored on the plate and written into the 3MF - so the same event now has two
+    //answers, the plate's and the app's, and the app's arrives last and wins.
+    //
+    //The preference could only ever turn off the wrong one of the two. Deleting the option is the
+    //honest version of that: the plate is the memory.
+    //
+    //Still to remove, in files owned elsewhere: the read in Tab::select_preset
+    //(app_config->get_bool("remember_printer_config") -> update_selections) and the default in
+    //AppConfig::set_defaults. Until those go the legacy behaviour still fires with no way to see
+    //or change it, which is worse than the option was.
 
     auto item_filament_preset_grouping = create_item_combobox(_L("Group user filament presets"), _L("Group user filament presets based on selection"),
         "group_filament_presets", {_L("All"), _L("None"), _L("By type"), _L("By vendor")}, [](wxString value) {wxGetApp().plater()->sidebar().update_presets(Preset::TYPE_FILAMENT);});

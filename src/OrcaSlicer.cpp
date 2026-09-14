@@ -3764,36 +3764,25 @@ int CLI::run(int argc, char **argv)
         PresetBundle::capture_plate_filament_colours(declared_appearance, m_print_config);
         PresetBundle::migrate_legacy_plate_filament_colours(context, declared_appearance);
 
-        //A single-colour plate slices as a single-filament print, exactly as the GUI's
-        //apply_plate_config decides it (see the comment there): when the plate's objects
-        //reference exactly one slot, the context is cut down to that slot before
-        //composition, so no multi-filament information reaches a single-spool machine's
-        //G-code. Same paint guard: painted states are stored slot numbers and are never
-        //clipped, so a plate painted above slot 1 keeps its full width.
-        int trimmed_slot = 0;
-        if (context.filament_preset_names.size() > 1) {
-            std::vector<int> used = plate->get_extruders_under_cli(true, m_print_config);
-            std::sort(used.begin(), used.end());
-            used.erase(std::unique(used.begin(), used.end()), used.end());
-            if (used.size() == 1) {
-                const int slot = used.front();
-                if (slot >= 1 && slot <= int(context.filament_preset_names.size()) &&
-                    (slot == 1 || !plate->has_mmu_painted_object())) {
-                    context.filament_preset_names = {context.filament_preset_names[size_t(slot - 1)]};
-                    context.filament_colours      = {size_t(slot) <= context.filament_colours.size()
-                                                         ? context.filament_colours[size_t(slot - 1)]
-                                                         : std::string()};
-                    context.filament_colour_types = {size_t(slot) <= context.filament_colour_types.size()
-                                                          ? context.filament_colour_types[size_t(slot - 1)] : "1"};
-                    context.filament_multi_colours = {size_t(slot) <= context.filament_multi_colours.size()
-                                                          ? context.filament_multi_colours[size_t(slot - 1)] : std::string()};
-                    context.filament_finishes = {size_t(slot) <= context.filament_finishes.size()
-                                                     ? context.filament_finishes[size_t(slot - 1)] : int(FilamentFinish::ffStandard)};
-                    trimmed_slot = slot;
-                    BOOST_LOG_TRIVIAL(info) << boost::format("plate %1% references only slot %2%; slicing as a single-filament print")
-                                               % (plate->get_index() + 1) % slot;
-                }
-            }
+        //A single-spool plate slices as a single-filament print, by the same rule the GUI's
+        //apply_plate_config applies through PartPlate::get_printing_context: when every slot
+        //the plate's objects reference holds the same spool (MMU paint and custom G-code tool
+        //changes included - get_extruders_under_cli reports both), the context is cut down to
+        //that slot before composition, so no multi-filament information reaches a single-spool
+        //machine's G-code.
+        //
+        //The GUI resolves blank colour cells against the filament preset's own default before
+        //comparing (see PartPlate::get_printing_context). There is no PresetBundle on this
+        //path, so a plate carrying a blank cell beside an explicit one declines the cut and
+        //slices at its full width, which is what it did before. That is the conservative
+        //direction and it is not a refusal: the plate still slices. migrate_legacy_plate_
+        //filament_colours above has already filled the case that actually occurs here, a
+        //context whose colour vector is absent entirely.
+        int trimmed_slot = context.single_spool_slot(plate->get_extruders_under_cli(true, m_print_config));
+        if (trimmed_slot > 0) {
+            context = context.cut_down_to_slot(trimmed_slot);
+            BOOST_LOG_TRIVIAL(info) << boost::format("plate %1% prints with one spool (%2%, slot %3%); slicing as a single-filament print")
+                                       % (plate->get_index() + 1) % context.filament_preset_names.front() % trimmed_slot;
         }
 
         const auto apply_named = [&](Preset::Type type, const std::string &name, const char *settings_key,

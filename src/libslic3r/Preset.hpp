@@ -434,6 +434,12 @@ public:
     // Idempotent, and it strips every trailing group rather than one, so a name that had
     // already grown comes back to what it was.
     static std::string                      strip_project_decoration(const std::string &name);
+    // Does this name CARRY a project decoration? Not the same question as whether stripping
+    // changes it: a name that is nothing but decoration - "(BD-1 qadqwLower.3mf)", which is what
+    // an empty base plus a decoration produces - strips to itself, because there is no name
+    // underneath worth preferring. Anything asking "can this name outlive the open project"
+    // has to ask this one, and that case is exactly the one that has been reaching disk.
+    static bool                             has_project_decoration(const std::string &name);
     static void                             normalize(DynamicPrintConfig &config);
     // Report configuration fields, which are misplaced into a wrong group, remove them from the config.
     static std::string                      remove_invalid_keys(DynamicPrintConfig &config, const DynamicPrintConfig &default_config);

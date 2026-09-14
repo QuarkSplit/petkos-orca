@@ -692,13 +692,57 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 void GLGizmoMmuSegmentation::update_model_object()
 {
     bool updated = false;
+    bool collapsed = false;
     ModelObject* mo = m_c->selection_info()->model_object();
     int idx = -1;
     for (ModelVolume* mv : mo->volumes) {
         if (! mv->is_model_part())
             continue;
         ++idx;
-        updated |= mv->mmu_segmentation_facets.set(*m_triangle_selectors[idx].get());
+        TriangleSelectorGUI *selector = m_triangle_selectors[idx].get();
+
+        // PAINTING A WHOLE PART ONE COLOUR IS AN ASSIGNMENT, NOT A PICTURE ON IT.
+        //
+        // Per-triangle paint and the part's filament slot are two ways of saying the same thing
+        // when every facet says the same thing, and they are not equally good ways. Paint is
+        // stored as raw slot numbers that nothing clips, it survives a change of machine
+        // unchanged, it forces MM segmentation over the whole object at slice time, and it makes
+        // a part read as multi-material to every reader that only asks "is this painted". The
+        // assignment says the same fact with none of that. So a commit that leaves a part in one
+        // uniform state is written as the assignment and the facet data goes.
+        //
+        // get_facet_states() is the exact test: ONE committed state per ORIGINAL facet, so it
+        // covers the facets nobody touched as well as the ones the brush subdivided. Anything
+        // short of every facet agreeing leaves the painting exactly as it is.
+        //
+        // The one case that is not collapsed: a state naming a slot this plate does not have.
+        // Paint above the slot count is ignored by the engine, while an ASSIGNMENT above it
+        // prints in the first slot (see init_model_triangle_selectors) - so collapsing there
+        // would change what comes out of the nozzle, which is the opposite of the point.
+        const std::vector<EnforcerBlockerType> states  = selector->get_facet_states();
+        EnforcerBlockerType                    uniform = states.empty() ? EnforcerBlockerType::NONE : states.front();
+        for (EnforcerBlockerType state : states)
+            if (state != uniform) {
+                uniform = EnforcerBlockerType::NONE;
+                break;
+            }
+        if (uniform >= EnforcerBlockerType::Extruder1 && int(uniform) <= int(m_extruders_colors.size())) {
+            mv->config.set("extruder", int(uniform));
+            if (idx < int(m_volumes_extruder_idxs.size()))
+                m_volumes_extruder_idxs[idx] = int(uniform);
+            selector->reset();
+            selector->request_update_render_data(true);
+            collapsed = true;
+        }
+        updated |= mv->mmu_segmentation_facets.set(*selector);
+    }
+
+    if (collapsed) {
+        // Unpainted facets draw as entry 0 of the palette, which is the part's own slot, so the
+        // selectors have to be told the slot changed or the part keeps drawing its old colour.
+        this->update_triangle_selectors_colors();
+        wxGetApp().obj_list()->update_objects_list_filament_column(int(m_extruders_colors.size()));
+        updated = true;
     }
 
     if (updated) {

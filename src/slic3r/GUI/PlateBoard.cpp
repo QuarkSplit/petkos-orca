@@ -2339,14 +2339,21 @@ void PlateBoard::end_drag(bool commit)
         //CustomNotification is also in m_multiple_types, compared by text, so repeating the
         //same drop does not stack the same sentence.
         wxString message;
+        //An empty machine group is not "the project printer" - there is no project printer.
+        //It is the group of plates that name no machine at all, which is a broken state, and
+        //saying they "already follow" something describes inheritance that does not exist and
+        //leaves the user with nothing to click.
         if (targets.size() == 1)
             message = group.machine.empty()
-                          ? wxString::Format(_L("Plate %d already follows the project printer."), plate + 1)
+                          ? wxString::Format(_L("Plate %d already names no printer. It cannot slice until it does - "
+                                                "drop it on a machine group, or set its printer in Plate Settings."),
+                                             plate + 1)
                           : wxString::Format(_L("Plate %d is already assigned to %s."), plate + 1,
                                              from_u8(group.machine));
         else
             message = group.machine.empty()
-                          ? wxString::Format(_L("Those %d plates already follow the project printer."),
+                          ? wxString::Format(_L("Those %d plates already name no printer. They cannot slice until they do - "
+                                                "drop them on a machine group, or set each one in Plate Settings."),
                                              (int) targets.size())
                           : wxString::Format(_L("Those %d plates are already assigned to %s."),
                                              (int) targets.size(), from_u8(group.machine));
@@ -3870,9 +3877,6 @@ void PlateInspector::on_process_click()
     if (overrides > 0) {
         if (menu.GetMenuItemCount() > 0)
             menu.AppendSeparator();
-        menu.Append(base_id + 9002,
-                    wxString::Format(_L("Save the %d changed setting(s) as a preset for this machine..."),
-                                     (int) overrides));
         menu.Append(base_id + 9001,
                     wxString::Format(_L("Clear the %d setting(s) this plate changed"), (int) overrides));
     }
@@ -3882,10 +3886,6 @@ void PlateInspector::on_process_click()
     menu.Bind(wxEVT_MENU, [plater, plate_index, names, base_id](wxCommandEvent &evt) {
         if (evt.GetId() == base_id + 9001) {
             plater->clear_plate_process_overrides(plate_index);
-            return;
-        }
-        if (evt.GetId() == base_id + 9002) {
-            plater->save_plate_process_as_preset(plate_index);
             return;
         }
         const size_t i = (size_t) (evt.GetId() - base_id);

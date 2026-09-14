@@ -46,7 +46,6 @@
 #include <wx/string.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
-#include <wx/textdlg.h>     // Plater::save_plate_process_as_preset asks for the preset's name
 #include <wx/choicdlg.h>
 #include <wx/debug.h>
 #include <wx/busyinfo.h>
@@ -1194,13 +1193,44 @@ struct DynamicFilamentList : DynamicList
         items.clear();
         if (!force && m_choices.empty())
             return;
-        auto icons = get_extruder_color_icons(true);
-        auto presets = wxGetApp().preset_bundle->filament_presets;
-        for (int i = 0; i < presets.size(); ++i) {
-            wxString str;
+        //THIS LIST IS THE CURRENT PLATE'S SLOTS, both halves of it.
+        //
+        //get_value() hands back the row's index and index_of() parses it back, so what these
+        //dropdowns actually store in support_filament, support_interface_filament and the wall
+        //filament settings is a 1-based FILAMENT INDEX - and at slice time that index is read
+        //against the resolved PLATE's filament vectors.
+        //
+        //The names used to come from preset_bundle->filament_presets, which is the spool POOL:
+        //what is on the shelf, printer-independent, and a different length from any plate's slot
+        //list. The icons came from get_extruder_color_icons(), which is plate-scoped. So the two
+        //halves of every row were drawn from different lists and zipped by position - a pool of
+        //five spools on a single-slot plate offered five choices, four of which named nothing
+        //the plate has, each wearing whichever colour the shorter icon list happened to hold at
+        //that index. Picking one wrote a slot number the plate does not have.
+        Plater *plater = wxGetApp().plater();
+        if (plater == nullptr || !plater->is_initialized())
+            return;
+        const PartPlate *plate = plater->get_partplate_list().get_curr_plate();
+        if (plate == nullptr)
+            return;
+        const std::vector<std::string> &slots = plate->get_filament_preset_names();
+        //Plate-scoped as well, and the same length as the slot list by contract. Anything
+        //shorter is a divergence, so the row is drawn without a swatch rather than borrowing
+        //another slot's colour.
+        const std::vector<wxBitmap *> icons = get_extruder_color_icons(true);
+        if (icons.size() != slots.size())
+            BOOST_LOG_TRIVIAL(warning) << "DynamicFilamentList: the plate has " << slots.size()
+                                       << " slot(s) but " << icons.size() << " colour icon(s)";
+        for (size_t i = 0; i < slots.size(); ++i) {
+            //A slot can name a preset this installation does not have - an imported project's
+            //own filament, or a bundle that has since been removed. find_preset returns nullptr
+            //for it, and this dereferenced the result without looking. Falling back to the
+            //stored name keeps the row honest about which slot it is rather than dropping it.
             std::string type;
-            wxGetApp().preset_bundle->filaments.find_preset(presets[i])->get_filament_type(type);
-            str << type;
+            if (Preset *preset = wxGetApp().preset_bundle->filaments.find_preset(slots[i], false))
+                preset->get_filament_type(type);
+            wxString str;
+            str << (type.empty() ? from_u8(slots[i]) : from_u8(type));
             items.push_back({str, i < icons.size() ? icons[i] : nullptr});
         }
         DynamicList::update();
@@ -3353,9 +3383,13 @@ void Sidebar::init_filament_combo(PlaterPresetComboBox **combo, const int filame
 
     PlaterPresetComboBox* combobox = (*combo);
     edit_btn->Bind(wxEVT_BUTTON, [this, edit_btn, combobox, filament_idx](wxCommandEvent) {
-        bool single_or_bbl     = should_show_SEMM_buttons();
-        bool is_multi_material = p->combos_filament.size() > 1;
-        if(single_or_bbl && is_multi_material) {
+        //Same test as the icon this button wears - see show_SEMM_buttons. The per-slot menu is
+        //only an answer on a machine that HAS slots to choose between; on a single-spool printer
+        //it offered a choice the machine cannot make, so that branch goes straight to the
+        //filament settings instead.
+        bool multi_spool_machine = plate_printer_spool_capacity() > 1;
+        bool is_multi_material = wxGetApp().preset_bundle->filament_presets.size() > 1;
+        if(multi_spool_machine && is_multi_material) {
            // MULTI MATERIAL Show menu
             auto menu = p->plater->filament_action_menu(filament_idx);
             wxPoint pt { 0, edit_btn->GetSize().GetHeight() + FromDIP(2) };
@@ -3424,6 +3458,12 @@ void Sidebar::update_all_preset_comboboxes()
     //plates rather than one machine, and the board is where an unresolved plate is both
     //visible and fixable, so it has to refresh even when nothing below can be decided.
     if (print_tech == ptFFF) {
+        //One row per spool, checked here because this runs after a printer change and after a
+        //project load - the two moments something outside the sidebar can have resized the pool.
+        //It returns immediately when the two already agree, which is every other time it runs.
+        //Making the invariant hold on every refresh is what stops it depending on each path that
+        //changes the pool remembering to say so.
+        sync_filament_rows_to_pool();
         for (PlaterPresetComboBox* cb : p->combos_filament)
             cb->update();
     }
@@ -4157,35 +4197,73 @@ void Sidebar::jump_to_option(size_t selected)
 //    wxGetApp().mainframe->select_tab();
 }
 
-// BBS. Move logic from Plater::on_extruders_change() to Sidebar::on_filament_count_change().
-void Sidebar::on_filament_count_change(size_t num_filaments)
+//THE INVARIANT, in one place: there is exactly one sidebar spool row per entry in the pool.
+//
+//The pool is PresetBundle::filament_presets, and project_config's filament_colour /
+//filament_multi_colour / filament_colour_type are held to the same length by
+//PresetBundle::set_num_filaments and update_num_filaments. combos_filament used to be resized
+//separately, from a count each caller worked out for itself, and the two came apart: commit
+//302fb11a86 removed the only call to Plater::on_filaments_delete - correctly, because it also
+//renumbered plates and pruned paint - and took the sidebar's row removal away with it, because
+//that lived inside the same function. Deleting a spool then left the pool one shorter and the
+//sidebar one longer, and the surplus row was the phantom: no colour behind it, nothing to edit,
+//and an access violation when its swatch was clicked (crash_Thu_Sep_10_17_14_07).
+//
+//A row count nobody can set independently cannot diverge from the pool, so this reads the pool
+//and every path that changes the pool comes through here.
+bool Sidebar::sync_filament_rows_to_pool()
 {
-    auto& choices = combos_filament();
+    auto &choices = combos_filament();
+    const PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return false;
+    //The sidebar always shows at least one row: a pool of zero is a state the app passes
+    //through during construction, not one the user can be shown.
+    const size_t pool_rows = std::max<size_t>(1, bundle->filament_presets.size());
+    if (pool_rows == choices.size())
+        return false;
 
-    if (num_filaments == choices.size())
-        return;
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+        << boost::format(": sidebar had %1% spool row(s) for a pool of %2%; rebuilding to match the pool")
+           % choices.size() % pool_rows;
 
-    if (choices.size() == 1 || num_filaments == 1)
+    if (choices.size() == 1 || pool_rows == 1)
         choices[0]->GetDropDown().Invalidate();
 
     wxWindowUpdateLocker noUpdates_scrolled_panel(this);
 
-    size_t i = choices.size();
-    while (i < num_filaments)
-    {
-        PlaterPresetComboBox* choice/*{ nullptr }*/;
-        init_filament_combo(&choice, i);
-        int last_selection = choices.back()->GetSelection();
+    while (choices.size() < pool_rows) {
+        PlaterPresetComboBox *choice = nullptr;
+        const size_t index = choices.size();
+        init_filament_combo(&choice, int(index));
+        const int last_selection = choices.back()->GetSelection();
         choices.push_back(choice);
 
         // initialize selection
         choice->update();
         choice->SetSelection(last_selection);
-        ++i;
     }
 
-    // remove unused choices if any
-    remove_unused_filament_combos(num_filaments);
+    remove_unused_filament_combos(pool_rows);
+    return true;
+}
+
+// BBS. Move logic from Plater::on_extruders_change() to Sidebar::on_filament_count_change().
+void Sidebar::on_filament_count_change(size_t num_filaments)
+{
+    //The argument is what the caller BELIEVES the pool is. Every live caller either calls
+    //PresetBundle::set_num_filaments first or passes filament_presets.size() outright, so the
+    //two agree - and when they do not, the pool is the fact and the caller is the bug. Saying so
+    //is how the next divergence gets found at the point it is introduced rather than three
+    //interactions later at a swatch nobody can click.
+    const size_t pool_rows = wxGetApp().preset_bundle != nullptr ? wxGetApp().preset_bundle->filament_presets.size() : num_filaments;
+    if (num_filaments != pool_rows)
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": asked for %1% spool row(s) while the pool holds %2%; the pool decides")
+               % num_filaments % pool_rows;
+
+    if (!sync_filament_rows_to_pool())
+        return;
 
     show_SEMM_buttons(); // ORCA
 
@@ -4199,46 +4277,16 @@ void Sidebar::on_filament_count_change(size_t num_filaments)
 
 void Sidebar::on_filaments_delete(size_t filament_id)
 {
-    auto &choices = combos_filament();
-
-    if (filament_id >= choices.size())
-        return;
-
-    if (choices.size() == 1)
-        choices[0]->GetDropDown().Invalidate();
-
-    wxWindowUpdateLocker noUpdates_scrolled_panel(this);
-
-    // delete UI item
-    if (filament_id < p->combos_filament.size()) {
-        const int last            = p->combos_filament.size() - 1;
-        auto      sizer_filaments = this->p->sizer_filaments->GetItem(last % 2)->GetSizer();
-        sizer_filaments->Remove(last / 2);
-
-        PlaterPresetComboBox* to_delete_combox = p->combos_filament[filament_id];
-        (*p->combos_filament[last]).Destroy();
-        p->combos_filament.pop_back();
-
-        // BBS:  filament double columns
-        auto sizer_filaments0 = this->p->sizer_filaments->GetItem((size_t) 0)->GetSizer();
-        auto sizer_filaments1 = this->p->sizer_filaments->GetItem(1)->GetSizer();
-        if (p->combos_filament.size() < 2) {
-            sizer_filaments1->Clear();
-        } else {
-            size_t c0 = sizer_filaments0->GetChildren().GetCount();
-            size_t c1 = sizer_filaments1->GetChildren().GetCount();
-            if (c0 < c1)
-                sizer_filaments1->Remove(c1 - 1);
-            else if (c0 > c1)
-                sizer_filaments1->AddStretchSpacer(1);
-        }
-    }
+    //The pool has already lost the entry at filament_id. Rows are positional and identical, so
+    //matching the count removes the last one and the survivors re-read the pool at their own
+    //index - row i now shows what used to be row i+1, for every i at or after the deletion.
+    //(The old code hand-rolled that removal here AND computed a to_delete_combox it never used.)
+    sync_filament_rows_to_pool();
 
     show_SEMM_buttons(); // ORCA
 
-    for (size_t idx = filament_id ; idx < p->combos_filament.size(); ++idx) {
+    for (size_t idx = filament_id; idx < p->combos_filament.size(); ++idx)
         p->combos_filament[idx]->update();
-    }
 
     update_filaments_area_height(); // ORCA
 
@@ -4246,12 +4294,30 @@ void Sidebar::on_filaments_delete(size_t filament_id)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     dynamic_filament_list.update();
+    refresh_plate_materials();
+}
+
+//EVERY REFUSAL SAYS WHY. A button that declines and reports nothing is indistinguishable from a
+//button that is broken, and this list is where the user has already met that: "a colour I cannot
+//delete" was the phantom row, but a delete button that silently does nothing reads exactly the
+//same from the outside. One helper so the refusals speak with one voice and none of them can be
+//added later without one.
+void Sidebar::refuse_spool_action(const wxString &reason) const
+{
+    BOOST_LOG_TRIVIAL(info) << "spool pool: refused - " << into_u8(reason);
+    if (Plater *plater = wxGetApp().plater())
+        if (NotificationManager *notifications = plater->get_notification_manager())
+            notifications->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(reason));
 }
 
 void Sidebar::add_filament() {
-    if (p->combos_filament.size() >= MAXIMUM_EXTRUDER_NUMBER) return;
-    wxColour    new_col        = Plater::get_next_color_for_filament();
-    add_custom_filament(new_col);
+    //The cap is checked and explained inside add_custom_filament, which every route into adding a
+    //spool goes through - the object-colour dialog and the EVT_ADD_CUSTOM_FILAMENT handler as well
+    //as this button. Checking it a second time here would be a second place for the two to drift.
+    if (!add_custom_filament(Plater::get_next_color_for_filament()))
+        return;
 
     auto filament_list = p->m_panel_filament_content;
     if(!filament_list->IsShown()){
@@ -4263,18 +4329,34 @@ void Sidebar::add_filament() {
 
 void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     if (is_new_project_in_gcode3mf()) { return; }
-    if (p->combos_filament.size() <= 1) return;
+    //Which spool is being removed is a question about the POOL, not about how many rows the
+    //sidebar happens to be showing. Reading the row count here is what made an out-of-date
+    //sidebar able to nominate an index the pool does not have.
+    const size_t pool_size = wxGetApp().preset_bundle->filament_presets.size();
+    if (pool_size <= 1) {
+        refuse_spool_action(_L("Your spool pool has only one spool left. The pool is what the app knows you own, so it never empties completely - change this spool instead of removing it."));
+        return;
+    }
 
-    size_t filament_count = p->combos_filament.size() - 1;
+    const size_t last_filament = pool_size - 1;
     if (filament_id == size_t(-2)) {
         filament_id = p->m_menu_filament_id;
     }
     if (filament_id == size_t(-1)) {
-        filament_id = filament_count;
+        filament_id = last_filament;
     }
 
-    if (filament_id > filament_count)
+    if (filament_id > last_filament) {
+        //Reaching here means a caller named a spool the pool does not have - a stale menu id, or
+        //a sidebar row that outlived its pool entry. That is the divergence class this file's
+        //sync_filament_rows_to_pool exists to end, so it is reported as a fault rather than
+        //shrugged off as a no-op.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": asked to delete spool %1% from a pool of %2%") % (filament_id + 1) % pool_size;
+        refuse_spool_action(wxString::Format(_L("There is no spool %d in your pool, so nothing was removed."),
+                                             int(filament_id + 1)));
         return;
+    }
 
     // Removing a spool from the pool removes exactly that: a row in the list of what is
     // available. Plates hold their materials by value - preset name and colour on the plate's
@@ -4293,11 +4375,19 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
         wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(wxGetApp().preset_bundle->filament_presets[0], false, "", true);
     }
 
-    if (p->editing_filament == filament_id || p->editing_filament >= filament_count) {
+    if (p->editing_filament >= 0 && (size_t(p->editing_filament) == filament_id || size_t(p->editing_filament) >= last_filament)) {
         p->editing_filament = -1;
     }
 
     wxGetApp().preset_bundle->update_num_filaments(filament_id);
+
+    //The pool just got shorter, so the sidebar's rows have to follow it in the same breath. This
+    //call is what commit 302fb11a86 lost: it used to arrive via Plater::on_filaments_delete,
+    //which was removed because it ALSO renumbered every plate and pruned painted facets - the
+    //right thing to remove and the wrong thing to remove it with. This is the pure-UI half, and
+    //it touches no plate, no object and no paint.
+    on_filaments_delete(filament_id);
+
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
 
@@ -4325,11 +4415,19 @@ void Sidebar::edit_filament()
         p->editing_filament = p->m_menu_filament_id; // sync with TabPresetComboxBox's m_filament_idx
 }
 
-void Sidebar::add_custom_filament(wxColour new_col) {
-    if (is_new_project_in_gcode3mf()) { return; }
-    if (p->combos_filament.size() >= MAXIMUM_EXTRUDER_NUMBER) return;
+bool Sidebar::add_custom_filament(wxColour new_col) {
+    //is_new_project_in_gcode3mf shows its own dialog and starts a new project, so it has already
+    //said what happened by the time it returns true.
+    if (is_new_project_in_gcode3mf()) { return false; }
+    //Same reason as delete_filament: how big the pool may grow is a fact about the pool.
+    const size_t pool_size = wxGetApp().preset_bundle->filament_presets.size();
+    if (pool_size >= MAXIMUM_EXTRUDER_NUMBER) {
+        refuse_spool_action(wxString::Format(_L("Your spool pool is full at %d spools, so no more can be added. Remove one you no longer keep in stock first."),
+                                             int(MAXIMUM_EXTRUDER_NUMBER)));
+        return false;
+    }
 
-    int         filament_count = p->combos_filament.size() + 1;
+    int         filament_count = int(pool_size) + 1;
     std::string new_color      = new_col.GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
     wxGetApp().preset_bundle->set_num_filaments(filament_count, new_color);
     //A new spool in the pool is a new row in what is available, nothing more. No plate grows
@@ -4338,6 +4436,7 @@ void Sidebar::add_custom_filament(wxColour new_col) {
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
     auto_calc_flushing_volumes(filament_count - 1);
+    return true;
 }
 
 bool Sidebar::is_new_project_in_gcode3mf()
@@ -4929,30 +5028,63 @@ bool Sidebar::should_show_SEMM_buttons()
     return resolved.config.opt_bool("single_extruder_multi_material") || resolved.is_bbl_printer;
 }
 
+//How many spools the CURRENT PLATE's printer can hold at once. Most of this farm is 1: one
+//nozzle, one spool, no AMS. A machine gets more from an AMS (Bambu), from being declared
+//single_extruder_multi_material, or from simply having more than one nozzle.
+int Sidebar::plate_printer_spool_capacity() const
+{
+    if (wxGetApp().plater() == nullptr || !wxGetApp().plater()->is_initialized())
+        return 1;
+    ResolvedPlateSlicingConfig resolved;
+    std::string error;
+    if (!wxGetApp().plater()->resolve_current_plate_slicing_config(resolved, error)) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error;
+        return 1;
+    }
+    int nozzles = 1;
+    if (const auto *diameters = resolved.config.option<ConfigOptionFloats>("nozzle_diameter"))
+        nozzles = std::max<int>(1, int(diameters->values.size()));
+    //An AMS or an MMU feeds many spools through one nozzle, so the nozzle count stops being the
+    //answer. MAXIMUM_EXTRUDER_NUMBER stands for "as many as the pool can hold".
+    if (resolved.is_bbl_printer || resolved.config.opt_bool("single_extruder_multi_material"))
+        return MAXIMUM_EXTRUDER_NUMBER;
+    return nozzles;
+}
+
 void Sidebar::show_SEMM_buttons()
 {
     // ORCA
     if (!p || p->combos_filament.empty() || !p->m_bpButton_add_filament || !p->m_bpButton_del_filament || !p->m_flushing_volume_btn)
         return;
-    
-    bool is_multi_material = p->combos_filament.size() > 1;
-    bool single_or_bbl     = should_show_SEMM_buttons();
-    bool is_single = single_or_bbl && !is_multi_material; // SINGLE EXTRUDER / BBL WITH 1 MATERIAL
-    bool is_multi  = single_or_bbl && is_multi_material;  // MULTI MATERIAL WITH SINGLE EXTRUDER
-    bool is_fixed  = !is_single && !is_multi;             // MULTI EXTRUDER / TOOLCHANGER / IDEX WITH FIXED MATERIAL
 
-    p->m_bpButton_add_filament->Show(single_or_bbl);
-    p->m_bpButton_del_filament->Show(is_multi);
-    p->m_flushing_volume_btn->Show(  is_multi);
+    //THREE DIFFERENT QUESTIONS, which this used to answer with one flag.
+    //
+    //"Can I own another spool?" is about the POOL, and the pool is printer-independent by
+    //design - it is what is on the shelf. It used to be gated on should_show_SEMM_buttons(),
+    //which asks whether the current plate's printer is Bambu or SEMM, so on a Creality or a
+    //Prusa - most of this farm - the pool could not be added to at all.
+    //
+    //"Does flushing apply?" is about the MACHINE: purging between colours is what a single
+    //nozzle does when it prints more than one material, and a machine that can only hold one
+    //spool never does it. It used to be gated on the pool size, so owning four spools put a
+    //flushing button on a single-spool printer, where it configures nothing that can happen.
+    //
+    //The AMS sync button is deliberately not touched here: update_ui_from_settings already owns
+    //it and decides on better evidence (the printer's network stack, and the agent's filament
+    //sync mode). Two functions showing and hiding one widget by two different rules is how a
+    //control ends up flickering between them, so this defers to the one that knows more.
+    const size_t pool_size = wxGetApp().preset_bundle->filament_presets.size();
+    const bool   multi_spool_machine = plate_printer_spool_capacity() > 1;
 
-    if (is_multi) {
-        for (auto &c : p->combos_filament)
-            c->edit_btn->SetBitmap_("menu_filament");
-    }
-    else if (is_single || is_fixed) {
-        for (auto &c : p->combos_filament)
-            c->edit_btn->SetBitmap_("edit");
-    }
+    p->m_bpButton_add_filament->Show(pool_size < MAXIMUM_EXTRUDER_NUMBER);
+    p->m_bpButton_del_filament->Show(pool_size > 1);
+    p->m_flushing_volume_btn->Show(multi_spool_machine);
+
+    //The row's own button opens a menu of per-slot actions on a machine that has slots to
+    //choose between, and the filament settings directly on one that does not.
+    for (auto &c : p->combos_filament)
+        if (c->edit_btn != nullptr)
+            c->edit_btn->SetBitmap_(multi_spool_machine && pool_size > 1 ? "menu_filament" : "edit");
 
     Layout();
 }
@@ -5320,68 +5452,139 @@ void Sidebar::refresh_plate_materials()
     if (plate == nullptr || bundle == nullptr)
         return;
 
-    std::vector<std::string> labels;
+    //WHAT THIS PANEL IS FOR, in one sentence: which spools this plate prints with. That is the
+    //question the two-second look has to answer, so the slot number, the colour and the material
+    //are what carry the row, and the preset name - the longest and least distinguishing part -
+    //sits underneath in the dim weight. It used to be a wrapped multi-line sentence per slot
+    //with a "Change..." button beside it, in a sidebar whose OTHER list of materials right below
+    //is swatch-and-dropdown: the same kind of thing drawn two different ways, and the half that
+    //actually prints was the half with no colour on it at all. Colour is material information in
+    //this app, so a screen about assigned materials that shows none of it is missing its subject.
+    struct SlotRow
+    {
+        std::string name;       // the preset the plate names for this slot
+        std::string material;   // PLA, PETG, ... - what actually comes out
+        std::string colour;     // the plate's own colour for this slot
+        bool        overridden = false;
+        bool        installed  = true;
+        bool operator==(const SlotRow &o) const
+        {
+            return name == o.name && material == o.material && colour == o.colour &&
+                   overridden == o.overridden && installed == o.installed;
+        }
+    };
+    std::vector<SlotRow> slots;
     const auto &names = plate->get_filament_preset_names();
+    //The plate's OWN colours, with each slot's material default filled in where the plate
+    //records a blank. Deliberately not the pool's colours: a plate slot holds what was assigned
+    //to it, and the two lists are different lengths for a reason.
+    const std::vector<std::string> colours = bundle->plate_filament_colours(plate->get_slicing_context());
     for (size_t i = 0; i < names.size(); ++i) {
+        SlotRow slot;
+        slot.name = names[i];
         const Preset *preset = bundle->filaments.find_preset(names[i], false);
-        std::string material;
+        slot.installed = preset != nullptr;
         if (preset != nullptr)
             if (const auto *type = preset->config.option<ConfigOptionStrings>("filament_type");
                 type != nullptr && !type->values.empty())
-                material = type->values.front();
-        bool material_overridden = false;
+                slot.material = type->values.front();
         if (const auto *type = plate->config()->option<ConfigOptionStrings>("filament_type");
             type != nullptr && !type->values.empty()) {
-            material_overridden = material != type->get_at(i);
-            material = type->get_at(i);
+            slot.overridden = slot.material != type->get_at(i);
+            slot.material   = type->get_at(i);
         }
-        wxString label = wxString::Format(_L("Slot %d: %s"), int(i + 1), from_u8(names[i]));
-        if (!material.empty())
-            label = wxString::Format(_L("Slot %d: %s\n%s"), int(i + 1), from_u8(material), from_u8(names[i]));
-        if (material_overridden)
-            label += " " + _L("(material changed by a plate override)");
-        if (preset == nullptr)
-            label += " " + _L("(not installed)");
-        labels.push_back(into_u8(label));
+        slot.colour = i < colours.size() ? colours[i] : std::string();
+        slots.push_back(std::move(slot));
     }
+
+    //A slot only exists on a machine that can hold one. Offering "add a slot" on a single-spool
+    //printer is offering something the machine cannot do.
+    const bool can_add_slot = int(slots.size()) < plate_printer_spool_capacity();
+
     const int width = std::max(FromDIP(180), p->plate_materials_panel->GetClientSize().x - FromDIP(75));
+    std::vector<std::string> labels;
+    labels.reserve(slots.size() + 1);
+    for (const SlotRow &slot : slots)
+        labels.push_back(slot.name + "\x1f" + slot.material + "\x1f" + slot.colour + "\x1f" +
+                         (slot.overridden ? "o" : "-") + (slot.installed ? "i" : "-"));
+    labels.push_back(can_add_slot ? "+" : "-"); // the add button is part of what is on screen
     if (p->shown_material_plate == plate_index && p->shown_material_width == width && p->shown_plate_materials == labels)
         return;
     p->shown_material_plate = plate_index;
     p->shown_material_width = width;
     p->shown_plate_materials = labels;
     p->plate_materials_sizer->Clear(true);
+
     auto *title = new wxStaticText(p->plate_materials_panel, wxID_ANY,
-                                   wxString::Format(_L("Plate %d assigned materials"), plate_index + 1));
+                                   wxString::Format(_L("Plate %d prints with"), plate_index + 1));
     title->SetFont(wxGetApp().bold_font());
     p->plate_materials_sizer->Add(title, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
-    for (size_t i = 0; i < labels.size(); ++i) {
+
+    const int swatch_w = 3 * wxGetApp().em_unit();
+    const int swatch_h = 2 * wxGetApp().em_unit();
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const SlotRow &slot = slots[i];
+        //The whole row is the control. Direct manipulation: click the thing you want to change,
+        //rather than read a sentence about it and then hunt for a button that acts on it.
+        auto *row_panel = new wxPanel(p->plate_materials_panel, wxID_ANY);
         auto *row = new wxBoxSizer(wxHORIZONTAL);
-        auto *label = new wxStaticText(p->plate_materials_panel, wxID_ANY, from_u8(labels[i]));
-        label->Wrap(width);
-        label->SetMinSize(wxSize(1, label->GetBestSize().y));
-        label->SetToolTip(from_u8(labels[i]));
-        row->Add(label, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(4));
-        auto *change = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Change…"),
-                                    wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
-        change->Bind(wxEVT_BUTTON, [this, i](wxCommandEvent &) {
+        row_panel->SetSizer(row);
+
+        const std::string shown_colour = slot.colour.empty() ? std::string("#26A69A") : slot.colour;
+        wxBitmap *swatch_bmp = get_extruder_color_icon(shown_colour, std::to_string(i + 1), swatch_w, swatch_h);
+        auto *swatch = new wxStaticBitmap(row_panel, wxID_ANY, swatch_bmp != nullptr ? *swatch_bmp : wxNullBitmap);
+        row->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
+
+        auto *text = new wxBoxSizer(wxVERTICAL);
+        //The material is the answer to "what comes out of the nozzle", so it leads. An empty one
+        //says the preset is not installed here, which is the more urgent fact and takes its place.
+        wxString headline = slot.material.empty() ? _L("Material unknown") : from_u8(slot.material);
+        if (!slot.installed)
+            headline += " " + _L("(not installed)");
+        else if (slot.overridden)
+            headline += " " + _L("(plate override)");
+        auto *headline_text = new wxStaticText(row_panel, wxID_ANY, headline);
+        headline_text->SetFont(wxGetApp().bold_font());
+        if (!slot.installed)
+            headline_text->SetForegroundColour(wxColour(0xC5, 0x3D, 0x3D));
+        text->Add(headline_text, 0, wxEXPAND);
+
+        auto *name_text = new wxStaticText(row_panel, wxID_ANY, from_u8(slot.name));
+        name_text->SetFont(wxGetApp().normal_font().Smaller());
+        name_text->SetForegroundColour(wxColour(0x6B, 0x6B, 0x6B));
+        name_text->Wrap(width - swatch_w - FromDIP(20));
+        text->Add(name_text, 0, wxEXPAND);
+        row->Add(text, 1, wxALIGN_CENTER_VERTICAL);
+
+        const wxString tip = wxString::Format(_L("Slot %d: %s\nClick to assign a different spool to this slot."),
+                                              int(i + 1), from_u8(slot.name));
+        const int slot_number = int(i + 1);
+        auto open_slot = [this, slot_number](wxMouseEvent &) {
             show_plate_filament_menu(p->plate_materials_panel, p->plater,
-                                      p->plater->get_partplate_list().get_curr_plate_index(), int(i + 1));
-        });
-        row->Add(change, 0, wxALIGN_CENTER_VERTICAL);
-        p->plate_materials_sizer->Add(row, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
+                                     p->plater->get_partplate_list().get_curr_plate_index(), slot_number);
+        };
+        for (wxWindow *hot : {static_cast<wxWindow *>(row_panel), static_cast<wxWindow *>(swatch),
+                              static_cast<wxWindow *>(headline_text), static_cast<wxWindow *>(name_text)}) {
+            hot->SetToolTip(tip);
+            hot->SetCursor(wxCursor(wxCURSOR_HAND));
+            hot->Bind(wxEVT_LEFT_UP, open_slot);
+        }
+        p->plate_materials_sizer->Add(row_panel, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
     }
-    if (labels.empty())
+
+    if (slots.empty())
         p->plate_materials_sizer->Add(new wxStaticText(p->plate_materials_panel, wxID_ANY,
                                                        _L("No material assigned. Add a slot to make this plate ready to slice.")),
                                        0, wxEXPAND);
-    auto *add = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Add plate material slot"),
-                             wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
-    add->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
-        show_plate_filament_menu(p->plate_materials_panel, p->plater,
-                                  p->plater->get_partplate_list().get_curr_plate_index(), 0);
-    });
-    p->plate_materials_sizer->Add(add, 0, wxTOP, FromDIP(2));
+    if (can_add_slot) {
+        auto *add = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Add plate material slot"),
+                                 wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+        add->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
+            show_plate_filament_menu(p->plate_materials_panel, p->plater,
+                                      p->plater->get_partplate_list().get_curr_plate_index(), 0);
+        });
+        p->plate_materials_sizer->Add(add, 0, wxTOP, FromDIP(2));
+    }
     wxGetApp().UpdateDarkUI(p->plate_materials_panel);
     for (wxWindow *child : p->plate_materials_panel->GetChildren())
         wxGetApp().UpdateDarkUI(child);
@@ -5440,6 +5643,11 @@ void Sidebar::on_plate_selection_changed(int current_plate)
     //navigated away from.
     m_scoped_plates.clear();
     refresh_plate_scope();
+
+    //The support/wall filament dropdowns list the CURRENT plate's slots now, not the spool pool,
+    //so the selection moving is what makes them stale. Nothing else on this path rebuilt them,
+    //because while they were pool-backed a plate click could not change what they held.
+    update_dynamic_filament_list();
 
     //The Process panel's Plate scope describes the CURRENT plate, so it re-points here for
     //exactly the reason above - and it is a separate panel, so it does not learn about the
@@ -7413,9 +7621,336 @@ void read_binary_stl(const std::string& filename, std::string& model_id, std::st
     return;
 }
 
+// ---------------------------------------------------------------------------------------
+// IMPORT RECEPTION: what happens to a project authored for a machine this farm does not own.
+//
+// The app decides and reports. It does not ask. A downloaded project names a printer that is
+// simply not here - "Bambu Lab H2S 0.4 nozzle" on a farm of Crealities - and the only thing a
+// dialog at that moment can do is stop the open to collect an answer the app can work out for
+// itself. Worse, it collects it MID-LOAD: the presets the project brought are half installed,
+// the plate contexts are half written, the project-backup thread is serialising the same model,
+// and a printer switch from there takes an undo snapshot of a half-built project. That is the
+// crash. Doing the identical switch from the plate board after the load works because by then
+// none of those things is true.
+//
+// So the switch is made through exactly the same path the plate board uses -
+// Plater::set_plate_printer - and it is made AFTER the load has finished, from the event loop.
+// No new write path, no second rule, and nothing mid-flight.
+namespace {
+
+//A machine this installation actually owns, as opposed to a name a project brought with it.
+//An imported project's printer is installed as an EXTERNAL preset decorated with the file name,
+//so it resolves, draws a bed and slices - it just is not a machine anybody here can print on.
+bool printer_is_owned_machine(const PresetBundle &bundle, const std::string &preset_name)
+{
+    if (preset_name.empty())
+        return false;
+    const Preset *preset = bundle.printers.find_preset(preset_name, false);
+    if (preset == nullptr || preset->is_default || !preset->is_visible)
+        return false;
+    //Both halves matter: is_external catches the preset this load synthesised from the file,
+    //and the decoration catches one a previous session already saved under that name.
+    return !preset->is_external && !preset->is_project_embedded && !Preset::has_project_decoration(preset->name);
+}
+
+//What the plate has to fit, in millimetres. An empty plate needs nothing, which is why it is
+//allowed to land anywhere.
+Vec3d plate_occupied_size(PartPlate *plate)
+{
+    BoundingBoxf3 bb;
+    for (const ModelObject *object : plate->get_objects_on_this_plate())
+        if (object != nullptr)
+            //_approx, not _exact: this is a "does it fit on that bed" question answered once per
+            //candidate machine per plate, and an exact convex-hull pass over every instance of
+            //every object is a slicing-grade computation to answer it.
+            bb.merge(object->bounding_box_approx());
+    return bb.defined ? bb.size() : Vec3d::Zero();
+}
+
+//THE RECEPTION TARGET, chosen deterministically so the same project lands the same way twice
+//and the report can say WHICH RULE chose. In order:
+//   1. the bed has to fit what the plate is actually carrying;
+//   2. of those, the one that loses fewest of the authored process's settings in translation -
+//      measured by running the translation dry, not guessed at from the vendor name;
+//   3. of those, the machine already in use - by another plate of this project first, then the
+//      one selected in the app - because a farm project that lands on one machine is a project
+//      somebody can actually print;
+//   4. of those, the first by name, so there is no "it depends".
+//Returns an empty name when this installation owns no machine at all, which is the one case
+//that genuinely cannot be resolved and is reported as such.
+std::string choose_reception_target(const PresetBundle               &bundle,
+                                    PartPlateList                    &plates,
+                                    PartPlate                        *plate,
+                                    const std::map<std::string, int> &plates_per_owned_machine,
+                                    wxString                         &rule_used)
+{
+    const Vec3d   need             = plate_occupied_size(plate);
+    const Preset *authored_process = bundle.prints.find_preset(plate->get_print_preset_name(), false);
+
+    struct Candidate
+    {
+        std::string name;
+        bool        fits     = false;
+        size_t      dropped  = 0;
+        int         in_use   = 0;
+        bool        selected = false;
+    };
+    std::vector<Candidate> candidates;
+    for (const Preset &printer : bundle.printers) {
+        if (printer.printer_technology() != ptFFF || !printer_is_owned_machine(bundle, printer.name))
+            continue;
+
+        Candidate candidate;
+        candidate.name = printer.name;
+
+        PlateBed bed;
+        if (plates.resolve_printer_bed(printer.name, bed) && !bed.shape.empty()) {
+            const BoundingBoxf bed_box(bed.shape);
+            const Vec2d        bed_size = bed_box.size();
+            candidate.fits = need.x() <= bed_size.x() + EPSILON && need.y() <= bed_size.y() + EPSILON &&
+                             (bed.printable_height <= 0.0 || need.z() <= bed.printable_height + EPSILON);
+        }
+
+        //The dry translation. carry_process_intent names every key the target has no definition
+        //for; that count IS "how much of what the author chose this machine cannot express".
+        const Preset *target_process = bundle.prints.find_preset(printer.config.opt_string("default_print_profile"), false);
+        if (authored_process != nullptr && target_process != nullptr) {
+            std::vector<std::string> dropped;
+            bundle.carry_process_intent(*authored_process, *target_process, dropped);
+            candidate.dropped = dropped.size();
+        }
+
+        const auto in_use  = plates_per_owned_machine.find(printer.name);
+        candidate.in_use   = in_use == plates_per_owned_machine.end() ? 0 : in_use->second;
+        candidate.selected = printer.name == bundle.printers.get_selected_preset_name();
+        candidates.push_back(std::move(candidate));
+    }
+    if (candidates.empty()) {
+        rule_used = _L("no machine is installed here");
+        return std::string();
+    }
+
+    const bool any_fits = std::any_of(candidates.begin(), candidates.end(), [](const Candidate &c) { return c.fits; });
+    std::sort(candidates.begin(), candidates.end(), [any_fits](const Candidate &a, const Candidate &b) {
+        if (any_fits && a.fits != b.fits) return a.fits;
+        if (a.dropped != b.dropped)       return a.dropped < b.dropped;
+        if (a.in_use != b.in_use)         return a.in_use > b.in_use;
+        if (a.selected != b.selected)     return a.selected;
+        return a.name < b.name;
+    });
+
+    const Candidate &chosen = candidates.front();
+    if (!any_fits)
+        rule_used = _L("nothing here has a bed big enough, so it went to the closest match by settings");
+    else if (chosen.in_use > 0)
+        rule_used = _L("it fits, and the rest of this project is already on it");
+    else
+        rule_used = _L("it fits and loses least of what the project asked for");
+    return chosen.name;
+}
+
+//WHICH SPOOL PRINTS WHICH AUTHORED COLOUR - decided, not asked.
+//
+//An OBJ carries colours and no configuration, so something has to say which of this plate's
+//spools each authored colour becomes. That was a modal raised from inside load_files, under the
+//progress dialog, before the plate had been retargeted - so the user was mapping colours onto a
+//slot list that was about to change underneath them.
+//
+//The mapping itself is not a judgement call: a colour is material information, and the nearest
+//spool to an authored colour is the answer in every case where the plate already holds spools.
+//So it is made here, in RGB distance, and reported. Changing it afterwards is the object's
+//filament assignment, which is where that decision lives anyway and where it can be seen.
+//
+//Never adds a slot. Adding one is a material decision - somebody has to load that spool - and
+//this is a file import, not a purchase.
+void assign_obj_colours_to_plate_spools(ObjDialogInOut &in_out, NotificationManager *notifications)
+{
+    if (in_out.input_colors.empty() || wxGetApp().plater() == nullptr) {
+        in_out.filament_ids.clear();
+        return;
+    }
+
+    const std::vector<std::string> pool = wxGetApp().plater()->get_extruder_colors_from_plater_config();
+    std::vector<std::array<float, 3>> spool_rgb;
+    for (const std::string &colour : pool) {
+        const wxColour parsed(from_u8(colour));
+        if (parsed.IsOk())
+            spool_rgb.push_back({parsed.Red() / 255.0f, parsed.Green() / 255.0f, parsed.Blue() / 255.0f});
+    }
+    if (spool_rgb.empty()) {
+        //No spools to map onto. Saying nothing here would leave the object silently single
+        //colour; the object's own filament assignment is the fix and it is one click away.
+        in_out.filament_ids.clear();
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": the OBJ carries " << in_out.input_colors.size()
+                                   << " colour(s) and this plate holds no spool to map them onto";
+        return;
+    }
+
+    std::vector<unsigned char> ids;
+    ids.reserve(in_out.input_colors.size());
+    std::set<unsigned char> used;
+    for (const RGBA &authored : in_out.input_colors) {
+        size_t best     = 0;
+        float  best_d2  = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < spool_rgb.size(); ++i) {
+            const float dr = authored[0] - spool_rgb[i][0];
+            const float dg = authored[1] - spool_rgb[i][1];
+            const float db = authored[2] - spool_rgb[i][2];
+            const float d2 = dr * dr + dg * dg + db * db;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best    = i;
+            }
+        }
+        //1-based, like every filament slot number in this application.
+        ids.push_back((unsigned char) (best + 1));
+        used.insert(ids.back());
+    }
+
+    in_out.filament_ids      = ids;
+    in_out.first_extruder_id = ids.front();
+    if (in_out.deal_vertex_color)
+        Model::obj_import_vertex_color_deal(in_out.filament_ids, in_out.first_extruder_id, in_out.model);
+    else
+        Model::obj_import_face_color_deal(in_out.filament_ids, in_out.first_extruder_id, in_out.model);
+
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": mapped " << in_out.input_colors.size()
+                            << " authored colour(s) onto " << used.size() << " of this plate's " << spool_rgb.size()
+                            << " spool(s) by nearest colour";
+    if (notifications != nullptr)
+        notifications->push_notification(
+            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+            into_u8(wxString::Format(_L("%d colour(s) in this file were matched to %d of this plate's spools by nearest colour. "
+                                        "Change it on the object if that is not what you meant."),
+                                     (int) in_out.input_colors.size(), (int) used.size())));
+}
+
+} // namespace
+
+//See the block comment above. Runs from the event loop once the load is completely finished.
+static void reconcile_imported_plates(Plater *plater, const std::string &authored_printer)
+{
+    if (plater == nullptr || !plater->is_initialized() || plater->is_loading_project())
+        return;
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return;
+    PartPlateList &plates = plater->get_partplate_list();
+
+    //Which owned machines this project is already on, so the plates that DO resolve pull the
+    //ones that do not towards them, rather than each being answered in isolation.
+    std::map<std::string, int> plates_per_owned_machine;
+    std::vector<int>           foreign;
+    for (int i = 0; i < plates.get_plate_count(); ++i) {
+        PartPlate *plate = plates.get_plate(i);
+        if (plate == nullptr)
+            continue;
+        if (printer_is_owned_machine(*bundle, plate->get_printer_preset_name()))
+            ++plates_per_owned_machine[plate->get_printer_preset_name()];
+        else
+            foreign.push_back(i);
+    }
+    if (foreign.empty())
+        return;
+
+    int                        retargeted = 0;
+    std::map<std::string, int> landed_on;
+    std::vector<int>           unresolved;
+    wxString                   rule_for_report;
+    for (int index : foreign) {
+        PartPlate *plate = plates.get_plate(index);
+        if (plate == nullptr)
+            continue;
+        const std::string authored = plate->get_printer_preset_name();
+        wxString          rule;
+        const std::string target = choose_reception_target(*bundle, plates, plate, plates_per_owned_machine, rule);
+        if (target.empty()) {
+            unresolved.push_back(index);
+            BOOST_LOG_TRIVIAL(error) << "reconcile_imported_plates: plate " << (index + 1) << " asks for '" << authored
+                                     << "', which is not installed, and there is no machine here to receive it";
+            continue;
+        }
+        BOOST_LOG_TRIVIAL(warning) << "reconcile_imported_plates: plate " << (index + 1) << " was authored for '" << authored
+                                   << "', which is not installed here; receiving it on '" << target << "' ("
+                                   << into_u8(rule) << ")";
+        //THE ONE WRITE PATH. set_plate_printer carries the chosen values across as plate
+        //overrides, re-expresses the materials for the new machine, re-derives the bed and names
+        //what it could not resolve - all of which is already built and none of which is
+        //re-implemented here.
+        if (plater->set_plate_printer(index, target)) {
+            ++retargeted;
+            ++landed_on[target];
+            ++plates_per_owned_machine[target];
+            rule_for_report = rule;
+        } else {
+            unresolved.push_back(index);
+        }
+    }
+
+    //ONE RECEPTION REPORT. Counts, not lists: a 21-plate project that needed the same decision
+    //21 times is one fact, and a message that grows with the plate count fails hardest on the
+    //project that needed it most. The per-plate detail is already on screen, pushed by the
+    //re-resolution of each plate as it moved.
+    NotificationManager *notifications = plater->get_notification_manager();
+    if (notifications == nullptr)
+        return;
+
+    wxString message;
+    if (!authored_printer.empty())
+        message = wxString::Format(_L("This project was made for \"%s\", which is not installed here. "),
+                                   from_u8(authored_printer));
+    if (retargeted > 0) {
+        wxString machines;
+        for (const auto &entry : landed_on) {
+            if (!machines.IsEmpty())
+                machines += ", ";
+            machines += wxString::Format("%s (%d)", from_u8(entry.first), entry.second);
+        }
+        message += wxString::Format(_L("%d plate(s) were received on %s - %s. The settings the project chose came with "
+                                       "them; anything a plate could not keep is named above it."),
+                                    retargeted, machines, rule_for_report);
+    }
+    if (!unresolved.empty()) {
+        wxString numbers;
+        for (int index : unresolved) {
+            if (!numbers.IsEmpty())
+                numbers += ", ";
+            numbers += wxString::Format("%d", index + 1);
+        }
+        message += " " + wxString::Format(_L("Plate(s) %s could not be received: there is no machine here to print them. "
+                                             "Install one, then assign them on the plate board."),
+                                          numbers);
+    }
+    notifications->push_notification(NotificationType::CustomNotification,
+                                     unresolved.empty() ? NotificationManager::NotificationLevel::RegularNotificationLevel
+                                                        : NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                     into_u8(message));
+}
+
 // BBS: backup & restore
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi)
 {
+    //"LOADING" HAS TO MEAN THE WHOLE LOAD, and it did not.
+    //
+    //Plater::is_loading_project() is the guard every path that writes to a plate already checks:
+    //Tab::write_selection_to_current_plate, Plater::reresolve_plate_context,
+    //Plater::follow_plate_presets, Plater::choose_plate_material_replacement, and the completion
+    //pass inside GUI_App::load_current_presets. All of them are correct, and all of them were
+    //being told the truth only when the load happened to have entered through
+    //Plater::load_project - which is the only place that set the flag. Every other way into this
+    //function (a dropped file, an imported geometry-only 3MF, add-model) ran the entire load with
+    //the flag false, so those guards were open at the exact moment they were written for.
+    //
+    //That is the shape of the reported crash: a printer switch reaching a plate list that is
+    //still being written, a model that is still being added to, an undo snapshot that is still
+    //open around the whole load, and a backup thread serialising the same model. The switch is
+    //not wrong; running it here is. Setting the flag for the duration closes every one of those
+    //guards over the whole load rather than over its entrance, which is what makes it impossible
+    //rather than merely unlikely - and it costs one line, because the rule already existed.
+    const bool was_loading = q->m_loading_project;
+    q->m_loading_project   = true;
+    ScopeGuard loading_sc([this, was_loading]() { q->m_loading_project = was_loading; });
+
     std::vector<size_t> empty_result;
     bool dlg_cont = true;
     bool is_user_cancel = false;
@@ -7460,6 +7995,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
 
     std::string  designer_model_id;
     std::string  designer_country_code;
+
+    //Import reception (see reconcile_imported_plates, above). Recorded here, acted on after the
+    //whole load has finished - never inside it. The authored name is read from the file BEFORE
+    //the presets are installed, because installing renames them: the user's project was made for
+    //"Bambu Lab H2S 0.4 nozzle", not for "Bambu Lab H2S 0.4 nozzle(CelticOwl-BambuStudio.3mf)",
+    //and a report that quotes the decorated name is quoting the app back at itself.
+    bool         project_config_loaded    = false;
+    std::string  project_authored_printer;
 
     int answer_convert_from_meters          = wxOK_DEFAULT;
     int answer_convert_from_imperial_units  = wxOK_DEFAULT;
@@ -7632,18 +8175,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                                          _sparse_infill_pattern == ipZigZag || _sparse_infill_pattern == ipCrossZag ||
                                                          _sparse_infill_pattern == ipLockedZag;
                                 if (!is_safe_to_rotate) {
-                                    wxString msg_text = _(
-                                        L("This project was created with an OrcaSlicer 2.3.1-alpha and uses "
-                                          "infill rotation template settings that may not work properly with your current infill pattern. "
-                                          "This could result in weak support or print quality issues."));
-                                    msg_text += "\n\n" +
-                                                _(L("Would you like OrcaSlicer to automatically fix this by clearing the rotation template settings?"));
-                                    MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
-                                    dialog.SetButtonLabel(wxID_YES, _L("Yes"));
-                                    dialog.SetButtonLabel(wxID_NO, _L("No"));
-                                    if (dialog.ShowModal() == wxID_YES) {
-                                        config_loaded.opt_string("sparse_infill_rotate_template") = "";
-                                    }
+                                    //THE APP HAS THE ANSWER, SO IT DOES NOT ASK. The rotation template cannot work with
+                                    //this infill pattern, and it is not a value this project's author chose - it is a
+                                    //2.3.1-alpha artefact that the pattern never supported. "Shall I fix this?" about a
+                                    //setting nobody picked is a question with one correct answer, and as a modal raised
+                                    //mid-load it stacked under the app-modal progress dialog and held the open hostage.
+                                    config_loaded.opt_string("sparse_infill_rotate_template") = "";
+                                    log_and_show_3mf_info(_L("This project carried infill rotation template settings from OrcaSlicer "
+                                                             "2.3.1-alpha that its infill pattern cannot use. They were cleared."),
+                                                          load_3mf_title);
                                 }
                             }
                         } else if (load_config && (file_version > app_version)) {
@@ -7687,18 +8227,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                                              _sparse_infill_pattern == ipZigZag || _sparse_infill_pattern == ipCrossZag ||
                                                              _sparse_infill_pattern == ipLockedZag;
                                     if (!is_safe_to_rotate) {
-                                        wxString msg_text = _(
-                                            L("This project was created with an OrcaSlicer 2.3.1-alpha and uses "
-                                              "infill rotation template settings that may not work properly with your current infill pattern. "
-                                              "This could result in weak support or print quality issues."));
-                                        msg_text += "\n\n" +
-                                                    _(L("Would you like OrcaSlicer to automatically fix this by clearing the rotation template settings?"));
-                                        MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
-                                        dialog.SetButtonLabel(wxID_YES, _L("Yes"));
-                                        dialog.SetButtonLabel(wxID_NO, _L("No"));
-                                        if (dialog.ShowModal() == wxID_YES) {
-                                            config_loaded.opt_string("sparse_infill_rotate_template") = "";
-                                        }
+                                        //THE APP HAS THE ANSWER, SO IT DOES NOT ASK. The rotation template cannot work with
+                                        //this infill pattern, and it is not a value this project's author chose - it is a
+                                        //2.3.1-alpha artefact that the pattern never supported. "Shall I fix this?" about a
+                                        //setting nobody picked is a question with one correct answer, and as a modal raised
+                                        //mid-load it stacked under the app-modal progress dialog and held the open hostage.
+                                        config_loaded.opt_string("sparse_infill_rotate_template") = "";
+                                        log_and_show_3mf_info(_L("This project carried infill rotation template settings from OrcaSlicer "
+                                                                 "2.3.1-alpha that its infill pattern cannot use. They were cleared."),
+                                                              load_3mf_title);
                                     }
                                 }
                             }
@@ -7927,37 +8464,37 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             }
                         }
 
-                        auto choise = wxGetApp().app_config->get("no_warn_when_modified_gcodes");
-                        if (choise.empty() || choise != "true") {
-                            // BBS: first validate the printer
-                            // validate the system profiles
-                            std::set<std::string> modified_gcodes;
-                            int validated = preset_bundle->validate_presets(filename.string(), config, modified_gcodes);
-                            if (validated == VALIDATE_PRESETS_MODIFIED_GCODES) {
-                                std::string warning_message;
-                                warning_message += "\n";
-                                for (std::set<std::string>::iterator it=modified_gcodes.begin(); it!=modified_gcodes.end(); ++it)
-                                    warning_message += "-" + *it + "\n";
-                                warning_message += "\n";
-                                //show_info(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
-                                MessageDialog dlg(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
-                            }
-                            else if ((validated == VALIDATE_PRESETS_PRINTER_NOT_FOUND) || (validated == VALIDATE_PRESETS_FILAMENTS_NOT_FOUND)) {
-                                std::string warning_message;
-                                warning_message += "\n";
-                                for (std::set<std::string>::iterator it=modified_gcodes.begin(); it!=modified_gcodes.end(); ++it)
-                                    warning_message += "-" + *it + "\n";
-                                warning_message += "\n";
-                                //show_info(q, _L("The 3MF has the following customized filament or printer presets:") + warning_message + _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                MessageDialog dlg(q, _L("The 3MF has the following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                        //THE LAST TWO MODALS ON THE PROJECT-OPEN PATH, and the pair a downloaded
+                        //project hits every time. Both said "here are preset names this build does
+                        //not have as system profiles, please confirm their G-code is safe", raised
+                        //from INSIDE load_files while the app-modal progress dialog was up - so a
+                        //project that was about to be retargeted onto a machine we own stopped,
+                        //stacked under the progress bar, to ask about the G-code of a machine we
+                        //do not have and are not going to print on.
+                        //
+                        //It is a statement of fact about the file, not a decision: nothing the user
+                        //can press changes what loads, and the "don't warn again" checkbox is the
+                        //giveaway - a question worth asking is not one you offer to stop asking.
+                        //What the project actually turned into is said once, afterwards, by the
+                        //reception report in reconcile_imported_plates.
+                        {
+                            std::set<std::string> unknown_presets;
+                            const int validated = preset_bundle->validate_presets(filename.string(), config, unknown_presets);
+                            if (validated != VALIDATE_PRESETS_SUCCESS && !unknown_presets.empty()) {
+                                std::string names;
+                                for (const std::string &preset_name : unknown_presets) {
+                                    if (!names.empty())
+                                        names += ", ";
+                                    names += preset_name;
+                                }
+                                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": 3MF '" << filename.string()
+                                    << "' carries presets this build does not have as system profiles: " << names;
+                                notification_manager->push_notification(
+                                    NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                    into_u8(wxString::Format(validated == VALIDATE_PRESETS_MODIFIED_GCODES
+                                                                 ? _L("This project carries modified G-code in %d preset(s): %s. It came with the file, not from this machine's profiles.")
+                                                                 : _L("This project brought %d preset(s) of its own: %s. They are the file's, not this machine's profiles."),
+                                                             (int) unknown_presets.size(), from_u8(names))));
                             }
                         }
 
@@ -7972,6 +8509,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 file_wipe_tower_x = *wipe_tower_x_opt;
                             if (wipe_tower_y_opt)
                                 file_wipe_tower_y = *wipe_tower_y_opt;
+
+                            //Read before the move, and before load_config_model renames anything:
+                            //this is the machine the person who made the project was printing on.
+                            project_authored_printer = config.opt_string("printer_settings_id", true);
 
                             preset_bundle->load_config_model(filename.string(), std::move(config), file_version);
 
@@ -8082,6 +8623,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             // when for extruder colors are used filament colors
                             q->on_filament_count_change(preset_bundle->filament_presets.size());
                             is_project_file = true;
+                            project_config_loaded = true;
 
                             DynamicConfig& proj_cfg = preset_bundle->project_config;
                             // do some post process after loading config
@@ -8170,13 +8712,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
 
                 //ObjImportColorFn obj_color_fun=nullptr;
                 auto obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
-
                     if (!boost::iends_with(path.string(), ".obj")) { return; }
-                    const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
-                    ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours, Sidebar::should_show_SEMM_buttons());
-                    if (color_dlg.ShowModal() != wxID_OK) {
-                        in_out.filament_ids.clear();
-                    }
+                    //See assign_obj_colours_to_plate_spools: the nearest spool IS the answer, so
+                    //the app gives it and says so instead of stopping the load to collect it.
+                    assign_obj_colours_to_plate_spools(in_out, notification_manager.get());
                 };
                 if (boost::iends_with(path.string(), ".stp") ||
                     boost::iends_with(path.string(), ".step")) {
@@ -8196,19 +8735,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 cont          = dlg.Update(progress_percent, msg);
                                 cancel        = !cont;
                         },
-                        [](int isUtf8StepFile) {
-                            if (!isUtf8StepFile) {
-                                const auto no_warn = wxGetApp().app_config->get_bool("step_not_utf8_no_warn");
-                                if (!no_warn) {
-                                    MessageDialog dlg(nullptr, _L("Component name(s) inside step file not in UTF8 format!") + "\n\n" + _L("Because of unsupported text encoding, garbage characters may appear!"),
-                                                      wxString(SLIC3R_APP_FULL_NAME " - ") + _L("Attention!"), wxOK | wxICON_INFORMATION);
-                                    dlg.show_dsa_button(_L("Remember my choice."));
-                                    dlg.ShowModal();
-                                    if (dlg.get_checkbox_state()) {
-                                        wxGetApp().app_config->set_bool("step_not_utf8_no_warn", true);
-                                    }
-                                }
-                            }
+                        [this](int isUtf8StepFile) {
+                            //Same shape as the 3MF origin messages: a fact about the file the user
+                            //cannot act on mid-load, so it informs instead of gating. The
+                            //"remember my choice" checkbox went with the dialog - there is no
+                            //choice left to remember.
+                            if (!isUtf8StepFile)
+                                notification_manager->push_notification(
+                                    NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                                    into_u8(_L("Component names in this STEP file are not UTF-8, so some may read as garbage characters.")));
                         },
                         [this, &path, &is_user_cancel, &linear, &angle, &split_compound](Slic3r::Step& file, double& linear_value, double& angle_value, bool& is_split)-> int {
                             if (wxGetApp().app_config->get_bool("enable_step_mesh_setting")) {
@@ -8307,27 +8842,33 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             if ((!is_project_file) && (!load_old_project)) {
                 // if (!is_project_file) {
                 if (int deleted_objects = model.removed_objects_with_zero_volume(); deleted_objects > 0) {
-                    MessageDialog(q, _L("Objects with zero volume removed"), _L("The volume of the object is zero"), wxICON_INFORMATION | wxOK).ShowModal();
+                    //A statement about the file, not a decision. The objects are already gone by
+                    //the time this runs and pressing OK does not bring them back.
+                    notification_manager->push_notification(
+                        NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                        into_u8(wxString::Format(_L("%d object(s) in this file had zero volume and were dropped."), deleted_objects)));
                 }
                 if (imperial_units)
                     // Convert even if the object is big.
                     convert_from_imperial_units(model, false);
+                //UNITS ARE A MEASUREMENT, NOT AN OPINION. looks_like_saved_in_meters() has
+                //already concluded this model is a thousand times too small to be millimetres;
+                //asking "shall I scale it?" after concluding that is a question with one
+                //answer, and it was being asked from under the progress dialog. It is also
+                //completely undoable - the load is inside an undo snapshot - which is the test
+                //for whether something may be decided rather than asked.
                 else if (model.looks_like_saved_in_meters()) {
-                    // BBS do not handle look like in meters
-                    MessageDialog dlg(q,
-                                      format_wxstr(_L("The object from file %s is too small, and may be in meters or inches.\n Do you want to scale to millimeters\?"),
-                                                   from_path(filename)),
-                                      _L("Object too small"), wxICON_QUESTION | wxYES_NO);
-                    int           answer = dlg.ShowModal();
-                    if (answer == wxID_YES) model.convert_from_meters(true);
+                    model.convert_from_meters(true);
+                    notification_manager->push_notification(
+                        NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                        into_u8(format_wxstr(_L("%1% was saved in metres, so it was scaled to millimetres. Undo if that is wrong."),
+                                             from_path(filename))));
                 } else if (model.looks_like_imperial_units()) {
-                    // BBS do not handle look like in meters
-                    MessageDialog dlg(q,
-                                      format_wxstr(_L("The object from file %s is too small, and may be in meters or inches.\n Do you want to scale to millimeters\?"),
-                                                   from_path(filename)),
-                                      _L("Object too small"), wxICON_QUESTION | wxYES_NO);
-                    int           answer = dlg.ShowModal();
-                    if (answer == wxID_YES) convert_from_imperial_units(model, true);
+                    convert_from_imperial_units(model, true);
+                    notification_manager->push_notification(
+                        NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                        into_u8(format_wxstr(_L("%1% was saved in inches, so it was scaled to millimetres. Undo if that is wrong."),
+                                             from_path(filename))));
                 }
                 // else if (model.looks_like_imperial_units()) {
                 // BBS do not handle look like in imperial
@@ -8353,12 +8894,16 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 // convert_model_if(model, answer_convert_from_imperial_units == wxID_YES);
             }
 
-             if (!is_project_file && model.looks_like_multipart_object()) {
-               MessageDialog msg_dlg(q, _L("This file contains several objects positioned at multiple heights.\nInstead of considering them as multiple objects, should \nthe file be loaded as a single object with multiple parts\?") + "\n",
-                    _L("Multi-part object detected"), wxICON_WARNING | wxYES | wxNO);
-                if (msg_dlg.ShowModal() == wxID_YES) {
-                    model.convert_multipart_object(filaments_cnt);
-                }
+            //SAME SHAPE AS THE UNITS QUESTION. looks_like_multipart_object() means "these
+            //solids are stacked at different heights", which is an assembly exported as one
+            //file - the case the conversion exists for. The app makes the call it has already
+            //made internally, and one Ctrl+Z separates them again.
+            if (!is_project_file && model.looks_like_multipart_object()) {
+                model.convert_multipart_object(filaments_cnt);
+                notification_manager->push_notification(
+                    NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                    into_u8(_L("The solids in this file are stacked at different heights, so it was loaded as one object with parts. "
+                               "Undo to keep them separate.")));
             }
         }
         // else if ((wxGetApp().get_mode() == comSimple) && (type_3mf || type_any_amf) && model_has_advanced_features(model)) {
@@ -8451,19 +8996,16 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
         bool new_model_auto_drop = true;
         int single_object_answer = false;
         if (ask_multi) {
-            RichMessageDialog dlg(q, _L("Load these files as a single object with multiple parts?\n"),
-                _L("An object with multiple parts was detected"), wxICON_QUESTION | wxYES_NO);
-
-            dlg.ShowCheckBox(_L("Auto-Drop"), true);
-            single_object_answer = dlg.ShowModal();
-
-            if (dlg.IsCheckBoxChecked() == false) 
-                new_model_auto_drop = false;
-
-            // convert to multipart and split after load_model_objects
-            // to keep relative positioning if auto_drop == false
-            if (single_object_answer == wxID_YES || new_model_auto_drop == false)
-                new_model->convert_multipart_object(filaments_cnt);
+            //SEVERAL FILES DROPPED AT ONCE ARE SEVERAL OBJECTS. That was already this dialog's
+            //default answer, and it is the non-destructive one: combining them afterwards is an
+            //object-list action, while un-combining a wrongly merged import is not something the
+            //user can see they need to do. So the load finishes and says what it did, instead of
+            //stopping several files in to ask one question about all of them.
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": " << new_model->objects.size()
+                                    << " files loaded as separate objects; combining them is an object-list action";
+            notification_manager->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
+                into_u8(wxString::Format(_L("%d files were loaded as separate objects."), (int) new_model->objects.size())));
         }
 
         // TODO
@@ -8597,12 +9139,34 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     if (tolal_model_count <= 0 && !q->m_exported_file) {
         dlg.Hide();
         if (!is_user_cancel) {
-            MessageDialog msg(wxGetApp().mainframe, _L("The file does not contain any geometry data."), _L("Warning"), wxYES | wxICON_WARNING);
-            if (msg.ShowModal() == wxID_YES) {}
+            //A modal whose only button was "Yes" and whose result was discarded: it was a
+            //notification wearing a dialog. A project can legitimately open with no geometry -
+            //an empty plate set is still a project - so this must not gate the open.
+            notification_manager->push_notification(
+                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                into_u8(_L("That file contains no geometry.")));
         }
     }
     q->schedule_background_process(true);
     q->mark_plate_toolbar_image_dirty();
+
+    //IMPORT RECEPTION, and the reason it is a CallAfter rather than a call.
+    //
+    //Everything above has been running inside the open: the project's presets were being
+    //installed, plate contexts were being written, an undo snapshot named "Load Project" is
+    //still open around this whole function, background processing is suppressed, and the
+    //project-backup thread is serialising the same model. A printer switch from in here
+    //operates on all of that half-built - which is why accepting the offer crashed while
+    //making the same switch from the plate board afterwards did not.
+    //
+    //By the time this lambda runs, load_project has returned, m_loading_project is false, the
+    //snapshot is closed and the model is whole. The retarget then goes through
+    //Plater::set_plate_printer like any other assignment, with no special case anywhere.
+    if (project_config_loaded) {
+        Plater *plater = q;
+        const std::string authored = project_authored_printer;
+        q->CallAfter([plater, authored]() { reconcile_imported_plates(plater, authored); });
+    }
 
     //Dev hook: PETKOS_TEST_ASSIGN="<plate>:<printer preset name>[:delay_ms][;<plate>:<preset>...]"
     //(1-based plates) drives the one plate-printer write path after a project load finishes. The
@@ -9626,48 +10190,20 @@ Print::ApplyStatus Plater::priv::apply_plate_config(PartPlate* plate)
     std::vector<int> filament_maps = plate->get_real_filament_maps(preset_bundle.project_config);
     std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(preset_bundle.project_config);
 
-    // A single-colour plate slices as a single-filament print. The plate's slot LIST is the
-    // spools it may draw on; what the engine needs is the spools this plate's objects actually
+    // A single-spool plate slices as a single-filament print. The plate's slot LIST is the
+    // spools it may draw on; what the engine needs is the spools its objects actually
     // reference. Composing all of the slots put multi-filament information - T commands, multi
     // entry filament_type/diameter/density, a live wipe-tower step - into the G-code of a plate
-    // that uses one filament, and single-spool firmwares reject such a file outright. So when
-    // exactly one slot is referenced (custom G-code tool changes included), the context is cut
-    // down to that one slot before composition and every filament-indexed array is born
-    // single-entry. Object references to the higher slot number clamp to the only slot, which
-    // is the same filament by construction.
-    //
-    // The one case that must NOT be cut down: per-triangle painting in a slot other than 1.
-    // MultiMaterialSegmentation sizes its facet-state arrays from the filament count, and paint
-    // states are stored slot numbers - deliberately never clipped (see GLGizmoMmuSegmentation),
-    // so a painted state above the trimmed count would index out of range.
-    PlateSlicingContext context = plate->get_slicing_context();
-    if (context.filament_preset_names.size() > 1) {
-        std::vector<int> used = plate->get_extruders(true);
-        std::sort(used.begin(), used.end());
-        used.erase(std::unique(used.begin(), used.end()), used.end());
-        if (used.size() == 1) {
-            const int slot = used.front();
-            if (slot >= 1 && slot <= int(context.filament_preset_names.size()) &&
-                (slot == 1 || !plate->has_mmu_painted_object())) {
-                context.filament_preset_names = {context.filament_preset_names[size_t(slot - 1)]};
-                context.filament_colours      = {size_t(slot) <= context.filament_colours.size()
-                                                     ? context.filament_colours[size_t(slot - 1)]
-                                                     : std::string()};
-                context.filament_colour_types = {size_t(slot) <= context.filament_colour_types.size()
-                                                      ? context.filament_colour_types[size_t(slot - 1)] : "1"};
-                context.filament_multi_colours = {size_t(slot) <= context.filament_multi_colours.size()
-                                                      ? context.filament_multi_colours[size_t(slot - 1)] : std::string()};
-                context.filament_finishes = {size_t(slot) <= context.filament_finishes.size()
-                                                      ? context.filament_finishes[size_t(slot - 1)] : 0};
-                filament_maps = {size_t(slot) <= filament_maps.size() ? filament_maps[size_t(slot - 1)] : 1};
-                volume_maps   = {size_t(slot) <= volume_maps.size() ? volume_maps[size_t(slot - 1)]
-                                                                    : int(NozzleVolumeType::nvtStandard)};
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__
-                    << boost::format(": plate %1% references only slot %2%; slicing as a single-filament print")
-                       % (plate->get_index() + 1) % slot;
-            }
-        }
-    }
+    // that uses one filament, and single-spool firmwares reject such a file outright. The
+    // rule - several slots holding the SAME spool are one filament, MMU paint included, since
+    // the slots paint names are among the slots the objects reference - lives in
+    // PlateSlicingContext::single_spool_slot and is applied by PartPlate::get_printing_context,
+    // the same call the preview and the flushing check make.
+    const PlateSlicingContext context = plate->get_printing_context(&filament_maps, &volume_maps);
+    if (context.filament_preset_names.size() == 1 && plate->get_slicing_context().filament_preset_names.size() > 1)
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+            << boost::format(": plate %1% prints with one spool (%2%); slicing as a single-filament print")
+               % (plate->get_index() + 1) % context.filament_preset_names.front();
 
     ResolvedPlateSlicingConfig resolved;
     std::string error;
@@ -10565,11 +11101,13 @@ void Plater::priv::reload_from_disk()
         const auto& path = input_paths[i].string();
         auto        obj_color_fun = [this, &path](ObjDialogInOut &in_out) {
             if (!boost::iends_with(path, ".obj")) { return; }
-            const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
-            ObjColorDialog                 color_dlg(nullptr, in_out, extruder_colours, Sidebar::should_show_SEMM_buttons());
-            if (color_dlg.ShowModal() != wxID_OK) {
-                in_out.filament_ids.clear();
-            }
+            //The SECOND copy of this decision. Reloading an OBJ from disk asked the same question
+            //as importing one, through the same dialog, and answering it differently in the two
+            //places would be the app disagreeing with itself about what colour a part is. One
+            //function decides now - see assign_obj_colours_to_plate_spools, where the nearest
+            //spool the plate already has IS the answer and cancelling was never a real option
+            //(it cleared the mapping and left the parts unassigned).
+            assign_obj_colours_to_plate_spools(in_out, notification_manager.get());
         };
         wxBusyCursor wait;
         wxBusyInfo info(_L("Reload from:") + " " + from_u8(path), q->get_current_canvas3D()->get_wxglcanvas());
@@ -11287,13 +11825,19 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     if (preset_type == Preset::TYPE_FILAMENT) {
         const auto selected_filament_flag = combo->GetFlag(selection);
         const auto apply_colour = combo->prepare_colour_update();
-        if (sidebar->is_multifilament()) {
-            if (!q->choose_plate_material_replacement(partplate_list.get_curr_plate_index(), size_t(idx), preset_name, true)) {
-                combo->update();
-                return;
-            }
-        } else {
-            // The tab owns both dirty-edit cancellation and the material-scope transaction.
+        //CHANGING A SPOOL IN THE POOL CHANGES THE POOL. This row says what is on the shelf; the
+        //plate holds its materials by value, so nothing here is a statement about any plate.
+        //
+        //It used to open choose_plate_material_replacement's wxSingleChoiceDialog - "Plate 2,
+        //slot 1 only / all matching slots on plate 2 / on the selected plates / across the
+        //project / spool pool only" - on every selection once the pool held more than one row.
+        //That is a modal asking the user to classify their own intent before it will do the
+        //thing they clicked, and four of its five answers edit plates the user was not looking
+        //at. Changing what a PLATE prints with is direct manipulation now: the assigned-material
+        //rows above this list, one click on the slot, which is where a question about plates is
+        //a question the user is actually asking.
+        {
+            // The tab owns dirty-edit cancellation.
             wxWindowUpdateLocker noUpdates(sidebar->filament_panel());
             if (!wxGetApp().get_tab(preset_type)->select_preset(preset_name)) {
                 combo->update();
@@ -11318,8 +11862,10 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
     //This event owns its plate writes; a Tab selection must not ask for material scope again.
     Tab::PlateWriteSuspend no_duplicate_plate_write;
     // TODO: ?
-    if (preset_type == Preset::TYPE_FILAMENT && sidebar->is_multifilament()) {
-        // Only update the plater UI for the 2nd and other filaments.
+    if (preset_type == Preset::TYPE_FILAMENT) {
+        //Every spool row redraws after its own selection, not only the second and later ones.
+        //The single-row case used to fall through to the branch below, which does nothing for a
+        //filament, so a one-spool pool kept showing the preset it had before the change.
         combo->update();
     }
     else if (select_preset && !filament_tab_selected) {
@@ -11981,20 +12527,18 @@ void Plater::priv::on_action_add_plate(SimpleEvent&)
 {
     if (q != nullptr) {
         take_snapshot("add partplate");
-        //The plate the user is on is the holder: "add a plate" means another one like this,
-        //not another one like whatever preset is selected. Captured before the new plate
-        //exists, because completion walks the whole list.
-        PlateSlicingContext seed;
-        if (const PartPlate *current = this->partplate_list.get_curr_plate())
-            seed = current->get_slicing_context();
-
-        this->partplate_list.create_plate();
-        int new_plate = this->partplate_list.get_plate_count() - 1;
-        if (seed.is_complete())
-            this->partplate_list.complete_plate_contexts(seed);
-        else
-            this->partplate_list.complete_plate_contexts();
-        this->partplate_list.apply_printer_to_plate(new_plate, true);
+        //"ADD A PLATE" MEANS ANOTHER ONE LIKE THIS ONE, and this one is the plate the user is
+        //standing on - never whatever preset the settings tabs happen to have selected.
+        //
+        //This used to seed the PlateSlicingContext and nothing else. A context is the preset
+        //NAMES; the values those presets were changed to live in the plate's own override
+        //config, and they were dropped every time. So: tune plate 1, add a plate, and the new
+        //plate showed plate 1's process name in the sidebar while slicing stock defaults.
+        //Silently, because nothing in the UI distinguishes the two. The whole of a plate's
+        //chosen state now moves together - PartPlateList::create_plate_like.
+        const int new_plate = this->partplate_list.create_plate_like(this->partplate_list.get_curr_plate());
+        if (new_plate < 0)
+            return;
         this->partplate_list.select_plate(new_plate);
         update();
 
@@ -14098,11 +14642,13 @@ int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_
     //get_partplate_list().reinit();
     //get_partplate_list().update_slice_context_to_current_plate(p->background_process);
     //p->preview->update_gcode_result(p->partplate_list.get_current_slice_result());
+    // The project layer names decisions about THIS project, so it ends with it. Unconditionally:
+    // there is no longer an answer under which the OLD project's layer is the new project's, and
+    // there is no longer a question being asked that could produce one. What the user typed is not
+    // lost by this - check_and_keep_current_preset_changes has already lifted every modified value
+    // off the presets into the tab caches, and reset() below puts them back.
+    wxGetApp().preset_bundle->project_overrides.clear();
     reset(transfer_preset_changes);
-    // The project layer names decisions about THIS project, so it ends with it - unless the user
-    // asked for the modified presets to be kept, which is the same answer for both stores.
-    if (!transfer_preset_changes)
-        wxGetApp().preset_bundle->project_overrides.clear();
     reset_project_dirty_after_save();
     reset_project_dirty_initial_presets();
     wxGetApp().update_saved_preset_from_current_preset();
@@ -14153,9 +14699,12 @@ void Plater::load_project(wxString const& filename2,
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__;
     auto filename = filename2;
     auto check = [&filename, this] (bool yes_or_no) {
-        if (!yes_or_no && !wxGetApp().check_and_save_current_preset_changes(_L("Load project"),
-                _L("Some presets are modified.")))
-            return false;
+        //NO PRESET GATE ON THE WAY INTO A PROJECT. This asked "some presets are modified -
+        //save, discard or cancel?" before the open, and it asked it from inside
+        //close_with_confirm's callback, so answering Save ran save_changes_for_preset and a
+        //full load_current_presets against the state between two projects. The question only
+        //ever made sense while a preset was the only place a changed value could live; here
+        //the values are on the plate and in the 3MF, and they are still there afterwards.
         if (filename.empty()) {
             // Ask user for a project file name.
             wxGetApp().load_project(this, filename);
@@ -14884,17 +15433,10 @@ void Plater::_calib_pa_pattern(const Calib_Params& params)
         if (!cur_plate) {
             //A plate is seeded by whoever ASKED for it; create_plate seeds nothing. The
             //calibration pattern is laid out for the machine the user is calibrating, so the
-            //current plate is the holder - without this the extra plates the pattern needs
-            //name no printer and the calibration cannot slice on any of them.
-            PlateSlicingContext seed;
-            if (const PartPlate *current = get_partplate_list().get_curr_plate())
-                seed = current->get_slicing_context();
-            plate_idx = get_partplate_list().create_plate();
-            if (seed.is_complete())
-                get_partplate_list().complete_plate_contexts(seed);
-            else
-                get_partplate_list().complete_plate_contexts();
-            get_partplate_list().apply_printer_to_plate(plate_idx, true);
+            //current plate is the holder - and the pattern's extra plates have to be the SAME
+            //plate as the first one, values included, or the calibration compares plates that
+            //differ in more than the thing being calibrated.
+            plate_idx = get_partplate_list().create_plate_like(get_partplate_list().get_curr_plate());
             cur_plate = get_partplate_list().get_plate(plate_idx);
         }
 
@@ -18782,64 +19324,15 @@ void Plater::on_filament_count_change(size_t num_filaments)
     // how many slots the cursor is currently showing is neither. This function runs whenever the filament
     // count changes for any reason at all - a plate click, a printer swap, a project load - and upstream
     // pruned every volume's painting against the new count here, which in this fork destroys the paint of
-    // every object in the project each time the user looks at a smaller machine. on_filaments_delete below
-    // is the one path where the user genuinely asked for a filament to go away, and it still prunes.
-}
-
-void Plater::on_filaments_delete(size_t num_filaments, size_t filament_id, int replace_filament_id)
-{
-    // only update elements in plater
-    update_filament_colors_in_full_config();
-
-    // update fisrt print sequence and other layer sequence
-    //move to partplate->on_filament_deleted
-    /*Slic3r::GUI::PartPlateList &plate_list = get_partplate_list();
-    for (int i = 0; i < plate_list.get_plate_count(); ++i) {
-        PartPlate *part_plate = plate_list.get_plate(i);
-        part_plate->update_first_layer_print_sequence_when_delete_filament(filament_id);
-    }*/
-
-    // update mmu info
-    for (ModelObject *mo : wxGetApp().model().objects) {
-        for (ModelVolume *mv : mo->volumes) {
-            mv->update_extruder_count_when_delete_filament(num_filaments, filament_id + 1, replace_filament_id + 1);  // this function is 1 base
-        }
-    }
-
-    // update UI
-    sidebar().on_filaments_delete(filament_id);
-
-    // update global support filament
-    static const char *keys[] = {"support_filament", "support_interface_filament"};
-    for (auto key : keys)
-        if (p->config->has(key)) {
-            if(p->config->opt_int(key) == filament_id + 1)
-                (*(p->config)).erase(key);
-            else {
-                int new_value = p->config->opt_int(key) > filament_id ? p->config->opt_int(key) - 1 : p->config->opt_int(key);
-                (*(p->config)).set_key_value(key, new ConfigOptionInt(new_value));
-            }
-        }
-
-    // update object/volume/support(object and volume) filament id
-    sidebar().obj_list()->update_objects_list_filament_column_when_delete_filament(filament_id, num_filaments, replace_filament_id);
-
-    // update customize gcode
-    for (auto item = p->model.plates_custom_gcodes.begin(); item != p->model.plates_custom_gcodes.end(); ++item) {
-        auto iter = std::remove_if(item->second.gcodes.begin(), item->second.gcodes.end(), [filament_id](const Item& gcode_item) {
-            return (gcode_item.type == CustomGCode::Type::ToolChange && gcode_item.extruder == filament_id + 1);
-        });
-        if (replace_filament_id == -1)
-            item->second.gcodes.erase(iter, item->second.gcodes.end());
-        else if(iter != item->second.gcodes.end()) {
-            iter->extruder = replace_filament_id + 1;
-        }
-
-        for (auto& item : item->second.gcodes) {
-            if (item.type == CustomGCode::Type::ToolChange && item.extruder > filament_id)
-                item.extruder--;
-        }
-    }
+    // every object in the project each time the user looks at a smaller machine.
+    //
+    // Nor does deleting a spool prune anything. A Plater::on_filaments_delete used to sit below this and
+    // do exactly that - renumber every plate, rewrite every object's filament column and shift every
+    // tool-change in every custom G-code - and commit 302fb11a86 stopped calling it, because a spool
+    // leaving the POOL says nothing about what any plate prints with. It then sat here for a release
+    // with no callers at all, still looking like the thing a deletion goes through, while the live
+    // deletion path was Sidebar::delete_filament -> Sidebar::on_filaments_delete. Deleted, so the next
+    // engineer cannot reintroduce the plate renumbering by wiring the obvious-looking function back up.
 }
 
 std::vector<Slic3r::ColorRGBA> Plater::get_extruders_colors()
@@ -20040,6 +20533,29 @@ bool Plater::resolve_plate_slicing_config(PartPlate *plate, ResolvedPlateSlicing
     return true;
 }
 
+bool Plater::resolve_plate_printing_config(PartPlate *plate, ResolvedPlateSlicingConfig &resolved,
+                                           std::string &error, std::vector<int> *used_slots) const
+{
+    PETKOS_PERF_SCOPE(Perf::Probe::ResolvePlateContext);
+    error.clear();
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (plate == nullptr) {
+        error = "No plate is selected";
+        return false;
+    }
+    if (bundle == nullptr) {
+        error = "The preset bundle is unavailable";
+        return false;
+    }
+    std::vector<int> filament_maps = plate->get_real_filament_maps(bundle->project_config);
+    std::vector<int> volume_maps   = plate->get_real_filament_volume_maps(bundle->project_config);
+    const PlateSlicingContext context = plate->get_printing_context(&filament_maps, &volume_maps, used_slots);
+    if (!bundle->resolve_plate_slicing_config(context, filament_maps, volume_maps, resolved, error))
+        return false;
+    resolved.config.apply(*plate->config(), true);
+    return true;
+}
+
 bool Plater::resolve_current_plate_slicing_config(ResolvedPlateSlicingConfig &resolved,
                                                   std::string &error, bool apply_plate_overrides) const
 {
@@ -20695,11 +21211,22 @@ void Plater::reresolve_plate_context(PartPlate *plate)
             if (reresolved.carried_process_count > 0)
                 message += " " + wxString::Format(_L("The %d setting(s) that were chosen came with it."),
                                                   (int) reresolved.carried_process_count);
-            else
+            else if (reresolved.machine_tuning_not_carried == 0)
+                //Only sayable when NOTHING was left behind. Once machine tuning is deliberately
+                //not carried, "nothing had been changed" is a false statement about a plate that
+                //has just had its speeds replaced.
                 message += " " + _L("Nothing had been changed from the old one.");
             if (!reresolved.dropped_process_keys.empty())
                 message += " " + wxString::Format(_L("%d setting(s) do not exist on this machine and were left behind."),
                                                   (int) reresolved.dropped_process_keys.size());
+            //Machine tuning is not a loss and is not phrased as one. A speed authored for another
+            //machine's motion system was never a choice about this object, and this machine's own
+            //value is the better answer - but it IS a change, and a change nobody is told about is
+            //how a print surprises somebody. Counted, not listed: the count is the fact, and the
+            //keys are in the log for whoever wants them.
+            if (reresolved.machine_tuning_not_carried > 0)
+                message += " " + wxString::Format(_L("%d speed and acceleration setting(s) were left behind; this machine's own apply."),
+                                                  (int) reresolved.machine_tuning_not_carried);
             notifications->push_notification(
                 NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
                 into_u8(message));
@@ -20945,158 +21472,76 @@ void Plater::clear_plate_process_overrides(int plate_index)
         schedule_background_process();
 }
 
-//See the header. What this plate changed becomes a preset its machine can run.
-void Plater::save_plate_process_as_preset(int plate_index)
+//DELETED: Plater::save_plate_process_as_preset.
+//
+//It asked for a name, built a process preset out of the plate's overrides, installed it and
+//pointed the plate at it. Every step of that was the old model showing through: the values were
+//already stored on the plate, already written into the 3MF, already duplicated with the plate and
+//already carried across a change of machine. What the preset added was a NAME - and a name is
+//what this fork decided a process setting does not need.
+//
+//The thing it was actually for - using one plate's tuning on another plate - is answered by
+//duplicating the plate or by adding a plate next to it, both of which now carry the values
+//(PartPlateList::create_plate_like). Cross-project reuse is importing the plate.
+
+//WHEN A SPOOL IN THE POOL IS REPLACED, the plate in front of the user follows it wherever it was
+//still using that spool, and nowhere else. No dialog, because there is no question: a slot that
+//names the spool being replaced is a slot that was taking the pool's word for it, and a slot
+//naming anything else is an assignment the user made on purpose and must not be stomped.
+//
+//This is the rule that replaces choose_plate_material_replacement's wxSingleChoiceDialog on the
+//sidebar path. That dialog offered five scopes - this slot / this plate / the selected plates /
+//the whole project / pool only - and demanded one before it would act, on every selection. Four
+//of the five edited plates the user was not looking at. The dialog itself is kept, because on
+//the plate slot menu (PlateBoard's strip) "and everywhere else this preset is used" is a real
+//question the user is genuinely asking; on a pool row it never was.
+//
+//The pool is printer-independent, so a plate that CANNOT take the new material does not veto the
+//pool change - it keeps what it had and the user is told. Owning a spool the machine in front of
+//you cannot run is a normal state on a farm with nine different printers.
+bool Plater::follow_pool_material_change(int plate_index, const std::string &replaced, const std::string &replacement)
 {
+    if (replaced.empty() || replaced == replacement)
+        return true;
     PartPlate    *plate  = p->partplate_list.get_plate(plate_index);
     PresetBundle *bundle = wxGetApp().preset_bundle;
-    if (plate == nullptr || bundle == nullptr)
-        return;
+    if (plate == nullptr || bundle == nullptr || is_loading_project())
+        return true;
 
-    const std::vector<std::string> overrides = plate->process_override_keys();
-    if (overrides.empty()) {
-        MessageDialog dlg(this, _L("This plate has not changed anything about its process, so there is nothing to save."),
-                          _L("Save the plate's settings as a preset"), wxOK | wxICON_INFORMATION);
-        dlg.ShowModal();
-        return;
+    PlateSlicingContext context = plate->get_slicing_context();
+    std::vector<size_t> following;
+    for (size_t i = 0; i < context.filament_preset_names.size(); ++i)
+        if (context.filament_preset_names[i] == replaced)
+            following.push_back(i);
+    if (following.empty()) {
+        //The plate had already been given something else here. That is the whole point of a
+        //plate holding its materials by value, so this is a success, not a miss.
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+            << boost::format(": plate %1% does not use '%2%', so the pool change does not reach it") % (plate_index + 1) % replaced;
+        return true;
     }
 
-    const PlateSlicingContext context = plate->get_slicing_context();
-    const Preset *base    = bundle->prints.find_preset(context.print_preset_name, false);
-    const Preset *printer = bundle->printers.find_preset(context.printer_preset_name, false);
-    if (base == nullptr || printer == nullptr) {
-        MessageDialog dlg(this, _L("This plate's printer or process is not installed here, so a preset cannot be built from it."),
-                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
-        dlg.ShowModal();
-        return;
-    }
-    //Taken by value now: find_preset hands back a pointer into the collection, and everything
-    //below - the save, the reselect, update_compatible - moves that collection underneath it.
-    const std::string base_name    = base->name;
-    const std::string printer_name = printer->name;
-
-    //A name that says what it is and what it runs on, which is the whole point of saving it.
-    const wxString suggested = wxString::Format("%s @%s", from_u8(base_name), from_u8(printer_name));
-    wxTextEntryDialog ask(this,
-                          wxString::Format(_L("Save the %d setting(s) this plate changed as a process preset for \"%s\". Plate %d will be resliced against it."),
-                                           (int) overrides.size(), from_u8(printer_name), plate_index + 1),
-                          _L("Save the plate's settings as a preset"), suggested);
-    if (ask.ShowModal() != wxID_OK)
-        return;
-    const std::string name = into_u8(ask.GetValue());
-    if (name.empty())
-        return;
-
-    //REFUSE A NAME THAT CANNOT BE WRITTEN, BEFORE WRITING ANYTHING. save_current_preset takes
-    //the can_overwrite() branch silently: a system or bundle preset of the same name makes it
-    //return having done nothing at all, and every step after it would then be reporting a
-    //success that never happened.
-    if (const Preset *clash = bundle->prints.find_preset(name, false); clash != nullptr && !clash->can_overwrite()) {
-        MessageDialog dlg(this,
-                          wxString::Format(_L("\"%s\" is a built-in process preset and cannot be overwritten. Choose another name."),
-                                           from_u8(name)),
-                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
-        dlg.ShowModal();
-        return;
+    std::string error;
+    for (size_t slot : following) {
+        if (!bundle->assign_plate_material(context, slot, replacement, error)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                << boost::format(": plate %1% slot %2% cannot take '%3%': %4%; the plate keeps '%5%'")
+                   % (plate_index + 1) % (slot + 1) % replacement % error % replaced;
+            if (NotificationManager *notifications = get_notification_manager())
+                notifications->push_notification(
+                    NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                    into_u8(wxString::Format(_L("\"%s\" is now in your spool pool, but plate %d cannot print with it: %s\nPlate %d still uses \"%s\"."),
+                                             from_u8(replacement), plate_index + 1, from_u8(error), plate_index + 1, from_u8(replaced))));
+            return true;
+        }
     }
 
-    //THE PRESET IS THE BASE PLUS WHAT THE PLATE CHANGED, which is exactly what the plate slices
-    //with today. Built from the base rather than from the edited preset, so an unrelated unsaved
-    //edit somewhere else cannot ride along into it.
-    //
-    //The name, the flags and the inherits stay the BASE's. save_current_preset reads them: it
-    //renames the copy itself and sets `inherits = old_name`, which is how the saved preset ends
-    //up a child of the base and how Preset::save writes a DIFF against that parent. Handing it a
-    //copy already renamed to the new name made the preset inherit from itself, so the diff was
-    //against itself and the .ini written to disk was empty - the settings were destroyed by the
-    //act of saving them.
-    Preset saved = *base;
-    saved.config.apply_only(*plate->config(), overrides, true);
-    //Compatible with THIS machine and stated as such, so it appears where it is usable and
-    //nowhere else. Without this the preset keeps the base's compatibility list, which after a
-    //printer change is the OLD machine's, and the preset would be invisible on the very printer
-    //it was made for. The condition is cleared for the same reason: an inherited expression
-    //written for another vendor's fields answers a question about a machine it never saw.
-    saved.config.option<ConfigOptionStrings>("compatible_printers", true)->values = { printer_name };
-    saved.config.option<ConfigOptionString>("compatible_printers_condition", true)->value.clear();
-
-    //ONE snapshot for one action. This deliberately does not chain set_plate_process() and
-    //clear_plate_process_overrides(): each takes its own, and a single menu click that needs two
-    //undo presses to reverse is a worse answer than repeating four lines of their bodies.
-    //The preset file itself is not in the snapshot - writing a file is not undoable - so undo
-    //returns the plate to its overrides and leaves the preset on disk, which is the honest half.
-    take_snapshot(std::string("Save plate settings as a preset"));
-
-    bundle->prints.save_current_preset(name, false, false, &saved);
-
-    //VERIFY, do not assume. save_current_preset returns void and has a silent early exit; the
-    //only evidence it did anything is that the selection moved to the new name.
-    if (bundle->prints.get_selected_preset_name() != name || bundle->prints.find_preset(name, false) == nullptr) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": the preset '" << name << "' was not saved, plate "
-                                 << (plate_index + 1) << " is unchanged";
-        MessageDialog dlg(this,
-                          wxString::Format(_L("\"%s\" could not be saved, so plate %d was left as it is."),
-                                           from_u8(name), plate_index + 1),
-                          _L("Save the plate's settings as a preset"), wxOK | wxICON_WARNING);
-        dlg.ShowModal();
-        return;
-    }
-
-    //The set of presets that run on each printer just changed, so the bundle has to be told.
-    //Never: nothing here may reselect anything on the user's behalf.
-    bundle->update_compatible(PresetSelectCompatibleType::Never);
-
-    //Point the plate at it and drop the overrides: the values are IN the preset now, and
-    //leaving them piled on top would mean editing the preset no longer changed this plate.
-    PlateSlicingContext updated = context;
-    updated.print_preset_name   = name;
-    plate->set_slicing_context(updated);
-    plate->clear_process_overrides();
-
+    TakeSnapshot snapshot(this, "Change material");
+    set_plate_filaments(plate_index, context.filament_preset_names, context.filament_colours, context);
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__
-        << boost::format(": plate %1%: %2% setting(s) saved as process preset '%3%' (base '%4%') for printer '%5%'")
-           % (plate_index + 1) % overrides.size() % name % base_name % printer_name;
-
-    //Say so if the result does not resolve, exactly as set_plate_process does. A preset that was
-    //just built for this printer should, and if it does not the user has to hear it here rather
-    //than discover it at the next slice.
-    ResolvedPlateSlicingConfig resolved;
-    std::string                resolve_error;
-    if (!resolve_plate_slicing_config(plate, resolved, resolve_error)) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
-            << boost::format(": plate %1% does not resolve after the save: %2%") % (plate_index + 1) % resolve_error;
-        if (NotificationManager *notifications = get_notification_manager())
-            notifications->push_notification(
-                NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
-                into_u8(wxString::Format(_L("Plate %d cannot slice with \"%s\": %s"),
-                                         plate_index + 1, from_u8(name), from_u8(resolve_error))));
-    }
-
-    update_project_dirty_from_presets();
-    set_plater_dirty(true);
-
-    //save_current_preset moved the GLOBAL selection onto the new preset. That is only where the
-    //cursor belongs if the plate that was saved is the one on screen, so the cursor is put back
-    //where it belongs: on the current plate. Reload first, or the Process page keeps describing
-    //the preset that was selected before the save.
-    if (Tab *tab = wxGetApp().get_tab(Preset::TYPE_PRINT))
-        tab->load_current_preset();
-    if (p->sidebar != nullptr) {
-        p->sidebar->update_presets(Preset::TYPE_PRINT);
-        p->sidebar->refresh_plate_board(plate_index);
-    }
-    follow_plate_presets(p->partplate_list.get_curr_plate_index());
-
-    if (NotificationManager *notifications = get_notification_manager())
-        notifications->push_notification(
-            NotificationType::CustomNotification, NotificationManager::NotificationLevel::RegularNotificationLevel,
-            into_u8(wxString::Format(_L("Plate %d now uses \"%s\", a process preset for \"%s\". You can choose it on any plate on that machine."),
-                                     plate_index + 1, from_u8(name), from_u8(printer_name))));
-
-    //The plate's configuration changed - print_settings_id is part of it - so its retained slice
-    //is stale by the same rule everything else is judged by, and it reslices.
-    if (plate_index == p->partplate_list.get_curr_plate_index())
-        schedule_background_process();
+        << boost::format(": plate %1%: %2% slot(s) followed the pool from '%3%' to '%4%'")
+           % (plate_index + 1) % following.size() % replaced % replacement;
+    return true;
 }
 
 //The scope refers to exact stored preset identities, never to slot numbers on unrelated plates.
@@ -21268,8 +21713,16 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
 
     update_project_dirty_from_presets();
     set_plater_dirty(true);
-    if (p->sidebar != nullptr)
+    if (p->sidebar != nullptr) {
         p->sidebar->refresh_plate_board(plate_index);
+        //The assigned-material rows and the support/wall filament dropdowns both describe THIS
+        //plate's slots, so a change to the slot list is exactly when they go stale. Only for the
+        //plate on screen: the others are redrawn when the user navigates to them.
+        if (plate_index == p->partplate_list.get_curr_plate_index()) {
+            p->sidebar->refresh_plate_materials();
+            p->sidebar->update_dynamic_filament_list();
+        }
+    }
     if (plate_index == p->partplate_list.get_curr_plate_index())
         schedule_background_process();
 }
@@ -21280,6 +21733,24 @@ void Plater::set_plate_filaments(int plate_index, std::vector<std::string> prese
 //machine that has it, so nothing here rewrites, clears or remaps it.
 bool Plater::set_plate_printer(int plate_index, std::string preset_name)
 {
+    //A LOAD IS NOT A USER CHOICE, and this is the write path, so the refusal belongs here.
+    //
+    //Mid-load the plate list is being built: plates exist with their printer not yet assigned,
+    //the model is half-populated, and a printer assignment triggers a bed change, a bounds
+    //re-check and a re-resolution against objects that are not all there. Every guard that used
+    //to protect this was at a CALLER, which means it protected only the routes someone
+    //remembered - and the loading flag itself was only raised by Plater::load_project, so on
+    //every other route into a load the guards that did exist were reading a flag nobody had set.
+    //One guard in the path that does the writing covers all of them, including the next route
+    //someone adds.
+    if (is_loading_project()) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+            << boost::format(": refusing to assign printer '%1%' to plate %2% while a project is loading"
+                             " - the plate list is still being built, and the load assigns each plate's printer itself")
+               % preset_name % (plate_index + 1);
+        return false;
+    }
+
     PartPlate* plate = p->partplate_list.get_plate(plate_index);
     if (plate == nullptr) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__

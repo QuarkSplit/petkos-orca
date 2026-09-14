@@ -441,32 +441,47 @@ std::string Preset::remove_suffix_modified(const std::string &name)
 }
 
 //See the header. A trailing balanced "(...3mf)" group is decoration; anything else is name.
+//Where the trailing "(<something>.3mf)" group of `name` opens, or npos when the name does not
+//end in one. Walking back from the end and counting depth is what makes a filename with
+//parentheses of its own survive: the NEAREST '(' is the wrong one whenever the inner text has
+//any, and "PLA(energy_revolver_(v2).3mf)" cut at the nearest one leaves "PLA(energy_revolver_",
+//whose plates all read unresolved.
+static size_t project_decoration_open(const std::string &name)
+{
+    if (name.size() < 2 || name.back() != ')')
+        return std::string::npos;
+    size_t depth = 0;
+    size_t open  = std::string::npos;
+    for (size_t i = name.size(); i-- > 0;) {
+        if (name[i] == ')') {
+            ++depth;
+        } else if (name[i] == '(') {
+            if (--depth == 0) {
+                open = i;
+                break;
+            }
+        }
+    }
+    if (open == std::string::npos)
+        return std::string::npos;   //unbalanced: not a group at all, so not decoration
+    const std::string inner = name.substr(open + 1, name.size() - open - 2);
+    //An ordinary parenthesised name, e.g. "0.20mm Standard (0.4 nozzle)", is not decoration.
+    if (inner.size() < 5 || !boost::algorithm::iends_with(inner, ".3mf"))
+        return std::string::npos;
+    return open;
+}
+
+bool Preset::has_project_decoration(const std::string &name)
+{
+    return project_decoration_open(name) != std::string::npos;
+}
+
 std::string Preset::strip_project_decoration(const std::string &name)
 {
     std::string reduced = name;
-    while (reduced.size() >= 2 && reduced.back() == ')') {
-        //Walk back to the '(' that OPENS this trailing group, counting depth. The nearest
-        //'(' is the wrong one whenever the filename inside contains parentheses of its own,
-        //which is routine: "PLA(energy_revolver_(v2).3mf)" would be cut to
-        //"PLA(energy_revolver_" by an unbalanced match, and the plates naming that preset
-        //would all read unresolved.
-        size_t depth = 0;
-        size_t open  = std::string::npos;
-        for (size_t i = reduced.size(); i-- > 0;) {
-            if (reduced[i] == ')') {
-                ++depth;
-            } else if (reduced[i] == '(') {
-                if (--depth == 0) {
-                    open = i;
-                    break;
-                }
-            }
-        }
-        if (open == std::string::npos)
-            break;   //unbalanced: not a group at all, so not decoration
-        const std::string inner = reduced.substr(open + 1, reduced.size() - open - 2);
-        if (inner.size() < 5 || !boost::algorithm::iends_with(inner, ".3mf"))
-            break;   //an ordinary parenthesised name, e.g. "0.20mm Standard (0.4 nozzle)"
+    //Every trailing group, not one: a name that had already grown comes back to what it was.
+    for (size_t open = project_decoration_open(reduced); open != std::string::npos;
+         open = project_decoration_open(reduced)) {
         reduced.erase(open);
         boost::algorithm::trim_right(reduced);
     }
