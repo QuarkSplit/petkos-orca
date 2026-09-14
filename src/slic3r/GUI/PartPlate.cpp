@@ -3500,6 +3500,38 @@ void PartPlate::rebuild_geometry()
 	if (m_plater == nullptr) // render data, skip in CLI mode where m_plater is null
 		return;
 
+	//No bed is a valid unresolved state: a plate can name a printer that is not installed,
+	//and the first startup plate can briefly exist before its presets are completed. The
+	//render path used to pass that empty contour to to_lines(), which dereferences its first
+	//point and made the whole application unopenable. Clear every bed-owned buffer here so a
+	//plate that becomes unresolved cannot retain the previous machine's geometry either.
+	if (m_shape_local.size() < 3) {
+		auto reset_picking = [](PickingModel &model) {
+			model.model.reset();
+			model.mesh_raycaster.reset();
+		};
+		m_shape.clear();
+		m_exclude_area.clear();
+		m_extruder_areas.clear();
+		m_print_polygon = {};
+		reset_picking(m_triangles);
+		m_exclude_triangles.reset();
+		m_wrapping_detection_triangles.reset();
+		m_logo_triangles.reset();
+		m_gridlines.reset();
+		m_gridlines_bolder.reset();
+		reset_picking(m_del_icon);
+		reset_picking(m_orient_icon);
+		reset_picking(m_arrange_icon);
+		reset_picking(m_lock_icon);
+		reset_picking(m_plate_settings_icon);
+		reset_picking(m_plate_filament_map_icon);
+		reset_picking(m_move_front_icon);
+		m_plate_idx_icon.reset();
+		invalidate_plate_name_texture();
+		return;
+	}
+
 	ExPolygon logo_poly;
 	generate_logo_polygon(logo_poly);
 	m_logo_triangles.reset();

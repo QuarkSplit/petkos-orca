@@ -934,6 +934,8 @@ void Sidebar::priv::layout_printer(bool isDual, const DynamicPrintConfig *printe
         if(!isShown && m_text_printer_settings){
             m_text_printer_settings->SetLabel(_L("Printer")); // ensure title returns to default state
             m_panel_printer_content->Show();
+            if (plate_materials_panel)
+                plate_materials_panel->Show();
         }
     }
 }
@@ -2616,6 +2618,8 @@ Sidebar::Sidebar(Plater *parent)
             wxString title   = _L("Printer") + wxString(!isShown ? "" : ("  |  " + printer_summary_text()));
             p->m_text_printer_settings->SetLabel(title);
             p->m_panel_printer_content->Show(!isShown);
+            if (p->plate_materials_panel != nullptr)
+                p->plate_materials_panel->Show(!isShown);
             p->m_panel_printer_separator->Show(isShown);
             m_scrolled_sizer->Layout();
         });
@@ -3024,7 +3028,9 @@ Sidebar::Sidebar(Plater *parent)
 
     {
 
-    //Assigned materials stay visible even while the independent spool pool is folded.
+    //Assigned materials belong to the Printer section rather than the independent spool pool.
+    //They therefore follow the Printer title bar's fold state, while folding Spool pool below
+    //continues to affect only the pool.
     p->plate_materials_panel = new wxPanel(p->scrolled);
     p->plate_materials_sizer = new wxBoxSizer(wxVERTICAL);
     p->plate_materials_panel->SetSizer(p->plate_materials_sizer);
