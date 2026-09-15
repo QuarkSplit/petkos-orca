@@ -8,27 +8,21 @@
     .MenuItem { width: auto; min-width: 180px; flex: 1 1 180px; margin-right: 0; box-sizing: border-box; }
 }
 
-#LibHeader {
-    display: flex; align-items: baseline; gap: 12px;
-    margin: 6px 0 14px 0; flex-wrap: wrap;
-}
-#LibHeader .Content-Title { margin: 0; }
-#LibCount { opacity: 0.6; font-size: 12px; }
 #LibRefresh { margin-left: auto; }
-#LibStatus { font-size: 12px; opacity: 0.75; margin-bottom: 10px; }
-#LibShelves { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+#LibStatus { font-size: 12px; opacity: 0.75; }
+#LibStatus:empty { display: none; }
+#LibShelves { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 14px 0; }
 .LibShelf { background: transparent; color: inherit; border: 1px solid rgba(128,128,128,.3); border-radius: 7px; padding: 10px 15px; font: inherit; cursor: pointer; }
 .LibShelfOn { background: #4F87A5; border-color: #4F87A5; color: white; }
 #LibLocation { font-size: 13px; margin-bottom: 12px; }
 .LibOverview #LibRoot, .LibOverview #LibGroup, .LibOverview #LibSort, .LibOverview #LibKindChip,
 .LibOverview #LibPickupChip, .LibOverview #LibControls > .LibChip, .LibOverview #LibChips, .LibOverview #LibPickup { display: none !important; }
 .LibOverview #LibGrid { grid-template-columns: repeat(auto-fill,minmax(230px,1fr)); }
-.LibDesignCard { border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 14px; min-width: 0; }
+.LibDesignCard { border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 12px; min-width: 0; cursor: pointer; }
+.LibDesignCard:hover { border-color: #4F87A5; }
 .LibDesignThumb { height: 150px; aspect-ratio: auto !important; }
-.LibDesignCard h3 { font-size: 16px; margin: 12px 0 7px; }
-.LibDesignCard p { font-size: 12px; opacity: .75; line-height: 1.5; min-height: 36px; }
-.LibDesignActions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
-.LibShelf:focus-visible, .LibDesignActions button:focus-visible { outline: 2px solid #4F87A5; outline-offset: 3px; }
+.LibDesignCard h3 { font-size: 15px; margin: 10px 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.LibShelf:focus-visible, .LibDesignCard:focus-visible { outline: 2px solid #4F87A5; outline-offset: 3px; }
 #LibFolders { font-size: 12px; margin-bottom: 14px; }
 #LibFolders summary { cursor: pointer; }
 .LibRootRow { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
@@ -111,6 +105,7 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .LibFacts { display: flex; align-items: center; gap: 4px; }
+.LibStrip { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
 .LibSwatch {
     display: inline-block; width: 9px; height: 9px; border-radius: 2px;
     border: 1px solid rgba(128, 128, 128, 0.5); flex: 0 0 auto;
@@ -257,3 +252,34 @@
 }
 .LibCard:hover .SlideLabel { opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .SlideArrow, .SlideLabel { transition: none; } }
+
+/* Collection cards. A collection is a range of products spread over several folders; the
+   mosaic is what makes the card recognisable at a glance and the pills say how much of it
+   is ready without opening anything. Nothing else is printed on it. */
+.LibOverview #LibGrid { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px; }
+.LibCollectionCard { display: flex; flex-direction: column; }
+.LibMosaic { display: grid; gap: 3px; border-radius: 8px; overflow: hidden; aspect-ratio: 1 / 1;
+             background: rgba(128,128,128,.08); }
+.LibMosaic1 { grid-template-columns: 1fr; }
+.LibMosaic2 { grid-template-columns: 1fr 1fr; }
+.LibMosaic3, .LibMosaic4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+.LibMosaic3 > :first-child { grid-row: 1 / 3; }
+.LibMosaic0 { display: block; }
+.LibMosaicTile { aspect-ratio: auto; border-radius: 0; min-height: 0; }
+.LibMosaicTile .LibThumbnailState { font-size: 10px; padding: 8px 4px; gap: 5px; }
+.LibMosaicTile .LibThumbnailPending::before { width: 12px; height: 12px; }
+.LibCollStats { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-top: auto; }
+.LibPill { font-size: 10px; padding: 1px 7px; border-radius: 999px; color: #fff; font-weight: 600; letter-spacing: .02em; }
+.LibCollectionHidden { opacity: .55; border-style: dashed; }
+.LibHiddenNote { grid-column: 1 / -1; padding: 8px 0 0; font-size: 12px; }
+
+/* The card menu. Fixed dark: the page swaps its theme stylesheet at runtime, and a menu
+   that borrowed the page colours would be one switch away from white text on white. */
+#LibMenu {
+    position: absolute; z-index: 50; min-width: 170px; padding: 5px 0; border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(38, 42, 44, 0.98); color: #F2F2F2;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4); font-size: 12px;
+}
+#LibMenu[hidden] { display: none; }
+.LibMenuItem { padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+.LibMenuItem:hover { background: #4F87A5; color: #fff; }

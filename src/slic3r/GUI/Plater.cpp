@@ -927,17 +927,13 @@ void Sidebar::priv::layout_printer(bool isDual, const DynamicPrintConfig *printe
 
     layout_printer_machine(isDual, printer_cfg);
 
-    // ORCA ensure printer section is visible after changing printer from printer selection dialog
-    // this will inform user on printer change when printer section is collapsed
-    if (m_panel_printer_content){
-        bool isShown = m_panel_printer_content->IsShown();
-        if(!isShown && m_text_printer_settings){
-            m_text_printer_settings->SetLabel(_L("Printer")); // ensure title returns to default state
-            m_panel_printer_content->Show();
-            if (plate_materials_panel)
-                plate_materials_panel->Show();
-        }
-    }
+    //THE FOLD IS THE USER'S. This used to re-expand the section on every printer change -
+    //and in this fork a plate click IS a printer change - so folding it never lasted more
+    //than a click. Folded, the title bar carries the machine summary; that is what a change
+    //of machine has to refresh.
+    if (m_panel_printer_content != nullptr && !m_panel_printer_content->IsShown() && m_text_printer_settings != nullptr &&
+        plater != nullptr && plater->is_initialized())
+        m_text_printer_settings->SetLabel(_L("Printer") + "  |  " + plater->sidebar().printer_summary_text());
 }
 
 //printer_cfg is the machine these controls describe. nullptr means it could not be resolved,
@@ -945,8 +941,17 @@ void Sidebar::priv::layout_printer(bool isDual, const DynamicPrintConfig *printe
 //forbids, and hiding a control because a fact is missing is a silent gate.
 void Sidebar::priv::layout_printer_machine(bool isDual, const DynamicPrintConfig *printer_cfg)
 {
-    if (printer_cfg == nullptr)
+    //Dual or single toolhead groups is isDual's answer, which the caller derives from the
+    //cursor preset and not from printer_cfg - so it is applied even when the plate's machine
+    //is unresolved. Left to the construction-time default, an unresolved first plate drew
+    //"Left Nozzle / Right Nozzle / AMS not installed" over a single-nozzle machine.
+    if (extruder_dual_sizer != nullptr)
+        extruder_dual_sizer->Show(isDual);
+    if (printer_cfg == nullptr) {
+        if (extruder_single_sizer != nullptr && !isDual)
+            extruder_single_sizer->Show(false);
         return;
+    }
 
     // ORCA show plate type combo box only when its supported
     // Orca: the vendor, not isBBL, decides whether the plate type combo is shown
@@ -965,8 +970,6 @@ void Sidebar::priv::layout_printer_machine(bool isDual, const DynamicPrintConfig
     m_printer_connect->Show(!has_bbl_network);
     //btn_sync_printer->Show(isBBL);
     m_printer_bbl_sync->Show(has_bbl_network);
-
-    extruder_dual_sizer->Show(isDual);
 
     // NEEDFIX requires AMS check or any type of ???
     // Single nozzle & non ams
@@ -2558,12 +2561,13 @@ Sidebar::Sidebar(Plater *parent)
         p->m_panel_printer_title->SetBackgroundColor(title_bg);
         p->m_panel_printer_title->SetBackgroundColor2(0xF1F1F1);
 
-        p->m_printer_icon = new ScalableButton(p->m_panel_printer_title, wxID_ANY, "printer");
+        //The chevron IS the section's icon: it says the bar folds, and which way it is.
+        p->m_printer_icon = new ScalableButton(p->m_panel_printer_title, wxID_ANY, "section_open");
+        p->m_printer_icon->SetToolTip(_L("Fold or unfold the printer section"));
         p->m_text_printer_settings = new Label(p->m_panel_printer_title, _L("Printer"), LB_PROPAGATE_MOUSE_EVENT | wxST_ELLIPSIZE_END);
 
         p->m_printer_icon->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
-            //auto wizard_t = new ConfigWizard(wxGetApp().mainframe);
-            //wizard_t->run(ConfigWizard::RR_USER, ConfigWizard::SP_CUSTOM);
+            set_printer_section_folded(!is_printer_section_folded());
             });
 
         // ORCA use connect button on titlebar
@@ -2608,20 +2612,7 @@ Sidebar::Sidebar(Plater *parent)
         // add printer title
         scrolled_sizer->Add(p->m_panel_printer_title, 0, wxEXPAND | wxALL, 0);
         p->m_panel_printer_title->Bind(wxEVT_LEFT_UP, [this] (auto & e) {
-            if (!p || !p->combo_printer || !p->m_text_printer_settings || !p->m_panel_printer_content || !m_scrolled_sizer)
-                return;
-            // ORCA Show printer name on title when its folded to inform user without expanding it again
-            // The collapsed title comes from printer_summary_text(), not from the project
-            // combo's displayed string: a project on five machines has no one printer name
-            // to show, and showing the project's would name the machine four plates are not on.
-            bool     isShown = p->m_panel_printer_content->IsShown();
-            wxString title   = _L("Printer") + wxString(!isShown ? "" : ("  |  " + printer_summary_text()));
-            p->m_text_printer_settings->SetLabel(title);
-            p->m_panel_printer_content->Show(!isShown);
-            if (p->plate_materials_panel != nullptr)
-                p->plate_materials_panel->Show(!isShown);
-            p->m_panel_printer_separator->Show(isShown);
-            m_scrolled_sizer->Layout();
+            set_printer_section_folded(!is_printer_section_folded());
         });
         // ORCA add bottom border for seperation wile sections folded
         p->m_panel_printer_separator = new wxPanel(p->scrolled, wxID_ANY, wxDefaultPosition, wxSize(-1, FromDIP(2))); // ORCA staticline class not works without string
@@ -3020,7 +3011,14 @@ Sidebar::Sidebar(Plater *parent)
         //No plate exists yet - Sidebar is built from inside Plater::priv's constructor - so the
         //Project row's machine is not a substitute for a plate here, it is the only machine
         //there is. update_presets(TYPE_PRINTER) lays it out for the current plate afterwards.
-        p->layout_printer(true, &wxGetApp().preset_bundle->printers.get_edited_preset().config);
+        //Dual or single toolheads is that machine's answer too: hard-coding "dual" here left
+        //"Left Nozzle / Right Nozzle / AMS not installed" standing over a single-nozzle Kobra
+        //whenever the first plate could not be resolved to correct it.
+        {
+            const DynamicPrintConfig &cursor_printer = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+            const auto *variants = cursor_printer.option<ConfigOptionStrings>("extruder_variant_list");
+            p->layout_printer(variants != nullptr && variants->size() == 2, &cursor_printer);
+        }
         p->m_panel_printer_content->SetSizer(p->vsizer_printer);
         p->m_panel_printer_content->Layout();
         scrolled_sizer->Add(p->m_panel_printer_content, 0, wxEXPAND, 0);
@@ -3048,6 +3046,8 @@ Sidebar::Sidebar(Plater *parent)
     p->m_panel_filament_title->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent &e) {
         if (!p || !p->m_panel_filament_content || !m_scrolled_sizer || !p->m_bpButton_set_filament || !p->m_purge_mode_btn || !p->m_flushing_volume_btn || !p->m_bpButton_add_filament || !ams_btn)
             return;
+        if (p->m_filament_icon != nullptr)
+            p->m_filament_icon->SetBitmap_(is_pool_folded() ? "section_folded" : "section_open");
         // ORCA exclude area of del button from titlebar collapse/expand feature to fix undesired collapse when user spams del filament button
         // also block fold/unfold feature when user clicks to spacing between icons
         int exclude_pt = p->m_bpButton_set_filament->GetPosition().x; // maximum fixed item
@@ -3057,17 +3057,15 @@ Sidebar::Sidebar(Plater *parent)
         else if (ams_btn->IsShown())                    exclude_pt = ams_btn->GetPosition().x;
         if (e.GetPosition().x > exclude_pt)
             return;
-        bool isShown = p->m_panel_filament_content->IsShown();
-        p->m_panel_filament_content->Show(!isShown);
-        p->m_panel_filament_separator->Show(isShown);
-        m_scrolled_sizer->Layout();
-
-        CallAfter([this]{update_filaments_counter(true);}); // call after all UI processing done
+        set_pool_folded(!is_pool_folded());
     });
 
     wxBoxSizer* bSizer39;
     bSizer39 = new wxBoxSizer( wxHORIZONTAL );
-    p->m_filament_icon = new ScalableButton(p->m_panel_filament_title, wxID_ANY, "filament");
+    //The chevron is the pool's icon, as it is the printer's: it says the bar folds.
+    p->m_filament_icon = new ScalableButton(p->m_panel_filament_title, wxID_ANY, "section_open");
+    p->m_filament_icon->SetToolTip(_L("Fold or unfold the spool pool"));
+    p->m_filament_icon->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) { set_pool_folded(!is_pool_folded()); });
     p->m_staticText_filament_settings = new Label(p->m_panel_filament_title, _L("Spool pool"), LB_PROPAGATE_MOUSE_EVENT);
     p->m_staticText_filament_settings->SetToolTip(_L("Available spools. The assigned materials above are what the selected plate will print with."));
     bSizer39->Add(p->m_filament_icon, 0, wxALIGN_CENTER | wxLEFT, FromDIP(SidebarProps::TitlebarMargin()));
@@ -3292,6 +3290,17 @@ Sidebar::Sidebar(Plater *parent)
     p->object_layers = new ObjectLayers(p->scrolled);
     p->object_layers->Hide();
     p->sizer_params->Add(p->object_layers->get_sizer(), 0, wxEXPAND | wxTOP, 0);
+
+    //REMEMBERED FOLDS. On a fresh config the pool starts folded: the plate's own materials
+    //are in the Printer section, and the pool is the shelf behind them, wanted when assigning
+    //and in the way the rest of the time. The process settings get the height.
+    {
+        AppConfig *cfg = wxGetApp().app_config;
+        const std::string printer_pref = cfg->get("sidebar_printer_folded");
+        const std::string pool_pref    = cfg->get("sidebar_pool_folded");
+        set_printer_section_folded(printer_pref.empty() ? false : cfg->get_bool("sidebar_printer_folded"), false);
+        set_pool_folded(pool_pref.empty() ? true : cfg->get_bool("sidebar_pool_folded"), false);
+    }
 
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
@@ -3557,10 +3566,10 @@ void Sidebar::update_all_preset_comboboxes()
 
     if (cfg.opt_bool("pellet_modded_printer")) {
 		p->m_staticText_filament_settings->SetLabel(_L("Pellet pool"));
-        p->m_filament_icon->SetBitmap_("pellets");
+        p->m_filament_icon->SetBitmap_(is_pool_folded() ? "section_folded" : "section_open");
     } else {
 		p->m_staticText_filament_settings->SetLabel(_L("Spool pool"));
-        p->m_filament_icon->SetBitmap_("filament");
+        p->m_filament_icon->SetBitmap_(is_pool_folded() ? "section_folded" : "section_open");
     }
 
     show_SEMM_buttons();
@@ -4325,11 +4334,10 @@ void Sidebar::add_filament() {
     if (!add_custom_filament(Plater::get_next_color_for_filament()))
         return;
 
+    //A click on the pool bar's own buttons is a click on the pool: unfold it to show the change.
+    if (is_pool_folded())
+        set_pool_folded(false);
     auto filament_list = p->m_panel_filament_content;
-    if(!filament_list->IsShown()){
-        filament_list->Show(); // ORCA show list if its folded
-        m_scrolled_sizer->Layout();
-    }
     filament_list->Scroll(-1, INT_MAX); // ORCA scroll to end of list on changes to inform user about filament count
 }
 
@@ -4399,11 +4407,10 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
 
     wxGetApp().plater()->update();
 
+    //A click on the pool bar's own buttons is a click on the pool: unfold it to show the change.
+    if (is_pool_folded())
+        set_pool_folded(false);
     auto filament_list = p->m_panel_filament_content;
-    if(!filament_list->IsShown()){
-        filament_list->Show(); // ORCA show list if its folded
-        m_scrolled_sizer->Layout();
-    }
 
     filament_list->Scroll(-1, INT_MAX); // ORCA scroll to end of list on changes to inform user about filament count
 }
@@ -4443,6 +4450,77 @@ bool Sidebar::add_custom_filament(wxColour new_col) {
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
     auto_calc_flushing_volumes(filament_count - 1);
     return true;
+}
+
+static std::string filament_material_of(const Preset *preset)
+{
+    if (preset == nullptr)
+        return std::string();
+    if (const auto *type = preset->config.option<ConfigOptionStrings>("filament_type"); type != nullptr && !type->values.empty())
+        return type->values.front();
+    return std::string();
+}
+
+//The first seven characters, upper-cased: "#rrggbb" and "#RRGGBBAA" name the same spool.
+static std::string spool_colour_key(const std::string &colour)
+{
+    std::string key = colour.substr(0, 7);
+    for (char &c : key)
+        c = char(std::toupper(static_cast<unsigned char>(c)));
+    return key;
+}
+
+//See the header. Same material and same colour is the same spool on the shelf.
+int Sidebar::merge_spool_into_pool(const PlateSlicingContext::Spool &spool, bool &added)
+{
+    added = false;
+    PresetBundle &bundle = *wxGetApp().preset_bundle;
+    const std::string material = filament_material_of(bundle.filaments.find_preset(spool.preset_name, false));
+    const std::string colour   = spool_colour_key(spool.colour);
+    const auto *pool_colours   = bundle.project_config.option<ConfigOptionStrings>("filament_colour");
+    for (size_t row = 0; row < bundle.filament_presets.size(); ++row) {
+        if (filament_material_of(bundle.filaments.find_preset(bundle.filament_presets[row], false)) != material)
+            continue;
+        const std::string here = pool_colours != nullptr && row < pool_colours->values.size() ? spool_colour_key(pool_colours->values[row]) : std::string();
+        if (here != colour)
+            continue;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": '" << spool.preset_name << "' " << colour << " (" << material
+                                << ") is already pool row " << (row + 1) << " ('" << bundle.filament_presets[row] << "'), not added";
+        return int(row);
+    }
+
+    //Not on the shelf yet: one more row, through the same door the "+" button uses, so the pool
+    //cap is one rule in one place. The row is then given THIS spool's identity -
+    //add_custom_filament copies the last row's preset, which is the right default for a spool
+    //added by hand and the wrong one here.
+    const wxColour rgb = colour.empty() ? Plater::get_next_color_for_filament() : wxColour(colour);
+    if (!add_custom_filament(rgb))
+        return -1;
+    const int row = int(bundle.filament_presets.size()) - 1;
+    bundle.filament_presets[row] = spool.preset_name;
+    DynamicPrintConfig &proj = bundle.project_config;
+    auto set_row = [&](const char *key, const std::string &value) {
+        auto *opt = proj.option<ConfigOptionStrings>(key, true);
+        if ((int) opt->values.size() <= row)
+            opt->values.resize(row + 1);
+        opt->values[row] = value;
+    };
+    set_row("filament_colour", colour.empty() ? rgb.GetAsString(wxC2S_HTML_SYNTAX).ToStdString() : colour);
+    set_row("filament_colour_type", spool.colour_type);
+    set_row("filament_multi_colour", spool.multi_colours);
+    if (auto *finish = proj.option<ConfigOptionEnumsGeneric>("filament_finish", true)) {
+        if ((int) finish->values.size() <= row)
+            finish->values.resize(row + 1, (int) FilamentFinish::ffStandard);
+        finish->values[row] = spool.finish;
+    }
+    bundle.update_multi_material_filament_presets();
+    if (row < (int) p->combos_filament.size() && p->combos_filament[row] != nullptr)
+        p->combos_filament[row]->update();
+    auto_calc_flushing_volumes(row);
+    added = true;
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": '" << spool.preset_name << "' " << colour << " (" << material
+                            << ") added to the pool as row " << (row + 1);
+    return row;
 }
 
 bool Sidebar::is_new_project_in_gcode3mf()
@@ -5521,11 +5599,9 @@ void Sidebar::refresh_plate_materials()
     p->shown_plate_materials = labels;
     p->plate_materials_sizer->Clear(true);
 
-    auto *title = new wxStaticText(p->plate_materials_panel, wxID_ANY,
-                                   wxString::Format(_L("Plate %d prints with"), plate_index + 1));
-    title->SetFont(wxGetApp().bold_font());
-    p->plate_materials_sizer->Add(title, 0, wxEXPAND | wxBOTTOM, FromDIP(4));
-
+    //No caption. The numbered swatches are the plate board's slot strip drawn large enough to
+    //read, under the plate they belong to; a line saying "plate N prints with" above them was
+    //a heading restating what the rows already show.
     const int swatch_w = 3 * wxGetApp().em_unit();
     const int swatch_h = 2 * wxGetApp().em_unit();
     for (size_t i = 0; i < slots.size(); ++i) {
@@ -5541,9 +5617,10 @@ void Sidebar::refresh_plate_materials()
         auto *swatch = new wxStaticBitmap(row_panel, wxID_ANY, swatch_bmp != nullptr ? *swatch_bmp : wxNullBitmap);
         row->Add(swatch, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
 
-        auto *text = new wxBoxSizer(wxVERTICAL);
-        //The material is the answer to "what comes out of the nozzle", so it leads. An empty one
-        //says the preset is not installed here, which is the more urgent fact and takes its place.
+        //ONE LINE PER SLOT. The material is the answer to "what comes out of the nozzle", so it
+        //leads in bold; the preset name follows in the dim weight and gives way first when the
+        //sidebar is narrow. An empty material says the preset is not installed here, which is
+        //the more urgent fact and takes its place.
         wxString headline = slot.material.empty() ? _L("Material unknown") : from_u8(slot.material);
         if (!slot.installed)
             headline += " " + _L("(not installed)");
@@ -5553,14 +5630,12 @@ void Sidebar::refresh_plate_materials()
         headline_text->SetFont(wxGetApp().bold_font());
         if (!slot.installed)
             headline_text->SetForegroundColour(wxColour(0xC5, 0x3D, 0x3D));
-        text->Add(headline_text, 0, wxEXPAND);
+        row->Add(headline_text, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(6));
 
-        auto *name_text = new wxStaticText(row_panel, wxID_ANY, from_u8(slot.name));
+        auto *name_text = new wxStaticText(row_panel, wxID_ANY, from_u8(slot.name), wxDefaultPosition, wxDefaultSize, wxST_ELLIPSIZE_END);
         name_text->SetFont(wxGetApp().normal_font().Smaller());
-        name_text->SetForegroundColour(wxColour(0x6B, 0x6B, 0x6B));
-        name_text->Wrap(width - swatch_w - FromDIP(20));
-        text->Add(name_text, 0, wxEXPAND);
-        row->Add(text, 1, wxALIGN_CENTER_VERTICAL);
+        name_text->SetForegroundColour(wxColour(0x8A, 0x8A, 0x8A));
+        row->Add(name_text, 1, wxALIGN_CENTER_VERTICAL);
 
         const wxString tip = wxString::Format(_L("Slot %d: %s\nClick to assign a different spool to this slot."),
                                               int(i + 1), from_u8(slot.name));
@@ -5583,8 +5658,9 @@ void Sidebar::refresh_plate_materials()
                                                        _L("No material assigned. Add a slot to make this plate ready to slice.")),
                                        0, wxEXPAND);
     if (can_add_slot) {
-        auto *add = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Add plate material slot"),
+        auto *add = new wxButton(p->plate_materials_panel, wxID_ANY, _L("Add slot"),
                                  wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+        add->SetToolTip(_L("Give this plate one more material slot"));
         add->Bind(wxEVT_BUTTON, [this](wxCommandEvent &) {
             show_plate_filament_menu(p->plate_materials_panel, p->plater,
                                       p->plater->get_partplate_list().get_curr_plate_index(), 0);
@@ -5683,6 +5759,53 @@ void Sidebar::on_plate_selection_changed(int current_plate)
         if (p->m_panel_printer_content != nullptr)
             p->m_panel_printer_content->Layout();
     }
+}
+
+void Sidebar::set_printer_section_folded(bool folded, bool remember)
+{
+    if (p == nullptr || p->m_panel_printer_content == nullptr || p->m_text_printer_settings == nullptr || m_scrolled_sizer == nullptr)
+        return;
+    //Folded, the bar carries the machine summary, so the fold costs nothing the two-second
+    //look needs. (Not before the plater exists: the summary reads the plate board.)
+    wxString title = _L("Printer");
+    if (folded && p->plater != nullptr && p->plater->is_initialized())
+        title += "  |  " + printer_summary_text();
+    p->m_text_printer_settings->SetLabel(title);
+    p->m_panel_printer_content->Show(!folded);
+    if (p->plate_materials_panel != nullptr)
+        p->plate_materials_panel->Show(!folded);
+    if (p->m_panel_printer_separator != nullptr)
+        p->m_panel_printer_separator->Show(folded);
+    if (p->m_printer_icon != nullptr)
+        p->m_printer_icon->SetBitmap_(folded ? "section_folded" : "section_open");
+    m_scrolled_sizer->Layout();
+    if (remember)
+        wxGetApp().app_config->set_bool("sidebar_printer_folded", folded);
+}
+
+void Sidebar::set_pool_folded(bool folded, bool remember)
+{
+    if (p == nullptr || p->m_panel_filament_content == nullptr || m_scrolled_sizer == nullptr)
+        return;
+    p->m_panel_filament_content->Show(!folded);
+    if (p->m_panel_filament_separator != nullptr)
+        p->m_panel_filament_separator->Show(folded);
+    if (p->m_filament_icon != nullptr)
+        p->m_filament_icon->SetBitmap_(folded ? "section_folded" : "section_open");
+    m_scrolled_sizer->Layout();
+    CallAfter([this] { update_filaments_counter(true); }); // after all UI processing is done
+    if (remember)
+        wxGetApp().app_config->set_bool("sidebar_pool_folded", folded);
+}
+
+bool Sidebar::is_printer_section_folded() const
+{
+    return p != nullptr && p->m_panel_printer_content != nullptr && !p->m_panel_printer_content->IsShown();
+}
+
+bool Sidebar::is_pool_folded() const
+{
+    return p != nullptr && p->m_panel_filament_content != nullptr && !p->m_panel_filament_content->IsShown();
 }
 
 wxString Sidebar::printer_summary_text() const
@@ -7933,6 +8056,50 @@ static void reconcile_imported_plates(Plater *plater, const std::string &authore
                                      into_u8(message));
 }
 
+//ADDING A PROJECT: carry its objects into the plates it was given here.
+//
+//Each instance is looked up in the file's own layout - the same "which plate rectangle is it in"
+//question reload_all_objects asks - and moved by the difference between that plate's centre and
+//the centre of the plate it became here, so a part front-left of its bed stays front-left of it
+//even when the two beds differ in size. An instance outside every plate in the file stays where
+//it was, which is outside every plate here too, and the plate list treats it as it treats any
+//loose object. The objects are the FILE's, not yet in the open model.
+static void carry_objects_into_added_plates(Model &model, const std::vector<BoundingBoxf> &file_plates, PartPlateList &plates, int first_new_plate)
+{
+    int carried = 0, loose = 0;
+    for (ModelObject *object : model.objects) {
+        for (size_t inst = 0; inst < object->instances.size(); ++inst) {
+            const BoundingBoxf3 box3 = object->instance_convex_hull_bounding_box(inst);
+            const BoundingBoxf  box(Vec2d(box3.min.x(), box3.min.y()), Vec2d(box3.max.x(), box3.max.y()));
+            int found = -1;
+            for (size_t k = 0; k < file_plates.size() && found < 0; ++k)
+                if (file_plates[k].contains(box.center()))
+                    found = int(k);
+            for (size_t k = 0; k < file_plates.size() && found < 0; ++k)
+                if (file_plates[k].overlap(box))
+                    found = int(k);
+            PartPlate *target = found < 0 ? nullptr : plates.get_plate(first_new_plate + found);
+            if (target == nullptr) {
+                ++loose;
+                continue;
+            }
+            const Vec3d origin = target->get_origin();
+            const Vec2d size   = target->get_size();
+            const Vec2d delta  = Vec2d(origin.x() + 0.5 * size.x(), origin.y() + 0.5 * size.y()) - file_plates[found].center();
+            if (delta.norm() > EPSILON) {
+                Vec3d offset = object->instances[inst]->get_offset();
+                offset.x() += delta.x();
+                offset.y() += delta.y();
+                object->instances[inst]->set_offset(offset);
+            }
+            ++carried;
+        }
+        object->invalidate_bounding_box();
+    }
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": " << carried << " instance(s) carried into plates from "
+                            << (first_new_plate + 1) << " on, " << loose << " outside every plate";
+}
+
 // BBS: backup & restore
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi)
 {
@@ -7966,7 +8133,11 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     if (input_files.empty())
         return std::vector<size_t>();
 
-    if (!input_files.empty())
+    //ADD TO PROJECT: the file is a whole project arriving AFTER what is open. Every place
+    //below where "replace" and "add" part ways reads this one flag.
+    const bool add_to_project = strategy & LoadStrategy::AddToProject;
+
+    if (!input_files.empty() && !add_to_project)
        q->m_3mf_path = input_files[0].string();
     
     // SoftFever: ugly fix so we can exist pa calib mode
@@ -8009,6 +8180,14 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     //and a report that quotes the decorated name is quoting the app back at itself.
     bool         project_config_loaded    = false;
     std::string  project_authored_printer;
+
+    //Add-to-project bookkeeping: where the file's plates landed, its own layout (so its objects
+    //can be carried across), and what its spools became in the pool.
+    int                       added_first_plate = -1;
+    int                       added_plate_count = 0;
+    int                       added_spools      = 0;
+    int                       merged_spools     = 0;
+    std::vector<BoundingBoxf> file_plate_boxes;
 
     int answer_convert_from_meters          = wxOK_DEFAULT;
     int answer_convert_from_imperial_units  = wxOK_DEFAULT;
@@ -8135,13 +8314,6 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
                     }
 
-                    std::string import_project_action = wxGetApp().app_config->get("import_project_action");
-                    LoadType load_type;
-                    if (import_project_action.empty())
-                        load_type = LoadType::Unknown;
-                    else
-                        load_type  = static_cast<LoadType>(std::stoi(import_project_action));
-
                     // BBS: version check
                     Semver app_version = *(Semver::parse(SoftFever_VERSION));
                     const wxString load_3mf_title              = _L("Load 3MF");
@@ -8167,8 +8339,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
                         // do not reset the model config
                         load_config = false;
-                        if (load_type != LoadType::LoadGeometry)
-                            log_and_show_3mf_info(msg_unsupported_geometry, load_3mf_title);
+                        log_and_show_3mf_info(msg_unsupported_geometry, load_3mf_title);
                     }
                     else if (en_3mf_file_type == En3mfType::From_Orca) {
                         // OrcaSlicer file (has OrcaSlicer tag) - compare file_version with SoftFever_VERSION
@@ -8334,12 +8505,40 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         }
 
                         Semver old_version(1, 5, 9);
-                        if ((en_3mf_file_type == En3mfType::From_BBS || en_3mf_file_type == En3mfType::From_Orca) && (file_version < old_version) && load_model && load_config && !config_loaded.empty()) {
+                        //(Not when adding: the added plates are laid out by the file's own
+                        //layout below, and a pre-1.5.9 grid is not worth a second path.)
+                        if ((en_3mf_file_type == En3mfType::From_BBS || en_3mf_file_type == En3mfType::From_Orca) && (file_version < old_version) && load_model && load_config && !config_loaded.empty() && !add_to_project) {
                             translate_old = true;
                             partplate_list.get_plate_size(current_width, current_depth, current_height);
                         }
 
-                        if (load_config) {
+                        if (load_config && add_to_project) {
+                            //THE FILE'S PLATES GO AFTER THE ONES ALREADY HERE. Where its objects
+                            //are is where its plates were, so the file's own layout is recorded
+                            //first - from the beds its printers resolve to here and its own bed
+                            //for the rest - and the objects are carried across once the new
+                            //plates exist. Its per-plate custom G-code follows the plate numbers.
+                            Vec2d file_bed(0.0, 0.0);
+                            if (const auto *area = config_loaded.option<ConfigOptionPoints>("printable_area");
+                                area != nullptr && area->values.size() >= 3) {
+                                const BoundingBoxf box(area->values);
+                                file_bed = box.size();
+                            }
+                            file_plate_boxes  = partplate_list.layout_of_file_plates(plate_data, file_bed, "(" + filename.string() + ")");
+                            added_first_plate = partplate_list.append_from_3mf_structure(plate_data);
+                            added_plate_count = added_first_plate < 0 ? 0 : partplate_list.get_plate_count() - added_first_plate;
+                            if (added_first_plate >= 0)
+                                for (const auto &entry : model.plates_custom_gcodes)
+                                    if (entry.first >= 0 && entry.first < added_plate_count)
+                                        this->model.plates_custom_gcodes[added_first_plate + entry.first] = entry.second;
+                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": added " << added_plate_count << " plate(s) of "
+                                                    << plate_data.size() << " from " << filename.string() << " after plate " << added_first_plate;
+                            partplate_list.update_slice_context_to_current_plate(background_process);
+                            this->preview->update_gcode_result(partplate_list.get_current_slice_result());
+                            release_PlateData_list(plate_data);
+                            sidebar->obj_list()->reload_all_plates();
+                            q->suppress_background_process(true);
+                        } else if (load_config) {
                             if (translate_old) {
                                 //set the size back
                                 partplate_list.reset_size(current_width + Bed3D::Axes::DefaultTipRadius, current_depth + Bed3D::Axes::DefaultTipRadius, current_height, false);
@@ -8405,6 +8604,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     // BBS
                     if (load_model && !load_config) {
                         ;
+                    }
+                    else if (add_to_project) {
+                        //Design and model info describe the project that is open; the file's stay
+                        //with the file. Its per-plate custom G-code went with its plates above.
                     }
                     else {
                         this->model.plates_custom_gcodes = model.plates_custom_gcodes;
@@ -8505,7 +8708,78 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         }
 
                         //always load config
-                        {
+                        if (add_to_project) {
+                            //ADDING THE FILE'S SETTINGS TO THE OPEN PROJECT.
+                            //
+                            //The file's presets are installed exactly as opening it would install
+                            //them, and nothing else moves: the selection stays where it is, the
+                            //pool stays the open project's pool, the project layer stays the open
+                            //project's. What comes back is the names the file's declaration goes
+                            //by here, which is what its plates are completed from - the same seed
+                            //the fresh open builds, read from the same place.
+                            project_authored_printer = config.opt_string("printer_settings_id", true);
+                            InstalledProjectPresets installed;
+                            preset_bundle->install_project_presets(filename.string(), std::move(config), file_version, installed);
+
+                            PlateSlicingContext declared;
+                            declared.printer_preset_name   = installed.printer;
+                            declared.print_preset_name     = installed.print;
+                            declared.filament_preset_names = installed.filaments;
+                            PresetBundle::capture_plate_filament_colours(declared, installed.project_layer);
+
+                            //THE SPOOLS JOIN THE POOL. Same material and same colour is the same
+                            //spool on the shelf whatever the profile is called; anything else is a
+                            //spool this project did not have yet. The plates keep naming the file's
+                            //own presets - that is what "opens as it would on its own" means - and
+                            //assignment translates them for the machine each plate lands on.
+                            for (size_t i = 0; i < declared.filament_preset_names.size(); ++i) {
+                                bool added = false;
+                                if (sidebar->merge_spool_into_pool(declared.spool_in_slot(i), added) < 0)
+                                    continue; //refused, and it said why
+                                if (added) ++added_spools; else ++merged_spools;
+                            }
+
+                            if (added_first_plate >= 0) {
+                                for (int i = added_first_plate; i < partplate_list.get_plate_count(); ++i) {
+                                    PartPlate *plate = partplate_list.get_plate(i);
+                                    PlateSlicingContext legacy = plate->get_slicing_context();
+                                    PresetBundle::migrate_legacy_plate_filament_colours(legacy, declared);
+                                    if (legacy != plate->get_slicing_context())
+                                        plate->set_slicing_context(legacy);
+                                }
+                                const int completed = partplate_list.complete_plate_contexts(declared, added_first_plate);
+                                BOOST_LOG_TRIVIAL(info)
+                                    << "load_files: added project '" << filename.string() << "' as plates " << (added_first_plate + 1)
+                                    << ".." << partplate_list.get_plate_count() << "; " << completed
+                                    << " completed from the file's declaration: printer '" << declared.printer_preset_name
+                                    << "', process '" << declared.print_preset_name << "', " << declared.filament_preset_names.size()
+                                    << " filament(s); " << added_spools << " spool(s) added to the pool, " << merged_spools << " merged";
+                                partplate_list.apply_printer_assignments();
+
+                                //The file's wipe-tower positions belong to its plates, which are
+                                //now numbered after the open project's.
+                                DynamicConfig &proj_cfg = preset_bundle->project_config;
+                                auto carry_per_plate = [&](const char *key) {
+                                    const auto *from = installed.project_layer.option<ConfigOptionFloats>(key);
+                                    auto       *to   = proj_cfg.option<ConfigOptionFloats>(key, true);
+                                    if (from == nullptr || to == nullptr)
+                                        return;
+                                    if ((int) to->values.size() < partplate_list.get_plate_count())
+                                        to->values.resize(partplate_list.get_plate_count(), to->values.empty() ? 0.0 : to->values.front());
+                                    for (int i = 0; i < added_plate_count && i < (int) from->values.size(); ++i)
+                                        to->values[added_first_plate + i] = from->values[i];
+                                };
+                                carry_per_plate("wipe_tower_x");
+                                carry_per_plate("wipe_tower_y");
+                            }
+
+                            //The sidebar follows the pool; the cursor follows whichever plate is
+                            //selected once the load is over. Nothing here moves the selection.
+                            q->on_filament_count_change(preset_bundle->filament_presets.size());
+                            wxGetApp().plater()->sidebar().update_presets(Preset::TYPE_FILAMENT);
+                            is_project_file       = true;
+                            project_config_loaded = true;
+                        } else {
                             // BBS: save the wipe tower pos in file here, will be used later
                             ConfigOptionFloats* wipe_tower_x_opt = config.opt<ConfigOptionFloats>("wipe_tower_x");
                             ConfigOptionFloats* wipe_tower_y_opt = config.opt<ConfigOptionFloats>("wipe_tower_y");
@@ -8965,10 +9239,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 model.center_instances_around_point(this->bed.build_volume().bed_center());
             // BBS: add auxiliary files logic
             // BBS: backup & restore
-            if (load_aux) {
+            //When adding, the open project keeps its own backup folder and auxiliary files; the
+            //file's temporary folder goes when this function's copy of the model does, and
+            //everything read out of it (thumbnails, plate data) is already in memory.
+            if (load_aux && !add_to_project) {
                 q->model().load_from(model);
                 load_auxiliary_files();
             }
+            if (add_to_project && added_first_plate >= 0)
+                carry_objects_into_added_plates(model, file_plate_boxes, partplate_list, added_first_plate);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", before load_model_objects, count %1%")%model.objects.size();
             auto loaded_idxs = load_model_objects(model.objects, is_project_file);
             obj_idxs.insert(obj_idxs.end(), loaded_idxs.begin(), loaded_idxs.end());
@@ -9051,7 +9330,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     //BBS: add gcode loading logic in the end
     q->m_exported_file = false;
     q->skip_thumbnail_invalid = false;
-    if (load_model && load_config) {
+    if (load_model && load_config && add_to_project) {
+        //An added project never turns the open one into a G-code preview, whatever it holds.
+        q->select_view_3D("3D");
+        if (added_first_plate >= 0)
+            q->select_plate(added_first_plate);
+    }
+    else if (load_model && load_config) {
         if (model.objects.empty()) {
             partplate_list.load_gcode_files();
             PartPlate * first_plate = nullptr, *cur_plate = nullptr;
@@ -9155,6 +9440,19 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
     }
     q->schedule_background_process(true);
     q->mark_plate_toolbar_image_dirty();
+
+    //ONE LINE ABOUT WHAT ARRIVED, for an added project. Counts, not lists; the plates are on
+    //screen and the spools are in the pool, so this only has to say where to look.
+    if (add_to_project && project_config_loaded) {
+        const wxString name = from_path(input_files.front().filename());
+        wxString message = added_plate_count > 0
+            ? wxString::Format(_L("%s was added as plates %d to %d."), name, added_first_plate + 1, added_first_plate + added_plate_count)
+            : wxString::Format(_L("%s was added, but none of its plates fitted: the plate limit is %d."), name, int(PartPlateList::MAX_PLATES_COUNT));
+        if (added_spools > 0 || merged_spools > 0)
+            message += " " + wxString::Format(_L("%d spool(s) joined the pool; %d were in it already."), added_spools, merged_spools);
+        notification_manager->push_notification(NotificationType::CustomNotification,
+                                                NotificationManager::NotificationLevel::RegularNotificationLevel, into_u8(message));
+    }
 
     //IMPORT RECEPTION, and the reason it is a CallAfter rather than a call.
     //
@@ -14692,18 +14990,31 @@ int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_
     return wxID_YES;
 }
 
-LoadType determine_load_type(std::string filename, std::string override_setting = "");
 
 // BBS: FIXME, missing resotre logic
 void Plater::load_project(wxString const& filename2,
     wxString const& originfile)
 {
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "filename is: " << filename2 << "and originfile is: " << originfile;
+    auto filename = filename2;
+
+    //ADDING, NOT REPLACING. An ordinary open onto a project that already holds something ADDS
+    //the file to it - plates, presets, spools and objects, as it would open on its own, after
+    //what is already here. Only a blank project is replaced. Restore and silent startup loads
+    //still replace: they are the app rebuilding a session, not a person opening a second file.
+    //Decided before anything of the open project is touched: the two resets below are part of
+    //replacing it, and an add keeps its calibration pattern and its custom G-code.
+    if ((originfile == "-" || originfile == "<loadall>") && !is_blank_project()) {
+        if (filename.empty())
+            wxGetApp().load_project(this, filename);
+        if (!filename.empty())
+            add_project(filename);
+        return;
+    }
+
     model().calib_pa_pattern.reset(nullptr);
     model().plates_custom_gcodes.clear();
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "filename is: " << filename2 << "and originfile is: " << originfile;
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__;
-    auto filename = filename2;
     auto check = [&filename, this] (bool yes_or_no) {
         //NO PRESET GATE ON THE WAY INTO A PROJECT. This asked "some presets are modified -
         //save, discard or cancel?" before the open, and it asked it from inside
@@ -14755,12 +15066,6 @@ void Plater::load_project(wxString const& filename2,
         // Do nothing
     } else if (originfile != "-") {
         strategy = strategy | LoadStrategy::Restore;
-    } else {
-        switch (determine_load_type(filename.ToStdString())) {
-            case LoadType::OpenProject: break; // Do nothing
-            case LoadType::LoadGeometry:; strategy = LoadStrategy::LoadModel; break;
-            default: return; // User cancelled
-        }
     }
     bool load_restore = strategy & LoadStrategy::Restore;
 
@@ -14827,6 +15132,65 @@ void Plater::load_project(wxString const& filename2,
     sidebar().set_flushing_volume_warning(has_modify);
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " load project done";
+}
+
+//See the header. Everything the file carries arrives through the same load as opening it
+//would use - LoadStrategy::AddToProject is the one difference, and Plater::priv::load_files
+//reads it wherever "replace" and "add" part ways.
+void Plater::add_project(const wxString &filename)
+{
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": " << filename;
+    if (m_loading_project) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": a project is already loading, not adding";
+        return;
+    }
+    NotificationManager *notifications = get_notification_manager();
+    if (is_background_process_slicing()) {
+        notifications->push_notification(NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                         into_u8(_L("Wait for the slice to finish, then add the project.")));
+        return;
+    }
+    if (using_exported_file() || m_only_gcode) {
+        notifications->push_notification(NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                         into_u8(_L("A project cannot be added while a G-code file is open. Start a new project first.")));
+        return;
+    }
+    const fs::path path = into_path(filename);
+    if (!boost::filesystem::exists(path)) {
+        notifications->push_notification(NotificationType::CustomNotification, NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                         into_u8(wxString::Format(_L("%s is not there any more."), filename)));
+        return;
+    }
+
+    const int    plates_before  = p->partplate_list.get_plate_count();
+    const size_t objects_before = model().objects.size();
+    {
+        Plater::TakeSnapshot snapshot(this, std::string("Add project: ") + into_u8(from_path(path.filename())));
+        load_files({path}, LoadStrategy::LoadModel | LoadStrategy::LoadConfig | LoadStrategy::AddToProject);
+    }
+    const int plates_after = p->partplate_list.get_plate_count();
+    if (plates_after <= plates_before && model().objects.size() == objects_before) {
+        //nothing arrived; the load has already said why
+        return;
+    }
+
+    if (get_project_name() == _L("Untitled"))
+        p->set_project_name(from_u8(path.stem().string()));
+    wxGetApp().mainframe->update_title();
+    wxGetApp().mainframe->add_to_recent_projects(filename);
+
+    //Show what arrived: the first of the new plates, and the whole project so the new plates
+    //are in the picture. An explicit open is one of the places the camera is allowed to move.
+    if (plates_after > plates_before)
+        select_plate(plates_before);
+    p->select_view_3D("3D");
+    p->camera.requires_zoom_to_plate = REQUIRES_ZOOM_TO_ALL_PLATE;
+    wxGetApp().mainframe->select_tab(MainFrame::tp3DEditor);
+    update_project_dirty_from_presets();
+    wxGetApp().params_panel()->switch_to_object_if_has_object_configs();
+    sidebar().set_flushing_volume_warning(is_flush_config_modified());
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": plates " << plates_before << " -> " << plates_after
+                            << ", objects " << objects_before << " -> " << model().objects.size();
 }
 
 // BBS: save logic
@@ -16611,8 +16975,9 @@ bool Plater::preview_zip_archive(const boost::filesystem::path& archive_path)
         return true;
     }
 
-    // load all projects and all models as geometry
-    load_files(project_paths, LoadStrategy::LoadModel);
+    // every project in the archive opens or is added as a project; the loose models are geometry
+    for (const fs::path &path : project_paths)
+        open_3mf_file(path);
     load_files(non_project_paths, LoadStrategy::LoadModel);
 
 
@@ -16632,166 +16997,6 @@ bool Plater::preview_zip_archive(const boost::filesystem::path& archive_path)
     }
 
     return true;
-}
-
-#define PROJECT_DROP_DIALOG_SELECT_PLANE_SIZE wxSize(FromDIP(350), FromDIP(120))
-
-class ProjectDropDialog : public DPIDialog
-{
-private:
-    wxColour          m_def_color = wxColour(255, 255, 255);
-    int               m_action{1};
-    bool              m_remember_choice{false};
-
-public:
-    ProjectDropDialog(const std::string &filename);
-
-    wxPanel *     m_top_line;
-    wxStaticText *m_fname_title;
-    wxStaticText *m_fname_f;
-    StaticBox * m_panel_select;
-
-    void      on_select_ok(wxCommandEvent &event);
-    void      on_select_cancel(wxCommandEvent &event);
-
-    int       get_action() const { return m_action; }
-    void      set_action(int index) { m_action = index; }
-
-    wxBoxSizer *create_remember_checkbox(wxString title, wxWindow* parent, wxString tooltip);
-
-protected:
-    void on_dpi_changed(const wxRect &suggested_rect) override;
-};
-
-ProjectDropDialog::ProjectDropDialog(const std::string &filename)
-    : DPIDialog(static_cast<wxWindow *>(wxGetApp().mainframe),
-                wxID_ANY,
-                from_u8((boost::format(_utf8(L("Drop project file")))).str()),
-                wxDefaultPosition,
-                wxDefaultSize,
-                wxCAPTION | wxCLOSE_BOX)
-    , m_action(2)
-{
-    // def setting
-    SetBackgroundColour(m_def_color);
-
-    wxBoxSizer *m_sizer_main = new wxBoxSizer(wxVERTICAL);
-
-    m_top_line = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL);
-    m_top_line->SetBackgroundColour(wxColour(166, 169, 170));
-
-    m_sizer_main->Add(m_top_line, 0, wxEXPAND, 0);
-
-    m_sizer_main->AddSpacer(FromDIP(15));
-
-    // ORCA use file name on new line to create room for longer names
-    m_fname_title = new wxStaticText(this, wxID_ANY, _L("Please select an action"), wxDefaultPosition, wxDefaultSize, 0);
-    m_fname_title->SetFont(::Label::Body_14);
-    m_fname_title->SetForegroundColour(wxColour("#363636"));
-
-    m_fname_f = new wxStaticText(this, wxID_ANY, filename);
-    m_fname_f->SetFont(::Label::Head_14);
-    m_fname_f->SetMaxSize(wxSize(FromDIP(300),-1));
-    m_fname_f->Wrap(FromDIP(300));
-    m_fname_f->SetForegroundColour(wxColour("#363636"));
-
-    m_sizer_main->Add(m_fname_title, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
-    m_sizer_main->AddSpacer(FromDIP(10));
-    m_sizer_main->Add(m_fname_f    , 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
-    m_sizer_main->AddSpacer(FromDIP(10));
-
-    auto radio_group = new RadioGroup(this, {
-        _L("Open as project"),     // 0
-        _L("Import geometry only") // 1
-    }, wxVERTICAL);
-    radio_group->SetMinSize(wxSize(FromDIP(300),-1));
-    radio_group->SetSelection(get_action() - 1);
-    radio_group->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this, radio_group](wxCommandEvent &e) {
-        set_action(radio_group->GetSelection() + 1);
-    });
-
-    m_sizer_main->Add(radio_group, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(20));
-
-    m_sizer_main->AddSpacer(FromDIP(10));
-
-    // wxBoxSizer *m_sizer_bottom = new wxBoxSizer(wxHORIZONTAL);
-    // Orca: hide the "Don't show again" checkbox, people keeps accidentally checked this then forgot
-    // wxBoxSizer *m_sizer_left = new wxBoxSizer(wxHORIZONTAL);
-    //
-    // auto dont_show_again = create_remember_checkbox(_L("Remember my choice."), this, _L("This option can be changed later in preferences, under 'Load Behaviour'."));
-    // m_sizer_left->Add(dont_show_again, 0, wxALL, 5);
-    //
-    // m_sizer_bottom->Add(m_sizer_left, 0, wxEXPAND, 5);
-
-    auto dlg_btns = new DialogButtons(this, {"OK", "Cancel"});
-
-    dlg_btns->GetOK()->Bind(wxEVT_BUTTON, &ProjectDropDialog::on_select_ok, this);
-
-    dlg_btns->GetCANCEL()->Bind(wxEVT_BUTTON, &ProjectDropDialog::on_select_cancel, this);
-
-    m_sizer_main->Add(dlg_btns, 0, wxEXPAND);
-
-    SetSizer(m_sizer_main);
-    Layout();
-    Fit();
-    Centre(wxBOTH);
-
-    wxGetApp().UpdateDlgDarkUI(this);
-}
-
-wxBoxSizer *ProjectDropDialog::create_remember_checkbox(wxString title, wxWindow *parent, wxString tooltip)
-{
-    wxBoxSizer *m_sizer_checkbox = new wxBoxSizer(wxHORIZONTAL);
-    m_sizer_checkbox->Add(0, 0, 0, wxEXPAND | wxLEFT, 5);
-
-    auto checkbox = new ::CheckBox(parent);
-    checkbox->SetValue(m_remember_choice);
-    checkbox->SetToolTip(tooltip);
-    m_sizer_checkbox->Add(checkbox, 0, wxALIGN_CENTER, 0);
-    m_sizer_checkbox->Add(0, 0, 0, wxEXPAND | wxLEFT, 8);
-
-    auto checkbox_title = new wxStaticText(parent, wxID_ANY, title, wxDefaultPosition, wxSize(-1, -1), 0);
-    checkbox_title->SetForegroundColour(wxColour(144,144,144));
-    checkbox_title->SetFont(::Label::Body_13);
-    checkbox_title->Wrap(-1);
-    checkbox_title->SetToolTip(tooltip);
-    m_sizer_checkbox->Add(checkbox_title, 0, wxALIGN_CENTER | wxALL, 3);
-
-    checkbox->Bind(wxEVT_TOGGLEBUTTON, [this, checkbox](wxCommandEvent &e) {
-        m_remember_choice = checkbox->GetValue();
-        e.Skip();
-    });
-
-    return m_sizer_checkbox;
-}
-
-void ProjectDropDialog::on_select_ok(wxCommandEvent &event)
-{
-    if (m_remember_choice) {
-        LoadType load_type = static_cast<LoadType>(get_action());
-        switch (load_type)
-        {
-            case LoadType::OpenProject:
-                wxGetApp().app_config->set(SETTING_PROJECT_LOAD_BEHAVIOUR, OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_ALL);
-                break;
-            case LoadType::LoadGeometry:
-                wxGetApp().app_config->set(SETTING_PROJECT_LOAD_BEHAVIOUR, OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY);
-                break;
-        }
-    }
-
-    EndModal(wxID_OK);
-}
-
-void ProjectDropDialog::on_select_cancel(wxCommandEvent &event)
-{
-    EndModal(wxID_CANCEL);
-}
-
-void ProjectDropDialog::on_dpi_changed(const wxRect& suggested_rect)
-{
-    Fit();
-    Refresh();
 }
 
 //BBS: remove GCodeViewer as seperate APP logic
@@ -16919,8 +17124,9 @@ bool Plater::load_files(const wxArrayString& filenames)
             if (i > 0) { other_file.push_back(normal_paths[i]); }
         };
 
-        open_3mf_file(first_file[0]);
-        if (load_files(other_file, LoadStrategy::LoadModel).empty()) {  res = false;  }
+        //Every 3MF dropped is a project: the first opens or is added, the rest are added.
+        for (const fs::path &path : normal_paths)
+            open_3mf_file(path);
         break;
 
     case LoadFilesType::MultipleOther: {
@@ -16945,7 +17151,8 @@ bool Plater::load_files(const wxArrayString& filenames)
         }
 
         open_3mf_file(first_file[0]);
-        if (load_files(tmf_file, LoadStrategy::LoadModel).empty()) {  res = false;  }
+        for (const fs::path &path : tmf_file)
+            open_3mf_file(path);
         if (res && handle_zips(other_file)) {
             if (normal_paths.empty()) return true;
         }
@@ -16957,36 +17164,6 @@ bool Plater::load_files(const wxArrayString& filenames)
     return res;
 }
 
-LoadType determine_load_type(std::string filename, std::string override_setting)
-{
-    std::string setting;
-
-    if (override_setting != "") {
-        setting = override_setting;
-    } else {
-        setting = wxGetApp().app_config->get(SETTING_PROJECT_LOAD_BEHAVIOUR);
-    }
-
-    if (setting == OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY) {
-        return LoadType::LoadGeometry;
-    } else if (setting == OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK) {
-        ProjectDropDialog dlg(filename);
-        if (dlg.ShowModal() == wxID_OK) {
-            int      choice    = dlg.get_action();
-            LoadType load_type = static_cast<LoadType>(choice);
-            wxGetApp().app_config->set("import_project_action", std::to_string(choice));
-
-            // BBS: jump to plater panel
-            wxGetApp().mainframe->select_tab(MainFrame::tp3DEditor);
-            return load_type;
-        }
-
-        return LoadType::Unknown; // Cancel
-    } else {
-        return LoadType::OpenProject;
-    }
-}
-
 bool Plater::open_3mf_file(const fs::path &file_path)
 {
     std::string filename = encode_path(file_path.filename().string().c_str());
@@ -16994,31 +17171,16 @@ bool Plater::open_3mf_file(const fs::path &file_path)
         return false;
     }
 
-    bool not_empty_plate = !model().objects.empty();
-    bool load_setting_ask_when_relevant = wxGetApp().app_config->get(SETTING_PROJECT_LOAD_BEHAVIOUR) == OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT;
-    LoadType load_type = determine_load_type(filename, (not_empty_plate && load_setting_ask_when_relevant) ? OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK : "");
-
-    if (load_type == LoadType::Unknown) return false;
-
-    switch (load_type) {
-        case LoadType::OpenProject: {
-            if (wxGetApp().can_load_project())
-                load_project(from_path(file_path), "<loadall>");
-            break;
-        }
-        case LoadType::LoadGeometry: {
-            Plater::TakeSnapshot snapshot(this, "Import Object");
-            load_files({file_path}, LoadStrategy::LoadModel);
-            break;
-        }
-        case LoadType::LoadConfig: {
-            load_files({file_path}, LoadStrategy::LoadConfig);
-            break;
-        }
-        case LoadType::Unknown: {
-            assert(false);
-            break;
-        }
+    //A 3MF OPENS AS WHAT IT IS. On a blank project it becomes the project. On a project that
+    //already holds something it is ADDED - plates, presets, spools and objects, exactly as it
+    //would open on its own, after what is already here. There is nothing to ask: "open as
+    //project / import geometry only / import settings only" were three ways of losing part of
+    //the file, and the dialog that offered them stood on the drop path of every download.
+    if (is_blank_project()) {
+        if (wxGetApp().can_load_project())
+            load_project(from_path(file_path), "<loadall>");
+    } else {
+        add_project(from_path(file_path));
     }
 
     return true;
@@ -17095,8 +17257,9 @@ void Plater::add_file()
             if (i > 0) { other_file.push_back(paths[i]); }
         };
 
-        open_3mf_file(first_file[0]);
-        if (!load_files(other_file, LoadStrategy::LoadModel).empty()) { wxGetApp().mainframe->update_title(); }
+        //Every 3MF imported is a project: the first opens or is added, the rest are added.
+        for (const fs::path &path : paths)
+            open_3mf_file(path);
         break;
 
     case LoadFilesType::MultipleOther: {
@@ -17126,7 +17289,8 @@ void Plater::add_file()
         }
 
         open_3mf_file(first_file[0]);
-        load_files(tmf_file, LoadStrategy::LoadModel);
+        for (const fs::path &path : tmf_file)
+            open_3mf_file(path);
         if (!load_files(other_file, LoadStrategy::LoadModel, false).empty()) {
             wxGetApp().mainframe->update_title();
             if (wxGetApp().app_config->get("recent_models") == "true")
@@ -18558,6 +18722,9 @@ void Plater::export_toolpaths_to_obj() const
 
 bool Plater::is_empty_project() {
     return model().objects.empty();
+}
+bool Plater::is_blank_project() {
+    return model().objects.empty() && get_project_filename().IsEmpty();
 }
 bool Plater::is_multi_extruder_ams_empty()
 {

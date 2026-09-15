@@ -202,6 +202,23 @@ struct PresetBundleMetadata
 };
 
 // Bundle of Print + Filament + Printer presets.
+// What a project's own configuration goes by in this bundle once it has been installed WITHOUT
+// being made the selection - the case of a project being added to one that is already open.
+// Opening a file installs its presets and then selects them, resets the spool pool to the file's
+// spools and writes the file's project options over the bundle's. Adding a file may only do the
+// first of those: the selection, the pool and the project layer belong to the project that is
+// open. So the installer hands back the names its plates now need to name, and the file's own
+// project layer, for the caller to merge the spools out of.
+struct InstalledProjectPresets
+{
+    std::string              printer;
+    std::string              print;
+    std::vector<std::string> filaments;
+    // The file's project-level options (colours, appearance, flushing, wipe tower positions),
+    // kept here instead of being applied to the open project's.
+    DynamicPrintConfig       project_layer;
+};
+
 class PresetBundle
 {
 public:
@@ -853,6 +870,10 @@ public:
     // This method is called by the Plater.
     void                        load_config_model(const std::string &name, DynamicPrintConfig config, Semver file_version = Semver())
         { this->load_config_file_config(name, true, std::move(config), file_version); }
+    // Install a project's presets the way opening it would, and leave the selection, the spool
+    // pool and the project layer exactly as they are. See InstalledProjectPresets.
+    void                        install_project_presets(const std::string &name, DynamicPrintConfig config, Semver file_version, InstalledProjectPresets &installed)
+        { this->load_config_file_config(name, true, std::move(config), file_version, false, &installed); }
 
     // Load an external config file containing the print, filament and printer presets.
     // Instead of a config file, a G-code may be loaded containing the full set of parameters.
@@ -987,7 +1008,7 @@ private:
     // Load print, filament & printer presets from a config. If it is an external config, then the name is extracted from the external path.
     // and the external config is just referenced, not stored into user profile directory.
     // If it is not an external config, then the config will be stored into the user profile directory.
-    void                        load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version = Semver(), bool selected = false);
+    void                        load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version = Semver(), bool selected = false, InstalledProjectPresets *install = nullptr);
     /*ConfigSubstitutions         load_config_file_config_bundle(
         const std::string &path, const boost::property_tree::ptree &tree, ForwardCompatibilitySubstitutionRule compatibility_rule);*/
 

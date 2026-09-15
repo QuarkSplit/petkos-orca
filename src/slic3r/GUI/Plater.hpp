@@ -208,6 +208,14 @@ public:
     //one plate or every plate inherits, and "N machines" otherwise. Replaces reading
     //the project combo's displayed string, which cannot describe a fleet.
     wxString printer_summary_text() const;
+    //THE MATERIAL PALETTE FOLDS, AND STAYS FOLDED. The Printer section (machine, plate
+    //details, this plate's materials) and the Spool pool each fold from their title bar or
+    //its chevron, the state is remembered across sessions, and nothing but a click on that
+    //bar unfolds it - a plate switch used to re-expand the printer section on every click.
+    void set_printer_section_folded(bool folded, bool remember = true);
+    void set_pool_folded(bool folded, bool remember = true);
+    bool is_printer_section_folded() const;
+    bool is_pool_folded() const;
     //BBS
     const std::vector<BedType>& get_cur_combox_bed_types() { return m_cur_combox_bed_types; }
     void update_presets_from_to(Slic3r::Preset::Type preset_type, std::string from, std::string to);
@@ -241,6 +249,11 @@ public:
     //Returns false when the spool was not added, having said why. Every route into adding a spool
     //comes through here, so the pool cap is checked and explained in exactly one place.
     bool add_custom_filament(wxColour new_col);
+    //A spool arriving with an ADDED project joins the pool unless a spool of the same material
+    //and colour is there already - that is the same spool on the shelf, whatever its profile is
+    //called. Returns the pool row the spool is now on, or -1 when the pool refused (it says why).
+    //`added` says whether a row was created or an existing one matched.
+    int merge_spool_into_pool(const PlateSlicingContext::Spool &spool, bool &added);
     //Decline out loud. A refusal nobody can see is how a working button and a broken one come to
     //look the same, which is precisely how the phantom spool row presented.
     void refuse_spool_action(const wxString &reason) const;
@@ -376,6 +389,11 @@ public:
     int new_project(bool skip_confirm = false, bool silent = false, const wxString& project_name = wxString());
     // BBS: save & backup
     void load_project(wxString const & filename = "", wxString const & originfile = "-");
+    //ADD a project to the one that is open: its plates after the existing ones, its presets
+    //installed, its spools merged into the pool by material and colour, its objects on its own
+    //plates - everything opening it on its own would give, added instead of replacing. This is
+    //what an ordinary open does whenever the project is not blank; see open_3mf_file.
+    void add_project(const wxString &filename);
     int save_project(bool saveAs = false);
     //BBS download project by project id
     void import_model_id(wxString download_info);
@@ -424,6 +442,9 @@ public:
     }
 
     bool is_empty_project();
+    //Nothing here that a second project could be added to: no objects, and never opened from
+    //or saved to a file. A blank project is replaced by an opened file; anything else is added to.
+    bool is_blank_project();
     bool is_multi_extruder_ams_empty();
     // BBS
     bool is_new_project_and_check_state() { return m_new_project_and_check_state; }

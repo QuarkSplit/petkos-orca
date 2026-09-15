@@ -5410,9 +5410,17 @@ static void convert_filament_preset_name(std::string& machine_name, std::string&
 }
 // Load a config file from a boost property_tree. This is a private method called from load_config_file.
 // is_external == false on if called from ConfigWizard
-void PresetBundle::load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version, bool selected)
+void PresetBundle::load_config_file_config(const std::string &name_or_path, bool is_external, DynamicPrintConfig &&config, Semver file_version, bool selected, InstalledProjectPresets *install)
 {
     PrinterTechnology printer_technology = Preset::printer_technology(config);
+
+    //ADDING A PROJECT TO AN OPEN ONE. With `install` set, the file's presets are created here
+    //exactly as opening the file would create them, and nothing else moves: the selection stays
+    //on the project that is open, the spool pool stays that project's pool, and the file's own
+    //project-level options are handed back instead of being written over the open project's.
+    //What the caller gets back is the names the file's declaration now goes by in this bundle,
+    //which is what the file's plates have to name.
+    const bool install_only = install != nullptr;
 
     auto clear_compatible_printers = [](DynamicPrintConfig& config){
         ConfigOption *opt_compatible = config.optptr("compatible_printers");
@@ -5536,8 +5544,8 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
 		[&config, &inherits, &inherits_values,
          &compatible_printers_condition, &compatible_printers_condition_values,
          &compatible_prints_condition, &compatible_prints_condition_values,
-         is_external, &name, &name_or_path, file_version, selected]
-		(PresetCollection &presets, size_t idx, const std::string &key, const std::set<std::string> &different_keys, std::string filament_id) {
+         is_external, &name, &name_or_path, file_version, selected, install_only]
+		(PresetCollection &presets, size_t idx, const std::string &key, const std::set<std::string> &different_keys, std::string filament_id) -> Preset * {
 		// Split the "compatible_printers_condition" and "inherits" values one by one from a single vector to the print & printer profiles.
 		inherits = inherits_values[idx];
 		compatible_printers_condition = compatible_printers_condition_values[idx];
@@ -5546,9 +5554,12 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
         //BBS: add config related logs
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": , name %1%, is_external %2%, inherits %3%")%name %is_external %inherits;
 		if (is_external)
-			presets.load_external_preset(name_or_path, name, config.opt_string(key, true), config, different_keys, PresetCollection::LoadAndSelect::Always, file_version, filament_id);
-		else
-            presets.load_preset(presets.path_from_name(name, inherits.empty()), name, config, selected, file_version).save(nullptr);
+			return presets.load_external_preset(name_or_path, name, config.opt_string(key, true), config, different_keys,
+			                                    install_only ? PresetCollection::LoadAndSelect::Never : PresetCollection::LoadAndSelect::Always,
+			                                    file_version, filament_id).first;
+		Preset &loaded = presets.load_preset(presets.path_from_name(name, inherits.empty()), name, config, selected, file_version);
+		loaded.save(nullptr);
+		return &loaded;
 	};
 
     switch (Preset::printer_technology(config)) {
@@ -5570,7 +5581,9 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
             compatible_printers->values = print_compatible_printers;
         }
 
-        load_preset(this->prints, 0, "print_settings_id", print_different_keys_set, std::string());
+        if (Preset *loaded_print = load_preset(this->prints, 0, "print_settings_id", print_different_keys_set, std::string());
+            install_only && loaded_print != nullptr)
+            install->print = loaded_print->name;
 
         //clear compatible printers
         clear_compatible_printers(config);
@@ -5589,7 +5602,9 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
         // PetkosOrca: the identity the project's own process refers to, captured before
         // load_external_preset renames the printer. See the rewrite immediately below.
         const std::string printer_name_in_project = config.opt_string("printer_settings_id", true);
-        load_preset(this->printers, num_filaments + 1, "printer_settings_id", printer_different_keys_set, std::string());
+        if (Preset *loaded_printer = load_preset(this->printers, num_filaments + 1, "printer_settings_id", printer_different_keys_set, std::string());
+            install_only && loaded_printer != nullptr)
+            install->printer = loaded_printer->name;
 
         // PetkosOrca: finish the rename that load_external_preset leaves half-done.
         //
@@ -5692,15 +5707,21 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
                     convert_filament_preset_name(old_machine_profile_name->value, old_filament_profile_names->values.front());
                 else
                     convert_filament_preset_name(old_machine_profile_name->value, inherits);
-                loaded = this->filaments.load_external_preset(name_or_path, name, old_filament_profile_names->values.front(), config, filament_different_keys_set, PresetCollection::LoadAndSelect::Always, file_version, filament_id).first;
+                loaded = this->filaments.load_external_preset(name_or_path, name, old_filament_profile_names->values.front(), config, filament_different_keys_set,
+                                                              install_only ? PresetCollection::LoadAndSelect::Never : PresetCollection::LoadAndSelect::Always,
+                                                              file_version, filament_id).first;
             }
             else {
                 // called from Config Wizard.
 				loaded= &this->filaments.load_preset(this->filaments.path_from_name(name, inherits.empty()), name, config, true, file_version);
 				loaded->save(nullptr);
 			}
-            this->filament_presets.clear();
-			this->filament_presets.emplace_back(loaded->name);
+            if (install_only) {
+                install->filaments = {loaded->name};
+            } else {
+                this->filament_presets.clear();
+                this->filament_presets.emplace_back(loaded->name);
+            }
         } else {
             assert(is_external);
             // Split the filament presets, load each of them separately.
@@ -5729,8 +5750,9 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
                     }
                 }
             }
-            // Load the configs into this->filaments and make them active.
-            this->filament_presets = std::vector<std::string>(configs.size());
+            // Load the configs into this->filaments and make them active - or, when adding a
+            // project, only load them, and hand the names back.
+            std::vector<std::string> loaded_filaments(configs.size());
             // To avoid incorrect selection of the first filament preset (means a value of Preset->m_idx_selected)
             // in a case when next added preset take a place of previosly selected preset,
             // we should add presets from last to first
@@ -5767,6 +5789,8 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
                     (i < int(old_filament_profile_names->values.size())) ? old_filament_profile_names->values[i] : "",
                     std::move(cfg),
                     filament_different_keys_set,
+                    install_only ?
+                        PresetCollection::LoadAndSelect::Never :
                     i == 0 ?
                         PresetCollection::LoadAndSelect::Always :
                     any_modified ?
@@ -5775,11 +5799,21 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
                     file_version,
                     filament_id);
                 any_modified |= modified;
-                this->filament_presets[i] = loaded->name;
+                loaded_filaments[i] = loaded->name;
             }
+            if (install_only)
+                install->filaments = std::move(loaded_filaments);
+            else
+                this->filament_presets = std::move(loaded_filaments);
         }
 
         // 4) Load the project config values (the per extruder wipe matrix etc).
+        if (install_only) {
+            // The open project keeps its own layer; the file's is handed back for the caller to
+            // merge the spools out of.
+            install->project_layer.apply_only(config, s_project_options);
+            break;
+        }
         this->project_config.apply_only(config, s_project_options);
 
         // The project layer of the project being replaced does not survive it. Everything the file
@@ -5809,7 +5843,9 @@ void PresetBundle::load_config_file_config(const std::string &name_or_path, bool
     //BBS
     //const std::string &physical_printer = config.option<ConfigOptionString>("physical_printer_settings_id", true)->value;
     const std::string physical_printer;
-    if (this->printers.get_edited_preset().is_external || physical_printer.empty()) {
+    if (install_only) {
+        //the open project's machine stays connected: nothing was selected
+    } else if (this->printers.get_edited_preset().is_external || physical_printer.empty()) {
         this->physical_printers.unselect_printer();
     } else {
         // Activate the physical printer profile if possible.

@@ -4560,6 +4560,43 @@ Vec2d PartPlateList::predict_plate_origin(int index) const
 }
 
 //lay every plate out from its own footprint, so plates of different sizes can coexist
+//The packing rule, once. Rows are as deep as their deepest plate and stack downwards; within a
+//row x accumulates each plate's own width, so plates of different machines sit side by side
+//without overlapping and without a shared stride that would space small beds like large ones.
+std::vector<Vec2d> PartPlateList::pack_plate_origins(const std::vector<Vec2d>& sizes, int cols)
+{
+	std::vector<Vec2d> origins(sizes.size(), Vec2d(0.0, 0.0));
+	if (sizes.empty())
+		return origins;
+	cols = std::max(1, cols);
+	const size_t row_count = (sizes.size() + cols - 1) / cols;
+
+	//pass 1: a row is as deep as its deepest plate
+	std::vector<double> row_depth(row_count, 0.0);
+	for (size_t i = 0; i < sizes.size(); ++i)
+		row_depth[i / cols] = std::max(row_depth[i / cols], sizes[i].y());
+
+	//pass 2: rows stack downwards, each clearing the one above it
+	std::vector<double> row_origin_y(row_count, 0.0);
+	for (size_t r = 1; r < row_count; ++r)
+		row_origin_y[r] = row_origin_y[r - 1] - row_depth[r - 1] * (1. + LOGICAL_PART_PLATE_GAP);
+
+	//pass 3: x accumulates each plate's own width rather than a shared stride
+	double x = 0.0;
+	size_t current_row = 0;
+	for (size_t i = 0; i < sizes.size(); ++i)
+	{
+		const size_t row = i / cols;
+		if (row != current_row) {
+			current_row = row;
+			x = 0.0;
+		}
+		origins[i] = Vec2d(x, row_origin_y[row]);
+		x += sizes[i].x() * (1. + LOGICAL_PART_PLATE_GAP);
+	}
+	return origins;
+}
+
 void PartPlateList::reflow_layout()
 {
 	if (m_plate_list.empty())
@@ -4567,44 +4604,23 @@ void PartPlateList::reflow_layout()
 
 	PETKOS_PERF_SCOPE_AUX(Perf::Probe::PlateReflow, (int32_t) m_plate_list.size());
 
-	const int cols = std::max(1, m_plate_cols);
-	const size_t row_count = (m_plate_list.size() + cols - 1) / cols;
-
-	//pass 1: a row is as deep as its deepest plate
-	std::vector<double> row_depth(row_count, 0.0);
+	std::vector<Vec2d> sizes;
+	sizes.reserve(m_plate_list.size());
 	for (size_t i = 0; i < m_plate_list.size(); ++i)
-		row_depth[i / cols] = std::max(row_depth[i / cols], get_plate_layout_size((int)i).y());
+		sizes.push_back(get_plate_layout_size((int)i));
+	const std::vector<Vec2d> origins = pack_plate_origins(sizes, std::max(1, m_plate_cols));
 
-	//pass 2: rows stack downwards, each clearing the one above it
-	std::vector<double> row_origin_y(row_count, 0.0);
-	for (size_t r = 1; r < row_count; ++r)
-		row_origin_y[r] = row_origin_y[r - 1] - row_depth[r - 1] * (1. + LOGICAL_PART_PLATE_GAP);
-
-	//pass 3: place them. x accumulates each plate's own width rather than a shared stride
-	double x = 0.0;
-	size_t current_row = 0;
 	for (size_t i = 0; i < m_plate_list.size(); ++i)
 	{
 		PartPlate* plate = m_plate_list[i];
 		assert(plate != NULL);
 
-		const size_t row = i / cols;
-		if (row != current_row) {
-			current_row = row;
-			x = 0.0;
-		}
-
-		const Vec2d size = get_plate_layout_size((int)i);
-		const Vec2d pos(x, row_origin_y[row]);
-
 		plate->set_index((int)i);
-		Vec3d origin(pos.x(), pos.y(), 0.0);
+		Vec3d origin(origins[i].x(), origins[i].y(), 0.0);
 		//one call: it moves the plate's instances and re-places the plate itself. The
 		//separate geometry re-stamp that used to follow is what made a reflow cost
 		//O(plates) rebuilds of outlines, grids, icons and picking meshes.
-		plate->set_pos_and_size(origin, (int)size.x(), (int)size.y(), m_plate_height, true);
-
-		x += size.x() * (1. + LOGICAL_PART_PLATE_GAP);
+		plate->set_pos_and_size(origin, (int)sizes[i].x(), (int)sizes[i].y(), m_plate_height, true);
 	}
 
 	//the unprintable plate parks after the last printable one
@@ -4821,7 +4837,7 @@ int PartPlateList::complete_plate_contexts()
 }
 
 //See the header. The seed is handed in, and nothing here reads a global.
-int PartPlateList::complete_plate_contexts(const PlateSlicingContext &declared)
+int PartPlateList::complete_plate_contexts(const PlateSlicingContext &declared, int first_index)
 {
 	//CLI mode has no wxApp instance and no bundle; it resolves each plate against the
 	//project config the 3MF carried. Same null-in-CLI signal the rest of this file uses.
@@ -4837,7 +4853,8 @@ int PartPlateList::complete_plate_contexts(const PlateSlicingContext &declared)
 	//in. So one machine recorded anywhere in a legacy project carries to the plates that
 	//recorded none, rather than every plate independently taking the file's global answer.
 	PlateSlicingContext seed = declared;
-	for (PartPlate *plate : m_plate_list) {
+	for (size_t i = size_t(std::max(0, first_index)); i < m_plate_list.size(); ++i) {
+		PartPlate *plate = m_plate_list[i];
 		if (plate == nullptr)
 			continue;
 		PlateSlicingContext context = plate->get_slicing_context();
@@ -7500,83 +7517,74 @@ int PartPlateList::store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool w
 	return ret;
 }
 
-int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int filament_count)
+//One plate's worth of a file. Shared by the fresh open (load_from_3mf_structure) and the
+//add-to-project path (append_from_3mf_structure), so a field the file carries can never be
+//read on one path and forgotten on the other.
+void PartPlateList::load_plate_data(int index, const PlateDataPtrs& plate_data_list, unsigned int i)
 {
-	int ret = 0;
-
-	if (plate_data_list.size() <= 0)
+	m_plate_list[index]->m_locked = plate_data_list[i]->locked;
+	m_plate_list[index]->config()->apply(plate_data_list[i]->config);
+	m_plate_list[index]->set_sliced_config(plate_data_list[i]->sliced_config);
+	//After set_sliced_config, which clears the reason: this plate's retained slice was
+	//dropped at load and the row must say so rather than render as never sliced.
+	m_plate_list[index]->set_sliced_config_dropped_reason(plate_data_list[i]->sliced_config_dropped_reason);
+	m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
 	{
-		BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":no plates, should not happen!");
-		return -1;
+		//Migration: before the plate context owned its colours, the one per-plate colour
+		//store was an untyped "filament_colour" key in the plate's override config (written
+		//by AMS sync). Left there it would be counted as a process override, deleted by
+		//"clear overrides", and applied OVER the properly sized per-plate colours - so it
+		//is hoisted into the context here and the override keys are retired.
+		PlateSlicingContext context = plate_data_list[i]->slicing_context;
+		DynamicPrintConfig *plate_cfg = m_plate_list[index]->config();
+		PresetBundle::capture_plate_filament_colours(context, *plate_cfg, true);
+		for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour", "filament_finish"})
+			plate_cfg->erase(key);
+		// Legacy plates may not name their filaments until completion. Resizing here
+		// discarded their AMS colours before the project presets had even been loaded.
+		if (!context.filament_preset_names.empty()) {
+			const size_t n = context.filament_preset_names.size();
+			if (context.filament_colours.size() > n) context.filament_colours.resize(n);
+			if (context.filament_colour_types.size() > n) context.filament_colour_types.resize(n);
+			if (context.filament_multi_colours.size() > n) context.filament_multi_colours.resize(n);
+			if (context.filament_finishes.size() > n) context.filament_finishes.resize(n);
+		}
+		m_plate_list[index]->set_slicing_context(context);
 	}
-	clear(true, true);
-	set_filament_count(filament_count);
-	for (unsigned int i = 0; i < (unsigned int)plate_data_list.size(); ++i)
+	if (plate_data_list[i]->plate_index != (int)i)
 	{
-		int index = create_plate(false);
-		m_plate_list[index]->m_locked = plate_data_list[i]->locked;
-		m_plate_list[index]->config()->apply(plate_data_list[i]->config);
-		m_plate_list[index]->set_sliced_config(plate_data_list[i]->sliced_config);
-		//After set_sliced_config, which clears the reason: this plate's retained slice was
-		//dropped at load and the row must say so rather than render as never sliced.
-		m_plate_list[index]->set_sliced_config_dropped_reason(plate_data_list[i]->sliced_config_dropped_reason);
-		m_plate_list[index]->set_plate_name(plate_data_list[i]->plate_name);
-		{
-			//Migration: before the plate context owned its colours, the one per-plate colour
-			//store was an untyped "filament_colour" key in the plate's override config (written
-			//by AMS sync). Left there it would be counted as a process override, deleted by
-			//"clear overrides", and applied OVER the properly sized per-plate colours - so it
-			//is hoisted into the context here and the override keys are retired.
-			PlateSlicingContext context = plate_data_list[i]->slicing_context;
-			DynamicPrintConfig *plate_cfg = m_plate_list[index]->config();
-			PresetBundle::capture_plate_filament_colours(context, *plate_cfg, true);
-			for (const char *key : {"filament_colour", "filament_colour_type", "filament_multi_colour", "filament_finish"})
-				plate_cfg->erase(key);
-			// Legacy plates may not name their filaments until completion. Resizing here
-			// discarded their AMS colours before the project presets had even been loaded.
-			if (!context.filament_preset_names.empty()) {
-				const size_t n = context.filament_preset_names.size();
-				if (context.filament_colours.size() > n) context.filament_colours.resize(n);
-				if (context.filament_colour_types.size() > n) context.filament_colour_types.resize(n);
-				if (context.filament_multi_colours.size() > n) context.filament_multi_colours.resize(n);
-				if (context.filament_finishes.size() > n) context.filament_finishes.resize(n);
-			}
-			m_plate_list[index]->set_slicing_context(context);
-		}
-		if (plate_data_list[i]->plate_index != index)
-		{
-			BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;
-		}
-		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, gcode_file %2%, is_sliced_valid %3%, toolpath_outside %4%, is_support_used %5% is_label_object_enabled %6%")
-			%i %plate_data_list[i]->gcode_file %plate_data_list[i]->is_sliced_valid %plate_data_list[i]->toolpath_outside %plate_data_list[i]->is_support_used %plate_data_list[i]->is_label_object_enabled;
-		//load object and instance from 3mf
-		//just test for file correct or not, we will rebuild later
-		/*for (std::vector<std::pair<int, int>>::iterator it = plate_data_list[i]->objects_and_instances.begin(); it != plate_data_list[i]->objects_and_instances.end(); ++it)
-			m_plate_list[index]->obj_to_instance_set.insert(std::pair(it->first, it->second));*/
-		if (!plate_data_list[i]->gcode_file.empty()) {
-			m_plate_list[index]->m_gcode_path_from_3mf = plate_data_list[i]->gcode_file;
-		}
-		GCodeResult* gcode_result = nullptr;
-		PrintBase* fff_print = nullptr;
-		m_plate_list[index]->get_print(&fff_print, &gcode_result, nullptr);
-		PrintStatistics& ps = (dynamic_cast<Print*>(fff_print))->print_statistics();
-		gcode_result->print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)].time = atoi(plate_data_list[i]->gcode_prediction.c_str());
-		ps.total_weight = atof(plate_data_list[i]->gcode_weight.c_str());
-		ps.total_used_filament = 0.f;
-		for (auto filament_item: plate_data_list[i]->slice_filaments_info)
-		{
-			ps.total_used_filament += filament_item.used_m;
-		}
-		ps.total_used_filament *= 1000; //koef
-		gcode_result->toolpath_outside = plate_data_list[i]->toolpath_outside;
-		gcode_result->label_object_enabled = plate_data_list[i]->is_label_object_enabled;
+		BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":plate index %1% seems invalid, skip it")% plate_data_list[i]->plate_index;
+	}
+	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, gcode_file %2%, is_sliced_valid %3%, toolpath_outside %4%, is_support_used %5% is_label_object_enabled %6%")
+		%i %plate_data_list[i]->gcode_file %plate_data_list[i]->is_sliced_valid %plate_data_list[i]->toolpath_outside %plate_data_list[i]->is_support_used %plate_data_list[i]->is_label_object_enabled;
+	//load object and instance from 3mf
+	//just test for file correct or not, we will rebuild later
+	/*for (std::vector<std::pair<int, int>>::iterator it = plate_data_list[i]->objects_and_instances.begin(); it != plate_data_list[i]->objects_and_instances.end(); ++it)
+		m_plate_list[index]->obj_to_instance_set.insert(std::pair(it->first, it->second));*/
+	if (!plate_data_list[i]->gcode_file.empty()) {
+		m_plate_list[index]->m_gcode_path_from_3mf = plate_data_list[i]->gcode_file;
+	}
+	GCodeResult* gcode_result = nullptr;
+	PrintBase* fff_print = nullptr;
+	m_plate_list[index]->get_print(&fff_print, &gcode_result, nullptr);
+	PrintStatistics& ps = (dynamic_cast<Print*>(fff_print))->print_statistics();
+	gcode_result->print_statistics.modes[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)].time = atoi(plate_data_list[i]->gcode_prediction.c_str());
+	ps.total_weight = atof(plate_data_list[i]->gcode_weight.c_str());
+	ps.total_used_filament = 0.f;
+	for (auto filament_item: plate_data_list[i]->slice_filaments_info)
+	{
+		ps.total_used_filament += filament_item.used_m;
+	}
+	ps.total_used_filament *= 1000; //koef
+	gcode_result->toolpath_outside = plate_data_list[i]->toolpath_outside;
+	gcode_result->label_object_enabled = plate_data_list[i]->is_label_object_enabled;
         gcode_result->timelapse_warning_code = plate_data_list[i]->timelapse_warning_code;
         m_plate_list[index]->set_timelapse_warning_code(plate_data_list[i]->timelapse_warning_code);
         gcode_result->filament_change_sequence = plate_data_list[i]->filament_change_sequence;
         gcode_result->nozzle_change_sequence = plate_data_list[i]->nozzle_change_sequence;
         gcode_result->optimal_assignment = plate_data_list[i]->optimal_assignment;
-		m_plate_list[index]->slice_filaments_info = plate_data_list[i]->slice_filaments_info;
-		gcode_result->warnings = plate_data_list[i]->warnings;
+	m_plate_list[index]->slice_filaments_info = plate_data_list[i]->slice_filaments_info;
+	gcode_result->warnings = plate_data_list[i]->warnings;
         gcode_result->filament_maps = plate_data_list[i]->filament_maps;
 
         // Reconstruct the device-side nozzle grouping from the loaded 3mf so
@@ -7630,46 +7638,63 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
             else
                 gcode_result->nozzle_group_result = nullptr;
         }
-		if (m_plater && !plate_data_list[i]->thumbnail_file.empty()) {
-			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load thumbnail from %2%.")%(i+1) %plate_data_list[i]->thumbnail_file;
-			if (boost::filesystem::exists(plate_data_list[i]->thumbnail_file)) {
-				m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->thumbnail_file, m_plate_list[index]->thumbnail_data);
-				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<boost::format(": plate %1% after load, width %2%, height %3%, size %4%!")
-					%(i+1) %m_plate_list[index]->thumbnail_data.width %m_plate_list[index]->thumbnail_data.height %m_plate_list[index]->thumbnail_data.pixels.size();
-			}
+	if (m_plater && !plate_data_list[i]->thumbnail_file.empty()) {
+		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load thumbnail from %2%.")%(i+1) %plate_data_list[i]->thumbnail_file;
+		if (boost::filesystem::exists(plate_data_list[i]->thumbnail_file)) {
+			m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->thumbnail_file, m_plate_list[index]->thumbnail_data);
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ <<boost::format(": plate %1% after load, width %2%, height %3%, size %4%!")
+				%(i+1) %m_plate_list[index]->thumbnail_data.width %m_plate_list[index]->thumbnail_data.height %m_plate_list[index]->thumbnail_data.pixels.size();
 		}
+	}
 
-		if (m_plater && !plate_data_list[i]->no_light_thumbnail_file.empty()) {
-			if (boost::filesystem::exists(plate_data_list[i]->no_light_thumbnail_file)) {
-				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load no_light_thumbnail_file from %2%.")%(i+1) %plate_data_list[i]->no_light_thumbnail_file;
-				m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->no_light_thumbnail_file, m_plate_list[index]->no_light_thumbnail_data);
-			}
+	if (m_plater && !plate_data_list[i]->no_light_thumbnail_file.empty()) {
+		if (boost::filesystem::exists(plate_data_list[i]->no_light_thumbnail_file)) {
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load no_light_thumbnail_file from %2%.")%(i+1) %plate_data_list[i]->no_light_thumbnail_file;
+			m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->no_light_thumbnail_file, m_plate_list[index]->no_light_thumbnail_data);
 		}
+	}
 
-		/*if (m_plater && !plate_data_list[i]->pattern_file.empty()) {
-			if (boost::filesystem::exists(plate_data_list[i]->pattern_file)) {
-				//no need to load pattern data currently
-				//m_plate_list[index]->load_pattern_thumbnail_data(plate_data_list[i]->pattern_file);
-			}
-		}*/
-		if (m_plater && !plate_data_list[i]->top_file.empty()) {
-			if (boost::filesystem::exists(plate_data_list[i]->top_file)) {
-				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load top_thumbnail from %2%.")%(i+1) %plate_data_list[i]->top_file;
-				m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->top_file, m_plate_list[index]->top_thumbnail_data);
-			}
+	/*if (m_plater && !plate_data_list[i]->pattern_file.empty()) {
+		if (boost::filesystem::exists(plate_data_list[i]->pattern_file)) {
+			//no need to load pattern data currently
+			//m_plate_list[index]->load_pattern_thumbnail_data(plate_data_list[i]->pattern_file);
 		}
-		if (m_plater && !plate_data_list[i]->pick_file.empty()) {
-			if (boost::filesystem::exists(plate_data_list[i]->pick_file)) {
-				BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load pick_thumbnail from %2%.")%(i+1) %plate_data_list[i]->pick_file;
-				m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->pick_file, m_plate_list[index]->pick_thumbnail_data);
-			}
+	}*/
+	if (m_plater && !plate_data_list[i]->top_file.empty()) {
+		if (boost::filesystem::exists(plate_data_list[i]->top_file)) {
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load top_thumbnail from %2%.")%(i+1) %plate_data_list[i]->top_file;
+			m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->top_file, m_plate_list[index]->top_thumbnail_data);
 		}
-		if (m_plater && !plate_data_list[i]->pattern_bbox_file.empty()) {
-			if (boost::filesystem::exists(plate_data_list[i]->pattern_bbox_file)) {
-				m_plate_list[index]->load_pattern_box_data(plate_data_list[i]->pattern_bbox_file);
-			}
+	}
+	if (m_plater && !plate_data_list[i]->pick_file.empty()) {
+		if (boost::filesystem::exists(plate_data_list[i]->pick_file)) {
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": plate %1%, load pick_thumbnail from %2%.")%(i+1) %plate_data_list[i]->pick_file;
+			m_plate_list[index]->load_thumbnail_data(plate_data_list[i]->pick_file, m_plate_list[index]->pick_thumbnail_data);
 		}
+	}
+	if (m_plater && !plate_data_list[i]->pattern_bbox_file.empty()) {
+		if (boost::filesystem::exists(plate_data_list[i]->pattern_bbox_file)) {
+			m_plate_list[index]->load_pattern_box_data(plate_data_list[i]->pattern_bbox_file);
+		}
+	}
 
+}
+
+int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int filament_count)
+{
+	int ret = 0;
+
+	if (plate_data_list.size() <= 0)
+	{
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":no plates, should not happen!");
+		return -1;
+	}
+	clear(true, true);
+	set_filament_count(filament_count);
+	for (unsigned int i = 0; i < (unsigned int)plate_data_list.size(); ++i)
+	{
+		int index = create_plate(false);
+		load_plate_data(index, plate_data_list, i);
 	}
 
 	//No completion here. This function has no seed to complete FROM: the project's own
@@ -7687,6 +7712,75 @@ int PartPlateList::load_from_3mf_structure(PlateDataPtrs& plate_data_list, int f
 	print();
 
 	return ret;
+}
+
+//See the header. The file's plates land AFTER the plates already here.
+int PartPlateList::append_from_3mf_structure(PlateDataPtrs& plate_data_list)
+{
+	if (plate_data_list.empty())
+	{
+		BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":no plates in the file, nothing to add");
+		return -1;
+	}
+	const int first = (int)m_plate_list.size();
+	for (unsigned int i = 0; i < (unsigned int)plate_data_list.size(); ++i)
+	{
+		//adjust_position = true: one more plate can change the column count, and when it does
+		//the plates already here move - WITH their objects, which is what true means here.
+		const int index = create_plate(true);
+		if (index < 0)
+		{
+			BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+				<< boost::format(": the plate limit of %1% is reached; %2% plate(s) of the file were not added")
+				   % MAX_PLATES_COUNT % (plate_data_list.size() - i);
+			break;
+		}
+		load_plate_data(index, plate_data_list, i);
+	}
+	if ((int)m_plate_list.size() == first)
+		return -1;
+
+	//Beds for the new plates, and one reflow for the whole list. The plates already here keep
+	//their objects with them; the new plates are still empty and the caller fills them.
+	apply_printer_assignments();
+	print();
+	return first;
+}
+
+//See the header: the file's own layout, so its objects can be carried into their new plates.
+std::vector<BoundingBoxf> PartPlateList::layout_of_file_plates(const PlateDataPtrs& plate_data_list, const Vec2d& file_bed_size, const std::string& project_decoration) const
+{
+	std::vector<Vec2d> sizes;
+	sizes.reserve(plate_data_list.size());
+	for (const PlateData *data : plate_data_list)
+	{
+		Vec2d size = file_bed_size;
+		if (data != nullptr)
+		{
+			const std::string &declared = data->slicing_context.printer_preset_name;
+			PlateBed bed;
+			for (const std::string &candidate : {declared, declared + project_decoration})
+			{
+				if (candidate.empty() || candidate == project_decoration)
+					continue;
+				if (!resolve_printer_bed(candidate, bed))
+					continue;
+				const BoundingBoxf box(bed.shape);
+				if (box.defined && box.size().x() > 0.0 && box.size().y() > 0.0)
+					size = box.size();
+				break;
+			}
+		}
+		if (size.x() <= 0.0 || size.y() <= 0.0)
+			size = Vec2d((double)m_plate_width, (double)m_plate_depth);
+		sizes.push_back(size);
+	}
+	const std::vector<Vec2d> origins = pack_plate_origins(sizes, compute_colum_count((int)sizes.size()));
+	std::vector<BoundingBoxf> boxes;
+	boxes.reserve(sizes.size());
+	for (size_t i = 0; i < sizes.size(); ++i)
+		boxes.emplace_back(origins[i], origins[i] + sizes[i]);
+	return boxes;
 }
 
 //load gcode files

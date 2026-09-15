@@ -12,7 +12,7 @@ var LIB = {
     sort: 'recent',
     shown: LIB_PAGE,
     shelf: 'all',
-    folderScope: '',
+    collection: '',   // id of the collection the grid is scoped to, '' for the overview
     recentPaths: {},  // normalised keys of the real recent-files list, for the Recent chip
     recentOrder: [],  // the same list in its own order, which is what "recent" means
     recentRecords: {},
@@ -23,6 +23,7 @@ var LIB = {
     picked: {},
     pickupOpen: false,
     nativeReady: false,
+    showHidden: false,
     thumbnails: {},
     thumbFingerprints: {},
     thumbRequested: {},
@@ -31,26 +32,138 @@ var LIB = {
     thumbVersions: {}
 };
 
-var LIB_WORKSPACE = (typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.workspace) || {mine: [], downloads: [], jobs: []};
+// ---------------------------------------------------------------------------------------
+// Collections
+//
+// The shelf is a list of COLLECTIONS, not folders. A range of products is spread across
+// the model library, the projects folder and the Comic Con pipeline at once, so a card
+// that can only point at one folder cannot show "Helldivers: helmet and props". A
+// collection names folders AND match strings, and a file may belong to several.
+//
+// Two writers, one list. The generated set comes from E:\3D-Printing\library-collections
+// .json through data/workspace.js and is Petko's to edit. What is done inside the app -
+// pinning a folder from a card, hiding a card - is kept as a small delta in local storage
+// on top of it, so a rebuild of the JSON never discards a pin and a pin never blocks a
+// rebuild. The old single-folder pins (podslicer.library.workspace) are migrated once.
+
+var LIB_STORE_KEY = 'podslicer.library.workspace.v2';
+var LIB_LEGACY_KEY = 'podslicer.library.workspace';
+
+var LIB_GENERATED = (typeof PROJECT_WORKSPACE !== 'undefined' && PROJECT_WORKSPACE) ||
+    (typeof PROJECT_LIBRARY !== 'undefined' && PROJECT_LIBRARY.workspace && {
+        collections: (PROJECT_LIBRARY.workspace.mine || []).map(function (f) {
+            return {id: 'folder-' + LibHash(f.path), title: f.title, description: f.description, folders: [f.path]};
+        }),
+        downloads: PROJECT_LIBRARY.workspace.downloads || [],
+        jobs: PROJECT_LIBRARY.workspace.jobs || []
+    }) || {collections: [], downloads: [], jobs: []};
+
+var LIB_DELTA = {added: [], removed: []};
 try {
-    var savedWorkspace = JSON.parse(window.localStorage.getItem('podslicer.library.workspace'));
-    if (savedWorkspace && Array.isArray(savedWorkspace.mine)) LIB_WORKSPACE = savedWorkspace;
+    var savedDelta = JSON.parse(window.localStorage.getItem(LIB_STORE_KEY));
+    if (savedDelta && Array.isArray(savedDelta.added)) LIB_DELTA = {added: savedDelta.added, removed: savedDelta.removed || []};
+    else {
+        // One-time migration of the single-folder pins the previous shelf kept.
+        var legacy = JSON.parse(window.localStorage.getItem(LIB_LEGACY_KEY));
+        if (legacy && Array.isArray(legacy.mine)) {
+            legacy.mine.forEach(function (f) {
+                if (f && f.path && !LibFolderCovered(f.path)) {
+                    LIB_DELTA.added.push({id: 'folder-' + LibHash(f.path), title: f.title || LibLeaf(f.path),
+                        description: f.description || '', folders: [f.path], user: true});
+                }
+            });
+            LibSaveDelta();
+        }
+    }
 } catch (_) { /* The library also works when webview storage is unavailable. */ }
+
+function LibHash(s) {
+    var h = 0, i;
+    s = LibKey(s);
+    for (i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+}
+
+function LibLeaf(path) {
+    return String(path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+}
+
+function LibSaveDelta() {
+    try { window.localStorage.setItem(LIB_STORE_KEY, JSON.stringify(LIB_DELTA)); } catch (_) {}
+}
+
+// Every collection on the shelf, generated first, then the ones added in the app.
+function LibCollections(includeHidden) {
+    var removed = {};
+    (LIB_DELTA.removed || []).forEach(function (id) { removed[id] = true; });
+    var all = (LIB_GENERATED.collections || []).concat(LIB_DELTA.added || []);
+    return includeHidden ? all : all.filter(function (c) { return !removed[c.id]; });
+}
+
+function LibCollection(id) {
+    var all = LibCollections(true), i;
+    for (i = 0; i < all.length; i++) if (all[i].id === id) return all[i];
+    return null;
+}
+
+function LibFolderCovered(path) {
+    return LibCollections(true).some(function (c) {
+        return (c.folders || []).some(function (f) { return LibKey(f) === LibKey(path); });
+    });
+}
 
 function LibWithin(path, folder) {
     var p = LibKey(path), f = LibKey(folder);
     return !!f && (p === f || p.indexOf(f + '\\') === 0);
 }
 
+// A match string is a case-insensitive substring of the full path; /.../ is a regex.
+// Compiled once per collection and cached on it, because membership is asked for every
+// file on every render.
+function LibPatterns(col, key) {
+    var cache = '_' + key;
+    if (!col[cache]) {
+        col[cache] = (col[key] || []).map(function (pat) {
+            var m = /^\/(.+)\/([a-z]*)$/.exec(pat);
+            try { return m ? new RegExp(m[1], m[2].indexOf('i') < 0 ? m[2] + 'i' : m[2]) : null; }
+            catch (_) { return null; }
+        }).map(function (re, i) { return re || String(col[key][i]).toLowerCase(); });
+    }
+    return col[cache];
+}
+
+function LibInCollection(it, col) {
+    var path = LibKey(it.path), hit = false, i, pat;
+    if ((col.folders || []).some(function (f) { return LibWithin(it.path, f); })) hit = true;
+    if (!hit) {
+        var pats = LibPatterns(col, 'match');
+        for (i = 0; i < pats.length && !hit; i++) {
+            pat = pats[i];
+            hit = typeof pat === 'string' ? path.indexOf(pat) >= 0 : pat.test(it.path);
+        }
+    }
+    if (!hit && col.where) {
+        hit = Object.keys(col.where).every(function (k) { return it[k] === col.where[k]; });
+    }
+    if (hit && col.exclude && col.exclude.length) {
+        var ex = LibPatterns(col, 'exclude');
+        for (i = 0; i < ex.length; i++) {
+            pat = ex[i];
+            if (typeof pat === 'string' ? path.indexOf(pat) >= 0 : pat.test(it.path)) return false;
+        }
+    }
+    return hit;
+}
+
 function LibShelfFor(it) {
-    if ((LIB_WORKSPACE.mine || []).some(function (folder) { return LibWithin(it.path, folder.path); })) return 'mine';
-    if ((LIB_WORKSPACE.downloads || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'downloads';
-    if ((LIB_WORKSPACE.jobs || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'jobs';
-    return /^(models|downloads)$/i.test(String(it.root || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()) ? 'downloads' : 'jobs';
+    if (LibCollections(false).some(function (c) { return LibInCollection(it, c); })) return 'mine';
+    if ((LIB_GENERATED.downloads || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'downloads';
+    if ((LIB_GENERATED.jobs || []).some(function (folder) { return LibWithin(it.path, folder); })) return 'jobs';
+    return /^(models|downloads)$/i.test(LibLeaf(it.root)) ? 'downloads' : 'jobs';
 }
 
 function LibSetShelf(shelf) {
-    LIB.shelf = shelf; LIB.folderScope = ''; LIB.root = 'all'; LIB.group = 'all';
+    LIB.shelf = shelf; LIB.collection = ''; LIB.root = 'all'; LIB.group = 'all';
     LIB.state = 'all'; LIB.search = ''; LIB.shown = LIB_PAGE;
     LIB.kind = shelf === 'jobs' ? '3mf' : 'all';
     $('#LibSearch').val(''); $('#LibRoot').val('all');
@@ -58,8 +171,8 @@ function LibSetShelf(shelf) {
     LibBuildGroups(); LibBuildChips(); LibRender();
 }
 
-function LibBrowseDesign(el) {
-    LIB.shelf = 'mine'; LIB.folderScope = el.getAttribute('data-path');
+function LibBrowseCollection(el) {
+    LIB.shelf = 'mine'; LIB.collection = el.getAttribute('data-id');
     LIB.kind = 'all'; LIB.state = 'all'; LIB.group = 'all'; LIB.search = ''; LIB.root = 'all';
     LIB.shown = LIB_PAGE;
     $('#LibSearch').val(''); $('#LibRoot').val('all'); $('#LibKindChip').addClass('LibChipOn');
@@ -71,23 +184,97 @@ function LibShowDesignFolder(el) {
     if (path) SendWXMessage(JSON.stringify({command: 'homepage_explore_recentfile', data: {path: path}}));
 }
 
+// Pinning a folder from a card makes a one-folder collection of it.
 function LibPinDesign(el) {
     var path = el.getAttribute('data-path');
     if (!path) return;
-    var mine = LIB_WORKSPACE.mine || [];
-    if (!mine.some(function (folder) { return LibKey(folder.path) === LibKey(path); })) {
-        mine.push({path: path, title: path.replace(/[\\/]+$/, '').split(/[\\/]/).pop()});
+    var id = 'folder-' + LibHash(path);
+    LIB_DELTA.removed = (LIB_DELTA.removed || []).filter(function (x) { return x !== id; });
+    if (!LibCollection(id)) {
+        LIB_DELTA.added.push({id: id, title: LibLeaf(path), description: '', folders: [path], user: true});
     }
-    LIB_WORKSPACE.mine = mine;
-    try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
+    LibSaveDelta();
     LibSetShelf('mine');
 }
 
+// Removing a generated card hides it; removing a pinned one deletes the pin. Files are
+// never touched either way, and hidden cards can be shown again from the overview.
 function LibUnpinDesign(el) {
-    var path = el.getAttribute('data-path');
-    LIB_WORKSPACE.mine = (LIB_WORKSPACE.mine || []).filter(function (folder) { return LibKey(folder.path) !== LibKey(path); });
-    try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
+    var id = el.getAttribute('data-id');
+    var added = (LIB_DELTA.added || []).filter(function (c) { return c.id !== id; });
+    if (added.length !== (LIB_DELTA.added || []).length) LIB_DELTA.added = added;
+    else if ((LIB_DELTA.removed || []).indexOf(id) < 0) LIB_DELTA.removed = (LIB_DELTA.removed || []).concat([id]);
+    LibSaveDelta();
     LibSetShelf('mine');
+}
+
+function LibRestoreHidden() {
+    LIB_DELTA.removed = [];
+    LibSaveDelta();
+    LibSetShelf('mine');
+}
+
+function LibToggleHidden() {
+    LIB.showHidden = !LIB.showHidden;
+    LibRender();
+}
+
+// What a collection holds, in the words the pipeline chips use. Counting is per render
+// and per collection, which is a few thousand membership tests; cheap next to a paint.
+function LibCollectionStats(col, items) {
+    var files = items.filter(function (it) { return LibInCollection(it, col); });
+    var byState = {}, i;
+    for (i = 0; i < files.length; i++) byState[files[i].state] = (byState[files[i].state] || 0) + 1;
+    files.sort(function (a, b) { return b.mtime - a.mtime; });
+    return {files: files, byState: byState};
+}
+
+// Up to four pictures, the ones that already have a preview first, projects before loose
+// meshes, newest first. A mosaic says "this is the Helldivers shelf" in a glance where one
+// cover could only say "this is a helmet".
+function LibMosaic(files) {
+    var ready = [], pending = [], i, f, info;
+    for (i = 0; i < files.length; i++) {
+        f = files[i];
+        info = LibThumbnail(f);
+        if (info.thumbState === 'ready') ready.push(f);
+        else if (info.thumbState === 'pending' && f.kind === '3mf') pending.push(f);
+    }
+    var pick = ready.concat(pending).slice(0, 4);
+    if (!pick.length) return '<div class="LibMosaic LibMosaic0"><div class="LibThumb LibDesignThumb">' +
+        LibThumbnailMarkup({path: '', name: 'empty', thumbState: 'unavailable', thumbError: 'No model files match this collection yet'}) + '</div></div>';
+    return '<div class="LibMosaic LibMosaic' + pick.length + '">' + pick.map(function (f) {
+        return '<div class="LibThumb LibMosaicTile" title="' + LibEscape(f.name) + '">' + LibThumbnailMarkup(f) + '</div>';
+    }).join('') + '</div>';
+}
+
+var LIB_STATE_PILLS = [
+    ['prepped', 'configured', 'LibBadgePrepped'],
+    ['sliced', 'with toolpaths', 'LibBadgeSliced'],
+    ['needs-colour', 'need colour', 'LibBadgeColour'],
+    ['foreign', 'Bambu preset', 'LibBadgeForeign'],
+    ['mesh', 'raw mesh', 'LibBadgeMesh']
+];
+
+// A collection card is its mosaic, its name and the state pills. The description, the folder
+// and the subtitle are one hover away in the tooltip; the actions are a right-click away.
+function LibCollectionCard(col, items) {
+    var stats = LibCollectionStats(col, items);
+    var pills = LIB_STATE_PILLS.filter(function (p) { return stats.byState[p[0]]; }).map(function (p) {
+        return '<span class="LibPill ' + p[2] + '">' + stats.byState[p[0]] + ' ' + p[1] + '</span>';
+    }).join('');
+    var folder = (col.folders || [])[0] || (stats.files[0] && stats.files[0].folder) || '';
+    var hidden = (LIB_DELTA.removed || []).indexOf(col.id) >= 0;
+    var tip = [col.title, col.subtitle, col.description || (col.user ? 'Pinned from ' + col.folders[0] : ''),
+               stats.files.length + (stats.files.length === 1 ? ' file' : ' files'), folder].filter(Boolean).join('\n');
+    return '<article class="LibDesignCard LibCollectionCard' + (hidden ? ' LibCollectionHidden' : '') +
+        '" data-id="' + LibEscape(col.id) + '" data-path="' + LibEscape(folder) + '" tabindex="0" role="button"' +
+        ' title="' + LibEscape(tip) + '" onclick="LibBrowseCollection(this)" onkeydown="LibCardKey(event, this)"' +
+        ' oncontextmenu="LibCollectionMenu(event, this)">' +
+        LibMosaic(stats.files) +
+        '<h3>' + LibEscape(col.title) + '</h3>' +
+        (pills ? '<div class="LibCollStats">' + pills + '</div>' : '') +
+        '</article>';
 }
 
 function LibWorkspaceRender() {
@@ -96,33 +283,32 @@ function LibWorkspaceRender() {
         return '<button class="LibShelf' + (LIB.shelf === entry[0] ? ' LibShelfOn' : '') +
             '" onclick="LibSetShelf(\'' + entry[0] + '\')">' + entry[1] + '</button>';
     }).join(''));
-    var overview = LIB.shelf === 'mine' && !LIB.folderScope;
+    var overview = LIB.shelf === 'mine' && !LIB.collection;
+    var scoped = LIB.collection ? LibCollection(LIB.collection) : null;
     $('#LibraryArea').toggleClass('LibOverview', overview);
-    $('#LibSearch').attr('placeholder', overview ? 'Search your project folders' : 'Search names, folders, printers or materials');
-    $('#LibLocation').html(LIB.folderScope ? '<button class="LibFolderButton" onclick="LibSetShelf(\'mine\')">My projects</button> / ' +
-        LibEscape(LIB.folderScope.replace(/[\\/]+$/, '').split(/[\\/]/).pop()) : '');
+    $('#LibSearch').attr('placeholder', overview ? 'Search your collections' : 'Search names, folders, printers or materials');
+    $('#LibLocation').html(scoped ? '<button class="LibFolderButton" onclick="LibSetShelf(\'mine\')">My projects</button> / ' +
+        LibEscape(scoped.title) : '');
     if (!overview) return false;
     var terms = LIB.search.toLowerCase().split(/\s+/).filter(Boolean);
-    var folders = (LIB_WORKSPACE.mine || []).filter(function (folder) {
-        var hay = [folder.title, folder.description, folder.path].join(' ').toLowerCase();
+    var items = LibItems();
+    var visible = LibCollections(LIB.showHidden).filter(function (col) {
+        var hay = [col.title, col.subtitle, col.description, (col.folders || []).join(' ')].join(' ').toLowerCase();
         return terms.every(function (term) { return hay.indexOf(term) >= 0; });
     });
-    var items = LibItems();
-    $('#LibGrid').html(folders.map(function (folder) {
-        var files = items.filter(function (it) { return LibWithin(it.path, folder.path); });
-        var cover = files[0] || {name: folder.title, thumbState: 'unavailable', thumbError: 'No model files in this folder'};
-        return '<article class="LibDesignCard"><div class="LibThumb LibDesignThumb">' + LibThumbnailMarkup(cover) + '</div>' +
-            '<h3>' + LibEscape(folder.title || folder.path.split(/[\\/]/).pop()) + '</h3>' +
-            '<p>' + LibEscape(folder.description || 'Design files, editable projects and working material.') + '</p>' +
-            '<div class="LibMeta">' + files.length + ' model files</div>' +
-            '<div class="LibDesignActions"><button class="LibChip" data-path="' + LibEscape(folder.path) +
-            '" onclick="LibBrowseDesign(this)">Browse files</button><button class="LibFolderButton" data-path="' +
-            LibEscape(folder.path) + '" onclick="LibShowDesignFolder(this)">Show folder</button></div>' +
-            '<button class="LibFolderButton" data-path="' + LibEscape(folder.path) +
-            '" onclick="LibUnpinDesign(this)" title="Remove this shortcut; files stay where they are">Remove shortcut</button></article>';
-    }).join('') || '<div class="LibEmpty">' + (terms.length ? 'No project folders match this search.' :
-        'Add your project folder, then choose “My project” under Library folders. CAD-only folders can live here too.') + '</div>');
-    $('#LibCount').text(folders.length + ' project folders'); $('#LibMore').hide();
+    var hiddenCount = (LIB_DELTA.removed || []).filter(function (id) { return !!LibCollection(id); }).length;
+    var html = visible.map(function (col) { return LibCollectionCard(col, items); }).join('');
+    if (!html) {
+        html = '<div class="LibEmpty">' + (terms.length ? 'No collections match this search.' :
+            'No collections yet. Edit E:\\3D-Printing\\library-collections.json and run build_workspace.py, or pin a folder from any file card.') + '</div>';
+    }
+    if (hiddenCount) {
+        html += '<div class="LibEmpty LibHiddenNote">' + hiddenCount + ' hidden ' + (hiddenCount === 1 ? 'card' : 'cards') +
+            ' <button class="LibFolderButton" onclick="LibToggleHidden()">' + (LIB.showHidden ? 'Stop showing' : 'Show') + '</button>' +
+            ' <button class="LibFolderButton" onclick="LibRestoreHidden()">Restore all</button></div>';
+    }
+    $('#LibGrid').html(html);
+    $('#LibMore').hide();
     return true;
 }
 
@@ -340,7 +526,7 @@ function LibSynthRecent(path) {
 
 function LibMatches(it) {
     if (LIB.shelf !== 'all' && LibShelfFor(it) !== LIB.shelf) return false;
-    if (LIB.folderScope && !LibWithin(it.path, LIB.folderScope)) return false;
+    if (LIB.collection) { var scopedCol = LibCollection(LIB.collection); if (!scopedCol || !LibInCollection(it, scopedCol)) return false; }
     if (LIB.kind === '3mf' && it.kind !== '3mf') return false;
     if (LIB.root !== 'all' && LibKey(it.root) !== LibKey(LIB.root)) return false;
     if (LIB.state === 'recent') {
@@ -520,32 +706,34 @@ function LibToggleFilaments(ev, el) {
     LibRender();
 }
 
-function LibCard(it) {
-    var badge = LIB_BADGE[it.state] || LIB_BADGE['mesh'];
-
+// A card is a picture and a name. The state badge and the colour strip ride on it because
+// they are read in a glance; everything that used to be printed under the name - group,
+// date, folder, plate and part counts, machines, materials, the note - is in the tooltip,
+// and every button is in the right-click menu. Attention is the scarce thing on a grid of
+// a thousand cards, and a line of text per card spends it on nothing.
+function LibCardFacts(it) {
     var facts = [];
     if (it.plateCount > 1) facts.push(it.plateCount + ' plates');
     if (it.parts) facts.push(it.parts + (it.parts === 1 ? ' part' : ' parts'));
     if (it.hours) facts.push(it.hours.toFixed(1) + ' h');
     if (it.grams) facts.push(Math.round(it.grams) + ' g');
     if (!it.hours && it.kind === 'stl') facts.push(it.sizeMB + ' MB');
+    return facts;
+}
 
-    var tags = '';
-    if (it.makerworld) tags += '<span class="LibTag">MakerWorld</span>';
-    if (it.handPrepared) tags += '<span class="LibTag">hand-prepared</span>';
-    if (it.kind === 'stl') tags += '<span class="LibTag">STL</span>';
-    // The machines a project delegates to are the fastest read on the card: it says at a
-    // glance whether this is a one-printer job or the whole farm.
-    if (it.machines && it.machines.length) {
-        tags += '<span class="LibTag LibTagMachine">' + LibEscape(
-            it.machines.join(' / ')) + '</span>';
-    }
-    if (it.materials && it.materials.length &&
-        !(it.materials.length === 1 && it.materials[0] === 'PLA')) {
-        tags += '<span class="LibTag LibTagWarn">' +
-                LibEscape(it.materials.join('/')) + '</span>';
-    }
+function LibCardTip(it) {
+    var lines = [it.name, it.folder, LibCardFacts(it).join(' · ')];
+    if (it.machines && it.machines.length) lines.push(it.machines.join(' / '));
+    if (it.materials && it.materials.length) lines.push(it.materials.join(' / '));
+    if (it.makerworld) lines.push('MakerWorld');
+    if (it.handPrepared) lines.push('hand-prepared');
+    lines.push([it.group, LibDate(it.mtime)].filter(Boolean).join(' · '));
+    if (it.note) lines.push(it.note);
+    return lines.filter(Boolean).join('\n');
+}
 
+function LibCard(it) {
+    var badge = LIB_BADGE[it.state] || LIB_BADGE['mesh'];
     var picked = !!LIB.picked[it.path];
     // Only a project with filaments can contribute to a pickup list, so only those offer
     // a tick. A checkbox on a raw mesh would promise a total it can never add to.
@@ -555,30 +743,99 @@ function LibCard(it) {
           (picked ? '&#10003;' : '') + '</span>'
         : '';
 
+    var strip = LibFilamentStrip(it);
     return '<div class="LibCard' + (picked ? ' LibCardPicked' : '') +
              '" fpath="' + LibEscape(it.path) + '" tabindex="0" role="button"' +
-             ' aria-label="Open ' + LibEscape(it.name) + '" title="' + LibEscape(it.path) +
-             '" onkeydown="LibCardKey(event, this)" onClick="LibOpen(this)">' +
+             ' aria-label="Open ' + LibEscape(it.name) + '" title="' + LibEscape(LibCardTip(it)) +
+             '" onkeydown="LibCardKey(event, this)" onClick="LibOpen(this)" oncontextmenu="LibCardMenu(event, this)">' +
              '<div class="LibThumb">' + LibThumbnailMarkup(it) +
                '<span class="LibBadge ' + badge.cls + '">' + badge.text + '</span>' +
                tick +
              '</div>' +
              '<div class="LibName TextS1">' + LibEscape(it.name) + '</div>' +
-             '<div class="LibMeta">' + LibEscape(it.group) + ' &middot; ' +
-                LibDate(it.mtime) + '</div>' +
-             '<div class="LibPath">' + LibEscape(it.folder) + '</div>' +
-             '<div class="LibMeta LibFacts">' + LibFilamentStrip(it) +
-                (facts.length ? '<span>' + facts.join(' &middot; ') + '</span>' : '') +
-             '</div>' +
+             (strip ? '<div class="LibStrip">' + strip + '</div>' : '') +
              LibFilamentRows(it) +
-             (tags ? '<div class="LibTags">' + tags + '</div>' : '') +
-             (it.note ? '<div class="LibProblem">' + LibEscape(it.note) + '</div>' : '') +
-             '<button class="LibFolderButton" onclick="LibReveal(event, this)">Open folder</button>' +
-             (it.folder && LibShelfFor(it) !== 'mine' ? ' <button class="LibFolderButton" data-path="' +
-                LibEscape(it.folder) + '" onclick="LibStop(event); LibPinDesign(this)">Add folder to My projects</button>' : '') +
-             (LIB.recentPaths[LibKey(it.path)] ?
-                ' <button class="LibFolderButton" onclick="LibForgetRecent(event, this)">Remove from recent</button>' : '') +
            '</div>';
+}
+
+// ---------------------------------------------------------------------------------------
+// Card menus
+//
+// Right-click. The entries are built per card, from what that card can do - a raw mesh
+// has no pickup tick to offer, a file outside the recent list has nothing to forget.
+var LIB_MENU_ACTIONS = {};
+
+function LibMenuElement() {
+    return typeof document !== 'undefined' && typeof document.getElementById === 'function' ?
+        document.getElementById('LibMenu') : null;
+}
+
+function LibMenuOpen(ev, entries) {
+    LibStop(ev);
+    if (ev && ev.preventDefault) ev.preventDefault();
+    var menu = LibMenuElement();
+    if (!menu || !entries.length) return;
+    LIB_MENU_ACTIONS = {};
+    menu.innerHTML = entries.map(function (entry, i) {
+        LIB_MENU_ACTIONS['m' + i] = entry.action;
+        return '<div class="LibMenuItem" onclick="LibMenuRun(event, \'m' + i + '\')">' + LibEscape(entry.label) + '</div>';
+    }).join('');
+    menu.hidden = false;
+    var x = ev.pageX || 0, y = ev.pageY || 0;
+    var doc = document.documentElement;
+    if (doc) {
+        if (x + menu.offsetWidth > doc.scrollWidth) x = Math.max(0, doc.scrollWidth - menu.offsetWidth);
+        if (y + menu.offsetHeight > doc.scrollHeight) y = Math.max(0, doc.scrollHeight - menu.offsetHeight);
+    }
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+}
+
+function LibMenuClose() {
+    var menu = LibMenuElement();
+    if (menu) { menu.hidden = true; menu.innerHTML = ''; }
+    LIB_MENU_ACTIONS = {};
+}
+
+function LibMenuRun(ev, id) {
+    LibStop(ev);
+    var action = LIB_MENU_ACTIONS[id];
+    LibMenuClose();
+    if (action) action();
+}
+
+function LibCardMenu(ev, el) {
+    var path = el.getAttribute('fpath'), it = LibFindItem(path);
+    var entries = [
+        {label: 'Open', action: function () { LibOpen(el); }},
+        {label: 'Open folder', action: function () {
+            SendWXMessage(JSON.stringify({command: 'homepage_explore_recentfile', data: {path: path}})); }}
+    ];
+    if (it.folder && !LibFolderCovered(it.folder)) {
+        entries.push({label: 'Add folder to My projects', action: function () {
+            LibPinDesign({getAttribute: function () { return it.folder; }}); }});
+    }
+    if (LibFilaments(it).length) {
+        entries.push({label: LIB.picked[path] ? 'Untick for the pickup list' : 'Tick for the pickup list', action: function () {
+            if (LIB.picked[path]) delete LIB.picked[path]; else LIB.picked[path] = true;
+            LibRender(); }});
+    }
+    if (LIB.recentPaths[LibKey(path)]) {
+        entries.push({label: 'Remove from recent', action: function () {
+            SendWXMessage(JSON.stringify({command: 'homepage_delete_recentfile', data: {path: path}})); }});
+    }
+    LibMenuOpen(ev, entries);
+}
+
+function LibCollectionMenu(ev, el) {
+    var id = el.getAttribute('data-id'), col = LibCollection(id), folder = el.getAttribute('data-path');
+    var hidden = (LIB_DELTA.removed || []).indexOf(id) >= 0;
+    var entries = [{label: 'Browse', action: function () { LibBrowseCollection(el); }}];
+    if (folder) entries.push({label: 'Show folder', action: function () { LibShowDesignFolder(el); }});
+    if (col && !hidden) {
+        entries.push({label: col.user ? 'Remove pin' : 'Hide', action: function () { LibUnpinDesign(el); }});
+    }
+    LibMenuOpen(ev, entries);
 }
 
 function LibRender() {
@@ -601,7 +858,6 @@ function LibRender() {
     } else {
         $('#LibMore').hide();
     }
-    $('#LibCount').text(all.length + (all.length === 1 ? ' file' : ' files'));
     LibPickupSync();
     LibQueueThumbnails();
 }
@@ -925,7 +1181,7 @@ function LibOpen(el) {
 function LibCardKey(ev, el) {
     if (ev.target !== el || (ev.key !== 'Enter' && ev.key !== ' ')) return;
     ev.preventDefault();
-    LibOpen(el);
+    if (typeof el.onclick === 'function') el.onclick.call(el, ev); else LibOpen(el);
 }
 
 function LibReveal(ev, el) {
@@ -950,6 +1206,7 @@ function LibResetFilters() {
 // Text fields own their keyboard shortcuts. Forwarding Ctrl+A or suppressing every
 // keydown here made search impossible even after the native focus fix.
 function LibKeyboard(event) {
+    if (event.key === 'Escape') LibMenuClose();
     var target = event.target;
     if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) return;
     if (event.ctrlKey || event.metaKey) {
@@ -995,7 +1252,7 @@ function LibBuildGroups() {
     var items = LibItems();
     for (var i = 0; i < items.length; i++) {
         if (LIB.shelf !== 'all' && LibShelfFor(items[i]) !== LIB.shelf) continue;
-        if (LIB.folderScope && !LibWithin(items[i].path, LIB.folderScope)) continue;
+        if (LIB.collection) { var col = LibCollection(LIB.collection); if (!col || !LibInCollection(items[i], col)) continue; }
         if (LIB.kind === '3mf' && items[i].kind !== '3mf') continue;
         if (LIB.root !== 'all' && LibKey(items[i].root) !== LibKey(LIB.root)) continue;
         groups[items[i].group] = (groups[items[i].group] || 0) + 1;
@@ -1034,19 +1291,22 @@ function LibNoteRecent(pList) {
 }
 
 function LibInit() {
-    if ((LIB_WORKSPACE.mine || []).length) {
-        LIB.shelf = 'mine';
-        try { window.localStorage.setItem('podslicer.library.workspace', JSON.stringify(LIB_WORKSPACE)); } catch (_) {}
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('click', LibMenuClose);
+        document.addEventListener('scroll', LibMenuClose, true);
     }
+    if (LibCollections(false).length) LIB.shelf = 'mine';
     LibBuildChips();
     LibBuildGroups();
     LibRender();
     LibRefresh();
 }
 
+// The button says it is scanning; a second line saying so again was a status nobody
+// asked for. The status line is for errors only.
 function LibBusy(busy) {
     $('#LibRefresh').prop('disabled', busy).text(busy ? 'Scanning folders…' : 'Refresh');
-    $('#LibStatus').text(busy ? 'Checking files and project metadata…' : '');
+    if (busy) $('#LibStatus').text('');
 }
 
 function LibRefresh() {
@@ -1087,6 +1347,6 @@ function LibReceive(data) {
             '" onclick="LibRemoveFolder(this)" title="Remove from library; files stay on disk">Remove folder</button></div>';
     });
     $('#LibFoldersList').html(folders || 'No folders added yet.');
-    $('#LibStatus').text('Updated ' + new Date((data.generated || 0) * 1000).toLocaleString() + '. Files stay in their original folders.');
+    $('#LibStatus').text('');
     LibBuildGroups(); LibBuildChips(); LibRender();
 }

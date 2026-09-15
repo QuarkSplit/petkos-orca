@@ -19,8 +19,10 @@
 <script type="text/javascript" src="../data/text.js"></script>		
 	
 <script type="text/javascript" src="js/home.js"></script>
-<!-- Optional local catalogue and workspace shortcuts, shown while the native scanner refreshes. -->
+<!-- Optional local catalogue, shown while the native scanner refreshes. -->
 <script type="text/javascript" src="data/library.js" onerror="void 0"></script>
+<!-- The shelf: collections generated from E:D-Printing\library-collections.json by build_workspace.py. -->
+<script type="text/javascript" src="data/workspace.js" onerror="void 0"></script>
 <script type="text/javascript" src="js/library.js"></script>
 <!-- Optional cached project pictures. -->
 <script type="text/javascript" src="data/views.js" onerror="void 0"></script>
@@ -118,14 +120,12 @@
 			<div class="MenuIcon"><img src="img/i4.png"></div>
 			<div>
 				<div class="trans TextS1" tid="t31">new project</div>
-				<div class="MenuDesc trans"  tid="t32">create new project</div>
 			</div>
 		</div>
 		<div class="MenuItem" onClick="OnClickOpenProject()">
 			<div class="MenuIcon"><img src="img/i5.png"></div>
 			<div>
 				<div class="trans TextS1" tid="t33">open project</div>
-				<div class="MenuDesc">3mf</div>
 			</div>
 		</div>		
 	</div>
@@ -133,14 +133,9 @@
 	<div id="DebugText"></div>
 
 	<!-- The library replaces the recent-files grid. Recent survives as a filter chip:
-	     it is one more way to narrow the same set, not a separate place to look. -->
+	     it is one more way to narrow the same set, not a separate place to look.
+	     No heading: the nav already says Library, and a card is a picture and a name. -->
 	<div id="LibraryArea">
-		<div id="LibHeader">
-			<div class="Content-Title TextS1">Library</div>
-			<div id="LibCount"></div>
-			<button id="LibRefresh" class="LibChip" onclick="LibRefresh()">Refresh</button>
-			<button class="LibChip" onclick="LibAddFolder()">Add folder</button>
-		</div>
 		<div id="LibShelves" aria-label="Library sections"></div>
 		<div id="LibLocation"></div>
 		<div id="LibStatus" role="status"></div>
@@ -157,6 +152,8 @@
 			<button id="LibKindChip" class="LibChip" onClick="LibToggleKind()">Include meshes</button>
 			<div id="LibPickupChip" class="LibChip" onClick="LibTogglePickup()">Pickup list</div>
 			<div class="LibChip" onClick="OnDeleteAllRecentFiles()">Clear recent</div>
+			<button id="LibRefresh" class="LibChip" onclick="LibRefresh()">Refresh</button>
+			<button class="LibChip" onclick="LibAddFolder()">Add folder</button>
 		</div>
 		<div id="LibChips"></div>
 		<!-- The pickup list sits in the flow above the grid rather than over it. An overlay
@@ -166,6 +163,8 @@
 		<div id="LibPickup" style="display:none"></div>
 		<div id="LibGrid"></div>
 		<div id="LibMore" onClick="LibMore()"></div>
+		<!-- Card actions live here, opened by right-click; see LibCardMenu. -->
+		<div id="LibMenu" hidden></div>
 	</div>
 
 	<div id="RecentFileArea" style="display:none">

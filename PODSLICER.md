@@ -392,6 +392,80 @@ base has to keep working while they are built:
 - **Filament and tool swaps are a SLICING step.** Different machines handle a swap differently.
   That difference belongs at slice time and must not reach import or printer-swap code at all.
 
+### Opening a second project ADDS it (15 September)
+
+**A 3MF opens as what it is.** On a blank project - no objects, never opened from or saved to a
+file - it becomes the project, as before. On a project that already holds something it is
+ADDED: its plates go after the existing ones, its presets are installed, its objects land on its
+own plates, and its spools join the pool. Everything opening it on its own would give, after what
+is already here. `Plater::add_project` is the door; `LoadStrategy::AddToProject` is the one flag
+`Plater::priv::load_files` reads wherever "replace" and "add" part ways.
+
+Before this a 3MF could only replace the project or be imported as geometry, which lost every
+colour, material and setting the file carried. The dialog that offered those two ways of losing
+part of the file ("open as project / import geometry / import settings") is gone with its
+preference; there was nothing to ask. Every route in - Ctrl+O, the home page, the recent list, a
+drop, Ctrl+I, a zip of projects - goes through `open_3mf_file`, and every 3MF in a multi-file
+drop is a project rather than the first one a project and the rest geometry.
+
+The rules, each of which the fresh open already had and the add now shares:
+
+- **The file's presets are installed without becoming the selection.**
+  `PresetBundle::install_project_presets` runs `load_config_file_config` in install mode: the
+  same external presets, the same names, and the bundle's selection, spool pool and project
+  layer untouched. It returns `InstalledProjectPresets` - the names the file's declaration goes
+  by here plus the file's own project layer - which is the seed its plates are completed from
+  (`complete_plate_contexts(declared, first_added_plate)`; the plates already here are not
+  re-examined). The reception report then retargets any plate whose machine is not installed,
+  exactly as it does for a fresh open.
+- **The file's plates go after the existing ones.** `PartPlateList::append_from_3mf_structure`
+  shares `load_plate_data` with the fresh loader so a field the file carries cannot be read on
+  one path and forgotten on the other. Its per-plate custom G-code and wipe-tower positions
+  follow the plate numbers.
+- **Its objects are carried into their new plates.** `layout_of_file_plates` reproduces the
+  file's own layout (each plate as big as the bed its printer resolves to here, or the file's
+  global bed, packed by `pack_plate_origins` - the one packing rule `reflow_layout` also uses),
+  and each instance moves by the difference between its file plate's centre and its new
+  plate's centre. The plate list then assigns them by position as it assigns everything.
+- **Spools merge by material and colour.** `Sidebar::merge_spool_into_pool`: same
+  `filament_type` and same colour is the same spool on the shelf whatever the profile is called,
+  so it is not added again; anything else is one more pool row, through the same door the "+"
+  button uses so the pool cap is one rule. The plates keep naming the file's own presets -
+  that is what "opens as it would on its own" means - and assignment translates them for the
+  machine each plate lands on.
+- **The open project keeps what is its.** Project name and file, design and model info, backup
+  folder, project layer, selection, the camera: none of it is the file's to change. What
+  arrives is said in one notification with counts, and the first added plate is selected.
+
+The perf driver's `add=<3mf>[;<3mf>]` spec key drives this path headlessly and checks it: the
+plate count grew, every added plate resolves, no plate that was there before changed its
+context, and the pool grew only by spools it did not have.
+
+### The material palette folds, and stays folded (15 September)
+
+The Printer section (machine, plate details, this plate's materials) and the Spool pool each
+fold from their title bar or its chevron, the state is remembered in the config
+(`sidebar_printer_folded`, `sidebar_pool_folded`; the pool starts folded on a fresh config) and
+nothing but a click on that bar unfolds it. Before this `layout_printer`'s tail re-expanded the
+printer section on every printer change, and in this fork a plate click IS a printer change, so
+folding it never lasted more than a click - which is why the palette was "not collapsible" and
+sat over 90% of the sidebar the process settings were meant to have. Folded, the printer bar
+carries the machine summary. Dual or single toolhead groups are derived from the cursor preset
+rather than hard-coded dual at construction, which is what drew "Left Nozzle / Right Nozzle /
+AMS not installed" over a single-nozzle Kobra whenever the first plate could not be resolved.
+
+### No subheadings (15 September)
+
+Petko's rule for every surface: no line of text under a title that restates, summarises or
+decorates what the thing already is. A card is a picture and a name; a section bar is a name.
+Facts go one gesture away - the hover tooltip, a right-click menu, a fold - and are never
+printed under the title. In this tree that removed: the Library heading and file count, the
+status line, the descriptions under the home tiles, every line under a library card's name
+(group, date, folder, facts, machines, materials, buttons) and under a collection card's title
+(subtitle, description, file count, buttons), and the "Plate N prints with" caption over the
+sidebar's material rows. The evidence moved, none of it was deleted: cards carry a tooltip with
+everything they used to print and a right-click menu with every action they used to show.
+
 The slicing identity and physical device identity are separate plate properties. Multiple
 physical printers may share one slicing preset, and one physical printer may use different nozzle
 variants over time.

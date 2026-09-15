@@ -18,11 +18,6 @@ using namespace nlohmann;
 #define ENV_PRE_HOST		"2"
 #define ENV_PRODUCT_HOST	"3"
 
-#define SETTING_PROJECT_LOAD_BEHAVIOUR "project_load_behaviour"
-#define OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_ALL "load_all"
-#define OPTION_PROJECT_LOAD_BEHAVIOUR_ASK_WHEN_RELEVANT "ask_when_relevant"
-#define OPTION_PROJECT_LOAD_BEHAVIOUR_ALWAYS_ASK "always_ask"
-#define OPTION_PROJECT_LOAD_BEHAVIOUR_LOAD_GEOMETRY "load_geometry_only"
 
 #define SETTING_NETWORK_PLUGIN_VERSION "network_plugin_version"
 #define SETTING_NETWORK_PLUGIN_SKIPPED_VERSIONS "network_plugin_skipped_versions"

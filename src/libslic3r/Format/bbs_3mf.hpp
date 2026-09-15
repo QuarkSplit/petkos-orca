@@ -192,6 +192,10 @@ enum class LoadStrategy
     LoadAuxiliary = 16,
     Silence = 32,
     ImperialUnits = 64,
+    // The file is a whole project being ADDED to the project that is open: its plates go after
+    // the existing ones, its presets are installed without becoming the selection, its spools
+    // join the pool, and nothing that belongs to the open project is replaced.
+    AddToProject = 128,
 
     Restore = 0x10000 | LoadModel | LoadConfig | LoadAuxiliary | Silence,
 };

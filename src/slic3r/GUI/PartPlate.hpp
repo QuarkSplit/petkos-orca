@@ -1233,7 +1233,10 @@ public:
     //That is the repair: the previous shape sampled the bundle and was therefore only correct
     //at one instant, which is how every plate of a Bambu project ended up named
     //"Default Filament" and quoting 21 hours.
-    int complete_plate_contexts(const PlateSlicingContext &declared);
+    //first_index: complete only the plates from that index on. A project being ADDED to an open
+    //one is completed from ITS file's declaration, and the plates already here are not
+    //re-examined - an existing plate that has no context is unresolved on purpose and stays so.
+    int complete_plate_contexts(const PlateSlicingContext &declared, int first_index = 0);
 
     //True when this process has a preset bundle to resolve plate beds from, which is
     //every GUI run and no CLI run. See the definition.
@@ -1312,6 +1315,24 @@ public:
     */
     int store_to_3mf_structure(PlateDataPtrs& plate_data_list, bool with_slice_info = true, int plate_idx = -1);
     int load_from_3mf_structure(PlateDataPtrs& plate_data_list, int filament_count = 1);
+    //ADD a file's plates after the plates already here. Returns the index of the first plate
+    //added, or -1 when none was. The plates already here keep their objects through the
+    //reflow; the new plates are empty until the caller carries the file's objects into them
+    //(see layout_of_file_plates) and adds them to the model, which assigns them by position.
+    int append_from_3mf_structure(PlateDataPtrs& plate_data_list);
+    //Where a FILE's plates sat relative to each other when it was saved, so its objects can be
+    //carried into the plates they now occupy here. Each plate is as big as the bed its own
+    //printer resolves to in this installation - tried under the name the file declared and
+    //under that name with the project's "(file)" decoration - or the file's global bed when it
+    //does not resolve, packed by the same rule reflow_layout packs this list. Touches nothing.
+    std::vector<BoundingBoxf> layout_of_file_plates(const PlateDataPtrs& plate_data_list, const Vec2d& file_bed_size, const std::string& project_decoration) const;
+    //The packing rule, stated once: rows as deep as their deepest plate, x accumulating each
+    //plate's own width plus the gap. reflow_layout applies it to this list; layout_of_file_plates
+    //applies it to a file.
+    static std::vector<Vec2d> pack_plate_origins(const std::vector<Vec2d>& sizes, int cols);
+    //One plate's worth of a file: everything load_from_3mf_structure and append_from_3mf_structure
+    //read out of a PlateData, written onto the plate at `index`. `i` is the plate's index in the FILE.
+    void load_plate_data(int index, const PlateDataPtrs& plate_data_list, unsigned int i);
     //load gcode files
     int load_gcode_files();
 

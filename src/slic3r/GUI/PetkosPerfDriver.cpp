@@ -94,6 +94,10 @@ struct Spec
     std::string install;
     //"Vendor/Model" - removes every variant of it.
     std::string uninstall;
+    //Projects to ADD to the one the run opened, ';'-separated, through Plater::add_project -
+    //the same door a second 3MF dropped on a non-blank project goes through. The check that
+    //follows counts plates and spools before and after and resolves every plate that arrived.
+    std::string add;
 };
 
 Spec parse_spec(const std::string &s)
@@ -133,6 +137,7 @@ Spec parse_spec(const std::string &s)
         else if (key == "walk")    spec.walk = num();
         else if (key == "install")   spec.install = val;
         else if (key == "uninstall") spec.uninstall = val;
+        else if (key == "add")       spec.add = val;
     }
     return spec;
 }
@@ -153,7 +158,7 @@ public:
     }
 
 private:
-    enum class Phase { Settle0, Build, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Cut, Slice, SliceWait, Board, Drag, Picker, Finish, Done };
+    enum class Phase { Settle0, Build, AddProject, Warmup, Orbit, Preview, Switch, Assign, Pick, Scope, Context, Cut, Slice, SliceWait, Board, Drag, Picker, Finish, Done };
 
     void on_idle(wxIdleEvent &evt)
     {
@@ -200,7 +205,12 @@ private:
         case Phase::Build:
             build_plates(plater);
             Perf::mark("driver.plates_built", plater->get_partplate_list().get_plate_count());
-            enter(Phase::Warmup);
+            enter(m_spec.add.empty() ? Phase::Warmup : Phase::AddProject);
+            evt.RequestMore();
+            break;
+
+        case Phase::AddProject:
+            add_project_step(plater);
             evt.RequestMore();
             break;
 
@@ -421,6 +431,95 @@ private:
             m_assigned = 0;
             collect_assign_presets();
         }
+    }
+
+    //ADD CHECK: a second project added to the one that is open arrives whole.
+    //
+    //Tick 0 adds every file named in add=; the reception (reconcile_imported_plates) runs on
+    //the event loop afterwards, so the check waits a few ticks and then asks: did the plate
+    //count grow by the files' plate counts, does every plate that arrived resolve, did the
+    //pool grow only by spools it did not have, and are the plates that were here before
+    //still what they were. Fails loudly by line, like the other checks.
+    struct BeforeAdd
+    {
+        int                              plates = 0;
+        size_t                           pool   = 0;
+        std::vector<PlateSlicingContext> contexts;
+    };
+    BeforeAdd m_before_add;
+
+    void add_project_step(Plater *plater)
+    {
+        PartPlateList &list   = plater->get_partplate_list();
+        PresetBundle  *bundle = wxGetApp().preset_bundle;
+        if (m_tick == 0) {
+            m_before_add.plates = list.get_plate_count();
+            m_before_add.pool   = bundle != nullptr ? bundle->filament_presets.size() : 0;
+            m_before_add.contexts.clear();
+            for (int i = 0; i < list.get_plate_count(); ++i)
+                if (PartPlate *plate = list.get_plate(i))
+                    m_before_add.contexts.push_back(plate->get_slicing_context());
+            std::string rest = m_spec.add;
+            while (!rest.empty()) {
+                const size_t semi = rest.find(';');
+                const std::string one = rest.substr(0, semi);
+                rest = semi == std::string::npos ? std::string() : rest.substr(semi + 1);
+                if (one.empty())
+                    continue;
+                BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ADD " << one << " onto " << list.get_plate_count() << " plate(s)";
+                plater->add_project(wxString::FromUTF8(one));
+            }
+        }
+        if (++m_tick < 40)
+            return;
+
+        bool ok = true;
+        const int after = list.get_plate_count();
+        if (after <= m_before_add.plates) {
+            BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ADD CHECK FAILED - plate count did not grow (" << m_before_add.plates << " -> " << after << ")";
+            ok = false;
+        }
+        for (int i = 0; i < (int) m_before_add.contexts.size() && i < after; ++i) {
+            PartPlate *plate = list.get_plate(i);
+            if (plate == nullptr)
+                continue;
+            if (plate->get_slicing_context() != m_before_add.contexts[i]) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ADD CHECK FAILED - plate " << (i + 1)
+                                         << " was here before and its context changed (printer '" << m_before_add.contexts[i].printer_preset_name
+                                         << "' -> '" << plate->get_slicing_context().printer_preset_name << "')";
+                ok = false;
+            }
+        }
+        for (int i = m_before_add.plates; i < after; ++i) {
+            PartPlate *plate = list.get_plate(i);
+            if (plate == nullptr)
+                continue;
+            const PlateSlicingContext context = plate->get_slicing_context();
+            if (!context.is_complete()) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ADD CHECK FAILED - added plate " << (i + 1)
+                                         << " has no complete context (printer='" << context.printer_preset_name
+                                         << "', process='" << context.print_preset_name << "', "
+                                         << context.filament_preset_names.size() << " filament(s))";
+                ok = false;
+                continue;
+            }
+            ResolvedPlateSlicingConfig resolved;
+            std::string                error;
+            if (bundle == nullptr || !bundle->resolve_plate_slicing_config(context, plate->get_real_filament_maps(bundle->project_config),
+                                                                           plate->get_real_filament_volume_maps(bundle->project_config), resolved, error)) {
+                BOOST_LOG_TRIVIAL(error) << "PETKOS_PERF_SCRIPT: ADD CHECK FAILED - added plate " << (i + 1) << " does not resolve: " << error;
+                ok = false;
+                continue;
+            }
+            BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ADD plate " << (i + 1) << " printer '" << context.printer_preset_name
+                                       << "' process '" << context.print_preset_name << "' " << context.filament_preset_names.size()
+                                       << " filament(s) " << plate->instance_count() << " instance(s) on it";
+        }
+        const size_t pool_after = bundle != nullptr ? bundle->filament_presets.size() : 0;
+        BOOST_LOG_TRIVIAL(warning) << "PETKOS_PERF_SCRIPT: ADD CHECK " << (ok ? "passed" : "FAILED") << " - plates " << m_before_add.plates
+                                   << " -> " << after << ", pool " << m_before_add.pool << " -> " << pool_after << " spool(s)";
+        Perf::mark("driver.add_plates", after - m_before_add.plates);
+        enter(Phase::Warmup);
     }
 
     //PetkosOrca: the half of correctness a timing run cannot show.
