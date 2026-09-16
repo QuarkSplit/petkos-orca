@@ -5,6 +5,7 @@
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "slic3r/GUI/Camera.hpp"
 #include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/PlateBoard.hpp"
 #include "slic3r/GUI/BitmapCache.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI_ObjectList.hpp"
@@ -49,14 +50,14 @@ std::string GLGizmoMmuSegmentation::on_get_name() const
 
 bool GLGizmoMmuSegmentation::on_is_selectable() const
 {
-    return /*wxGetApp().get_mode() != comSimple && */wxGetApp().plater()->get_extruders_colors().size() > 1;
+    return true;
 }
 
 bool GLGizmoMmuSegmentation::on_is_activable() const
 {
     const Selection& selection = m_parent.get_selection();
     return !selection.is_empty() && (selection.is_single_full_instance() || selection.is_any_volume()) &&
-           wxGetApp().plater()->get_extruders_colors().size() > 1;
+           !wxGetApp().plater()->get_extruders_colors().empty();
 }
 
 static std::vector<int> get_extruder_id_for_volumes(const ModelObject &model_object)
@@ -175,7 +176,7 @@ void GLGizmoMmuSegmentation::data_changed(bool is_serializing)
 {
     GLGizmoPainterBase::data_changed(is_serializing);
     const std::vector<ColorRGBA> current_colors = wxGetApp().plater()->get_extruders_colors();
-    if (m_state != On || current_colors.size() <= 1)
+    if (m_state != On || current_colors.empty())
         return;
 
     ModelObject* model_object = m_c->selection_info()->model_object();
@@ -436,6 +437,24 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
         if (extruder_idx < 16 && ImGui::IsItemHovered()) m_imgui->tooltip(_L("Shortcut Key ") + std::to_string(extruder_idx + 1), max_tooltip_width);
     }
+    m_imgui->disabled_begin(m_extruders_colors.size() >= EXTRUDERS_LIMIT);
+    if (m_imgui->button(_L("Add colour…"))) {
+        const int plate_index = wxGetApp().plater()->get_partplate_list().get_curr_plate_index();
+        wxGetApp().CallAfter([this, plate_index]() {
+            auto *plater = wxGetApp().plater();
+            if (m_state != On || plater->get_partplate_list().get_curr_plate_index() != plate_index)
+                return;
+            const size_t previous_count = m_extruders_colors.size();
+            show_plate_filament_menu(plater, plater, plate_index, 0);
+            if (m_state != On || plater->get_partplate_list().get_curr_plate_index() != plate_index)
+                return;
+            data_changed(false);
+            if (m_extruders_colors.size() > previous_count)
+                m_selected_extruder_idx = m_extruders_colors.size() - 1;
+            m_parent.set_as_dirty();
+        });
+    }
+    m_imgui->disabled_end();
     // ORCA: Remap filaments section (Border only, Title in border). 
     // Styled as a panel for visual grouping.
     if (ImGui::TreeNodeEx(m_desc.at("perform_remap").c_str(), ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_FramePadding)){

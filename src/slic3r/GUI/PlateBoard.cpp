@@ -4013,7 +4013,7 @@ void show_plate_filament_menu(wxWindow *parent, Plater *plater, int plate_index,
         bool        header_done  = false;
         for (size_t i = 0; i < bundle->filament_presets.size(); ++i) {
             const Preset *pool_preset = bundle->filaments.find_preset(bundle->filament_presets[i], false);
-            if (pool_preset == nullptr || pool_preset->is_default)
+            if (pool_preset == nullptr)
                 continue;
             std::string colour;
             if (pool_colours != nullptr && i < pool_colours->values.size())
@@ -4025,7 +4025,7 @@ void show_plate_filament_menu(wxWindow *parent, Plater *plater, int plate_index,
 
             std::string target = pool_preset->name;
             std::string note;
-            if (!runs_here(*pool_preset)) {
+            if (pool_preset->is_default || !runs_here(*pool_preset)) {
                 target = bundle->translate_filament_to_printer(pool_preset->name, printer_profile, process_profile);
                 if (target.empty()) {
                     //Named, not hidden: a spool this machine cannot express is a fact the
