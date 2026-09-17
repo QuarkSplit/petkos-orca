@@ -1031,6 +1031,60 @@ void PresetBundle::apply_plate_filament_colours(const PlateSlicingContext &conte
     config.option<ConfigOptionEnumsGeneric>("filament_finish", true)->values = std::move(finishes);
 }
 
+// A PLATE'S COMPOSITION MUST NOT DEPEND ON WHICH PRINTER THE SETTINGS TABS ARE SHOWING.
+//
+// extruder_nozzle_stats is session-only: no saved preset carries it, and the printer tab seeds it into
+// the EDITED preset whenever a printer is selected (seedExtruderNozzleStats, GUI side). find_preset hands
+// back the edited copy for the selected printer and the saved one otherwise, so a plate composed with no
+// stats while the cursor was elsewhere composed WITH them the moment the cursor followed it. Print::apply
+// read that as a real change, and a re-apply landing mid-slice cancelled the slice: on 17 Sep 2026 a
+// four-part AD5X plate, selected and sliced back to back, lost its slice every time ("changed keys:
+// extruder_nozzle_stats", then "got cancelled exception"), while larger plates only survived because
+// their invalidated step had not started yet.
+//
+// So the stats are completed here, by the rule the tab seeds with - each extruder gets its maximum
+// nozzle count of its selected volume type, Hybrid starting as Standard - and the composed value is the
+// same whether or not the tab has seeded its copy yet. A value that is already complete (synced from a
+// machine, or set by hand) is kept.
+static void complete_extruder_nozzle_stats(DynamicPrintConfig &config)
+{
+    const auto *nozzles = config.option<ConfigOptionFloats>("nozzle_diameter");
+    const size_t extruders = nozzles != nullptr ? nozzles->values.size() : 0;
+    if (extruders == 0)
+        return;
+
+    auto *stats = config.option<ConfigOptionStrings>("extruder_nozzle_stats", true);
+    const bool complete = stats->values.size() == extruders &&
+                          std::any_of(stats->values.begin(), stats->values.end(),
+                                      [](const std::string &s) { return !s.empty(); });
+    if (complete)
+        return;
+
+    const auto *volume_types = config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
+    const ConfigOption *max_opt = config.option("extruder_max_nozzle_count");
+    auto max_count = [max_opt](size_t extruder) {
+        if (const auto *nullable = dynamic_cast<const ConfigOptionIntsNullable *>(max_opt);
+            nullable != nullptr && extruder < nullable->values.size() &&
+            nullable->values[extruder] != ConfigOptionIntsNullable::nil_value())
+            return nullable->values[extruder];
+        if (const auto *plain = dynamic_cast<const ConfigOptionInts *>(max_opt);
+            plain != nullptr && extruder < plain->values.size())
+            return plain->values[extruder];
+        return 1;
+    };
+
+    std::vector<std::map<NozzleVolumeType, int>> seeded(extruders);
+    for (size_t extruder = 0; extruder < extruders; ++extruder) {
+        NozzleVolumeType type = nvtStandard;
+        if (volume_types != nullptr && extruder < volume_types->values.size())
+            type = NozzleVolumeType(volume_types->values[extruder]);
+        if (type == nvtHybrid)
+            type = nvtStandard;
+        seeded[extruder][type] = max_count(extruder);
+    }
+    stats->values = save_extruder_nozzle_stats_to_string(seeded);
+}
+
 void PresetBundle::apply_plate_flush_matrix(const PlateSlicingContext &context, DynamicPrintConfig &config)
 {
     // THE FLUSH MATRIX IS FILAMENT-INDEXED, SO IT IS SUBJECT TO THE SAME INVARIANT AS THE COLOURS.
@@ -1521,6 +1575,8 @@ bool PresetBundle::compose_plate_slicing_config(const PlateSlicingContext       
         // read, so a plate whose slot count differs from the pool's read the wrong cells or ran
         // off the end of the vector.
         apply_plate_flush_matrix(context, resolved.config);
+        // And the one session-only value the editing cursor used to leak into a plate. See the function.
+        complete_extruder_nozzle_stats(resolved.config);
     } catch (const std::exception &ex) {
         error = "Unable to compose plate context: " + std::string(ex.what());
         resolved = {};

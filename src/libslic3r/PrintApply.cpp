@@ -1366,6 +1366,17 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         update_apply_status(false);
         //BBS: add more logs
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got print_diff %1%, object_diff %2%, region_diff %3%, set status to APPLY_STATUS_CHANGED")%print_diff.size() %object_diff.size() %region_diff.size();
+        // Podslicer: a count says that something changed, never what. A re-apply that changes one key
+        // while a slice is running is the difference between a finished plate and a cancelled one, and
+        // the only way to find that key was a rebuild. A handful of names is cheap; a whole preset
+        // switch (a hundred keys) is summarised by its count above.
+        if (print_diff.size() + object_diff.size() + region_diff.size() <= 12) {
+            std::string names;
+            for (const auto *diff : { &print_diff, &object_diff, &region_diff })
+                for (const std::string &key : *diff)
+                    names += (names.empty() ? "" : ", ") + key;
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", changed keys: " << names;
+        }
     }
 
     // Grab the lock for the Print / PrintObject milestones.
